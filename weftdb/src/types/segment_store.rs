@@ -394,6 +394,11 @@ pub struct SegmentStoreOptions {
 	/// ([`MaintenanceBreaker::default`]): decision 17's scheduler is on by
 	/// default, and the breaker is part of it.
 	pub breaker: MaintenanceBreaker,
+	/// The per-aspect decode breaker (ROB-22): consecutive decode failures on
+	/// an aspect trip this breaker independently of the maintenance breaker, so
+	/// a decode crash loop on a damaged frame stops the retries without affecting
+	/// the maintenance breaker's sweep-level tripped-aspect list.
+	pub decode_breaker: MaintenanceBreaker,
 	/// The most series one aspect may register (TAG-7):
 	/// [`DEFAULT_MAX_SERIES_PER_ASPECT`] unless changed. An ingest that would register
 	/// one more is refused with [`StoreError::SeriesLimit`](crate::StoreError::SeriesLimit);
@@ -454,7 +459,7 @@ pub const DEFAULT_MAX_POINT_BATCH: usize = 10_000;
 
 impl Default for SegmentStoreOptions {
 	fn default() -> Self {
-		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT, max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: false, disk_reserve_bytes: 0 }
+		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), decode_breaker: MaintenanceBreaker::default(), max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT, max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: false, disk_reserve_bytes: 0 }
 	}
 }
 
@@ -472,7 +477,7 @@ impl SegmentStoreOptions {
 	/// as it documents. Explicit: nothing in the library calls it.
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()) }
+		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), decode_breaker: MaintenanceBreaker::decode_from_env(), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()) }
 	}
 
 	/// These options with `policy` for checkpoints.
@@ -500,6 +505,15 @@ impl SegmentStoreOptions {
 	#[must_use]
 	pub const fn with_breaker(mut self, breaker: MaintenanceBreaker) -> Self {
 		self.breaker = breaker;
+		self
+	}
+
+	/// Decode circuit breaker (ROB-22) for background decodes, builder form of
+	/// [`SegmentStoreOptions::decode_breaker`]. A store that decodes damaged frames outside the
+	/// maintenance loop uses this to keep its own retry budget separate from the maintenance one.
+	#[must_use]
+	pub const fn with_decode_breaker(mut self, breaker: MaintenanceBreaker) -> Self {
+		self.decode_breaker = breaker;
 		self
 	}
 
@@ -672,6 +686,17 @@ pub const DEFAULT_MAINTENANCE_BREAKER_FAILURES: u32 = 3;
 /// a store-wide sweep may try it once more (ROB-19).
 pub const DEFAULT_MAINTENANCE_BREAKER_COOLDOWN: Duration = Duration::from_secs(300);
 
+/// Consecutive decode failures for an aspect after which the decode breaker trips
+/// (ROB-22). Same threshold as the maintenance breaker (3): a single transient I/O
+/// blip must not skip a whole tick's maintenance, but two more attempts at the same
+/// damaged frame should stop the retry loop without waiting for the maintenance
+/// breaker's cooldown.
+pub const DEFAULT_DECODE_BREAKER_FAILURES: u32 = 3;
+
+/// How long a tripped decode breaker leaves its aspect alone before a background
+/// pass may try a decode once more (ROB-22).
+pub const DEFAULT_DECODE_BREAKER_COOLDOWN: Duration = Duration::from_secs(300);
+
 /// The per-aspect **circuit breaker** for store-wide maintenance sweeps (ROB-19,
 /// release plan decision 17's maintenance scheduler).
 ///
@@ -718,6 +743,16 @@ impl MaintenanceBreaker {
 	pub fn from_env() -> Self {
 		let failure_threshold = std::env::var("WEFT_MAINTENANCE_BREAKER_FAILURES").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(DEFAULT_MAINTENANCE_BREAKER_FAILURES);
 		let cooldown = std::env::var("WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(DEFAULT_MAINTENANCE_BREAKER_COOLDOWN, Duration::from_secs);
+		Self { failure_threshold, cooldown }
+	}
+
+	/// The decode breaker the environment describes (ROB-22):
+	/// `WEFT_DECODE_BREAKER_FAILURES` and `WEFT_DECODE_BREAKER_COOLDOWN_SECS`.
+	/// Same fallback behaviour as [`from_env`](Self::from_env).
+	#[must_use]
+	pub fn decode_from_env() -> Self {
+		let failure_threshold = std::env::var("WEFT_DECODE_BREAKER_FAILURES").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(DEFAULT_DECODE_BREAKER_FAILURES);
+		let cooldown = std::env::var("WEFT_DECODE_BREAKER_COOLDOWN_SECS").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(DEFAULT_DECODE_BREAKER_COOLDOWN, Duration::from_secs);
 		Self { failure_threshold, cooldown }
 	}
 }
@@ -1630,6 +1665,11 @@ pub struct SegmentStore {
 	/// The per-aspect circuit breaker store-wide maintenance sweeps run under
 	/// (ROB-19): its policy, from the open options.
 	maintenance_breaker: MaintenanceBreaker,
+	/// The per-aspect decode breaker (ROB-22): shares the same breaker-state map
+	/// as the maintenance breaker but with its own threshold and cooldown, so a
+	/// decode crash loop on a damaged frame stops the retries without affecting
+	/// the maintenance breaker's sweep-level tripped-aspect list.
+	decode_breaker: MaintenanceBreaker,
 	/// The most series one aspect may register, from the open options
 	/// ([`SegmentStoreOptions::max_series_per_aspect`]).
 	max_series_per_aspect: usize,
@@ -1652,6 +1692,10 @@ pub struct SegmentStore {
 	/// tripped, when the cooldown ends), guarded by a plain mutex: it is only
 	/// ever held for a map touch, never across an await.
 	breaker_state: Mutex<HashMap<String, AspectBreakerState>>,
+	/// Each aspect's decode-breaker state (ROB-22), separate from the maintenance
+	/// breaker so decode failures on a damaged frame do not affect the sweep-level
+	/// tripped-aspect list.
+	decode_breaker_state: Mutex<HashMap<String, AspectBreakerState>>,
 	/// Segment-index transaction attempts that lost an MVCC conflict; see
 	/// [`index_conflicts`](SegmentStore::index_conflicts).
 	index_conflicts: AtomicU64,

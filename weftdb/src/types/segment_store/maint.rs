@@ -84,6 +84,60 @@ impl SegmentStore {
 		false
 	}
 
+	/// Whether `aspect`'s decode may be attempted under the decode circuit breaker
+	/// (ROB-22): `false` only while the breaker is tripped and its cooldown is still
+	/// running. A cooldown that has passed permits the attempt — that pass is the
+	/// half-open trial whose outcome [`decode_breaker_record`](Self::decode_breaker_record)
+	/// settles.
+	fn decode_breaker_permits(&self, aspect: &str) -> bool {
+		if self.decode_breaker.failure_threshold == 0 {
+			return true;
+		}
+		let state = self.decode_breaker_state.lock().unwrap_or_else(PoisonError::into_inner);
+		state.get(aspect).and_then(|aspect_state| aspect_state.open_until).is_none_or(|until| until <= Instant::now())
+	}
+
+	/// Record the outcome of one decode attempt on `aspect` in its decode circuit
+	/// breaker (ROB-22). A success clears the aspect's state outright (the breaker
+	/// closes, the consecutive count resets). A failure extends the count and, once
+	/// it reaches the policy's threshold, trips the breaker for a fresh cooldown —
+	/// logged once, at the trip, so a failing aspect announces its decode quarantine
+	/// instead of failing silently forever. A failure on a half-open trial re-trips
+	/// at once: the count is already at the threshold, so the increment keeps it
+	/// there.
+	///
+	/// Returns whether this record tripped (or re-tripped) the breaker, so the
+	/// sweep can count the trip event.
+	fn decode_breaker_record(&self, aspect: &str, failed: bool) -> bool {
+		if self.decode_breaker.failure_threshold == 0 {
+			return false;
+		}
+		let mut state = self.decode_breaker_state.lock().unwrap_or_else(PoisonError::into_inner);
+		if !failed {
+			state.remove(aspect);
+			return false;
+		}
+		let tripped = self.decode_breaker_count_failure(aspect, state.entry(aspect.to_string()).or_default());
+		drop(state);
+		tripped
+	}
+
+	/// Count one more decode failure against `aspect_state`, opening the decode
+	/// breaker when the count reaches the threshold. Returns whether this failure
+	/// opened (or re-opened) the breaker.
+	fn decode_breaker_count_failure(&self, aspect: &str, aspect_state: &mut AspectBreakerState) -> bool {
+		aspect_state.consecutive_failures = aspect_state.consecutive_failures.saturating_add(1);
+		if aspect_state.consecutive_failures >= self.decode_breaker.failure_threshold {
+			let was_open = aspect_state.open_until.is_some_and(|until| until > Instant::now());
+			aspect_state.open_until = Some(Instant::now() + self.decode_breaker.cooldown);
+			if !was_open {
+				tracing::warn!(aspect, failures = aspect_state.consecutive_failures, cooldown = ?self.decode_breaker.cooldown, "decode circuit breaker tripped: consecutive decode failures for this aspect stop retries until the cooldown passes; suspect-frame policy applies");
+			}
+			return true;
+		}
+		false
+	}
+
 	/// Take `aspect`'s maintenance lock for a store-wide sweep: at once or not at all with
 	/// no `deadline` ([`MaintenanceWait::Skip`]), else waiting until `deadline`.
 	pub(crate) async fn sweep_maintain(&self, aspect: &str, deadline: Option<tokio::time::Instant>) -> Option<MaintGuard> {
