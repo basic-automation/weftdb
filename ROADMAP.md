@@ -81,7 +81,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] (2026-10-08 list.) The 2026-10-08 run (PR `routine/dsp-2026-10-08`)
 - [ ] (2026-09-23 list; item 3 shipped 2026-10-08.) The 2026-09-23 run
 - [ ] Run D-S21's privileged power-loss validation (sudo: dm-log-writes or a QEMU hard reset) *(owner)*
-- [ ] read lane: **X-READ** Read-time newer-wins merge across overlapping segments, per series
+- [x] read lane: **X-READ** Read-time newer-wins merge across overlapping segments, per series
 - [ ] maint lane: **ROB-20** Maintenance resource limits, k-way merge, re-split of oversized frames
 - [ ] open lane: **ROB-22** Suspect-frame policy and background-decode crash-loop breaker
 - [ ] L-INGEST: **ROB-18** Two-phase ingest admission, total body deadline, panic mapping by phase
