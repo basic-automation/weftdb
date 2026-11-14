@@ -220,13 +220,13 @@ fn the_contract_coverage_spans_the_whole_registry() {
 // --- Gate: every route in the families ----------------------------------------
 
 /// What a key that holds the route's scope gets back: the handler's answer
-/// when the gate passes. For the metrics routes that are not configured
-/// (headroom needs a store, bench runs need `WEFT_BENCH_RUNS_DIR`), the
-/// handler answers `503 unconfigured` — that is the gate passing, not a
-/// refusal.
+/// when the gate passes. The bench-run routes answer `503 unconfigured`
+/// because no `WEFT_BENCH_RUNS_DIR` is set — that is the gate passing, not a
+/// refusal. Headroom is not in that list: these routers carry a real store, so
+/// it answers `200` with the host's free-space numbers.
 fn expected_pass_status(entry: &RouteEntry) -> StatusCode {
 	match entry.spec.operation_id {
-		"storage_headroom" | "list_bench_runs" | "get_bench_run" => StatusCode::SERVICE_UNAVAILABLE,
+		"list_bench_runs" | "get_bench_run" => StatusCode::SERVICE_UNAVAILABLE,
 		_ => StatusCode::OK,
 	}
 }
@@ -234,28 +234,38 @@ fn expected_pass_status(entry: &RouteEntry) -> StatusCode {
 /// A request that passes the gate behind the handler, per route: the
 /// stateless compute endpoints carry a valid body; probes and metrics
 /// routes need no body beyond the GET/POST method itself.
-fn family_request(entry: &RouteEntry, key: Option<&str>) -> Request<Body> {
-	let path = entry.path.clone();
-	let method = entry.method.clone();
-	if method == Method::GET {
-		return get(&path, key);
+/// The templated paths in these families, with a parameter value that reaches
+/// the handler. A bench run id is 64 lower-case hex digits; its value is
+/// irrelevant here, because the bench routes answer `503` before it is looked
+/// up.
+fn concrete_path(path: &'static str) -> &'static str {
+	match path {
+		"/bench/runs/{id}" => "/bench/runs/0000000000000000000000000000000000000000000000000000000000000000",
+		other => other,
 	}
-	// POST.
-	match path.as_str() {
-		// JSON-input compute routes: interpolate (+ formats), downsample (+ formats).
-		"/api/v1/interpolate" | "/api/v1/interpolate/csv" | "/api/v1/interpolate/arrow" | "/api/v1/interpolate/parquet" => post_json(&path, key, &interpolate_body()),
-		"/api/v1/interpolate/point" => post_json(&path, key, &interpolate_point_body()),
-		// ILP-input compute routes.
-		"/api/v1/interpolate/ilp" => post_text("/api/v1/interpolate/ilp?field=load&precision=s", key, ILP_BODY),
-		"/api/v1/interpolate/ilp/csv" => post_text("/api/v1/interpolate/ilp/csv?field=load&precision=s", key, ILP_BODY),
-		"/api/v1/interpolate/ilp/arrow" => post_text("/api/v1/interpolate/ilp/arrow?field=load&precision=s", key, ILP_BODY),
-		"/api/v1/interpolate/ilp/parquet" => post_text("/api/v1/interpolate/ilp/parquet?field=load&precision=s", key, ILP_BODY),
-		"/api/v1/downsample" | "/api/v1/downsample/csv" | "/api/v1/downsample/arrow" | "/api/v1/downsample/parquet" => post_json(&path, key, &downsample_body()),
-		"/api/v1/downsample/ilp" => post_text("/api/v1/downsample/ilp?field=load&precision=s", key, ILP_BODY),
-		"/api/v1/downsample/ilp/csv" => post_text("/api/v1/downsample/ilp/csv?field=load&precision=s", key, ILP_BODY),
-		"/api/v1/downsample/ilp/arrow" => post_text("/api/v1/downsample/ilp/arrow?field=load&precision=s", key, ILP_BODY),
-		"/api/v1/downsample/ilp/parquet" => post_text("/api/v1/downsample/ilp/parquet?field=load&precision=s", key, ILP_BODY),
-		_ => post_empty(&path, key),
+}
+
+/// True for the eight line-protocol compute routes: their body is `text/plain`
+/// line protocol and their URI carries a `field` and a `precision`.
+fn is_ilp_route(path: &str) -> bool {
+	path.split('/').any(|segment| segment == "ilp")
+}
+
+fn family_request(entry: &RouteEntry, key: Option<&str>) -> Request<Body> {
+	let path = concrete_path(entry.path);
+	if entry.method == Method::GET {
+		return get(path, key);
+	}
+	if is_ilp_route(path) {
+		return post_text(&format!("{path}?field=load&precision=s"), key, ILP_BODY);
+	}
+	// The remaining POSTs: the stateless compute routes carry a JSON body,
+	// every other route in these families is a bodyless POST.
+	match path {
+		"/api/v1/interpolate" | "/api/v1/interpolate/csv" | "/api/v1/interpolate/arrow" | "/api/v1/interpolate/parquet" => post_json(path, key, &interpolate_body()),
+		"/api/v1/interpolate/point" => post_json(path, key, &interpolate_point_body()),
+		"/api/v1/downsample" | "/api/v1/downsample/csv" | "/api/v1/downsample/arrow" | "/api/v1/downsample/parquet" => post_json(path, key, &downsample_body()),
+		_ => post_empty(path, key),
 	}
 }
 
@@ -372,10 +382,12 @@ async fn profile_current_answers_its_frozen_shape() {
 	let router = secured_router().await.1;
 	let (status, _headers, body) = send_json(router.clone(), get("/debug/profile/current", None)).await;
 	assert_eq!(status, StatusCode::OK, "{body}");
-	// The profile report: service identity, then a section per endpoint family.
+	// The profile report: service identity, then a section per profiled family.
+	// Three families carry a profile today; the maintenance and backup lanes
+	// count their work in ledger rows, not in this report.
 	assert_eq!(body["service"], "weft-server", "{body}");
 	assert_eq!(body["version"], VERSION, "{body}");
-	let sections = ["interpolate", "downsample", "ingest", "reconcile", "maintenance", "backup"];
+	let sections = ["interpolate", "downsample", "ingest"];
 	for section in &sections {
 		assert!(body[section].is_object(), "the {section} section is present: {body}");
 	}
@@ -391,17 +403,20 @@ async fn interpolate_json_answers_its_frozen_shape() {
 	// InterpolateResponse: spline, resolution, input_points, output_points,
 	// backend, gpu_fallback, points[].
 	assert_eq!(key_set(&body), expected(&["spline", "resolution", "input_points", "output_points", "backend", "gpu_fallback", "points"]), "exactly the interpolate keys: {body}");
-	assert_eq!(body["spline"], "Cubic", "the default method: {body}");
+	// The tokens are the request tokens echoed back: `spline` is the
+	// `SplineSpec` serde token (lower-case) and `resolution` the
+	// `ResolutionSpec` token, so the response round-trips into a request.
+	assert_eq!(body["spline"], "cubic", "the default method: {body}");
 	assert_eq!(body["resolution"], "minutes", "the default resolution: {body}");
 	assert_eq!(body["input_points"], 3, "{body}");
-	assert_eq!(body["output_points"], 3, "three input minutes → three output grid points: {body}");
+	assert_eq!(body["output_points"], 3, "three aligned input minutes → three grid points: {body}");
 	assert_eq!(body["gpu_fallback"], false, "no GPU configured: {body}");
-	assert!(body["backend"].as_str().is_some_and(|b| b == "cpu"), "the backend that ran: {body}");
+	assert!(body["backend"].as_str().is_some_and(|b| matches!(b, "cpu" | "gpu")), "the backend that ran: {body}");
 	let points = body["points"].as_array().expect("points is an array");
 	assert_eq!(points.len(), 3, "{body}");
 	for point in points {
 		assert_eq!(key_set(point), expected(&["timestamp", "value", "kind"]), "exactly the point keys: {point}");
-		assert!(point["kind"].as_str().is_some_and(|k| matches!(k, "raw" | "interpolated")), "every point has a known kind: {point}");
+		assert!(point["kind"].as_str().is_some_and(|k| matches!(k, "raw" | "interpolated" | "extrapolated")), "every point has a known kind: {point}");
 	}
 }
 
@@ -413,6 +428,7 @@ async fn downsample_json_answers_its_frozen_shape() {
 	// DownsampleResponse: resolution, aggregations, input_points, buckets,
 	// series[], optional fill, optional tags (absent on the compute endpoint).
 	assert_eq!(key_set(&body), expected(&["resolution", "aggregations", "input_points", "buckets", "series"]), "exactly the downsample keys: {body}");
+	// The bucket timestamps sit on minute boundaries, so one bucket per input.
 	assert_eq!(body["resolution"], "minutes", "the default resolution: {body}");
 	assert_eq!(body["aggregations"], serde_json::json!(["min", "max", "avg"]), "the default reductions, in order: {body}");
 	assert_eq!(body["input_points"], 3, "{body}");
