@@ -5,6 +5,25 @@ use weft_physical_type::merge_newer_wins;
 
 use super::*;
 
+/// Reduce one pass of already-deduplicated rows (as from [`read_time_range_of`]) into
+/// a [`PartialReduction`], for the overlap fallback route.
+/// Pure and synchronous: no store state, spawn_blocking-safe.
+fn reduce_decoded_rows(ts: Vec<i64>, vs: Vec<Option<BigDecimal>>, start: i64, end: i64, unit: TimeUnit, resolution: Resolution, aggregations: Vec<Aggregation>) -> Result<Option<PartialReduction>> {
+	let mut points: Vec<Point> = Vec::with_capacity(ts.len().min(256));
+	for (t, v) in ts.into_iter().zip(vs) {
+		if let Some(value) = v {
+			if start <= t && t <= end {
+				points.push(Point::new(instant_from_epoch(t, unit).ok_or_else(|| anyhow::anyhow!("epoch {t} outside the representable instant range"))?, value));
+			}
+		}
+	}
+	if points.is_empty() {
+		return Ok(None);
+	}
+	let partial = weft_reduce::reduce_partial(&points, resolution, None, None, &aggregations).map_err(|e| anyhow::anyhow!("reducing decoded rows: {e}"))?;
+	Ok(Some(partial))
+}
+
 impl SegmentStore {
 	/// Pin the reclaim epoch for a read about to prune the index, so that no frame a swap
 	/// retires meanwhile is unlinked under it (see `reaper`). Every read path takes one
@@ -215,6 +234,18 @@ impl SegmentStore {
 	/// while it runs, so no caller of the store — HTTP handler or embedder —
 	/// can make it hold an unbounded partial.
 	///
+	/// ## Cross-segment overlap (P12 #719)
+	///
+	/// When two sealed segments of one series share timestamps, the per-segment partial
+	/// merge would double-count overlapping rows → wrong `count`, `sum`, `min`, `max`,
+	/// `first`, `last`, percentiles and time-weighted average. The implementation detects
+	/// real cross-descriptor overlap from the descriptors' clipped `min_ts`/`max_ts` bounds
+	/// (conservative: over-triggers safely, never under-triggers). When overlap is found,
+	/// it falls back to reading the deduplicated range via `read_time_range_of` (already
+	/// newer-wins-correct) and reducing once. This route holds the entire window's rows in
+	/// memory at once, so it is the slow path — overlapping segments are the transient
+	/// state [`reconcile_overlaps`](crate::SegmentStore::reconcile_overlaps) removes.
+	///
 	/// # Errors
 	///
 	/// If `aspect` has no declared schema, if a segment cannot be read or decoded, if a
@@ -296,6 +327,23 @@ impl SegmentStore {
 		// prune: its answer *is* the rows, nulls included, so dropping that segment there
 		// would delete timestamps the caller asked for.
 		let (descriptors, frame_crcs): (Vec<SegmentDescriptor>, Vec<Option<u32>>) = self.index.prune_series_present_rows(aspect, series, start, end).await?.into_iter().map(|row| (row.desc, row.frame_crc)).unzip();
+
+		// Cross-segment overlap detection (P12 #719): when two pruned descriptors' clipped time
+		// windows intersect, the per-segment partial merge would double-count rows at shared
+		// timestamps. Fall back to the contract: read the deduplicated range via
+		// `read_time_range_of` (already newer-wins-correct) and reduce once. Over-triggering is
+		// safe (costs a slower route); under-triggering is a correctness bug, so the predicate
+		// is deliberately conservative on the descriptors' time bounds.
+		if descriptors_overlap(&descriptors, start, end) {
+			let (ts, vs) = self.read_time_range_of(aspect, series, start, end).await?;
+			// Run the conversion and reduction on the blocking pool so the fallback does not
+			// block the async runtime for a large result set.
+			let unit = schema.timestamp_unit;
+			let aggs = aggregations.to_vec();
+			let partial = tokio::task::spawn_blocking(move || reduce_decoded_rows(ts, vs, start, end, unit, resolution, aggs)).await.context("overlap fallback reduce panicked")??;
+			// Enforce the ROB-13 cap on the fallback too, matching the other routes.
+			return partial.map_or(Ok(None), |p| check_partial_len(aspect, p, max_buckets).map(Some));
+		}
 
 		// A persisted per-segment partial can *substitute* for decoding a segment only when
 		// it can answer this exact query: every requested reduction must be one the sidecar
