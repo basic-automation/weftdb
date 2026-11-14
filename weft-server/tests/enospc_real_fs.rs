@@ -75,10 +75,12 @@ async fn space_source_reports_a_full_filesystem_and_the_server_says_507() {
 	// filesystem's available bytes below u64::MAX, and refuses.
 	let (_dir, router) = router_with_impossible_reserve();
 	let response = router.oneshot(ingest_points_request()).await.expect("the router answers");
+	// Read the status before the body moves out of the response.
+	let status = response.status();
 	let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024).await.expect("a body fits");
 	let body: serde_json::Value = serde_json::from_slice(&bytes).expect("a JSON body");
 
-	assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+	assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
 	assert_eq!(body["code"], "insufficient_storage", "the code is the §4 name: {body}");
 }
 
