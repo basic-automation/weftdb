@@ -6779,3 +6779,20 @@ issue to self plus a claim comment naming the exact scope, then verify state wit
 from local `origin/main` reads and unverified branch names, which produced claims about PRs that did not
 exist (the numbers were issues). Correction applied: every "done/merged/landed" statement in this session
 is now backed by a `gh` read in the same turn, and `git fetch` precedes any worktree created off `main`.
+
+## 2026-11-14 — ROB-20: what maintenance budgets and merging actually do today (#445)
+
+**Three axes, three independent statuses.** The 1.0 plan's §6 W9 groups "Maintenance resource limits,
+k-way merge and re-splitting of oversized frames" as a single lane. The audit shows they are disjoint:
+
+| Axis | Status | Evidence `file:line` |
+|---|---|---|
+| Maintenance resource limits / budgets | **Mostly missing** — the disk guard excludes maintenance writes (`seal.rs:1093` vs no call in `swap_plans` at `seal.rs:348`); no per-op byte/memory/time budget exists; `MaintenanceBreaker` (`segment_store.rs:696`) is a circuit breaker for sweep failures, not a resource budget | `docs/maintenance-budgets-plan.md §1.1` |
+| k-way merge | **Not shipped** — the merge is pairwise serial fold (`fold_newest_wins` at `segment_store.rs:1065` calling two-pointer `merge_newer_wins` at `split.rs:147` iteratively) | `docs/maintenance-budgets-plan.md §1.2` |
+| Re-splitting of oversized frames | **Partial** — the overlap-merge split path exists (Phase 4.6, `reconcile_overlaps_with_policy` at `maint.rs:1071`), but automatic size-driven resplit is missing; `split_segment` (`maint.rs:634`) is operator-only, never called from any daemon | `docs/maintenance-budgets-plan.md §1.3` |
+
+**The cut proposed.** The plan in `docs/maintenance-budgets-plan.md` orders five slices: disk guard
+coverage for maintenance writes (G2), maintenance byte budget (G1), k-way merge (G3), automatic resplit
+of oversized frames (G4), and per-op time budget (G5). G2 is the smallest risk and the largest guard
+against data-loss; it should ship first. G4 changes the segment count and needs the most validation.
+ROADMAP.md:85 stays unticked until the behaviours ship.

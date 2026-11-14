@@ -52,3 +52,34 @@ check:
 2. Seal order is the one conflict dimension — the newer-in-older-segment case
    cannot be expressed.
 3. `declare_with_upsert_keys` is forward-compatible with untagged ingests.
+
+## Handoff — 2026-11-14 — ROB-20 (#445)
+
+### What was delivered
+
+- `docs/maintenance-budgets-plan.md` (new) — full audit + gap table + 5 ordered slices
+- Append to end of `DECISIONS.md` — entry dated 2026-11-14
+
+### Statuses found
+
+| Behaviour | Status | Key evidence |
+|---|---|---|
+| Maintenance resource budgets | Most mechanisms missing | Disk guard excludes maint writes (`seal.rs:1093` vs `swap_plans` at `seal.rs:348`); no byte/memory/time budget env variables; `MaintenanceBreaker` is a circuit breaker for failures, not a resource budget |
+| k-way merge | Not shipped | `fold_newest_wins` calls `merge_newer_wins` pairwise in serial loop (`segment_store.rs:1065-1073`); no k-way/priority-queue merge exists |
+| Re-splitting of oversized frames | Partial — overlap-split exists, auto-resplit missing | `reconcile_overlaps_with_policy` (`maint.rs:1071`) splits cold prefix off; `split_segment` (`maint.rs:634`) is operator-only, never daemon-called |
+
+### Next concrete step (after review)
+
+1. Read the plan and decisions entry in a PR.
+2. Brief Slice 1 (disk guard coverage for maintenance writes, G2) as a single crate `weftdb` change.
+
+### Changed files (local, not yet committed)
+
+- `docs/maintenance-budgets-plan.md` (new)
+- `DECISIONS.md` (append)
+
+### Not changed, as instructed
+
+- `ROADMAP.md` (unticked)
+- `CHANGELOG.md` (no `docs:` entries found)
+- No `.rs` files
