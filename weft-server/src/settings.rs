@@ -150,6 +150,7 @@ pub const VARS: &[VarSpec] = &[
 	VarSpec { name: "WEFT_RECONCILE_SPLIT_MIN_BYTES", tier: Tier::Tuning, summary: "The floor under which the overlap merge rewrites a component outright instead of splitting its cold prefix off.", accepts: "a whole number of bytes", default: "50 MiB", read_by: "weft-server/startup/daemons.rs" },
 	VarSpec { name: "WEFT_RECONCILE_THRESHOLD", tier: Tier::Tuning, summary: "How many out-of-order segments an aspect must hold before the threshold sweep reconciles it.", accepts: "a non-negative whole number of segments", default: "1 — any aspect with at least one out-of-order segment; a non-numeric value stops the server from starting", read_by: "weft-server/startup/daemons.rs" },
 	VarSpec { name: "WEFT_REQUIRE_GPU", tier: Tier::Test, summary: "Makes a Weft-Bench run fail instead of skipping when no usable GPU is present.", accepts: "any value", default: "unset: a missing GPU skips the GPU cases", read_by: "weft-bench/gpu_memory.rs" },
+	VarSpec { name: "WEFT_RESTORE_BASE_DIR", tier: Tier::Stable, summary: "Where `POST /api/v1/storage/restore/into` publishes restored backups. Each restore lands in a subdirectory `<base>/<name>` whose `name` the caller picks.", accepts: "a directory path (absolute, or relative to the process's working directory)", default: "the parent directory of `WEFT_SEGMENT_STORE_ROOT` (the live store's own parent, so a restored root sits beside the live one)", read_by: "weft-server/backup_routes.rs" },
 	VarSpec { name: "WEFT_SEGMENT_CHECKPOINT_MAX_CODEC_OVERHEAD", tier: Tier::Tuning, summary: "The ceiling on the timestamp-codec override a checkpointed frame may pay, as blocked bytes over best-codec bytes — the gate that stops a column whose shape does not benefit from checkpoints being bloated for a lookup win.", accepts: "a finite number at or above 1.0 (`1.0` = only when free)", default: "1.25 (`DEFAULT_CHECKPOINT_MAX_CODEC_OVERHEAD`)", read_by: "weftdb/types/segment_store.rs (`CheckpointPolicy::from_env`)" },
 	VarSpec { name: "WEFT_SEGMENT_CHECKPOINT_MIN_ROWS", tier: Tier::Tuning, summary: "The segment row floor below which no checkpoint index is written: a small segment decodes trivially, so indexing it is pure cost.", accepts: "a positive whole number of rows", default: "8,192 (`DEFAULT_CHECKPOINT_MIN_ROWS`)", read_by: "weftdb/types/segment_store.rs (`CheckpointPolicy::from_env`)" },
 	VarSpec { name: "WEFT_SEGMENT_CHECKPOINT_STRIDE", tier: Tier::Tuning, summary: "Turns on the checkpoint index inside a frame — one entry every this many rows — trading about 0.4% more bytes for a bounded timestamp scan.", accepts: "a positive whole number of rows (~1024 measured the sweet spot)", default: "unset or `0`: no checkpoint index; the frames WeftDB has always written", read_by: "weftdb/types/segment_store.rs (`CheckpointPolicy::from_env`)" },
@@ -527,7 +528,7 @@ mod tests {
 				assert!(!value.trim().is_empty(), "{} describes its {field} as empty", spec.name);
 			}
 		}
-		assert_eq!(VARS.len(), 109, "the registry's size is asserted so an entry added or dropped is a deliberate act");
+		assert_eq!(VARS.len(), 110, "the registry's size is asserted so an entry added or dropped is a deliberate act");
 	}
 
 	/// The registry's whole point: it cannot drift from the code. A name read but not
@@ -560,7 +561,7 @@ mod tests {
 	#[test]
 	fn the_tiers_are_the_explicit_choice_they_claim() {
 		let stable: Vec<&str> = VARS.iter().filter(|spec| spec.tier == Tier::Stable).map(|spec| spec.name).collect();
-		assert_eq!(stable, ["OTEL_EXPORTER_OTLP_ENDPOINT", "WEFT_ALLOW_ANY_HOST", "WEFT_ALLOW_PLAINTEXT", "WEFT_AUDIT_FILE", "WEFT_AUTH", "WEFT_BACKUP_DIR", "WEFT_DATA_DIR", "WEFT_KEYS_FILE", "WEFT_ON_AMBIGUOUS_COMMIT", "WEFT_SEGMENT_STORE_ROOT", "WEFT_SERVER_ADDR", "WEFT_TLS_CERT_FILE", "WEFT_TLS_KEY_FILE"], "the stable surface is what 1.0 promises; adding to it costs a deprecation cycle later");
+		assert_eq!(stable, ["OTEL_EXPORTER_OTLP_ENDPOINT", "WEFT_ALLOW_ANY_HOST", "WEFT_ALLOW_PLAINTEXT", "WEFT_AUDIT_FILE", "WEFT_AUTH", "WEFT_BACKUP_DIR", "WEFT_DATA_DIR", "WEFT_KEYS_FILE", "WEFT_ON_AMBIGUOUS_COMMIT", "WEFT_RESTORE_BASE_DIR", "WEFT_SEGMENT_STORE_ROOT", "WEFT_SERVER_ADDR", "WEFT_TLS_CERT_FILE", "WEFT_TLS_KEY_FILE"], "the stable surface is what 1.0 promises; adding to it costs a deprecation cycle later");
 		let experimental: Vec<&str> = VARS.iter().filter(|spec| spec.tier == Tier::Experimental).map(|spec| spec.name).collect();
 		assert_eq!(experimental, ["WEFT_BENCH_RUNS_DIR", "WEFT_FLIGHT_ADDR", "WEFT_GPU_ADAPTER", "WEFT_GPU_BACKEND", "WEFT_GPU_CALIBRATE", "WEFT_GPU_DEVICES", "WEFT_SEGMENT_MMAP_READS", "WEFT_SEGMENT_TRANSPOSED_MAX_OVERHEAD"], "two surfaces outside the 1.0 freeze (the bench-run routes and the Flight listener), and six knobs whose value is unproven (GPU adapter, backend pin and multi-device selection, GPU calibration's thresholds, memory-mapped range reads, and a codec the measurements retired)");
 		let harness: BTreeSet<&str> = VARS.iter().filter(|spec| spec.tier == Tier::Test).map(|spec| spec.name).collect();
