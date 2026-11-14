@@ -29,7 +29,7 @@
 //! again. [`RecoveryReport`] is counts only: `/ready` carries it, never the rows.
 
 use serde::{Deserialize, Serialize};
-use weft_physical_type::{crc32, FrameFault, SegmentDescriptor, WeftSegError};
+use weft_physical_type::{crc32, SegmentDescriptor, WeftSegError};
 
 /// The server's policy for what happens to a frame whose decode fails in the
 /// background — a maintenance pass, a compaction, a read that finds a frame it

@@ -549,6 +549,27 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
   serialisation" was therefore wrong. The real silent failure is a `#[serial]` in a block with no test
   attribute at all — it compiles, passes, and runs concurrently — and that is what fails CI now. Scan of
   all 355 tracked `.rs` files: no violations, so no site needed moving.
+- **DONE (2026-11-14) — ROB-22 Suspect-frame policy and background-decode crash-loop breaker (#720).**
+  The slice adds three things. First, `SuspectFramePolicy` (`weftdb/src/types/quarantine.rs`): an enum
+  with three variants (`Skip`, `Quarantine`, `Fail`), parsed from `WEFT_SUSPECT_FRAME_POLICY`, and a
+  `decode_failure_action` function that applies the policy to a C5-classified failure — corrupt frames
+  are always quarantined, suspect frames follow the policy. Second, a decode circuit breaker alongside
+  the existing maintenance breaker: `SegmentStoreOptions::decode_breaker`, the
+  `decode_breaker_state` map on `SegmentStore`, `decode_breaker_permits`,
+  `decode_breaker_record`, and `decode_breaker_count_failure` methods on the maintain impl, plus
+  `WEFT_DECODE_BREAKER_FAILURES` / `WEFT_DECODE_BREAKER_COOLDOWN_SECS` in the registry. Third, the
+  env-var registration: `WEFT_DECODE_BREAKER_COOLDOWN_SECS`, `WEFT_DECODE_BREAKER_FAILURES`, and
+  `WEFT_SUSPECT_FRAME_POLICY` are all registered in `weft-server/src/settings.rs` (in sorted position
+  with PAC-5b strict validation), documented in `docs/config-schema.md` (forty-nine Tuning variables,
+  112 total) and ticked in `ROADMAP.md:92`. The breaker methods replicate the maintenance breaker's
+  tripping logic on a separate state map with its own threshold and cooldown, so decode failures on a
+  damaged frame do not contaminate the sweep-level tripped-aspect list.
+  What is **deliberately left out**: the integration of the decode breaker into the daemon sweep entry
+  points and the interactive read path — those call sites are in `weft-server/src/*daemon*.rs` and the
+  maintenance code path, and wiring them was the part the first worker stopped on. The policy type and
+  breaker API are ready for those callers; which daemon loop checks `decode_breaker_permits` before
+  decoding and calls `decode_breaker_record` after is the next slice's decision, and was too speculative
+  to commit to without the daemon author's input.
 - **NEXT — UDDSketch (uniform guarantee under collapse):**
   - The sketch itself, as a library type (2026-11-11): `weft_reduce::UddSketch` (`weft-reduce/src/uniform.rs`). Tests pin the uniform bound after collapse against an exact sort, the closed form of the bound, and exact merging under collapse.
   - A bench for the cost against `DdSketch` (2026-11-11): `cargo bench -p weft-reduce --bench sketch_collapse`, two seeded synthetic inputs of 100,000 samples at 1%. First figures, criterion medians on a Ryzen 9 7950X3D **while the host ran at a load average near 100**, so they are indicative and not a claim. `add`, random walk, no collapse at 2048 buckets: `DdSketch` 0.65 ms, `UddSketch` 0.44 ms (three runs each, within 1%); `UddSketch` took 1.83 ms in the one run before it had `DdSketch`'s last-bucket cache. `add`, eighteen decades at a 256-bucket budget, both collapsing: 6.7 to 9.6 ms against 6.2 to 7.0 ms over five runs, no clear difference. `merge` of 64 collapsed sketches: 0.67 to 0.75 ms against 78 to 101 µs. What the speed buys on that input: `UddSketch` collapsed four times and reports a 15.9% bound on every quantile, where `DdSketch` keeps 1% on the quantiles above its folded buckets and no bound below.
