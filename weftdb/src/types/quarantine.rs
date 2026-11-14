@@ -66,7 +66,7 @@ impl SuspectFramePolicy {
 	/// returning `None` for anything unrecognised.
 	#[must_use]
 	pub fn parse(text: &str) -> Option<Self> {
-		match text.trim().to_lower() {
+		match text.trim().to_lowercase() {
 			"skip" => Some(Self::Skip),
 			"quarantine" => Some(Self::Quarantine),
 			"fail" => Some(Self::Fail),
