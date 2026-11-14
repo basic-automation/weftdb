@@ -8,11 +8,11 @@
 //! nobody has restored is a hope, not a plan.
 
 use axum::{
-	Json, extract::State, http::StatusCode, response::{IntoResponse, Response}
+	extract::State, http::StatusCode, response::{IntoResponse, Response}, Json
 };
 use serde::{Deserialize, Serialize};
 use weftdb::{
-	BackupManifest, DiskGuard, RESTORE_DRILL_PREFIX, VerifyMode, disk_space_at, durable::{RealFs, StoreFs}
+	disk_space_at, durable::{RealFs, StoreFs}, BackupManifest, DiskGuard, VerifyMode, RESTORE_DRILL_PREFIX
 };
 
 use crate::{
@@ -246,7 +246,7 @@ pub async fn restore_into(State(state): State<AppState>, StrictQuery(params): St
 /// the daemon would take it verbatim. A plain drive path carries no information in that prefix,
 /// so it is dropped here; macOS resolves `/var` to `/private/var`, which is a real path and is
 /// left alone.
-fn operator_path(path: &Path) -> String {
+fn operator_path(path: &std::path::Path) -> String {
 	let text = path.display().to_string();
 	if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
 		return format!(r"\\{rest}");
@@ -550,7 +550,7 @@ mod tests {
 	use weftdb::SegmentStore;
 
 	use crate::{
-		AppState, app_with_state, error::Code, test_fs::{FsOp, INJECTED_CLEANUP_FAILURE, RecordingFs}, test_support::*
+		app_with_state, error::Code, test_fs::{FsOp, RecordingFs, INJECTED_CLEANUP_FAILURE}, test_support::*, AppState
 	};
 
 	#[test]
