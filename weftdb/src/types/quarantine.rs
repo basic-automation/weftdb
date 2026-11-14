@@ -29,7 +29,51 @@
 //! again. [`RecoveryReport`] is counts only: `/ready` carries it, never the rows.
 
 use serde::{Deserialize, Serialize};
-use weft_physical_type::{crc32, SegmentDescriptor, WeftSegError};
+use weft_physical_type::{crc32, FrameFault, SegmentDescriptor, WeftSegError};
+
+/// The server's policy for what happens to a frame whose decode fails in the
+/// background — a maintenance pass, a compaction, a read that finds a frame it
+/// cannot open (ROB-22). The policy sits next to
+/// [`classify_decode_failure`](Self::classify_decode_failure) so both the read path
+/// and the daemon use one rule, configured at startup from
+/// `WEFT_SUSPECT_FRAME_POLICY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspectFramePolicy {
+	/// Serve the store without the frame, count the event, and never quarantine.
+	Skip,
+	/// Quarantine the frame under its C5 class (corrupt or suspect), following
+	/// the existing quarantine path.
+	Quarantine,
+	/// Propagate the decode error to the caller, as before ROB-22.
+	Fail,
+}
+
+impl std::fmt::Display for SuspectFramePolicy {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter.write_str(match self {
+			Self::Skip => "skip",
+			Self::Quarantine => "quarantine",
+			Self::Fail => "fail",
+		})
+	}
+}
+
+impl SuspectFramePolicy {
+	/// The environment variable that names this policy.
+	pub const ENV_NAME: &'static str = "WEFT_SUSPECT_FRAME_POLICY";
+
+	/// Parse the policy from its configuration text (case-insensitive),
+	/// returning `None` for anything unrecognised.
+	#[must_use]
+	pub fn parse(text: &str) -> Option<Self> {
+		match text.trim().to_lower() {
+			"skip" => Some(Self::Skip),
+			"quarantine" => Some(Self::Quarantine),
+			"fail" => Some(Self::Fail),
+			_ => None,
+		}
+	}
+}
 
 /// How long a corrupt quarantine record lives before
 /// [`SegmentStore::purge_expired_quarantine`](crate::SegmentStore::purge_expired_quarantine) may delete
@@ -238,6 +282,26 @@ pub const fn is_newer_format(error: &WeftSegError) -> bool {
 	matches!(error, WeftSegError::UnsupportedVersion { found } if *found > weft_physical_type::FRAME_VERSION_MAX_KNOWN)
 }
 
+/// The action the server takes when a decode failure is C5-suspect (ROB-22):
+/// whether to skip the frame silently, quarantine it, or fail the caller.
+/// A corrupt frame is always quarantined ([`QuarantineClass::Corrupt`]) — the
+/// policy's purpose is the suspect half, where the right answer depends on
+/// whether the deployment wants to keep reading or stop on an undecodable
+/// frame. The policy grows from a single env var for now (ROB-22 1.) and is
+/// resolved here via [`classify_decode_failure`](Self::classify_decode_failure)
+/// so callers never decide on their own.
+#[must_use]
+pub fn decode_failure_action(bytes: &[u8], error: &WeftSegError, policy: SuspectFramePolicy) -> SuspectFramePolicy {
+	if classify_decode_failure(bytes, error) == QuarantineClass::Suspect {
+		// Suspect-class failure: the frame is internally sound but this build
+		// cannot read it. The configured policy decides what to do.
+		policy
+	} else {
+		// Integrity failure: the frame is damaged. Always quarantine it.
+		SuspectFramePolicy::Quarantine
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use bigdecimal::BigDecimal;
@@ -316,5 +380,62 @@ mod tests {
 			assert_eq!(QuarantineClass::parse(class.as_str()), Some(class));
 		}
 		assert_eq!(QuarantineClass::parse("bogus"), None);
+	}
+
+	#[test]
+	fn suspect_frame_policy_parse_accepts_every_variant() {
+		for (text, expected) in [("skip", Some(SuspectFramePolicy::Skip)), ("Skip", Some(SuspectFramePolicy::Skip)), ("SKIP", Some(SuspectFramePolicy::Skip)), ("quarantine", Some(SuspectFramePolicy::Quarantine)), ("Quarantine", Some(SuspectFramePolicy::Quarantine)), ("fail", Some(SuspectFramePolicy::Fail)), ("Fail", Some(SuspectFramePolicy::Fail)), ("bogus", None), ("", None)] {
+			assert_eq!(SuspectFramePolicy::parse(text), expected, "parse({text:?})");
+		}
+	}
+
+	#[test]
+	fn suspect_frame_policy_display_round_trips() {
+		for policy in [SuspectFramePolicy::Skip, SuspectFramePolicy::Quarantine, SuspectFramePolicy::Fail] {
+			let text: String = format!("{policy}");
+			assert_eq!(SuspectFramePolicy::parse(text.as_str()), Some(policy), "the Display text parses back");
+		}
+	}
+
+	#[test]
+	fn decode_failure_action_suspect_frames_respect_the_policy() {
+		let bytes = paged_bytes();
+		// A post-CRC failure is suspect; each policy is honoured.
+		let post_crc = {
+			let mut b = bytes.clone();
+			let middle = b.len() / 2;
+			b[middle] ^= 0xff;
+			let body = b.len() - 4;
+			let checksum = crc32(&b[..body]);
+			b[body..].copy_from_slice(&checksum.to_le_bytes());
+			b
+		};
+		assert!(crc_verified(&post_crc));
+		assert_eq!(decode_failure_action(&post_crc, &WeftSegError::InvalidDecimal, SuspectFramePolicy::Skip), SuspectFramePolicy::Skip);
+		assert_eq!(decode_failure_action(&post_crc, &WeftSegError::InvalidDecimal, SuspectFramePolicy::Quarantine), SuspectFramePolicy::Quarantine);
+		assert_eq!(decode_failure_action(&post_crc, &WeftSegError::InvalidDecimal, SuspectFramePolicy::Fail), SuspectFramePolicy::Fail);
+	}
+
+	#[test]
+	fn decode_failure_action_corrupt_frames_always_quarantine() {
+		let mut bytes = paged_bytes();
+		let middle = bytes.len() / 2;
+		bytes[middle] ^= 0xff;
+		// No CRC verification: this is an integrity failure.
+		assert!(!crc_verified(&bytes));
+		// Every policy returns Quarantine for a corrupt frame.
+		for policy in [SuspectFramePolicy::Skip, SuspectFramePolicy::Quarantine, SuspectFramePolicy::Fail] {
+			assert_eq!(decode_failure_action(&bytes, &WeftSegError::ChecksumMismatch { stored: 1, computed: 2 }, policy), SuspectFramePolicy::Quarantine);
+		}
+	}
+
+	#[test]
+	fn decode_failure_action_c5_named_causes_are_subject_to_policy() {
+		let bytes = paged_bytes();
+		for error in [WeftSegError::UnsupportedVersion { found: 99 }, WeftSegError::CodecNotEnabled { codec: "x", feature: "y" }, WeftSegError::UnknownCriticalExtension { id: 7 }, WeftSegError::InvalidTag { kind: "codec", value: 0xff }] {
+			for policy in [SuspectFramePolicy::Skip, SuspectFramePolicy::Quarantine, SuspectFramePolicy::Fail] {
+				assert_eq!(decode_failure_action(&bytes, &error, policy), policy, "{error:?} with {policy:?} should respect the policy");
+			}
+		}
 	}
 }
