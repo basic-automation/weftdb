@@ -36,7 +36,7 @@ use weft_physical_type::{timestamp::TimeUnit, AspectSchema, PhysicalType};
 use weft_reduce::Aggregation;
 
 use super::{descriptors_overlap, SegmentStore};
-use crate::{IngestBatch, SeriesId, TagSet, UpsertKeys};
+use crate::{IngestBatch, PartialSidecarPolicy, SeriesId, TagSet, UpsertKeys, SIDECAR_AGGREGATIONS};
 
 fn bd(s: &str) -> BigDecimal {
 	BigDecimal::from_str(s).expect("parses")
@@ -673,4 +673,57 @@ async fn descriptors_overlap_touching_disjoint_vs_shared() {
 	let d6 = SegmentDescriptor { id: 6, min_ts: None, max_ts: None, row_count: 0, null_count: 0, ..d1 };
 	let d7 = SegmentDescriptor { id: 7, min_ts: None, max_ts: None, row_count: 0, null_count: 0, ..d2 };
 	assert!(!descriptors_overlap(&[d6, d7], 0, 50), "two empty descriptors do not overlap");
+}
+
+/// The whole history of [`ASPECT`] at one-minute buckets, summed: the single number that
+/// separates the exact (deduplicated) answer from the sidecar merge's approximation.
+async fn history_sum(store: &SegmentStore) -> BigDecimal {
+	let buckets = store.downsample_range(ASPECT, i64::MIN, i64::MAX, Resolution::Minutes, &SIDECAR_AGGREGATIONS).await.expect("downsamples");
+	assert_eq!(buckets.len(), 2, "the fixture spans two minute buckets");
+	buckets.iter().map(|b| b.values.get("sum").expect("a sum").clone()).fold(BigDecimal::from(0), |acc, v| acc + v)
+}
+
+/// P12 #719, the hard corner: two segments of one series that **share instants**, and whose
+/// frames are gone, so nothing but the persisted per-segment partials is left to answer with.
+///
+/// The store must keep answering — a store whose frames have been reclaimed is the normal
+/// state sidecars exist for, not corruption, and a hard error here would take a healthy store
+/// off line — and the number it answers is the documented approximation: each segment
+/// contributes its own rows, so the six shared instants are counted twice and their older
+/// values are added again. Exactness needs the rows, and they are gone. `reconcile_overlaps`
+/// is the remedy; the read says so on `tracing::warn!` every time it takes this route.
+#[tokio::test]
+async fn overlapping_sidecar_only_downsample_serves_the_documented_approximation() {
+	let dir = TempDir::new().expect("tempdir");
+	let store = SegmentStore::open(dir.path()).await.expect("opens").with_partial_sidecar_policy(PartialSidecarPolicy::at_tiered(Resolution::Minutes, 1, &[Resolution::Hours]));
+	let schema = schema();
+	store.declare(ASPECT, &schema).await.expect("declares");
+
+	// 0..=110 every 10 s with value = timestamp, then 60..=110 again with value = timestamp +
+	// 1000: six instants shared, so the exact answer holds 12 rows (150 + 6510 = 6660) while a
+	// merge of the two segments' own rows sees 18 (660 + 6510 = 7170).
+	let mut older_times = Vec::new();
+	let mut older_values = Vec::new();
+	for i in 0..12 {
+		older_times.push(i * 10);
+		older_values.push(bd(&(i * 10).to_string()));
+	}
+	let mut newer_times = Vec::new();
+	let mut newer_values = Vec::new();
+	for i in 6..12 {
+		newer_times.push(i * 10);
+		newer_values.push(bd(&(i * 10 + 1000).to_string()));
+	}
+	let descriptors = vec![store.seal(ASPECT, &schema, &older_times, &older_values).await.expect("seals the older segment"), store.seal(ASPECT, &schema, &newer_times, &newer_values).await.expect("seals the newer segment")];
+	for descriptor in &descriptors {
+		assert!(store.load_partial_sidecar(ASPECT, descriptor, None).await.expect("loads").is_some(), "segment {} has a sidecar", descriptor.id);
+	}
+
+	// Frames present: the overlap fallback reads the rows and dedupes them newer-wins.
+	assert_eq!(history_sum(&store).await, bd("6660"), "the frame-backed answer counts each shared instant once, keeping the newer value");
+
+	for descriptor in &descriptors {
+		std::fs::remove_file(&descriptor.path).expect("removes the frame");
+	}
+	assert_eq!(history_sum(&store).await, bd("7170"), "with the frames gone the sidecar merge answers instead, adding the older values of the six shared instants back in");
 }
