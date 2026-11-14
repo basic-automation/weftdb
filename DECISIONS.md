@@ -6801,9 +6801,18 @@ operate independently on the same aspect.
 **Behaviour-preserving default.** The policy defaults to `quarantine`, which is the same outcome a corrupt
 frame got before ROB-22 (the frame is quarantined under its C5 class, TTL-purgeable). A suspect frame also
 lands in quarantine by default. This means the entire ROB-22 change is a no-op until an operator explicitly
-switches `WEFT_SUSPECT_FRAME_POLICY` to `skip` or `fail`. The decode breaker is off by default too
-(`WEFT_DECODE_BREAKER_FAILURES` default 0 wires it into the default-constructed breaker which permits
-everything and never trips), so the background decode loop behaviour does not change on upgrade.
+switches `WEFT_SUSPECT_FRAME_POLICY` to `skip` or `fail`. The *policy* half of ROB-22 is therefore a no-op
+on upgrade.
+
+The decode breaker is deliberately **not** off by default. `DEFAULT_DECODE_BREAKER_FAILURES` is 3 with a 300 s
+`DEFAULT_DECODE_BREAKER_COOLDOWN`; `MaintenanceBreaker::decode_from_env` (`weftdb/src/types/segment_store.rs:753`)
+falls back to those when `WEFT_DECODE_BREAKER_FAILURES` is unset or unparseable, and a default-constructed
+store reaches the same number because `SegmentStoreOptions::default()` uses `MaintenanceBreaker::default()`, whose threshold is `DEFAULT_MAINTENANCE_BREAKER_FAILURES` — also 3 (`segment_store.rs:462`, `:683`). Only `WEFT_DECODE_BREAKER_FAILURES=0` disables it: `decode_breaker_permits` and `decode_breaker_record`
+(`weftdb/src/types/segment_store/maint.rs:92`, `:111`) return early on a zero threshold. So an upgrade *does*
+change behaviour for an aspect whose frames keep failing to decode — after three consecutive failures its
+background retries pause for five minutes and then allow one trial decode. That is the point of #720: a poison
+frame should stop hammering the decode loop instead of crashing it. An operator who wants the old
+retry-everything behaviour sets the variable to 0, and that is the `0` in its registry `accepts` column.
 
 **Per-segment-path breaker with cooldown, not a process-global one.** The breaker state map keys are
 `(StoreId, aspect_name)`, so one corrupt frame trips the breaker for that aspect only. Other aspects
