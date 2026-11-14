@@ -1096,3 +1096,40 @@ async fn refusals_carry_the_contract_codes() {
 	assert_eq!(body["code"], "method_not_allowed", "{body}");
 	assert_eq!(headers[header::ALLOW], "GET, POST", "both verbs the path serves: {body}");
 }
+
+/// ROB-18 phase 1 admission, driven over HTTP (FRE-10b, #721).
+#[tokio::test]
+///
+/// The 408 body timeout and the 507 on the decoded top-up cannot be
+/// driven over HTTP — the first needs a stream that never delivers a
+/// byte (pinned by [`ingest_body_read_past_the_total_deadline_is_408`]
+/// in `weft-server/src/ingest.rs`), and the second needs an injectable
+/// `DiskSpace` (pinned by
+/// [`ingest_body_top_up_refuses_when_the_decoded_weight_breaches_the_reserve`]
+/// in the same file). The per-phase panic mapping is pinned by
+/// `a_panic_during_validating_is_commit_failed_and_phase_is_not_on_wire`
+/// and its siblings in `weft-server/src/panic_catch.rs`.
+async fn ingest_admission_refuses_over_cap_and_no_headroom() {
+	let dir = tempfile::tempdir().expect("tempdir");
+	let store = Arc::new(weftdb::SegmentStore::open_with_options(dir.path(), weftdb::SegmentStoreOptions::default().with_disk_reserve_bytes(1 << 60)).await.expect("store opens"));
+	store.declare("r18", &weft_physical_type::AspectSchema::new(PhysicalType::F64, "0".parse().unwrap(), TimeUnit::Seconds)).await.expect("declares");
+
+	// 413: a body over the configured cap is refused before the handler runs.
+	let config = weft_server::IngestConfig::with_max_body_bytes(32);
+	let router = app_with_state(weft_server::AppState::new().with_store(Arc::clone(&store)).with_ingest_config(config));
+	let body = "timestamp,value\n100,1.5\n110,2.5\n120,3.5\n130,4.5\n";
+	assert!(body.len() > 32, "the CSV body must exceed the cap");
+	let (status, _, json) = send_json(router, post_text("/api/v1/storage/r18/csv", None, body)).await;
+	assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{json}");
+	assert_eq!(json["code"], "payload_too_large", "{json}");
+	assert_eq!(json["limit"], 32, "the refusal names the cap: {json}");
+
+	// 507: a tiny body on a store with a reserve the filesystem cannot meet.
+	let config = weft_server::IngestConfig::with_max_body_bytes(1024);
+	let router = app_with_state(weft_server::AppState::new().with_store(store).with_ingest_config(config));
+	let payload = serde_json::to_vec(&serde_json::json!({ "points": [{ "timestamp": 100, "value": "1.5" }] })).unwrap();
+	let request = Request::builder().method("POST").uri("/api/v1/storage/r18/points").header(header::CONTENT_TYPE, "application/json").header(header::CONTENT_LENGTH, payload.len().to_string()).body(Body::from(payload)).unwrap();
+	let (status, _, json) = send_json(router, request).await;
+	assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{json}");
+	assert_eq!(json["code"], "insufficient_storage", "{json}");
+}

@@ -6779,3 +6779,30 @@ issue to self plus a claim comment naming the exact scope, then verify state wit
 from local `origin/main` reads and unverified branch names, which produced claims about PRs that did not
 exist (the numbers were issues). Correction applied: every "done/merged/landed" statement in this session
 is now backed by a `gh` read in the same turn, and `git fetch` precedes any worktree created off `main`.
+
+## 2026-11-14 — ROB-18 closes: contract coverage pins the #681 behaviour; the client-abort code family stays out of scope (#742)
+
+**This slice delivers contract coverage, not new product code.** The two-phase ingest admission,
+whole-body deadline, `Committing`→`503 outcome_unknown` mapping, and §4 5xx redaction are
+**already shipped in `main`** via #681. What was missing was a contract that no future change
+regresses them, and a record that the phase-to-wire-code mapping is a scope correction, not a new
+design.
+
+**Chosen: test the existing mapping by phase, and stop — no new `Code` variant, no product-rule
+change.** `map_ingest_panic` keeps its two arms (`Some(IngestPhase::Committing)` → `503
+outcome_unknown`, everything else → `500 commit_failed`). Per-phase unit tests in `panic_catch.rs`
+pin that `Validating`, `Encoding` and `WritingFrames` all answer `500 commit_failed` with
+`committed: false`, `Committing` answers `503 outcome_unknown` with no `committed`, and every
+phase name is redacted from the wire (§4). HTTP-driven contract tests in `fre10b_contract.rs`
+pin 413 declared-over-cap and 507 reserve-before-body-read. The 43-code table (`error.rs:1139`)
+and 5xx count (`error.rs:1205`) stay unchanged.
+
+**Rejected as out of scope:** 4 new per-phase `Code` variants, and a new `client_abort`
+(`4xx`) code family. The `client_abort` problem — a client disconnect during an ingest body
+produces a 5xx when §4 redaction cannot distinguish it from a server failure — is a real gap.
+Findings are recorded in #742 (deadline re-arming per chunk at `ingest.rs:478`,
+`tokio::time::timeout` dropping the inner future, §4 redaction turning a validate-phase abort
+into 500, the frozen 43-code table and its checker gates). Filing it as a separate issue avoids
+scope creep on a PR whose mandate was contract coverage of what #681 already ships. **Both
+belong in a future slice** that also owns the error-taxonomy, config-schema, and OpenAPI updates
+a new `Code` variant requires.
