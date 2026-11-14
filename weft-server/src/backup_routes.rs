@@ -505,9 +505,9 @@ mod tests {
 	use axum::{
 		body::Body, http::{Request, StatusCode}
 	};
-	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 	use tempfile::TempDir;
 	use tower::ServiceExt;
+	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 	use weftdb::SegmentStore;
 
 	use crate::{
@@ -913,9 +913,7 @@ mod tests {
 		// Restore into a fresh name under our restore root.
 		let router = app_with_state(AppState::new().with_store(store.clone()));
 		let r2 = router.clone();
-		let (status, body) = post_empty_with_env(router, "/api/v1/storage/restore/into?label=nightly&name=my-restore-1", &[
-			("WEFT_RESTORE_BASE_DIR", restore_root.to_string_lossy().as_ref()),
-		]).await;
+		let (status, body) = post_empty_with_env(router, "/api/v1/storage/restore/into?label=nightly&name=my-restore-1", &[("WEFT_RESTORE_BASE_DIR", restore_root.to_string_lossy().as_ref())]).await;
 		assert_eq!(status, StatusCode::OK, "restore_into: {body}");
 		assert_eq!(body["backup_label"], "nightly", "body: {body}");
 		let restored_dir = restore_root.join("my-restore-1");
@@ -929,26 +927,18 @@ mod tests {
 		assert!(body["next_step"].as_str().unwrap().contains(&*restored_dir.to_string_lossy()), "body: {body}");
 
 		// Restore again into the same name is refused.
-		let (status, body) = post_empty_with_env(r2, "/api/v1/storage/restore/into?label=nightly&name=my-restore-1", &[
-			("WEFT_RESTORE_BASE_DIR", restore_root.to_string_lossy().as_ref()),
-		]).await;
+		let (status, body) = post_empty_with_env(r2, "/api/v1/storage/restore/into?label=nightly&name=my-restore-1", &[("WEFT_RESTORE_BASE_DIR", restore_root.to_string_lossy().as_ref())]).await;
 		assert_eq!(status, StatusCode::CONFLICT, "duplicate dest: {body}");
 		assert_eq!(body["code"], "already_exists", "body: {body}");
 
 		// Restore with an invalid destination name.
-		let (status, body) = post_empty_with_env(app_with_state(AppState::new().with_store(store.clone())), "/api/v1/storage/restore/into?label=nightly&name=../bad", &[
-			("WEFT_RESTORE_BASE_DIR", restore_root.to_string_lossy().as_ref()),
-		]).await;
+		let (status, body) = post_empty_with_env(app_with_state(AppState::new().with_store(store.clone())), "/api/v1/storage/restore/into?label=nightly&name=../bad", &[("WEFT_RESTORE_BASE_DIR", restore_root.to_string_lossy().as_ref())]).await;
 		assert_eq!(status, StatusCode::BAD_REQUEST, "traversal name: {body}");
-		let (status, body) = post_empty_with_env(app_with_state(AppState::new().with_store(store.clone())), "/api/v1/storage/restore/into?label=nightly&name=", &[
-			("WEFT_RESTORE_BASE_DIR", restore_root.to_string_lossy().as_ref()),
-		]).await;
+		let (status, body) = post_empty_with_env(app_with_state(AppState::new().with_store(store.clone())), "/api/v1/storage/restore/into?label=nightly&name=", &[("WEFT_RESTORE_BASE_DIR", restore_root.to_string_lossy().as_ref())]).await;
 		assert_eq!(status, StatusCode::BAD_REQUEST, "empty name: {body}");
 
 		// Restore of a missing backup.
-		let (status, body) = post_empty_with_env(app_with_state(AppState::new().with_store(store.clone())), "/api/v1/storage/restore/into?label=no-such-backup&name=dest", &[
-			("WEFT_RESTORE_BASE_DIR", restore_root.to_string_lossy().as_ref()),
-		]).await;
+		let (status, body) = post_empty_with_env(app_with_state(AppState::new().with_store(store.clone())), "/api/v1/storage/restore/into?label=no-such-backup&name=dest", &[("WEFT_RESTORE_BASE_DIR", restore_root.to_string_lossy().as_ref())]).await;
 		assert_eq!(status, StatusCode::NOT_FOUND, "missing backup: {body}");
 		assert_eq!(body["code"], "aspect_not_found", "body: {body}");
 
