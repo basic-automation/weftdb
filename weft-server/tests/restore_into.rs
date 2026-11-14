@@ -1,6 +1,9 @@
 #![recursion_limit = "1024"]
 #![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
 #![allow(clippy::multiple_crate_versions)]
+// Every test here keeps a `TempDir` alive while its assertions reopen paths derived from it, so
+// the early-drop suggestion this lint makes would delete the tree underneath the test.
+#![allow(clippy::significant_drop_tightening)]
 //! Acceptance tests for `POST /api/v1/storage/restore/into` — restoring a
 //! backup into a caller-chosen new root under the restore base.
 //!
@@ -21,6 +24,7 @@ use axum::{
 	body::Body, http::{Request, StatusCode}, Router
 };
 use bigdecimal::BigDecimal;
+use serial_test::serial;
 use tower::ServiceExt as _;
 use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 use weft_server::{app_with_state, AppState};
@@ -47,7 +51,7 @@ async fn store_with_frame(root: &Path) -> SegmentStore {
 async fn whole_store_backup(live: &Path, backup_dir: &Path) {
 	let store = SegmentStore::open(live).await.expect("opens the live store");
 	let report = store.backup_store(backup_dir, BackupMode::Copy).await.expect("backs the store up");
-	assert!(report.frames.len() >= 1, "the backup carries at least one frame");
+	assert!(!report.frames.is_empty(), "the backup carries at least one frame");
 	drop(store);
 }
 
@@ -67,7 +71,7 @@ async fn send_json(router: Router, request: Request<Body>) -> (StatusCode, serde
 
 /// A POST to the restore-into endpoint with query params.
 fn restore_into_request(label: &str, name: &str) -> Request<Body> {
-	let uri = format!("/api/v1/storage/restore/into?label={}&name={}", label, name);
+	let uri = format!("/api/v1/storage/restore/into?label={label}&name={name}");
 	Request::builder().method("POST").uri(uri).header(axum::http::header::CONTENT_TYPE, "application/json").body(Body::empty()).unwrap()
 }
 
@@ -84,14 +88,10 @@ fn list_contains(entries: &[String], target: &str) -> bool {
 /// List the entry file names under `dir` that match `predicate`.
 fn matching_entry_names(dir: &Path, predicate: fn(&str) -> bool) -> Vec<String> {
 	let mut names = Vec::new();
-	if let Ok(iter) = std::fs::read_dir(dir) {
-		for entry in iter {
-			if let Ok(entry) = entry {
-				if let Some(name) = entry.file_name().into_string().ok() {
-					if predicate(&name) {
-						names.push(name);
-					}
-				}
+	for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+		if let Ok(name) = entry.file_name().into_string() {
+			if predicate(&name) {
+				names.push(name);
 			}
 		}
 	}
@@ -102,6 +102,7 @@ fn matching_entry_names(dir: &Path, predicate: fn(&str) -> bool) -> Vec<String> 
 // Test 1: insufficient disk → 507, no `.restoring-*`
 // ---------------------------------------------------------------------------
 
+#[serial]
 #[tokio::test]
 async fn insufficient_disk_returns_507_and_leaves_no_staging() {
 	let dir = tempfile::tempdir().expect("tempdir");
@@ -145,6 +146,7 @@ async fn insufficient_disk_returns_507_and_leaves_no_staging() {
 // Test 2: failure after staging began → no `.restoring-*`
 // ---------------------------------------------------------------------------
 
+#[serial]
 #[tokio::test]
 async fn failed_restore_cleans_up_staging() {
 	let dir = tempfile::tempdir().expect("tempdir");
@@ -195,6 +197,7 @@ async fn failed_restore_cleans_up_staging() {
 // Test 3: completed restore produces the name, survives listing and prune
 // ---------------------------------------------------------------------------
 
+#[serial]
 #[tokio::test]
 async fn completed_restore_produces_the_chosen_root_and_survives_prune() {
 	let dir = tempfile::tempdir().expect("tempdir");
@@ -236,16 +239,23 @@ async fn completed_restore_produces_the_chosen_root_and_survives_prune() {
 	let entries = matching_entry_names(&restore_base, |_| true);
 	assert!(list_contains(&entries, "backup-123"), "backup-123 is listed in the restore base: {entries:?}");
 
-	// The restored root survives (no daemon prune of a manually-named directory).
-	// The daemon only prunes directories whose names match `backup-\d+` that it
-	// created itself; a manually-restored `backup-123` is never touched.
-	assert!(restored_root.is_dir(), "the restored root survives (no daemon prune of manual directories)");
+	// The restored root survives a retention pass. This is the guarantee the containment check
+	// exists for: `prune_generated_backups` deletes generated `backup-<digits>` directories it
+	// counts inside the base it is pointed at, so a restored root is only safe because the
+	// restore base is a different directory from the backup base. Point the real daemon sweep at
+	// the backup base with `keep = 0` — it must remove the snapshot there and leave `backup-123`
+	// under the restore base alone.
+	let pruned = weft_server::backup_daemon::prune_generated_backups(&backups, 0).await.expect("a retention pass runs");
+	assert!(pruned >= 1, "the sweep should have retired the generated snapshot in the backup base, pruned {pruned}");
+	assert!(restored_root.is_dir(), "the retention pass must not touch a restored root in another base: {restored_root:?}");
+	assert!(list_contains(&matching_entry_names(&backups, |n| n == "test-backup"), "test-backup"), "a hand-labelled snapshot in the backup base is not a generated name and must survive: {backups:?}");
 }
 
 // ---------------------------------------------------------------------------
 // Test 4: restore base inside backup base is refused
 // ---------------------------------------------------------------------------
 
+#[serial]
 #[tokio::test]
 async fn restore_base_inside_backup_base_is_refused() {
 	let dir = tempfile::tempdir().expect("tempdir");

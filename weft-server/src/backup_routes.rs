@@ -505,6 +505,7 @@ mod tests {
 	use axum::{
 		body::Body, http::{Request, StatusCode}
 	};
+	use serial_test::serial;
 	use tempfile::TempDir;
 	use tower::ServiceExt;
 	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
@@ -888,6 +889,12 @@ mod tests {
 		assert!(!valid_destination_name("a..b"), ".. inside");
 	}
 
+	// The endpoint takes its restore base from the process env, so this test cannot run
+	// concurrently with itself or with the integration tests in `tests/restore_into.rs`; and the
+	// `TempDir` handles must outlive the paths the assertions reopen, so the lint's early-drop
+	// suggestion would delete the tree underneath the test.
+	#[serial]
+	#[allow(clippy::significant_drop_tightening)]
 	#[tokio::test]
 	async fn restore_into_publishes_the_backup_under_the_chosen_name() {
 		let dir = TempDir::new().unwrap();
