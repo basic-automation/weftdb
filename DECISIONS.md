@@ -6779,3 +6779,21 @@ issue to self plus a claim comment naming the exact scope, then verify state wit
 from local `origin/main` reads and unverified branch names, which produced claims about PRs that did not
 exist (the numbers were issues). Correction applied: every "done/merged/landed" statement in this session
 is now backed by a `gh` read in the same turn, and `git fetch` precedes any worktree created off `main`.
+
+## 2026-11-14 — Real-filesystem ENOSPC evidence (#723)
+
+**Strategy A (mount a tmpfs inside a namespace) cannot prove anything on this host.**
+The Step-1 probe (`unshare -Um true`) failed with EPERM. User and mount namespaces
+are unavailable in this environment, so a real ENOSPC from a `size=1m` tmpfs inside a
+namespace cannot be demonstrated here. The test `a_real_full_filesystem_produces_enospc_end_to_end`
+skips honestly with the reason printed.
+
+**Strategy B (the injectable space source via `DiskSpace`/`DiskGuard::admit`) is unconditional.**
+`space_source_reports_a_full_filesystem_and_the_server_says_507` uses
+`SegmentStoreOptions::with_disk_reserve_bytes(u64::MAX)` so the guard refuses every write
+as `507 insufficient_storage` regardless of the host's free space. The library already pins
+ENOSPC at its level in `disk_guard_tests.rs` (`insufficient_space_failure_is_reported_as_enospc`).
+This slice pins the server's HTTP decision on top of the injectable space source #694 added.
+
+**CI is the first execution.** This slice was never compiled or run locally — the host cannot
+carry a `cargo build`, so every test in `weft-server/tests/enospc_real_fs.rs` runs first in CI.

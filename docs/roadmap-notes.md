@@ -585,3 +585,25 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
 - **NEXT — checkpoint index adopt-or-drop into the DEFAULT policy — owner-gated (bytes/point
 - **NEXT — a random-access-capable Gorilla/RLE would widen the checkpoint index's reach:**
 - Publish a methodology document **before** any performance claim
+
+## Host probe (run 2026-11-14 on DeepThought, before the worker starts)
+
+```
+$ unshare -Um true
+exit=1
+unshare: unshare failed: Operation not permitted
+$ unshare -rm true
+exit=1
+unshare: unshare failed: Operation not permitted
+$ df -h /tmp
+/dev/nvme0n1p2  3.7T  2.8T  729G  80% /tmp
+```
+
+Conclusion for this host: **user and mount namespaces are unavailable** (`unshare -Um true` fails with
+EPERM), so Strategy A (`mount -t tmpfs -o size=1m` inside a namespace) cannot run here and must skip
+honestly with that reason printed. The figure the guard compares against is injectable through the
+public `weftdb::DiskSpace` / `DiskGuard::admit` pair (`weftdb/src/types/disk_guard.rs:29`, `:138`), so
+Strategy B pins the refusal without privileges. There is no `WEFT_DISK_USAGE_COMMAND` or any other
+command/env seam for filesystem usage anywhere in this repository — the only operator knob is
+`WEFT_DISK_RESERVE_BYTES`, and the library-side injectable figure is the `Option<DiskSpace>` argument
+of `admit`.

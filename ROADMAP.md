@@ -89,7 +89,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] **ROB-14** Cgroup-aware memory budget with per-request reservations
 - [ ] Restoring *into a chosen new root* over HTTP (7.3)
 - [ ] Store-side row-level TTL/expiry (prerequisite for the SOA-15 TTL lane)
-- [ ] Real-filesystem ENOSPC test for #656 on the injectable space source (#694 merged)
+- [x] Real-filesystem ENOSPC test for #656 on the injectable space source (#694 merged)
 - [ ] **Measurement bulk ingest routed through the `.weftseg` seal**
 - [x] **CI**
 - [x] Packaging (1.0 minimum)
