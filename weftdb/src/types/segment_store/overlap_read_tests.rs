@@ -726,4 +726,7 @@ async fn overlapping_sidecar_only_downsample_serves_the_documented_approximation
 		std::fs::remove_file(&descriptor.path).expect("removes the frame");
 	}
 	assert_eq!(history_sum(&store).await, bd("7170"), "with the frames gone the sidecar merge answers instead, adding the older values of the six shared instants back in");
+	// `history_sum` borrows the store, which clippy does not count as a usage of the binding, so
+	// it is closed here: the frame store has to let go of its handles before `dir` is removed.
+	drop(store);
 }
