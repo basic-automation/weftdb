@@ -5,6 +5,25 @@ use weft_physical_type::merge_newer_wins;
 
 use super::*;
 
+/// Reduce one pass of already-deduplicated rows (as from [`read_time_range_of`]) into
+/// a [`PartialReduction`], for the overlap fallback route.
+/// Pure and synchronous: no store state, spawn_blocking-safe.
+fn reduce_decoded_rows(ts: Vec<i64>, vs: Vec<Option<BigDecimal>>, start: i64, end: i64, unit: TimeUnit, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>> {
+	let mut points: Vec<Point> = Vec::with_capacity(ts.len().min(256));
+	for (t, v) in ts.into_iter().zip(vs) {
+		if let Some(value) = v {
+			if start <= t && t <= end {
+				points.push(Point::new(instant_from_epoch(t, unit).ok_or_else(|| anyhow::anyhow!("epoch {t} outside the representable instant range"))?, value));
+			}
+		}
+	}
+	if points.is_empty() {
+		return Ok(None);
+	}
+	let partial = weft_reduce::reduce_partial(&points, resolution, None, None, aggregations).map_err(|e| anyhow::anyhow!("reducing decoded rows: {e}"))?;
+	Ok(Some(partial))
+}
+
 impl SegmentStore {
 	/// Pin the reclaim epoch for a read about to prune the index, so that no frame a swap
 	/// retires meanwhile is unlinked under it (see `reaper`). Every read path takes one
@@ -215,6 +234,18 @@ impl SegmentStore {
 	/// while it runs, so no caller of the store — HTTP handler or embedder —
 	/// can make it hold an unbounded partial.
 	///
+	/// ## Cross-segment overlap (P12 #719)
+	///
+	/// When two sealed segments of one series share timestamps, the per-segment partial
+	/// merge would double-count overlapping rows → wrong `count`, `sum`, `min`, `max`,
+	/// `first`, `last`, percentiles and time-weighted average. The implementation detects
+	/// real cross-descriptor overlap from the descriptors' clipped `min_ts`/`max_ts` bounds
+	/// (conservative: over-triggers safely, never under-triggers). When overlap is found,
+	/// it falls back to reading the deduplicated range via `read_time_range_of` (already
+	/// newer-wins-correct) and reducing once. This route holds the entire window's rows in
+	/// memory at once, so it is the slow path — overlapping segments are the transient
+	/// state [`reconcile_overlaps`](crate::SegmentStore::reconcile_overlaps) removes.
+	///
 	/// # Errors
 	///
 	/// If `aspect` has no declared schema, if a segment cannot be read or decoded, if a
@@ -296,6 +327,36 @@ impl SegmentStore {
 		// prune: its answer *is* the rows, nulls included, so dropping that segment there
 		// would delete timestamps the caller asked for.
 		let (descriptors, frame_crcs): (Vec<SegmentDescriptor>, Vec<Option<u32>>) = self.index.prune_series_present_rows(aspect, series, start, end).await?.into_iter().map(|row| (row.desc, row.frame_crc)).unzip();
+
+		// Cross-segment overlap detection (P12 #719): when two pruned descriptors' clipped time
+		// windows intersect, the per-segment partial merge would double-count rows at shared
+		// timestamps. Row-level newer-wins dedup — `read_time_range_of` (already newer-wins-correct)
+		// plus one reduction — is the only exact answer, so take it when the frames are there.
+		// Over-triggering is safe (costs a slower route); under-triggering is a correctness bug, so
+		// the predicate is deliberately conservative on the descriptors' time bounds.
+		if descriptors_overlap(&descriptors, start, end) {
+			if all_frames_readable(self, &descriptors).await {
+				let (ts, vs) = self.read_time_range_of(aspect, series, start, end).await?;
+				// Run the conversion and reduction on the blocking pool so the fallback does not
+				// block the async runtime for a large result set.
+				let unit = schema.timestamp_unit;
+				let aggs = aggregations.to_vec();
+				let partial = tokio::task::spawn_blocking(move || reduce_decoded_rows(ts, vs, start, end, unit, resolution, &aggs)).await.context("overlap fallback reduce panicked")??;
+				// Enforce the ROB-13 cap on the fallback too, matching the other routes.
+				return partial.map_or(Ok(None), |p| check_partial_len(aspect, p, max_buckets).map(Some));
+			}
+			// Overlapping segments whose frames are gone: the persisted-partial merge below is the
+			// only thing that can still answer, and it is exact whenever the overlapping segments
+			// hold no instant in common — the usual case, an out-of-order backfill sealed beside
+			// newer data, where the ranges touch but the rows differ. Where they do share instants
+			// it contributes both copies, so `count`/`sum`/`avg`/`first`/`last` double-count and
+			// `min`/`max` can come from a row the newer segment superseded. Serving that rather than
+			// failing is deliberate: a store whose frames have been reclaimed is the normal state
+			// these sidecars exist for, not corruption, and an error here would take a healthy store
+			// off line. The approximation is announced, never silent; `reconcile_overlaps` removes
+			// the overlap that causes it, and exactness is impossible without the rows.
+			tracing::warn!("overlapping segments of aspect `{aspect}` have no readable frames: serving this downsample from persisted sidecars, which double-counts count/sum/avg/first/last across the overlap until reconcile_overlaps removes it");
+		}
 
 		// A persisted per-segment partial can *substitute* for decoding a segment only when
 		// it can answer this exact query: every requested reduction must be one the sidecar
@@ -627,6 +688,28 @@ impl SegmentStore {
 /// A single segment's partial against the fold's bucket bound (ROB-13): the
 /// partial passes unchanged at or under `max_buckets`, and is refused —
 /// dropped, with the count it reached — over it.
+/// Whether every one of `descriptors` still has a frame that can be opened (P12 #719).
+///
+/// The overlap fallback is the only exact answer across overlapping segments and it decodes
+/// frames, so the caller needs to know whether it is even possible. Any failure here — no
+/// file, a recorded path that does not resolve under `segments/`, a permission refusal — means
+/// "rows cannot be deduped", and the caller serves the query from persisted sidecars instead.
+/// A frame that exists but is corrupt is *not* hidden by this check: decoding it still fails
+/// as it always has, which is corruption, not the sidecar-only state.
+async fn all_frames_readable(store: &SegmentStore, descriptors: &[SegmentDescriptor]) -> bool {
+	for descriptor in descriptors {
+		match store.frame_path(descriptor) {
+			Ok(path) => {
+				if tokio::fs::metadata(&path).await.is_err() {
+					return false;
+				}
+			}
+			Err(_) => return false,
+		}
+	}
+	true
+}
+
 fn check_partial_len(aspect: &str, partial: PartialReduction, max_buckets: usize) -> Result<PartialReduction> {
 	if partial.len() > max_buckets {
 		return Err(StoreError::DownsampleTooLarge { aspect: aspect.to_string(), buckets: partial.len(), limit: max_buckets }.into());

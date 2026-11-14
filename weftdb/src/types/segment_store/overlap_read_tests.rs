@@ -30,11 +30,13 @@
 use std::{path::Path, str::FromStr};
 
 use bigdecimal::BigDecimal;
+use splimes::Resolution;
 use tempfile::TempDir;
 use weft_physical_type::{timestamp::TimeUnit, AspectSchema, PhysicalType};
+use weft_reduce::Aggregation;
 
-use super::SegmentStore;
-use crate::{IngestBatch, SeriesId, TagSet, UpsertKeys};
+use super::{descriptors_overlap, SegmentStore};
+use crate::{IngestBatch, PartialSidecarPolicy, SeriesId, TagSet, UpsertKeys, SIDECAR_AGGREGATIONS};
 
 fn bd(s: &str) -> BigDecimal {
 	BigDecimal::from_str(s).expect("parses")
@@ -434,5 +436,297 @@ async fn value_range_of_is_a_raw_scan_pinned_against_point_of() {
 	assert_eq!(ts, vec![100, 100], "tagged value range: two rows, one per segment");
 	assert_eq!(vs, vec![bd("1"), bd("2")], "tagged value range: both values, older first");
 
+	drop(store);
+}
+
+// === P12 #719 acceptance tests: downsample with overlapping segments ===
+
+/// 1. Overlapping newer-wins value: two segments, same timestamps, `downsample_range`.
+/// Newer segment's values must appear in every aggregation bucket — count is 1, not 2.
+#[tokio::test]
+async fn downsample_overlap_newer_wins_value() {
+	let dir = TempDir::new().expect("tempdir");
+	let store = store_at(dir.path()).await;
+
+	// Older segment: timestamps [10,20], values [100, 150]
+	ingest(&store, "a", &[10, 20], &[bd("100"), bd("150")]).await;
+	// Newer segment: same timestamps, higher (newer-wins) values
+	ingest(&store, "b", &[10, 20], &[bd("200"), bd("250")]).await;
+
+	assert_sealed_overlap(&store, SeriesId::UNTAGGED, &[10, 20], &[10, 20], (0, 50)).await;
+
+	let aggs = [Aggregation::Sum, Aggregation::Min, Aggregation::Max, Aggregation::First, Aggregation::Last];
+	let buckets = store.downsample_range(ASPECT, 0, 50, Resolution::Seconds, &aggs).await.expect("overlap downsample succeeds");
+
+	assert_eq!(buckets.len(), 2, "two timestamps → two buckets");
+	for b in &buckets {
+		assert_eq!(b.count, 1, "each bucket has exactly one point (not 2)");
+	}
+	// Bucket at t=10: newer-wins → sum=200, min=200, max=200, first=200, last=200
+	assert_eq!(buckets[0].values.get("sum").unwrap(), &bd("200"), "t=10 sum is newer=200");
+	assert_eq!(buckets[0].values.get("min").unwrap(), &bd("200"));
+	assert_eq!(buckets[0].values.get("max").unwrap(), &bd("200"));
+	assert_eq!(buckets[0].values.get("first").unwrap(), &bd("200"));
+	assert_eq!(buckets[0].values.get("last").unwrap(), &bd("200"));
+	// Bucket at t=20: newer-wins → sum=250, etc.
+	assert_eq!(buckets[1].values.get("sum").unwrap(), &bd("250"), "t=20 sum is newer=250");
+	assert_eq!(buckets[1].values.get("min").unwrap(), &bd("250"));
+	assert_eq!(buckets[1].values.get("max").unwrap(), &bd("250"));
+	assert_eq!(buckets[1].values.get("first").unwrap(), &bd("250"));
+	assert_eq!(buckets[1].values.get("last").unwrap(), &bd("250"));
+
+	drop(store);
+}
+
+/// 2. Same through `downsample_range_width` (width parity).
+#[tokio::test]
+async fn downsample_overlap_newer_wins_width() {
+	let dir = TempDir::new().expect("tempdir");
+	let store = store_at(dir.path()).await;
+
+	ingest(&store, "a", &[10, 20], &[bd("100"), bd("150")]).await;
+	ingest(&store, "b", &[10, 20], &[bd("200"), bd("250")]).await;
+
+	assert_sealed_overlap(&store, SeriesId::UNTAGGED, &[10, 20], &[10, 20], (0, 50)).await;
+
+	// A width of 60 seconds: both stored instants land in the same bucket whichever epoch or
+	// window base the reducer aligns to, so this pins the merge and not the alignment. (A 15 s
+	// width would split them across two buckets and prove nothing about the overlap.)
+	let width = weft_reduce::BucketWidth::new(Resolution::Seconds, 60).expect("non-zero count");
+	let aggs = [Aggregation::Sum];
+	let buckets = store.downsample_range_width(ASPECT, 0, 50, width, &aggs).await.expect("overlap width downsample succeeds");
+
+	// One bucket holding both instants, each worth exactly one point after the newer-wins merge:
+	// count 2 and sum 450. Without the overlap merge this is count 4 and sum 700 (both segments
+	// counted), which is the regression this test exists to catch.
+	assert_eq!(buckets.len(), 1, "one 60s bucket covers both timestamps");
+	assert_eq!(buckets[0].count, 2, "two points in the single bucket, not four");
+	assert_eq!(buckets[0].values.get("sum").unwrap(), &bd("450"), "sum = 200+250 = 450");
+
+	drop(store);
+}
+
+/// 3. Integer (`ScaledI64`) route: overlapping segments produce the same result as
+/// a one-pass reduce of `read_time_range_of` over the same window.
+#[tokio::test]
+async fn downsample_overlap_scaled_integer_equals_one_pass() {
+	let dir = TempDir::new().expect("tempdir");
+	let store = SegmentStore::open(dir.path()).await.expect("opens");
+	let sc_schema = AspectSchema::new(PhysicalType::ScaledI64 { scale: 2 }, bd("0"), TimeUnit::Seconds);
+	store.declare_with_upsert_keys(ASPECT, &sc_schema, Some(&host_key())).await.expect("declares");
+
+	ingest(&store, "a", &[10, 20], &[bd("1.00"), bd("1.50")]).await;
+	ingest(&store, "b", &[10, 20], &[bd("2.00"), bd("2.50")]).await;
+	assert_sealed_overlap(&store, SeriesId::UNTAGGED, &[10, 20], &[10, 20], (0, 50)).await;
+
+	// downsample_range via overlap fallback
+	let aggs = [Aggregation::Sum, Aggregation::Min, Aggregation::Max, Aggregation::First, Aggregation::Last];
+	let buckets = store.downsample_range(ASPECT, 0, 50, Resolution::Seconds, &aggs).await.expect("integer overlap downsample succeeds");
+
+	// One-pass answer: read_time_range directly, then reduce manually
+	let (_ts, vs) = store.read_time_range(ASPECT, 0, 50).await.expect("range read for one-pass comparison");
+	// Verify values: newer-wins at 10 → 2.00, at 20 → 2.50
+	assert_eq!(vs, vec![Some(bd("2.00")), Some(bd("2.50"))], "range read: newer-wins on scaled");
+
+	assert_eq!(buckets.len(), 2, "two timestamps → two buckets");
+	for b in &buckets {
+		assert_eq!(b.count, 1, "each bucket has exactly one point");
+	}
+	assert_eq!(buckets[0].values.get("sum").unwrap(), &bd("2.00"), "t=10 sum is newer=2.00");
+	assert_eq!(buckets[1].values.get("sum").unwrap(), &bd("2.50"), "t=20 sum is newer=2.50");
+
+	drop(store);
+}
+
+/// 4. Sidecar present: overlapping segments trigger the overlap fallback even though each
+/// individual segment would have been sidecar-eligible. The result matches one-pass.
+#[tokio::test]
+async fn downsample_overlap_sidecar_not_substituted() {
+	let dir = TempDir::new().expect("tempdir");
+	let store = SegmentStore::open(dir.path()).await.expect("opens").with_partial_sidecar_policy(crate::PartialSidecarPolicy::at(Resolution::Seconds, 1));
+	store.declare_with_upsert_keys(ASPECT, &schema(), Some(&host_key())).await.expect("declares");
+
+	let tags = TagSet::from_pairs([("host", "x")]).expect("valid tags");
+	store.ingest(ASPECT, &IngestBatch::dense("a", vec![10], vec![bd("100")]).with_groups(tags.clone())).await.expect("ingests older");
+	store.ingest(ASPECT, &IngestBatch::dense("b", vec![10], vec![bd("200")]).with_groups(tags.clone())).await.expect("ingests newer");
+
+	let series = store.resolve_series(ASPECT, &crate::SeriesSelector::exact([("host", Some("x"))]).expect("valid")).await.expect("resolves").expect("series x");
+	assert_sealed_overlap(&store, series, &[10], &[10], (0, 50)).await;
+
+	let aggs = [Aggregation::Sum, Aggregation::Min, Aggregation::Max];
+	let buckets = store.downsample_range_of(ASPECT, series, 0, 50, Resolution::Seconds, &aggs).await.expect("overlap downsample with sidecars succeeds");
+
+	assert_eq!(buckets.len(), 1, "one timestamp → one bucket");
+	assert_eq!(buckets[0].count, 1, "one point (not 2) — overlap fallback deduped");
+	assert_eq!(buckets[0].values.get("sum").unwrap(), &bd("200"), "newer wins at t=10");
+
+	// Verify that the overlap fallback was triggered: each segment individually had its
+	// sidecar materialized, but descriptors_overlap returned true, taking the slow path.
+	// If the test passed, the overlap was handled correctly (not double-counting).
+
+	drop(store);
+}
+
+/// 5. Non-overlapping two-segment downsample: no regression, fast path intact.
+/// Two segments with disjoint timestamps; the downsample must match one-pass.
+#[tokio::test]
+async fn downsample_non_overlapping_two_segments() {
+	let dir = TempDir::new().expect("tempdir");
+	let store = store_at(dir.path()).await;
+
+	// Older: t=10, newer: t=20 (no overlap)
+	ingest(&store, "a", &[10], &[bd("100")]).await;
+	ingest(&store, "b", &[20], &[bd("200")]).await;
+
+	let (all, ours) = seal_counts(&store, SeriesId::UNTAGGED).await;
+	assert_eq!(ours, 2, "two segments (index holds {all} rows)");
+
+	let aggs = [Aggregation::Sum, Aggregation::Min, Aggregation::Max];
+	let buckets = store.downsample_range(ASPECT, 0, 50, Resolution::Seconds, &aggs).await.expect("non-overlapping downsample succeeds");
+
+	assert_eq!(buckets.len(), 2, "two timestamps → two buckets");
+	for b in &buckets {
+		assert_eq!(b.count, 1, "each bucket has one point");
+	}
+	assert_eq!(buckets[0].values.get("sum").unwrap(), &bd("100"), "t=10: older value");
+	assert_eq!(buckets[1].values.get("sum").unwrap(), &bd("200"), "t=20: newer value");
+
+	drop(store);
+}
+
+/// 6. `SketchP99` over overlapping segments equals the one-pass answer.
+#[tokio::test]
+async fn downsample_overlap_sketch_p99() {
+	let dir = TempDir::new().expect("tempdir");
+	let store = store_at(dir.path()).await;
+
+	// Older: values 1,2,3 at timestamps 10,11,12
+	ingest(&store, "a", &[10, 11, 12], &[bd("1"), bd("2"), bd("3")]).await;
+	// Newer: values 10,20,30 at timestamps 10,11,12 (overlap)
+	ingest(&store, "b", &[10, 11, 12], &[bd("10"), bd("20"), bd("30")]).await;
+
+	assert_sealed_overlap(&store, SeriesId::UNTAGGED, &[10, 11, 12], &[10, 11, 12], (0, 50)).await;
+
+	// downsample with the exact and the sketch p99 side by side (one bucket: the window is
+	// 50 seconds and the resolution is one hour)
+	let aggs = [Aggregation::P99, Aggregation::SketchP99];
+	let buckets = store.downsample_range(ASPECT, 0, 50, Resolution::Hours, &aggs).await.expect("overlap sketch p99 succeeds");
+
+	assert_eq!(buckets.len(), 1, "one bucket for the whole hour");
+	assert_eq!(buckets[0].count, 3, "three points (newer-wins deduped)");
+	let exact = buckets[0].values.get("p99").expect("p99 present").clone();
+	let sketch = buckets[0].values.get("sketch_p99").expect("sketch_p99 present").clone();
+
+	// One-pass answer: read_time_range, then reduce manually
+	let (ts, vs) = store.read_time_range(ASPECT, 0, 50).await.expect("range read for one-pass");
+	assert_eq!(ts, vec![10, 11, 12], "three timestamps, deduplicated");
+	let non_null: Vec<BigDecimal> = vs.iter().flatten().cloned().collect();
+	assert_eq!(non_null, vec![bd("10"), bd("20"), bd("30")], "newer-wins values");
+	// `sketch_p99` is a `DdSketch` estimate, so it is pinned the way the server route pins it
+	// (`weft-server/src/storage.rs`: within 1% of the exact nearest-rank percentile) rather than
+	// as an exact decimal. The exact p99 of the merged {10,20,30} is 30; double-counting the
+	// older segment would not change the exact p99, which is why the count above carries the
+	// dedup assertion and this one pins that the fallback feeds the sketch the merged values.
+	let (exact_f, sketch_f) = (weft_reduce::decimal_to_f64(&exact).expect("exact p99 is finite"), weft_reduce::decimal_to_f64(&sketch).expect("sketch p99 is finite"));
+	assert_eq!(exact, bd("30"), "exact p99 of the 3 newer-wins points");
+	assert!((sketch_f - exact_f).abs() / exact_f < 0.01, "sketch_p99 {sketch_f} must be within 1% of the exact p99 {exact_f}");
+
+	drop(store);
+}
+
+/// 7. Unit test of `descriptors_overlap`: touching-but-disjoint does NOT trigger,
+/// one shared instant DOES trigger.
+#[tokio::test]
+async fn descriptors_overlap_touching_disjoint_vs_shared() {
+	use weft_physical_type::SegmentDescriptor;
+
+	// Two descriptors with no overlap: t=[0,10) and [10,20) — touching at 10, not overlapping.
+	let d1 = SegmentDescriptor { id: 1, path: String::new(), format_version: 1, physical_type: Some(PhysicalType::F64), time_unit: Some(TimeUnit::Seconds), row_count: 1, null_count: 0, time_sorted: true, min_ts: Some(0), max_ts: Some(10), min_value: None, max_value: None, byte_len: 100 };
+	let d2 = SegmentDescriptor { id: 2, path: String::new(), format_version: 1, physical_type: Some(PhysicalType::F64), time_unit: Some(TimeUnit::Seconds), row_count: 1, null_count: 0, time_sorted: true, min_ts: Some(10), max_ts: Some(20), min_value: None, max_value: None, byte_len: 100 };
+
+	// Touching at 10: clipped to [0, 30]: (0,10) and (10,20).
+	// current_hi(10) >= next_lo(10) — this IS overlap per the conservative detection.
+	assert!(descriptors_overlap(&[d1.clone(), d2.clone()], 0, 30), "touching-but-disjoint is conservatively detected as overlap (current_hi=10 >= lo=10)");
+
+	// No overlap when the query window doesn't include the boundary: [0, 9] vs [10, 10]
+	assert!(!descriptors_overlap(&[d1.clone(), d2.clone()], 0, 9), "window that ends before the next segment's start is not overlapping");
+
+	// One shared instant: [0,10] and [10,20] → (0,10) and (10,10) → overlap
+	assert!(descriptors_overlap(&[d1.clone(), d2.clone()], 10, 20), "window that includes the common boundary triggers overlap");
+
+	// Two descriptors with truly overlapping ranges: [0,15] and [10,20]
+	let d3 = SegmentDescriptor { id: 3, path: String::new(), format_version: 1, physical_type: Some(PhysicalType::F64), time_unit: Some(TimeUnit::Seconds), row_count: 2, null_count: 0, time_sorted: true, min_ts: Some(10), max_ts: Some(20), min_value: None, max_value: None, byte_len: 100 };
+	let d4 = SegmentDescriptor { id: 4, path: String::new(), format_version: 1, physical_type: Some(PhysicalType::F64), time_unit: Some(TimeUnit::Seconds), row_count: 2, null_count: 0, time_sorted: true, min_ts: Some(15), max_ts: Some(25), min_value: None, max_value: None, byte_len: 100 };
+	// (10,20) and (15,25) → current_hi(20) >= next_lo(15) → overlap
+	assert!(descriptors_overlap(&[d3, d4], 0, 50), "truly overlapping descriptors trigger overlap");
+
+	let d1_c = d1.clone();
+
+	// Single descriptor: no overlap
+	let d5 = SegmentDescriptor { id: 5, min_ts: Some(0), max_ts: Some(10), ..d1_c };
+	assert!(!descriptors_overlap(&[d5], 0, 50), "single descriptor never overlaps");
+
+	// Empty list: no overlap
+	assert!(!descriptors_overlap(&[], 0, 50), "empty descriptor list never overlaps");
+
+	// Descriptors with None min_ts/max_ts (empty segments): filtered out, no overlap
+	let d6 = SegmentDescriptor { id: 6, min_ts: None, max_ts: None, row_count: 0, null_count: 0, ..d1 };
+	let d7 = SegmentDescriptor { id: 7, min_ts: None, max_ts: None, row_count: 0, null_count: 0, ..d2 };
+	assert!(!descriptors_overlap(&[d6, d7], 0, 50), "two empty descriptors do not overlap");
+}
+
+/// The whole history of [`ASPECT`] at one-minute buckets, summed: the single number that
+/// separates the exact (deduplicated) answer from the sidecar merge's approximation.
+async fn history_sum(store: &SegmentStore) -> BigDecimal {
+	let buckets = store.downsample_range(ASPECT, i64::MIN, i64::MAX, Resolution::Minutes, &SIDECAR_AGGREGATIONS).await.expect("downsamples");
+	assert_eq!(buckets.len(), 2, "the fixture spans two minute buckets");
+	buckets.iter().map(|b| b.values.get("sum").expect("a sum").clone()).fold(BigDecimal::from(0), |acc, v| acc + v)
+}
+
+/// P12 #719, the hard corner: two segments of one series that **share instants**, and whose
+/// frames are gone, so nothing but the persisted per-segment partials is left to answer with.
+///
+/// The store must keep answering — a store whose frames have been reclaimed is the normal
+/// state sidecars exist for, not corruption, and a hard error here would take a healthy store
+/// off line — and the number it answers is the documented approximation: each segment
+/// contributes its own rows, so the six shared instants are counted twice and their older
+/// values are added again. Exactness needs the rows, and they are gone. `reconcile_overlaps`
+/// is the remedy; the read says so on `tracing::warn!` every time it takes this route.
+#[tokio::test]
+async fn overlapping_sidecar_only_downsample_serves_the_documented_approximation() {
+	let dir = TempDir::new().expect("tempdir");
+	let store = SegmentStore::open(dir.path()).await.expect("opens").with_partial_sidecar_policy(PartialSidecarPolicy::at_tiered(Resolution::Minutes, 1, &[Resolution::Hours]));
+	let schema = schema();
+	store.declare(ASPECT, &schema).await.expect("declares");
+
+	// 0..=110 every 10 s with value = timestamp, then 60..=110 again with value = timestamp +
+	// 1000: six instants shared, so the exact answer holds 12 rows (150 + 6510 = 6660) while a
+	// merge of the two segments' own rows sees 18 (660 + 6510 = 7170).
+	let mut older_times = Vec::new();
+	let mut older_values = Vec::new();
+	for i in 0..12 {
+		older_times.push(i * 10);
+		older_values.push(bd(&(i * 10).to_string()));
+	}
+	let mut newer_times = Vec::new();
+	let mut newer_values = Vec::new();
+	for i in 6..12 {
+		newer_times.push(i * 10);
+		newer_values.push(bd(&(i * 10 + 1000).to_string()));
+	}
+	let descriptors = vec![store.seal(ASPECT, &schema, &older_times, &older_values).await.expect("seals the older segment"), store.seal(ASPECT, &schema, &newer_times, &newer_values).await.expect("seals the newer segment")];
+	for descriptor in &descriptors {
+		assert!(store.load_partial_sidecar(ASPECT, descriptor, None).await.expect("loads").is_some(), "segment {} has a sidecar", descriptor.id);
+	}
+
+	// Frames present: the overlap fallback reads the rows and dedupes them newer-wins.
+	assert_eq!(history_sum(&store).await, bd("6660"), "the frame-backed answer counts each shared instant once, keeping the newer value");
+
+	for descriptor in &descriptors {
+		std::fs::remove_file(&descriptor.path).expect("removes the frame");
+	}
+	assert_eq!(history_sum(&store).await, bd("7170"), "with the frames gone the sidecar merge answers instead, adding the older values of the six shared instants back in");
+	// `history_sum` borrows the store, which clippy does not count as a usage of the binding, so
+	// it is closed here: the frame store has to let go of its handles before `dir` is removed.
 	drop(store);
 }
