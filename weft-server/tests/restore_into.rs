@@ -131,6 +131,11 @@ async fn insufficient_disk_returns_507_and_leaves_no_staging() {
 	let restore_base = dir.path().join("restored");
 	std::env::set_var("WEFT_RESTORE_BASE_DIR", path_to_env(&restore_base));
 
+	// The handler resolves the backup base as `WEFT_BACKUP_DIR`, falling back to
+	// `<live root>/backups` (`weft-server/src/backup_routes.rs:145`). These fixtures keep
+	// their snapshots in a tree of their own, so point the variable at it.
+	std::env::set_var("WEFT_BACKUP_DIR", path_to_env(&backups));
+
 	let router = router_with_store(&live_http).await;
 
 	let (status, body) = send_json(router, restore_into_request("test-backup", "restored-root")).await;
@@ -184,6 +189,11 @@ async fn failed_restore_cleans_up_staging() {
 	let restore_base = dir.path().join("restored");
 	std::env::set_var("WEFT_RESTORE_BASE_DIR", path_to_env(&restore_base));
 
+	// The handler resolves the backup base as `WEFT_BACKUP_DIR`, falling back to
+	// `<live root>/backups` (`weft-server/src/backup_routes.rs:145`). These fixtures keep
+	// their snapshots in a tree of their own, so point the variable at it.
+	std::env::set_var("WEFT_BACKUP_DIR", path_to_env(&backups));
+
 	let router = router_with_store(&live_http).await;
 	let (status, body) = send_json(router, restore_into_request("test-backup", "restored-root")).await;
 	assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "restore fails with 500: {body}");
@@ -221,9 +231,21 @@ async fn completed_restore_produces_the_chosen_root_and_survives_prune() {
 		s.shutdown().await.expect("shuts down");
 	}
 
+	// A second snapshot under a *generated* label, the shape the daemon's own tick writes:
+	// `is_generated_label` (`weft-server/src/backup_daemon.rs:138`) accepts only
+	// `backup-<digits>`, and `is_complete_backup` (`weftdb/src/types/backup.rs:634`) accepts any
+	// directory holding a manifest, so this one is a genuine prune candidate while `test-backup`
+	// is not.
+	whole_store_backup(&live, &backups.join("backup-20260101")).await;
+
 	// Normalise env: reserve 0 (no disk guard interference), restore base set.
 	std::env::set_var("WEFT_DISK_RESERVE_BYTES", "0");
 	std::env::set_var("WEFT_RESTORE_BASE_DIR", path_to_env(&restore_base));
+
+	// The handler resolves the backup base as `WEFT_BACKUP_DIR`, falling back to
+	// `<live root>/backups` (`weft-server/src/backup_routes.rs:145`). These fixtures keep
+	// their snapshots in a tree of their own, so point the variable at it.
+	std::env::set_var("WEFT_BACKUP_DIR", path_to_env(&backups));
 
 	let router = router_with_store(&live_http).await;
 	let (status, body) = send_json(router, restore_into_request("test-backup", "backup-123")).await;
@@ -243,10 +265,10 @@ async fn completed_restore_produces_the_chosen_root_and_survives_prune() {
 	// exists for: `prune_generated_backups` deletes generated `backup-<digits>` directories it
 	// counts inside the base it is pointed at, so a restored root is only safe because the
 	// restore base is a different directory from the backup base. Point the real daemon sweep at
-	// the backup base with `keep = 0` — it must remove the snapshot there and leave `backup-123`
+	// the backup base with `keep = 0` — it must remove the generated snapshot there and leave `backup-123`
 	// under the restore base alone.
 	let pruned = weft_server::backup_daemon::prune_generated_backups(&backups, 0).await.expect("a retention pass runs");
-	assert!(pruned >= 1, "the sweep should have retired the generated snapshot in the backup base, pruned {pruned}");
+	assert_eq!(pruned, 1, "only the generated `backup-20260101` snapshot retires, pruned {pruned}");
 	assert!(restored_root.is_dir(), "the retention pass must not touch a restored root in another base: {restored_root:?}");
 	assert!(list_contains(&matching_entry_names(&backups, |n| n == "test-backup"), "test-backup"), "a hand-labelled snapshot in the backup base is not a generated name and must survive: {backups:?}");
 }
@@ -284,10 +306,15 @@ async fn restore_base_inside_backup_base_is_refused() {
 	std::env::set_var("WEFT_DISK_RESERVE_BYTES", "0");
 	std::env::set_var("WEFT_RESTORE_BASE_DIR", path_to_env(&restore_base));
 
+	// The handler resolves the backup base as `WEFT_BACKUP_DIR`, falling back to
+	// `<live root>/backups` (`weft-server/src/backup_routes.rs:145`). These fixtures keep
+	// their snapshots in a tree of their own, so point the variable at it.
+	std::env::set_var("WEFT_BACKUP_DIR", path_to_env(&backups));
+
 	let router = router_with_store(&live_http).await;
 	let (status, body) = send_json(router, restore_into_request("test-backup", "sub-restored")).await;
 	assert_eq!(status, StatusCode::BAD_REQUEST, "restore base inside backup base is 400: {body}");
 	assert_eq!(body["code"], "bad_request", "the code is bad_request: {body}");
-	let message = body["message"].as_str().expect("message is a string");
+	let message = body["error"].as_str().expect("message is a string");
 	assert!(message.contains("restore base") || message.contains("backup base"), "message mentions the conflict: {message}");
 }
