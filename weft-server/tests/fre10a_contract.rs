@@ -19,11 +19,11 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use axum::{
-	body::Body, http::{header, HeaderMap, Method, Request, StatusCode}, Router
+	Router, body::Body, http::{HeaderMap, Method, Request, StatusCode, header}
 };
 use tower::ServiceExt as _;
 use weft_server::{
-	app_with_state, auth::{format_key_hash, AuthConfig, KeyStore}, routes::{build_registry, RouteEntry, Scope}, AppState, VERSION
+	AppState, VERSION, app_with_state, auth::{AuthConfig, KeyStore, format_key_hash}, routes::{RouteEntry, Scope, build_registry}
 };
 use weftdb::SegmentStore;
 
