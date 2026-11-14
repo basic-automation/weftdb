@@ -2047,6 +2047,57 @@
         ],
         "type": "object"
       },
+      "RestoreIntoResponse": {
+        "description": "Response body for `POST /api/v1/storage/restore/into` — the outcome of restoring a backup into a caller-chosen new root.",
+        "properties": {
+          "backup_label": {
+            "description": "The backup label that was restored.",
+            "type": "string"
+          },
+          "bytes": {
+            "description": "Total on-disk size of the restored files in bytes.",
+            "type": "integer"
+          },
+          "databases": {
+            "description": "Per-database verification of each restored file, read back at its destination.",
+            "items": {
+              "$ref": "#/components/schemas/BackupDbReport"
+            },
+            "type": "array"
+          },
+          "elapsed_ms": {
+            "description": "Wall-clock milliseconds the restore itself took.",
+            "type": "integer"
+          },
+          "mode": {
+            "description": "`\"whole_store\"` or `\"control_plane\"`, chosen by the backup's manifest.",
+            "type": "string"
+          },
+          "next_step": {
+            "description": "What the operator should do next to serve the restored store.",
+            "type": "string"
+          },
+          "restored_root": {
+            "description": "The absolute path of the restored root directory.",
+            "type": "string"
+          },
+          "rows_verified": {
+            "description": "Total rows verified readable across the restored control plane.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "backup_label",
+          "restored_root",
+          "mode",
+          "databases",
+          "rows_verified",
+          "bytes",
+          "elapsed_ms",
+          "next_step"
+        ],
+        "type": "object"
+      },
       "RunListResponse": {
         "description": "Response body for `GET /bench/runs`.",
         "properties": {
