@@ -6854,3 +6854,21 @@ should either shorten the staging window or ensure the staging mtime is refreshe
 backup base.** This prevents a restored root named `backup-<digits>` from being placed
 where the retention sweep could prune it. The containment check is in
 `backup_routes.rs` and returns 422 Unprocessable Entity with a descriptive message.
+
+## 2026-11-14 — What `restored_root` names: canonical path, verbatim prefix dropped (#213)
+The first Windows and macOS CI runs of `POST /api/v1/storage/restore/into` failed on their own
+assertions, not on the restore: the handler returned `root.display()` of a canonicalised path, so a
+macOS operator was told `/private/var/folders/…` where they had configured `/var/folders/…`, and a
+Windows operator was told `WEFT_SEGMENT_STORE_ROOT=\\?\C:\Users\…`. The canonicalisation is not
+incidental — the destination is canonicalised so the containment check against the backup base and
+the live root compares real paths, and so the response cannot name a path a later symlink swap moves.
+The verbatim prefix is the part that was wrong: `\\?\` is a Win32 file-API spelling, not something to
+put in a config value, and pasting it back is rejected by most tools and re-canonicalised
+inconsistently by the rest. The response now strips it for plain drive paths and turns `\\?\UNC\host\share`
+into `\\host\share`; `\\?\GlobalRoot\…` and any other non-drive verbatim form are passed through
+untouched rather than mangled, because there is no safe rewrite for them.
+
+Rejected first: relaxing the tests to compare one platform's spelling. Both failures were real
+usability defects on those platforms, and a test that compares a canonical path to an un-resolved one
+would have hidden the next such defect rather than catching it. The tests now compare canonical forms
+of both sides, which is what they always meant to assert.

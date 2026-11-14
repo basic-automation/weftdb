@@ -231,10 +231,34 @@ pub async fn restore_into(State(state): State<AppState>, StrictQuery(params): St
 	let bytes: u64 = dbs.iter().map(|r| r.bytes).sum();
 
 	let mode = if whole { "whole_store".to_string() } else { "control_plane".to_string() };
-	let next_step = format!("serve it with WEFT_SEGMENT_STORE_ROOT={}", root.display());
+	let shown_root = operator_path(&root);
+	let next_step = format!("serve it with WEFT_SEGMENT_STORE_ROOT={shown_root}");
 
-	let response = RestoreIntoResponse { backup_label: params.label, restored_root: root.display().to_string(), mode, databases: dbs, rows_verified, bytes, elapsed_ms, next_step };
+	let response = RestoreIntoResponse { backup_label: params.label, restored_root: shown_root, mode, databases: dbs, rows_verified, bytes, elapsed_ms, next_step };
 	Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+/// Render a restored root the way an operator should paste it back.
+///
+/// The destination is canonicalised so the response names a path that exists and cannot be
+/// re-pointed by a symlink swap. On Windows that form is verbatim (`\\?\C:\…`): valid for the
+/// file APIs, hostile everywhere else — a config value holding it is rejected by most tools, and
+/// the daemon would take it verbatim. A plain drive path carries no information in that prefix,
+/// so it is dropped here; macOS resolves `/var` to `/private/var`, which is a real path and is
+/// left alone.
+fn operator_path(path: &Path) -> String {
+	let text = path.display().to_string();
+	if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+		return format!(r"\\{rest}");
+	}
+	if let Some(rest) = text.strip_prefix(r"\\?\") {
+		// Only unwrap a plain drive path: `\\?\GlobalRoot\…` and friends are not drive paths.
+		let bytes = rest.as_bytes();
+		if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+			return rest.to_string();
+		}
+	}
+	text
 }
 
 /// Validate a destination name against the grammar: non-empty, ≤ 200 bytes,
@@ -945,7 +969,10 @@ mod tests {
 		assert_eq!(body["mode"], "control_plane", "body: {body}");
 		assert!(body["rows_verified"].as_i64().unwrap_or(0) >= 2, "body: {body}");
 		assert!(body["elapsed_ms"].is_u64(), "body: {body}");
-		assert!(body["next_step"].as_str().unwrap().contains(&*restored_dir.to_string_lossy()), "body: {body}");
+		// The handler reports the canonicalised destination, so compare like with like.
+		let expected = operator_path(&restored_dir.canonicalize().expect("restored root exists"));
+		assert_eq!(body["restored_root"].as_str().unwrap(), expected, "body: {body}");
+		assert!(body["next_step"].as_str().unwrap().ends_with(&expected), "body: {body}");
 
 		// Restore again into the same name is refused.
 		let (status, body) = post_empty_with_env(r2, "/api/v1/storage/restore/into?label=nightly&name=my-restore-1", &[("WEFT_RESTORE_BASE_DIR", restore_root.to_string_lossy().as_ref())]).await;

@@ -250,11 +250,15 @@ async fn completed_restore_produces_the_chosen_root_and_survives_prune() {
 	let router = router_with_store(&live_http).await;
 	let (status, body) = send_json(router, restore_into_request("test-backup", "backup-123")).await;
 	assert_eq!(status, StatusCode::OK, "restore succeeds: {body}");
-	assert_eq!(body["restored_root"].as_str().expect("restored_root is a string"), restore_base.join("backup-123").display().to_string(), "the restored root is the expected path");
+	let restored_root = restore_base.join("backup-123");
+	// The handler reports the canonicalised destination with the Windows verbatim prefix removed:
+	// on macOS the tempdir is reached through the `/var` → `/private/var` symlink, on Windows the
+	// stripped path re-canonicalises to the same file. Canonicalising both sides keeps the
+	// assertion about the restored tree rather than about one platform's spelling of a path.
+	let reported = body["restored_root"].as_str().expect("restored_root is a string");
+	assert_eq!(Path::new(reported).canonicalize().unwrap_or_else(|err| panic!("reported root `{reported}` is not reachable: {err}")), restored_root.canonicalize().unwrap_or_else(|err| panic!("restored root is not reachable: {err}")), "the restored root is the expected path");
 	assert_eq!(body["mode"], "whole_store", "the backup is a whole-store backup");
 	assert!(body["rows_verified"].as_u64().unwrap_or(0) > 0, "rows were verified");
-
-	let restored_root = restore_base.join("backup-123");
 	assert!(restored_root.is_dir(), "the restored root directory exists");
 
 	// The restored root is visible to filesystem listing.
