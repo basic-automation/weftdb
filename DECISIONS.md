@@ -6777,5 +6777,68 @@ dropped rather than kept as a style fence that would have forced a 28-site churn
 issue to self plus a claim comment naming the exact scope, then verify state with
 `gh pr view <n> --json state,mergeCommit` before building on anything. This session initially reasoned
 from local `origin/main` reads and unverified branch names, which produced claims about PRs that did not
-exist (the numbers were issues). Correction applied: every "done/merged/landed" statement in this session
-is now backed by a `gh` read in the same turn, and `git fetch` precedes any worktree created off `main`.
+
+## 2026-11-14 — FRE-10a contract tests (FRE-10 half, PR #?)
+
+**Spec:** ROADMAP.md:88. "Contract tests: probes, compute endpoints, metrics and roles" — the first
+half of the 73-route registry, partitioned between `tests/fre10a_contract.rs` (this file) and
+`tests/fre10b_contract.rs` (the earlier half).
+
+**File:** `weft-server/tests/fre10a_contract.rs`, house style of `fre10b_contract.rs`.
+
+**What it pins:**
+
+- **Probes** (`/health`, `/healthz`, `/ready`, `/readyz`): the key sets of `HealthResponse`
+  and `ReadyResponse`, and that `/ready` with a store reports the store identity fields.
+- **Metrics** (`/metrics`, `/debug/profile/current`, `/api/v1/storage/headroom`,
+  `/bench/runs`, `/bench/runs/{id}`): the Prometheus exposition format's `text/plain; version=0.0.4`
+  content type and the counter names it carries, and the profile report's section structure.
+- **Compute** (17 routes: 9 interpolate + 8 downsample): the JSON response key sets for all
+  three JSON-input handler families (`interpolate`, `downsample`, `interpolate/point`), and
+  the media types (JSON, CSV, Arrow, Parquet) of every format suffix, including the ILP
+  variants.
+- **Gate on every route** enumerated from `build_registry()`: all seven principals
+  (anonymous, unknown, reader, writer, declarer, maintainer, admin) exercised against each
+  of the 26 routes. The cumulative grant table is verified per scope: probes pass at
+  anonymous, compute at reader, metrics at maintainer.
+- **Coverage partition** that proves the two FRE-10 files sum to the registry without
+  overlap: `(first_half, second_half) == (26, 47) == (73 total)`.
+
+**Deliberate omissions (not pinned here, reason stated):**
+
+- `storage_headroom`, `list_bench_runs` and `get_bench_run` pass the gate but answer
+  `503 unconfigured` in tests (no store with bench-run dir or a configured bench dir);
+  the gate passing is what matters for the contract, and the handler's own shape is purely
+  a number of bytes — it is not an object whose key set the contract should freeze.
+- The precise Prometheus metric names and their initial values are spot-checked but not
+  exhaustively listed; the exhaustive list belongs in the metrics slice's own tests.
+- The ILP-format output bodies (which are JSON when the response is JSON, and CSV/Arrow/Parquet
+  otherwise) are checked for their content types but not for full body shape, because the
+  JSON-input variants already pin the answer shape and the ILP variants share the same
+  response serialization.
+
+**Change to product logic:** None. Test-only.
+
+**CI expected to fail.** The PR body says "CI is the first execution." The file may contain
+compilation errors or latent test failures that only `cargo test` reveals. The PR will go
+as a draft or marked with the CI-as-first-run notice.
+
+## 2026-11-14 — EOD handoff: test file written, ROADMAP ticked, DECISIONS section written
+
+**What exists:** `weft-server/tests/fre10a_contract.rs` in the house style. ROADMAP.md:88 ticked.
+Section written above.
+
+**Not yet done:**
+- `cargo +nightly fmt` to format the new file (hard rules forbid all other cargo
+  commands, and fmt is explicitly allowed). Must run before commit.
+- Git commit with `-s`, push, and a PR opened (no merge).
+- The PR body must say "CI is the first execution; no cargo build/check/test/clippy/miri
+  was run locally."
+- `progress.md` ## Handoff section (this section is that handoff — rewrite if needed).
+
+**Risks:** The stored `Fre10b` key constants prefix `fre10b-`; the test bodies and expected
+values are derived from the handler types and the route registry rather than copied from
+`fre10b_contract.rs`; compiler errors from `cargo test` are expected on first CI run. No
+`cargo` command besides `+nightly fmt` was run.
+
+**Next step after this session:** `cargo +nightly fmt weft-server/tests/fre10a_contract.rs &&\n  git add -A &&\n  git commit -sm "fre10a: contract tests for probes, compute endpoints, metrics and roles (#325)" &&\n  git push origin p12/fre10a-contract-tests &&\n  gh pr create --base main --head p12/fre10a-contract-tests --title "FRE-10a: contract tests for probes, compute endpoints, metrics and roles" --body "Implements FRE-10a. CI is the first execution; no cargo build/check/test/clippy/miri was run locally."
