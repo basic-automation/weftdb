@@ -32,8 +32,7 @@
 use std::sync::Arc;
 
 use axum::{
-	body::Body,
-	http::{Request, StatusCode},
+	body::Body, http::{Request, StatusCode}
 };
 use bigdecimal::BigDecimal;
 use tempfile::TempDir;
@@ -55,35 +54,18 @@ fn schema() -> AspectSchema {
 /// is unconditional: every write gets `507 insufficient_storage`.
 fn router_with_impossible_reserve() -> (TempDir, Router) {
 	let dir = TempDir::new().expect("tempdir");
-	let store = Arc::new(
-		tokio::runtime::Runtime::new()
-			.expect("a runtime for setup")
-			.block_on(async {
-				let store = SegmentStore::open_with_options(
-					dir.path(),
-					SegmentStoreOptions::default().with_disk_reserve_bytes(u64::MAX),
-				)
-				.await
-				.expect("opens the store");
-				store
-					.declare(ASPECT, &schema())
-					.await
-					.expect("declares the aspect");
-				store
-			}),
-	);
+	let store = Arc::new(tokio::runtime::Runtime::new().expect("a runtime for setup").block_on(async {
+		let store = SegmentStore::open_with_options(dir.path(), SegmentStoreOptions::default().with_disk_reserve_bytes(u64::MAX)).await.expect("opens the store");
+		store.declare(ASPECT, &schema()).await.expect("declares the aspect");
+		store
+	}));
 	let router = app_with_state(AppState::new().with_store(store));
 	(dir, router)
 }
 
 /// POST a JSON points body (a single point at timestamp 1, value 1.0).
 fn ingest_points_request() -> Request<Body> {
-	Request::builder()
-		.method("POST")
-		.uri(&format!("/api/v1/storage/{ASPECT}/points"))
-		.header("content-type", "application/json")
-		.body(Body::from(r#"{"points":[{"t":1,"v":1.0}]}"#))
-		.expect("builds the request")
+	Request::builder().method("POST").uri(&format!("/api/v1/storage/{ASPECT}/points")).header("content-type", "application/json").body(Body::from(r#"{"points":[{"t":1,"v":1.0}]}"#)).expect("builds the request")
 }
 
 #[tokio::test]
@@ -92,22 +74,12 @@ async fn space_source_reports_a_full_filesystem_and_the_server_says_507() {
 	// The guard checks disk_space_at(store.root()), finds the real
 	// filesystem's available bytes below u64::MAX, and refuses.
 	let (_dir, router) = router_with_impossible_reserve();
-	let response = router
-		.oneshot(ingest_points_request())
-		.await
-		.expect("the router answers");
-	let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
-		.await
-		.expect("a body fits");
-	let body: serde_json::Value =
-		serde_json::from_slice(&bytes).expect("a JSON body");
+	let response = router.oneshot(ingest_points_request()).await.expect("the router answers");
+	let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024).await.expect("a body fits");
+	let body: serde_json::Value = serde_json::from_slice(&bytes).expect("a JSON body");
 
 	assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
-	assert_eq!(
-		body["code"],
-		"insufficient_storage",
-		"the code is the §4 name: {body}"
-	);
+	assert_eq!(body["code"], "insufficient_storage", "the code is the §4 name: {body}");
 }
 
 #[tokio::test]
@@ -117,9 +89,7 @@ async fn a_real_full_filesystem_produces_enospc_end_to_end() {
 	// this test skips honestly.
 
 	// Probe: can this host create a user+mount namespace?
-	let probe = std::process::Command::new("unshare")
-		.args(["-Um", "true"])
-		.output();
+	let probe = std::process::Command::new("unshare").args(["-Um", "true"]).output();
 
 	match probe {
 		Err(e) => {
@@ -153,22 +123,11 @@ if [ "$FILLED" -ge 1048576 ]; then echo "ENOSPC_NOT_REACHED"; exit 1; fi
 echo "ENOSPC_CONFIRMED at ${FILLED} bytes"
 "#;
 
-	let result = std::process::Command::new("unshare")
-		.args(["-Um", "-r", "sh", "-c", script])
-		.output()
-		.expect("runs the namespace script");
+	let result = std::process::Command::new("unshare").args(["-Um", "-r", "sh", "-c", script]).output().expect("runs the namespace script");
 
 	let stdout = String::from_utf8_lossy(&result.stdout);
-	assert!(
-		result.status.success(),
-		"Expected ENOSPC confirmed inside 1 MiB tmpfs, got exit={} stdout:\n{}",
-		result.status.code().unwrap_or(-1),
-		stdout
-	);
-	assert!(
-		stdout.contains("ENOSPC_CONFIRMED"),
-		"ENOSPC not confirmed. stdout:\n{stdout}"
-	);
+	assert!(result.status.success(), "Expected ENOSPC confirmed inside 1 MiB tmpfs, got exit={} stdout:\n{}", result.status.code().unwrap_or(-1), stdout);
+	assert!(stdout.contains("ENOSPC_CONFIRMED"), "ENOSPC not confirmed. stdout:\n{stdout}");
 
 	eprintln!(
 		"NOTE (enospc_real_fs): tmpfs ENOSPC confirmed via dd inside \
