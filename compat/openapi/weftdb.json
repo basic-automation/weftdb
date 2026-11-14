@@ -9058,7 +9058,7 @@
         "operationId": "storage_restore_into",
         "parameters": [
           {
-            "description": "The backup subdirectory to rehearse restoring, under the backup root, in the label grammar (`[A-Za-z0-9][A-Za-z0-9._-]{0,99}`, not ending with `.`).",
+            "description": "The backup subdirectory to restore, under the backup root, in the label grammar (`[A-Za-z0-9][A-Za-z0-9._-]{0,99}`, not ending with `.`).",
             "in": "query",
             "name": "label",
             "required": true,
