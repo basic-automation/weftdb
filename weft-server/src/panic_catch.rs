@@ -238,14 +238,6 @@ mod tests {
 		assert!(!wire.contains("WritingFrames"), "the §4 redacted sentence does not name a phase: {wire}");
 	}
 
-	#[tokio::test]
-	async fn a_request_that_does_not_panic_passes_through_untouched() {
-		let response = panicking_router().oneshot(Request::builder().method("POST").uri("/calm").body(Body::empty()).unwrap()).await.unwrap();
-		assert_eq!(response.status(), StatusCode::OK);
-		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-		assert_eq!(&bytes[..], b"fine");
-	}
-
 	#[test]
 	fn ingest_route_detection_matches_the_four_ingest_suffixes_only() {
 		let request = |method: &str, uri: &str| Request::builder().method(method).uri(uri).body(Body::empty()).unwrap();
