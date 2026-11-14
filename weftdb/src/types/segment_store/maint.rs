@@ -854,6 +854,10 @@ impl SegmentStore {
 				sweep.tripped.push(aspect.clone());
 				continue;
 			}
+			if !self.decode_breaker_permits(aspect) {
+				sweep.tripped.push(aspect.clone());
+				continue;
+			}
 			let Some(held) = self.sweep_maintain(aspect, deadline).await else {
 				sweep.busy.push(aspect.clone());
 				continue;
@@ -861,16 +865,19 @@ impl SegmentStore {
 			match self.reconcile_aspect_if_unsorted_exceeds_held(&held, threshold).await {
 				Ok(Some(reconciled)) => {
 					self.breaker_record(aspect, false);
+					self.decode_breaker_record(aspect, false);
 					sweep.aspects_reconciled += 1;
 					sweep.segments_reconciled += reconciled;
 				}
 				Ok(None) => {
 					self.breaker_record(aspect, false);
+					self.decode_breaker_record(aspect, false);
 				}
 				Err(err) => {
 					if self.breaker_record(aspect, true) {
 						sweep.breaker_trips += 1;
 					}
+					self.decode_breaker_record(aspect, true);
 					sweep.failed.push((aspect.clone(), err));
 				}
 			}
@@ -993,6 +1000,10 @@ impl SegmentStore {
 				sweep.tripped.push(aspect.clone());
 				continue;
 			}
+			if !self.decode_breaker_permits(aspect) {
+				sweep.tripped.push(aspect.clone());
+				continue;
+			}
 			let Some(held) = self.sweep_maintain(aspect, deadline).await else {
 				sweep.busy.push(aspect.clone());
 				continue;
@@ -1000,17 +1011,20 @@ impl SegmentStore {
 			match self.reconcile_aspect_hot_cold_held(&held, threshold).await {
 				Ok(outcome) if outcome.total() > 0 => {
 					self.breaker_record(aspect, false);
+					self.decode_breaker_record(aspect, false);
 					sweep.aspects_reconciled += 1;
 					sweep.cold_reconciled += outcome.cold_reconciled;
 					sweep.hot_reconciled += outcome.hot_reconciled;
 				}
 				Ok(_) => {
 					self.breaker_record(aspect, false);
+					self.decode_breaker_record(aspect, false);
 				}
 				Err(err) => {
 					if self.breaker_record(aspect, true) {
 						sweep.breaker_trips += 1;
 					}
+					self.decode_breaker_record(aspect, true);
 					sweep.failed.push((aspect.clone(), err));
 				}
 			}
@@ -1230,6 +1244,10 @@ impl SegmentStore {
 				sweep.tripped.push(aspect.clone());
 				continue;
 			}
+			if !self.decode_breaker_permits(aspect) {
+				sweep.tripped.push(aspect.clone());
+				continue;
+			}
 			let Some(held) = self.sweep_maintain(aspect, deadline).await else {
 				sweep.busy.push(aspect.clone());
 				continue;
@@ -1237,16 +1255,19 @@ impl SegmentStore {
 			match self.reconcile_overlaps_held(&held, SplitPolicy::questdb_default()).await {
 				Ok(removed) if removed > 0 => {
 					self.breaker_record(aspect, false);
+					self.decode_breaker_record(aspect, false);
 					sweep.aspects_reconciled += 1;
 					sweep.segments_removed += removed;
 				}
 				Ok(_) => {
 					self.breaker_record(aspect, false);
+					self.decode_breaker_record(aspect, false);
 				}
 				Err(err) => {
 					if self.breaker_record(aspect, true) {
 						sweep.breaker_trips += 1;
 					}
+					self.decode_breaker_record(aspect, true);
 					sweep.failed.push((aspect.clone(), err));
 				}
 			}

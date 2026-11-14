@@ -686,8 +686,9 @@ pub const DEFAULT_MAINTENANCE_BREAKER_FAILURES: u32 = 3;
 /// a store-wide sweep may try it once more (ROB-19).
 pub const DEFAULT_MAINTENANCE_BREAKER_COOLDOWN: Duration = Duration::from_secs(300);
 
-/// Consecutive decode failures for an aspect after which the decode breaker trips
-/// (ROB-22). Same threshold as the maintenance breaker (3): a single transient I/O
+/// Consecutive decode failures before the decode breaker trips (ROB-22).
+///
+/// Same threshold as the maintenance breaker (3): a single transient I/O
 /// blip must not skip a whole tick's maintenance, but two more attempts at the same
 /// damaged frame should stop the retry loop without waiting for the maintenance
 /// breaker's cooldown.

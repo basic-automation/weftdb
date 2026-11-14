@@ -31,10 +31,11 @@
 use serde::{Deserialize, Serialize};
 use weft_physical_type::{crc32, SegmentDescriptor, WeftSegError};
 
-/// The server's policy for what happens to a frame whose decode fails in the
-/// background — a maintenance pass, a compaction, a read that finds a frame it
-/// cannot open (ROB-22). The policy sits next to
-/// [`classify_decode_failure`](Self::classify_decode_failure) so both the read path
+/// The server's policy for a frame whose decode fails (ROB-22).
+///
+/// Applies to maintenance passes, compactions, and reads that find a frame they
+/// cannot open. The policy sits next to
+/// [`classify_decode_failure`] so both the read path
 /// and the daemon use one rule, configured at startup from
 /// `WEFT_SUSPECT_FRAME_POLICY`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,11 +285,12 @@ pub const fn is_newer_format(error: &WeftSegError) -> bool {
 
 /// The action the server takes when a decode failure is C5-suspect (ROB-22):
 /// whether to skip the frame silently, quarantine it, or fail the caller.
+///
 /// A corrupt frame is always quarantined ([`QuarantineClass::Corrupt`]) — the
 /// policy's purpose is the suspect half, where the right answer depends on
 /// whether the deployment wants to keep reading or stop on an undecodable
 /// frame. The policy grows from a single env var for now (ROB-22 1.) and is
-/// resolved here via [`classify_decode_failure`](Self::classify_decode_failure)
+/// resolved here via [`classify_decode_failure`]
 /// so callers never decide on their own.
 #[must_use]
 pub fn decode_failure_action(bytes: &[u8], error: &WeftSegError, policy: SuspectFramePolicy) -> SuspectFramePolicy {
@@ -399,17 +401,14 @@ mod tests {
 
 	#[test]
 	fn decode_failure_action_suspect_frames_respect_the_policy() {
-		let bytes = paged_bytes();
+		let mut bytes = paged_bytes();
 		// A post-CRC failure is suspect; each policy is honoured.
-		let post_crc = {
-			let mut b = bytes.clone();
-			let middle = b.len() / 2;
-			b[middle] ^= 0xff;
-			let body = b.len() - 4;
-			let checksum = crc32(&b[..body]);
-			b[body..].copy_from_slice(&checksum.to_le_bytes());
-			b
-		};
+		let middle = bytes.len() / 2;
+		bytes[middle] ^= 0xff;
+		let body = bytes.len() - 4;
+		let checksum = crc32(&bytes[..body]);
+		bytes[body..].copy_from_slice(&checksum.to_le_bytes());
+		let post_crc = bytes;
 		assert!(crc_verified(&post_crc));
 		assert_eq!(decode_failure_action(&post_crc, &WeftSegError::InvalidDecimal, SuspectFramePolicy::Skip), SuspectFramePolicy::Skip);
 		assert_eq!(decode_failure_action(&post_crc, &WeftSegError::InvalidDecimal, SuspectFramePolicy::Quarantine), SuspectFramePolicy::Quarantine);
