@@ -105,7 +105,7 @@ pub async fn restore_drill(State(state): State<AppState>, StrictQuery(params): S
 	Ok((StatusCode::OK, Json(response)).into_response())
 }
 
-/// Handle `POST /api/v1/storage/restore/into?label=&name=&adopt=true`: restore a backup
+/// Handle `POST /api/v1/storage/restore/into?label=&name=`: restore a backup
 /// into a caller-chosen new root under the configured restore base.
 ///
 /// The caller picks a `name` which must be a single safe path segment (non-empty, ≤ 200
@@ -115,9 +115,9 @@ pub async fn restore_drill(State(state): State<AppState>, StrictQuery(params): S
 /// store, chosen by the backup's manifest — into the destination, verifies every
 /// restored database at its destination, and reports the outcome.
 ///
-/// With `adopt=true`, the restored root is opened once afterwards so frame adoption
-/// runs and the restore intent marker clears (like the CLI's `--adopt`), then closed.
-/// The live store is never touched.
+/// Adoption is deliberately not an option here: this route never opens the restored root,
+/// so frame adoption runs and the restore intent marker clears on that root's first server
+/// open, or now with the CLI's `--adopt`. The live store is never touched.
 ///
 /// # Errors
 ///
