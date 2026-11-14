@@ -1097,8 +1097,8 @@ async fn refusals_carry_the_contract_codes() {
 	assert_eq!(headers[header::ALLOW], "GET, POST", "both verbs the path serves: {body}");
 }
 
-#[tokio::test]
 /// ROB-18 phase 1 admission, driven over HTTP (FRE-10b, #721).
+#[tokio::test]
 ///
 /// The 408 body timeout and the 507 on the decoded top-up cannot be
 /// driven over HTTP — the first needs a stream that never delivers a
@@ -1125,7 +1125,6 @@ async fn ingest_admission_refuses_over_cap_and_no_headroom() {
 	assert_eq!(json["limit"], 32, "the refusal names the cap: {json}");
 
 	// 507: a tiny body on a store with a reserve the filesystem cannot meet.
-	drop(router);
 	let config = weft_server::IngestConfig::with_max_body_bytes(1024);
 	let router = app_with_state(weft_server::AppState::new().with_store(store).with_ingest_config(config));
 	let payload = serde_json::to_vec(&serde_json::json!({ "points": [{ "timestamp": 100, "value": "1.5" }] })).unwrap();
