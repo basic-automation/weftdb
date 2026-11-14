@@ -970,7 +970,7 @@ mod tests {
 		assert!(body["rows_verified"].as_i64().unwrap_or(0) >= 2, "body: {body}");
 		assert!(body["elapsed_ms"].is_u64(), "body: {body}");
 		// The handler reports the canonicalised destination, so compare like with like.
-		let expected = operator_path(&restored_dir.canonicalize().expect("restored root exists"));
+		let expected = super::operator_path(&restored_dir.canonicalize().expect("restored root exists"));
 		assert_eq!(body["restored_root"].as_str().unwrap(), expected, "body: {body}");
 		assert!(body["next_step"].as_str().unwrap().ends_with(&expected), "body: {body}");
 
