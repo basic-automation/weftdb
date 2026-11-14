@@ -441,7 +441,7 @@ async fn value_range_of_is_a_raw_scan_pinned_against_point_of() {
 
 // === P12 #719 acceptance tests: downsample with overlapping segments ===
 
-/// 1. Overlapping newer-wins value: two segments, same timestamps, downsample_range.
+/// 1. Overlapping newer-wins value: two segments, same timestamps, `downsample_range`.
 /// Newer segment's values must appear in every aggregation bucket — count is 1, not 2.
 #[tokio::test]
 async fn downsample_overlap_newer_wins_value() {
@@ -478,7 +478,7 @@ async fn downsample_overlap_newer_wins_value() {
 	drop(store);
 }
 
-/// 2. Same through downsample_range_width (width parity).
+/// 2. Same through `downsample_range_width` (width parity).
 #[tokio::test]
 async fn downsample_overlap_newer_wins_width() {
 	let dir = TempDir::new().expect("tempdir");
@@ -489,24 +489,25 @@ async fn downsample_overlap_newer_wins_width() {
 
 	assert_sealed_overlap(&store, SeriesId::UNTAGGED, &[10, 20], &[10, 20], (0, 50)).await;
 
-	// A bucket width of 15 seconds: timestamps 10 and 20 both fall in [10,25).
-	let width = weft_reduce::BucketWidth::new(Resolution::Seconds, 15).expect("non-zero count");
+	// A width of 60 seconds: both stored instants land in the same bucket whichever epoch or
+	// window base the reducer aligns to, so this pins the merge and not the alignment. (A 15 s
+	// width would split them across two buckets and prove nothing about the overlap.)
+	let width = weft_reduce::BucketWidth::new(Resolution::Seconds, 60).expect("non-zero count");
 	let aggs = [Aggregation::Sum];
 	let buckets = store.downsample_range_width(ASPECT, 0, 50, width, &aggs).await.expect("overlap width downsample succeeds");
 
-	// Both timestamps [10,20] fall within the same [10,25) bucket.
-	// count=1 each, so total count=2, sum=200+250=450.
-	// Wait — width of 15 × Seconds(1) = 15-second buckets.
-	// t=10 falls in [10, 25), t=20 also falls in [10, 25). So one bucket with count=2, sum=450.
-	assert_eq!(buckets.len(), 1, "one 15s bucket covers both timestamps");
-	assert_eq!(buckets[0].count, 2, "two points in the single bucket");
+	// One bucket holding both instants, each worth exactly one point after the newer-wins merge:
+	// count 2 and sum 450. Without the overlap merge this is count 4 and sum 700 (both segments
+	// counted), which is the regression this test exists to catch.
+	assert_eq!(buckets.len(), 1, "one 60s bucket covers both timestamps");
+	assert_eq!(buckets[0].count, 2, "two points in the single bucket, not four");
 	assert_eq!(buckets[0].values.get("sum").unwrap(), &bd("450"), "sum = 200+250 = 450");
 
 	drop(store);
 }
 
-/// 3. Integer (ScaledI64) route: overlapping segments produce the same result as
-/// a one-pass reduce of read_time_range_of over the same window.
+/// 3. Integer (`ScaledI64`) route: overlapping segments produce the same result as
+/// a one-pass reduce of `read_time_range_of` over the same window.
 #[tokio::test]
 async fn downsample_overlap_scaled_integer_equals_one_pass() {
 	let dir = TempDir::new().expect("tempdir");
@@ -593,7 +594,7 @@ async fn downsample_non_overlapping_two_segments() {
 	drop(store);
 }
 
-/// 6. SketchP99 over overlapping segments equals the one-pass answer.
+/// 6. `SketchP99` over overlapping segments equals the one-pass answer.
 #[tokio::test]
 async fn downsample_overlap_sketch_p99() {
 	let dir = TempDir::new().expect("tempdir");
@@ -606,26 +607,34 @@ async fn downsample_overlap_sketch_p99() {
 
 	assert_sealed_overlap(&store, SeriesId::UNTAGGED, &[10, 11, 12], &[10, 11, 12], (0, 50)).await;
 
-	// downsample with sketch_p99 (only one bucket since resolution is Hours(1))
-	let aggs = [Aggregation::SketchP99];
+	// downsample with the exact and the sketch p99 side by side (one bucket: the window is
+	// 50 seconds and the resolution is one hour)
+	let aggs = [Aggregation::P99, Aggregation::SketchP99];
 	let buckets = store.downsample_range(ASPECT, 0, 50, Resolution::Hours, &aggs).await.expect("overlap sketch p99 succeeds");
 
 	assert_eq!(buckets.len(), 1, "one bucket for the whole hour");
 	assert_eq!(buckets[0].count, 3, "three points (newer-wins deduped)");
-	let p99 = buckets[0].values.get("sketch_p99").expect("sketch_p99 present").clone();
+	let exact = buckets[0].values.get("p99").expect("p99 present").clone();
+	let sketch = buckets[0].values.get("sketch_p99").expect("sketch_p99 present").clone();
 
 	// One-pass answer: read_time_range, then reduce manually
 	let (ts, vs) = store.read_time_range(ASPECT, 0, 50).await.expect("range read for one-pass");
 	assert_eq!(ts, vec![10, 11, 12], "three timestamps, deduplicated");
 	let non_null: Vec<BigDecimal> = vs.iter().flatten().cloned().collect();
 	assert_eq!(non_null, vec![bd("10"), bd("20"), bd("30")], "newer-wins values");
-	// The sketch p99 of {10, 20, 30} should be 30 (the largest).
-	assert_eq!(p99, bd("30"), "sketch_p99 ≈ 30 on the 3 newer-wins points");
+	// `sketch_p99` is a `DdSketch` estimate, so it is pinned the way the server route pins it
+	// (`weft-server/src/storage.rs`: within 1% of the exact nearest-rank percentile) rather than
+	// as an exact decimal. The exact p99 of the merged {10,20,30} is 30; double-counting the
+	// older segment would not change the exact p99, which is why the count above carries the
+	// dedup assertion and this one pins that the fallback feeds the sketch the merged values.
+	let (exact_f, sketch_f) = (weft_reduce::decimal_to_f64(&exact).expect("exact p99 is finite"), weft_reduce::decimal_to_f64(&sketch).expect("sketch p99 is finite"));
+	assert_eq!(exact, bd("30"), "exact p99 of the 3 newer-wins points");
+	assert!((sketch_f - exact_f).abs() / exact_f < 0.01, "sketch_p99 {sketch_f} must be within 1% of the exact p99 {exact_f}");
 
 	drop(store);
 }
 
-/// 7. Unit test of descriptors_overlap: touching-but-disjoint does NOT trigger,
+/// 7. Unit test of `descriptors_overlap`: touching-but-disjoint does NOT trigger,
 /// one shared instant DOES trigger.
 #[tokio::test]
 async fn descriptors_overlap_touching_disjoint_vs_shared() {
@@ -661,7 +670,7 @@ async fn descriptors_overlap_touching_disjoint_vs_shared() {
 	assert!(!descriptors_overlap(&[], 0, 50), "empty descriptor list never overlaps");
 
 	// Descriptors with None min_ts/max_ts (empty segments): filtered out, no overlap
-	let d6 = SegmentDescriptor { id: 6, min_ts: None, max_ts: None, row_count: 0, null_count: 0, ..d1.clone() };
+	let d6 = SegmentDescriptor { id: 6, min_ts: None, max_ts: None, row_count: 0, null_count: 0, ..d1 };
 	let d7 = SegmentDescriptor { id: 7, min_ts: None, max_ts: None, row_count: 0, null_count: 0, ..d2 };
 	assert!(!descriptors_overlap(&[d6, d7], 0, 50), "two empty descriptors do not overlap");
 }

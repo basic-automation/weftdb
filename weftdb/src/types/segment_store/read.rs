@@ -8,7 +8,7 @@ use super::*;
 /// Reduce one pass of already-deduplicated rows (as from [`read_time_range_of`]) into
 /// a [`PartialReduction`], for the overlap fallback route.
 /// Pure and synchronous: no store state, spawn_blocking-safe.
-fn reduce_decoded_rows(ts: Vec<i64>, vs: Vec<Option<BigDecimal>>, start: i64, end: i64, unit: TimeUnit, resolution: Resolution, aggregations: Vec<Aggregation>) -> Result<Option<PartialReduction>> {
+fn reduce_decoded_rows(ts: Vec<i64>, vs: Vec<Option<BigDecimal>>, start: i64, end: i64, unit: TimeUnit, resolution: Resolution, aggregations: &[Aggregation]) -> Result<Option<PartialReduction>> {
 	let mut points: Vec<Point> = Vec::with_capacity(ts.len().min(256));
 	for (t, v) in ts.into_iter().zip(vs) {
 		if let Some(value) = v {
@@ -20,7 +20,7 @@ fn reduce_decoded_rows(ts: Vec<i64>, vs: Vec<Option<BigDecimal>>, start: i64, en
 	if points.is_empty() {
 		return Ok(None);
 	}
-	let partial = weft_reduce::reduce_partial(&points, resolution, None, None, &aggregations).map_err(|e| anyhow::anyhow!("reducing decoded rows: {e}"))?;
+	let partial = weft_reduce::reduce_partial(&points, resolution, None, None, aggregations).map_err(|e| anyhow::anyhow!("reducing decoded rows: {e}"))?;
 	Ok(Some(partial))
 }
 
@@ -340,7 +340,7 @@ impl SegmentStore {
 			// block the async runtime for a large result set.
 			let unit = schema.timestamp_unit;
 			let aggs = aggregations.to_vec();
-			let partial = tokio::task::spawn_blocking(move || reduce_decoded_rows(ts, vs, start, end, unit, resolution, aggs)).await.context("overlap fallback reduce panicked")??;
+			let partial = tokio::task::spawn_blocking(move || reduce_decoded_rows(ts, vs, start, end, unit, resolution, &aggs)).await.context("overlap fallback reduce panicked")??;
 			// Enforce the ROB-13 cap on the fallback too, matching the other routes.
 			return partial.map_or(Ok(None), |p| check_partial_len(aspect, p, max_buckets).map(Some));
 		}
