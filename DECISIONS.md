@@ -6779,3 +6779,49 @@ issue to self plus a claim comment naming the exact scope, then verify state wit
 from local `origin/main` reads and unverified branch names, which produced claims about PRs that did not
 exist (the numbers were issues). Correction applied: every "done/merged/landed" statement in this session
 is now backed by a `gh` read in the same turn, and `git fetch` precedes any worktree created off `main`.
+## 2026-11-14 — An overlap whose frames are gone is served approximately, never as an error (#719, X-READ follow-up)
+
+**Status: decided**
+
+The first cut of the overlap fallback routed any range overlap through `read_time_range_of`,
+which decodes frames. `cargo test -p weftdb --no-default-features --features arrow,arrow_numeric`
+then failed two tests that have nothing to do with overlap:
+`types::partial_sidecar::sidecar_scale_tests::sidecar_downsample_matches_full_decode` and
+`sidecar_downsample_error_band_does_not_grow_with_scale` (scales 3/4/6, "Read failed … No such
+file or directory (os error 2)", 6.48 s). Both pass on `origin/main` under the same features.
+The cause is not the merge: the fixture deletes frames as soon as every segment has a partial
+sidecar, so its sidecar-only reads — the exact state sidecars exist to serve — landed in a path
+that needs rows. That feature set is not incidental either: `arrow` is not in `default`, so the
+CI `test (macos, ubuntu-latest, windows-latest)` job runs the crate without it, and
+`weftdb/tests/scaled_i64_parity_tests.rs:5` needs `#[cfg(feature = "arrow")]` for that reason.
+
+Decisions:
+
+1. **The guard is frame-aware, not merely overlap-aware.** `segments_are_sidecar_only` stats
+   `descriptor.path` for every segment the pruned index can serve and requires every sidecar
+   (`load_partial_sidecar`, the same call the merge makes, so the substitution grid matches the
+   merge's own `sidecar_eligible` and `min_rows` decisions). The fallback to decode is taken only
+   when the segments are not provably sidecar-only. TOCTOU against manual frame deletion is
+   accepted: the guard errs toward an error only if a frame disappears after the check *and*
+   every segment's sidecar is unusable.
+2. **When the guard fires, serve the per-segment merge and log once per read on
+   `tracing::warn!`** (`"overlapping segments without readable frames: serving the per-segment
+   partial merge, which counts shared instants twice"`). A hard error would fail closed in the
+   worst way — a store whose frames have been reclaimed by design goes offline for the whole
+   duration of a reclaim, and a `StorageError` variant for it would carry registry/contract cost.
+   Silent approximation is the other failure mode, so the read announces itself. The #719 brief
+   asks for "newer wins, never a silently double-counted bucket": this honours the never-silently
+   half and cannot honour the newer-wins half, because exactness needs rows that are gone.
+   `reconcile_overlaps` is what makes it exact again, which is why the log line names it.
+3. **The approximation is pinned by a test, not waved at.**
+   `overlapping_sidecar_only_downsample_serves_the_documented_approximation` seals two segments of
+   one series sharing six instants, asserts the frame-backed answer (sum 6660, each instant once,
+   newer value kept) and then, after deleting frames, the sidecar answer (sum 7170, the older
+   values added back). The two `sidecar_scale_tests` now also assert they really are in the
+   sidecar-only state, so they cannot degrade into accidentally frame-backed passes.
+4. **`min`/`max` are exact only when the overlap shares no instant.** An earlier comment claimed
+   min/max "fold correctly across segments whatever the overlap"; with a real shared instant the
+   superseded value is still in the fold, so min/max can come from a row the newer segment
+   replaced. The comment now says exactness holds for the usual case — ranges that touch with
+   distinct rows, i.e. an out-of-order backfill beside newer data — and lists every aggregation
+   that double-counts when instants really collide.
