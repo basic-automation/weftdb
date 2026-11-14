@@ -508,6 +508,15 @@ impl SegmentStoreOptions {
 		self
 	}
 
+	/// Decode circuit breaker (ROB-22) for background decodes, builder form of
+	/// [`SegmentStoreOptions::decode_breaker`]. A store that decodes damaged frames outside the
+	/// maintenance loop uses this to keep its own retry budget separate from the maintenance one.
+	#[must_use]
+	pub const fn with_decode_breaker(mut self, breaker: MaintenanceBreaker) -> Self {
+		self.decode_breaker = breaker;
+		self
+	}
+
 	/// These options with `limit` as the per-aspect series cap (see
 	/// [`max_series_per_aspect`](Self::max_series_per_aspect)).
 	#[must_use]
