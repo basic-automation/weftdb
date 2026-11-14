@@ -157,35 +157,49 @@ pub async fn restore_into(State(state): State<AppState>, StrictQuery(params): St
 		std::path::PathBuf::from,
 	);
 
-	// Canonicalize both the restore base and backup base for containment checks.
+	// Canonicalize both bases for the containment checks below. A restore base
+	// need not exist yet: the first restore into a fresh location creates it,
+	// because canonicalizing a missing path fails and every check here needs a
+	// real path to compare. A request refused further down removes the
+	// directory again, so a refusal leaves nothing behind.
+	let created_restore_base = !restore_base.exists();
+	if created_restore_base {
+		std::fs::create_dir_all(&restore_base).map_err(|err| ApiError::internal(format!("restore base `{}` cannot be created: {err}", restore_base.display())))?;
+	}
 	let restore_base = restore_base.canonicalize().map_err(|err| ApiError::internal(format!("restore base cannot be canonicalized: {err}")))?;
 	let backup_base = backup_base.canonicalize().unwrap_or(backup_base);
+	let refuse = |err: ApiError| {
+		if created_restore_base {
+			let _ = std::fs::remove_dir(&restore_base);
+		}
+		err
+	};
 
 	// Amendment #4: refuse a restore base that sits inside or equals the backup base,
 	// because a restored root named e.g. `backup-123` could be pruned by the daemon.
 	if restore_base == backup_base || backup_base.starts_with(&restore_base) || restore_base.starts_with(&backup_base) {
-		return Err(ApiError::bad_request(format!("restore base `{}` sits inside or equals the backup base `{}`; a restored root named e.g. `backup-123` could be pruned by the backup daemon", restore_base.display(), backup_base.display())));
+		return Err(refuse(ApiError::bad_request(format!("restore base `{}` sits inside or equals the backup base `{}`; a restored root named e.g. `backup-123` could be pruned by the backup daemon", restore_base.display(), backup_base.display()))));
 	}
 
 	// Join the caller-chosen destination name.
 	let dest = restore_base.join(&params.name);
 	if dest.exists() {
-		return Err(ApiError::already_exists(format!("restore destination already exists: {}; choose a fresh destination name, or remove it first", dest.display())));
+		return Err(refuse(ApiError::already_exists(format!("restore destination already exists: {}; choose a fresh destination name, or remove it first", dest.display()))));
 	}
 
 	// Refuse if the destination is or contains the live store root.
 	let live_root = store.root();
 	let live_root = live_root.canonicalize().unwrap_or_else(|_| live_root.to_path_buf());
 	if dest.starts_with(&live_root) || live_root.starts_with(&dest) {
-		return Err(ApiError::bad_request(format!("destination `{}` would overlap the live store root `{}`; a restore must go elsewhere", params.name, live_root.display())));
+		return Err(refuse(ApiError::bad_request(format!("destination `{}` would overlap the live store root `{}`; a restore must go elsewhere", params.name, live_root.display()))));
 	}
 
 	drop(store);
 
 	// Read the backup's manifest to determine the mode.
-	let manifest = BackupManifest::read(&backup_dir).await.map_err(|err| ApiError::internal(format!("reading backup manifest: {err:#}")))?;
+	let manifest = BackupManifest::read(&backup_dir).await.map_err(|err| refuse(ApiError::internal(format!("reading backup manifest: {err:#}"))))?;
 	let Some(manifest) = manifest else {
-		return Err(ApiError::internal(format!("backup `{}` has no manifest — it was taken before manifests were introduced; take a fresh backup and retry", params.label)));
+		return Err(refuse(ApiError::internal(format!("backup `{}` has no manifest — it was taken before manifests were introduced; take a fresh backup and retry", params.label))));
 	};
 	let whole = manifest.is_whole_store();
 
@@ -196,8 +210,8 @@ pub async fn restore_into(State(state): State<AppState>, StrictQuery(params): St
 	if let Err(err) = guard.admit(disk_space_at(&dest), manifest_bytes) {
 		use crate::error::Code;
 		return Err(match err {
-			weftdb::StoreError::InsufficientStorage { available_bytes: _, reserve_bytes: _, need_bytes: _ } => ApiError::server(Code::InsufficientStorage, format!("restore needs the manifest's declared {manifest_bytes} bytes but the disk guard refuses; check the store's headroom")),
-			other => ApiError::internal(format!("disk guard refused: {other}")),
+			weftdb::StoreError::InsufficientStorage { available_bytes: _, reserve_bytes: _, need_bytes: _ } => refuse(ApiError::server(Code::InsufficientStorage, format!("restore needs the manifest's declared {manifest_bytes} bytes but the disk guard refuses; check the store's headroom"))),
+			other => refuse(ApiError::internal(format!("disk guard refused: {other}"))),
 		});
 	}
 
