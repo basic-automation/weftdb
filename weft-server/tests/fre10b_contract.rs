@@ -41,14 +41,14 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use axum::{
-	Router, body::Body, http::{HeaderMap, Method, Request, StatusCode, header}
+	body::Body, http::{header, HeaderMap, Method, Request, StatusCode}, Router
 };
 use bigdecimal::BigDecimal;
 use tower::ServiceExt as _;
 use weft_arrow::{columns_to_record_batch_typed, write_parquet};
 use weft_physical_type::{PhysicalType, TimeUnit};
 use weft_server::{
-	AppState, VERSION, app_with_state, auth::{AuthConfig, KeyStore, format_key_hash}, routes::{RouteEntry, Scope, build_registry}, store_open::{ScopePin, ServingScope}
+	app_with_state, auth::{format_key_hash, AuthConfig, KeyStore}, routes::{build_registry, RouteEntry, Scope}, store_open::{ScopePin, ServingScope}, AppState, VERSION
 };
 use weftdb::SegmentStore;
 
