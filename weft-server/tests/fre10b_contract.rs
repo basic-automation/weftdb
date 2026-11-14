@@ -41,14 +41,14 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use axum::{
-	body::Body, http::{header, HeaderMap, Method, Request, StatusCode}, Router
+	Router, body::Body, http::{HeaderMap, Method, Request, StatusCode, header}
 };
 use bigdecimal::BigDecimal;
 use tower::ServiceExt as _;
 use weft_arrow::{columns_to_record_batch_typed, write_parquet};
 use weft_physical_type::{PhysicalType, TimeUnit};
 use weft_server::{
-	app_with_state, auth::{format_key_hash, AuthConfig, KeyStore}, routes::{build_registry, RouteEntry, Scope}, store_open::{ScopePin, ServingScope}, AppState, VERSION
+	AppState, VERSION, app_with_state, auth::{AuthConfig, KeyStore, format_key_hash}, routes::{RouteEntry, Scope, build_registry}, store_open::{ScopePin, ServingScope}
 };
 use weftdb::SegmentStore;
 
@@ -1126,10 +1126,14 @@ async fn ingest_admission_refuses_over_cap_and_no_headroom() {
 
 	// 507: a tiny body on a store with a reserve the filesystem cannot meet.
 	let config = weft_server::IngestConfig::with_max_body_bytes(1024);
-	let router = app_with_state(weft_server::AppState::new().with_store(store).with_ingest_config(config));
+	let router = app_with_state(weft_server::AppState::new().with_store(Arc::clone(&store)).with_ingest_config(config));
 	let payload = serde_json::to_vec(&serde_json::json!({ "points": [{ "timestamp": 100, "value": "1.5" }] })).unwrap();
 	let request = Request::builder().method("POST").uri("/api/v1/storage/r18/points").header(header::CONTENT_TYPE, "application/json").header(header::CONTENT_LENGTH, payload.len().to_string()).body(Body::from(payload)).unwrap();
 	let (status, _, json) = send_json(router, request).await;
 	assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE, "{json}");
 	assert_eq!(json["code"], "insufficient_storage", "{json}");
+
+	// The binding is an `Arc` over a store with a finalizer, so it is released
+	// at the point of last use rather than at the end of the test body.
+	drop(store);
 }
