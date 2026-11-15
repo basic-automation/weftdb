@@ -83,8 +83,9 @@ pub fn is_row_expired(policy: &RowExpiryPolicy, now_ns: i64, row_ts: i64, unit: 
 	}
 }
 
-/// Compute the cutoff timestamp (in the aspect's unit) for `policy` at `now_ns`: any
-/// row with `timestamp < cutoff` is expired (strictly less than). For `NoExpiry` (or
+/// Compute the cutoff timestamp (in the aspect's unit) for `policy` at `now_ns`.
+///
+/// A row with `timestamp < cutoff` is expired (strictly less than). For `NoExpiry` (or
 /// when `now - ttl` would underflow), returns `i64::MIN` so nothing is expired.
 ///
 /// The cutoff is `floor(now_ns_as_unit - ttl)`, a **strictly less than** boundary.

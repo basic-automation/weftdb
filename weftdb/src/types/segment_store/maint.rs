@@ -4,8 +4,9 @@
 use super::*;
 
 impl SegmentStore {
-	/// **Expiry sweep** (P12-722, cut 1): visit every declared aspect, count rows that are
-	/// expired under the store's `expiry` policy at `now_ns`, and return a report.
+	/// **Expiry sweep** (P12-722, cut 1): count the rows that are expired at `now_ns`.
+	///
+	/// Visit every declared aspect under the store's `expiry` policy and return a report.
 	///
 	/// Cut 1 is **report-only**: no rows or segments are deleted. The sweep is idempotent
 	/// (running it twice finds the same expired rows). Aspects whose maintenance breaker is

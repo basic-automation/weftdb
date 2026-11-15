@@ -49,7 +49,7 @@ async fn no_expiry_makes_no_difference_to_reads() {
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![90, 95, 100], vec![bd("1"), bd("2"), bd("3")])).await.expect("ingests rows");
 	// With NoExpiry, all rows are visible regardless of now_ns.
-	let (ts, _vs) = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads with expiry");
+	let (ts, vs) = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads with expiry");
 	let (ts2, vs2) = store.read_time_range(ASPECT, 0, 200).await.expect("reads without expiry");
 	assert_eq!(ts, ts2, "timestamps match");
 	assert_eq!(vs, vs2, "values match");
@@ -82,7 +82,7 @@ async fn boundary_age_equals_ttl_is_not_expired() {
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 	// Row at t=90: age = 100 - 90 = 10, which equals TTL → NOT expired.
 	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![90, 89], vec![bd("a"), bd("b")])).await.expect("ingests");
-	let (ts, vs) = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads with expiry");
+	let (ts, _vs) = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads with expiry");
 	assert!(ts.contains(&90), "row at t=90 (age == TTL) must be visible");
 	assert!(!ts.contains(&89), "row at t=89 (age > TTL) must be hidden");
 	drop(store);
