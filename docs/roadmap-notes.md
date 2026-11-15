@@ -607,7 +607,6 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
 - **NEXT — a random-access-capable Gorilla/RLE would widen the checkpoint index's reach:**
 - Publish a methodology document **before** any performance claim
 
-<<<<<<< HEAD
 ## Panic audit (2026-11-14, P242, #242)
 
 **Phase 14 item ticked.** Static-grep audit of every panic-capable construct in
@@ -642,7 +641,6 @@ the mistaken premise, is closed as not-a-bug.
 
 **Not audited** (out of scope): `compat/`, `weft-client/`, `weft-tui/`, `weft-bench/`,
 `weft-xbench/`, `benches/` directories, `clients/`, test-only files.
-=======
 ## Host probe (run 2026-11-14 on DeepThought, before the worker starts)
 
 ```
@@ -664,4 +662,3 @@ Strategy B pins the refusal without privileges. There is no `WEFT_DISK_USAGE_COM
 command/env seam for filesystem usage anywhere in this repository — the only operator knob is
 `WEFT_DISK_RESERVE_BYTES`, and the library-side injectable figure is the `Option<DiskSpace>` argument
 of `admit`.
->>>>>>> origin/main
