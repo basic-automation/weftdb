@@ -20,7 +20,7 @@ use std::{
 };
 
 use axum::{body::Body, http::Request};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{TimeZone, Utc};
 use tower::ServiceExt as _;
 
 const DEFAULT_VALUES: usize = 100_000;
@@ -34,7 +34,7 @@ fn ms(d: Duration) -> f64 {
 }
 
 fn ns_per(d: Duration, n: usize) -> f64 {
-	d.as_nanos_f64() / n as f64
+	d.as_nanos() as f64 / n as f64
 }
 
 fn quantile(samples: &[Duration], q: f64) -> Duration {
@@ -86,13 +86,13 @@ fn generate_body(n: usize) -> Vec<u8> {
 	})).expect("serialises the request body")
 }
 
-fn run_one(runtime: &tokio::runtime::Runtime, router: &axum::Router, body: &[u8]) {
+fn run_one(runtime: &tokio::runtime::Runtime, router: &axum::Router, body: Vec<u8>) {
 	let _ = runtime.block_on(async {
 		let request = Request::builder()
 			.method("POST")
 			.uri("/api/v1/interpolate")
 			.header("content-type", "application/json")
-			.body(Body::from(body.clone()))
+			.body(Body::from(body))
 			.expect("request");
 		let response = router.clone().oneshot(request).await.expect("the router answers");
 		assert!(response.status().is_success(), "status {}", response.status());
@@ -111,13 +111,13 @@ fn main() {
 	let router = weft_server::app();
 
 	// Untimed warm-up.
-	run_one(&runtime, &router, &body);
+	run_one(&runtime, &router, body.clone());
 
 	// Timed repetitions.
 	let mut samples = Vec::with_capacity(reps);
 	for _ in 0..reps {
 		let began = Instant::now();
-		run_one(&runtime, &router, &body);
+		run_one(&runtime, &router, body.clone());
 		samples.push(began.elapsed());
 	}
 	samples.sort_unstable();
