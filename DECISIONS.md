@@ -6780,32 +6780,57 @@ from local `origin/main` reads and unverified branch names, which produced claim
 exist (the numbers were issues). Correction applied: every "done/merged/landed" statement in this session
 is now backed by a `gh` read in the same turn, and `git fetch` precedes any worktree created off `main`.
 
-## 2026-11-14 — ROB-18 closes: contract coverage pins the #681 behaviour; the client-abort code family stays out of scope (#742)
+## 2026-11-14 — Suspect-frame policy and a decode crash-loop breaker (#720, ROB-22)
 
-**This slice delivers contract coverage, not new product code.** The two-phase ingest admission,
-whole-body deadline, `Committing`→`503 outcome_unknown` mapping, and §4 5xx redaction are
-**already shipped in `main`** via #681. What was missing was a contract that no future change
-regresses them, and a record that the phase-to-wire-code mapping is a scope correction, not a new
-design.
+**The three new Tuning variables.** `WEFT_SUSPECT_FRAME_POLICY` is a closed enum (`skip`, `quarantine`,
+`fail`; default `quarantine`) that decides what happens when a frame's decode fails in the background.
+`WEFT_DECODE_BREAKER_FAILURES` (default 3) sets how many consecutive decode failures trip the per-aspect
+circuit breaker; `WEFT_DECODE_BREAKER_COOLDOWN_SECS` (default 300 s) sets how long a tripped breaker waits
+before one trial decode is allowed. All three are Tuning-tier: their names are permanent but defaults and
+accepted shapes may change in a minor release.
 
-**Chosen: test the existing mapping by phase, and stop — no new `Code` variant, no product-rule
-change.** `map_ingest_panic` keeps its two arms (`Some(IngestPhase::Committing)` → `503
-outcome_unknown`, everything else → `500 commit_failed`). Per-phase unit tests in `panic_catch.rs`
-pin that `Validating`, `Encoding` and `WritingFrames` all answer `500 commit_failed` with
-`committed: false`, `Committing` answers `503 outcome_unknown` with no `committed`, and every
-phase name is redacted from the wire (§4). HTTP-driven contract tests in `fre10b_contract.rs`
-pin 413 declared-over-cap and 507 reserve-before-body-read. The 43-code table (`error.rs:1139`)
-and 5xx count (`error.rs:1205`) stay unchanged.
+**Separate decode breaker state from maintenance breaker state.** A decode failure is a file-level problem
+(the frame cannot be read) while a maintenance failure is an aspect-level problem (sweep operations on that
+aspect keep failing). The two blast radii should not merge: a corrupt frame should not trip the maintenance
+breaker and stop the reconcile/compaction daemon from even touching that aspect, and a maintenance-level
+failure should not suppress decode retries that could recover a readable frame after a transient I/O issue.
+The decode breaker state (`decode_breaker_state` in `SegmentStore`) is therefore a separate `Mutex<HashMap
+…>` from the existing `breaker_state`, keyed by the same `(StoreId, Arc<str>)` pair, so the two breakers
+operate independently on the same aspect.
 
-**Rejected as out of scope:** 4 new per-phase `Code` variants, and a new `client_abort`
-(`4xx`) code family. The `client_abort` problem — a client disconnect during an ingest body
-produces a 5xx when §4 redaction cannot distinguish it from a server failure — is a real gap.
-Findings are recorded in #742 (deadline re-arming per chunk at `ingest.rs:478`,
-`tokio::time::timeout` dropping the inner future, §4 redaction turning a validate-phase abort
-into 500, the frozen 43-code table and its checker gates). Filing it as a separate issue avoids
-scope creep on a PR whose mandate was contract coverage of what #681 already ships. **Both
-belong in a future slice** that also owns the error-taxonomy, config-schema, and OpenAPI updates
-a new `Code` variant requires.
+**Behaviour-preserving default.** The policy defaults to `quarantine`, which is the same outcome a corrupt
+frame got before ROB-22 (the frame is quarantined under its C5 class, TTL-purgeable). A suspect frame also
+lands in quarantine by default. This means the entire ROB-22 change is a no-op until an operator explicitly
+switches `WEFT_SUSPECT_FRAME_POLICY` to `skip` or `fail`. The *policy* half of ROB-22 is therefore a no-op
+on upgrade.
+
+The decode breaker is deliberately **not** off by default. `DEFAULT_DECODE_BREAKER_FAILURES` is 3 with a 300 s
+`DEFAULT_DECODE_BREAKER_COOLDOWN`; `MaintenanceBreaker::decode_from_env` (`weftdb/src/types/segment_store.rs:753`)
+falls back to those when `WEFT_DECODE_BREAKER_FAILURES` is unset or unparseable, and a default-constructed
+store reaches the same number because `SegmentStoreOptions::default()` uses `MaintenanceBreaker::default()`, whose threshold is `DEFAULT_MAINTENANCE_BREAKER_FAILURES` — also 3 (`segment_store.rs:462`, `:683`). Only `WEFT_DECODE_BREAKER_FAILURES=0` disables it: `decode_breaker_permits` and `decode_breaker_record`
+(`weftdb/src/types/segment_store/maint.rs:92`, `:111`) return early on a zero threshold. So an upgrade *does*
+change behaviour for an aspect whose frames keep failing to decode — after three consecutive failures its
+background retries pause for five minutes and then allow one trial decode. That is the point of #720: a poison
+frame should stop hammering the decode loop instead of crashing it. An operator who wants the old
+retry-everything behaviour sets the variable to 0, and that is the `0` in its registry `accepts` column.
+
+**Per-segment-path breaker with cooldown, not a process-global one.** The breaker state map keys are
+`(StoreId, aspect_name)`, so one corrupt frame trips the breaker for that aspect only. Other aspects
+decode normally. The cooldown timer means the breaker allows one trial decode after `cooldown_secs`;
+a failed trial trips it again for a fresh cooldown. This prevents one corrupt frame from spinning the
+background decode loop forever while still allowing eventual recovery if the frame becomes readable
+(e.g. after a storage-level repair).
+
+**Reconciliation with ROB-8 and ROB-9.** ROB-8 established the decode limit set and classified oversized
+frames as Integrity (corrupt, TTL-purgeable) under C5 — always quarantined, never suspect. ROB-9 contained
+Parquet decoder panics inside `weft_arrow::read_parquet` with `catch_unwind`. The ROB-22 `SuspectFramePolicy`
+sits downstream of both: ROB-8's `DecodeLimit` refusals are already C5-corrupt (always quarantine, the
+`quarantine` default), and ROB-9's `catch_unwind` returns `ConvertError::Parquet` which the ingest
+classifier maps to `400 bad_request` before any ROB-22 policy is reached. ROB-22's policy applies only to
+*suspect* frames (those whose C5 class is `Suspect` — newer format, unknown codec, unknown critical
+extension, unknown codec tag), which by construction have passed every limit and every decode check and
+are structurally sound but produced by a build this one cannot fully interpret. ROB-8's oversized-category
+frames never reach ROB-22's policy at all; ROB-9's panicked Parquet bodies were never frames.
 
 ## 2026-11-13 — P12 #213 restore-into HTTP route: staging cleanup and design decisions
 
@@ -6899,3 +6924,31 @@ Rejected first: relaxing the tests to compare one platform's spelling. Both fail
 usability defects on those platforms, and a test that compares a canonical path to an un-resolved one
 would have hidden the next such defect rather than catching it. The tests now compare canonical forms
 of both sides, which is what they always meant to assert.
+
+## 2026-11-14 — ROB-18 closes: contract coverage pins the #681 behaviour; the client-abort code family stays out of scope (#742)
+
+**This slice delivers contract coverage, not new product code.** The two-phase ingest admission,
+whole-body deadline, `Committing`→`503 outcome_unknown` mapping, and §4 5xx redaction are
+**already shipped in `main`** via #681. What was missing was a contract that no future change
+regresses them, and a record that the phase-to-wire-code mapping is a scope correction, not a new
+design.
+
+**Chosen: test the existing mapping by phase, and stop — no new `Code` variant, no product-rule
+change.** `map_ingest_panic` keeps its two arms (`Some(IngestPhase::Committing)` → `503
+outcome_unknown`, everything else → `500 commit_failed`). Per-phase unit tests in `panic_catch.rs`
+pin that `Validating`, `Encoding` and `WritingFrames` all answer `500 commit_failed` with
+`committed: false`, `Committing` answers `503 outcome_unknown` with no `committed`, and every
+phase name is redacted from the wire (§4). HTTP-driven contract tests in `fre10b_contract.rs`
+pin 413 declared-over-cap and 507 reserve-before-body-read. The 43-code table (`error.rs:1139`)
+and 5xx count (`error.rs:1205`) stay unchanged.
+
+**Rejected as out of scope:** 4 new per-phase `Code` variants, and a new `client_abort`
+(`4xx`) code family. The `client_abort` problem — a client disconnect during an ingest body
+produces a 5xx when §4 redaction cannot distinguish it from a server failure — is a real gap.
+Findings are recorded in #742 (deadline re-arming per chunk at `ingest.rs:478`,
+`tokio::time::timeout` dropping the inner future, §4 redaction turning a validate-phase abort
+into 500, the frozen 43-code table and its checker gates). Filing it as a separate issue avoids
+scope creep on a PR whose mandate was contract coverage of what #681 already ships. **Both
+belong in a future slice** that also owns the error-taxonomy, config-schema, and OpenAPI updates
+a new `Code` variant requires.
+
