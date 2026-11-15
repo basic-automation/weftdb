@@ -6972,6 +6972,27 @@ usability defects on those platforms, and a test that compares a canonical path 
 would have hidden the next such defect rather than catching it. The tests now compare canonical forms
 of both sides, which is what they always meant to assert.
 
+## 2026-11-14 — A client disconnect during an ingest body is a 4xx, not a new wire code (#742)
+
+**Q:** Does a client disconnect during an ingest body need a new `Code` variant?
+
+**Evidence:** The code table at `weft-server/src/error.rs:1139` (`TABLE.len() == 43`) is a frozen contract.
+Adding one means updating `docs/config-schema.md`, `compat/openapi/weftdb.json` and the CI (
+checker in the same commit — a coordination cost with no upstream client dependency.
+The issue found no client that branches on the distinction, and the frozen 43-code table sums to
+43 because every existing variant has a client that reads it.
+
+**A:** No new `Code` variant. The existing `Code::BadRequest` (400) is the right map for a body the
+peer stopped sending — the same code the route already uses for an unreadable/truncated body
+(`ingest.rs:470`). The causes are separated at the seam (`IngestBody::from_request`, the timeout call):
+
+1. The body read succeeds but the received length is less than the declared `Content-Length` →
+   `400 bad_request` with a `tracing::info!` line recording the mismatch.
+2. The `tokio::time::timeout` fires before the stream ends → `408 body_timeout` (unchanged).
+
+The 4xx is produced in `from_request` *before* the `IngestPhase` scope wraps the read, so the §4
+5xx redaction rule (`error.rs:420-430`) cannot overwrite it.
+
 ## 2026-11-14 — Real-filesystem ENOSPC evidence (#723)
 
 **Strategy A (mount a tmpfs inside a namespace) cannot prove anything on this host.**
