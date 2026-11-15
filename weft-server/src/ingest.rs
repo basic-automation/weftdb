@@ -1390,13 +1390,14 @@ mod tests {
 	use std::sync::Arc;
 
 	use axum::{
-		body::Body, http::{Request, StatusCode}
+		body::{Body, Bytes}, http::{Request, StatusCode}
 	};
 	use tempfile::TempDir;
 	use tower::ServiceExt;
 	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
 	use weftdb::SegmentStore;
 
+	use super::check_body_truncation;
 	use crate::{app_with_state, test_support::*, AppState};
 
 	#[tokio::test]
