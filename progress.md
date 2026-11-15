@@ -52,3 +52,34 @@ check:
 2. Seal order is the one conflict dimension — the newer-in-older-segment case
    cannot be expressed.
 3. `declare_with_upsert_keys` is forward-compatible with untagged ingests.
+## Handoff — PR #741 (ROB-18 CI fix) — 2026-11-14
+
+### Per-job diagnosis
+
+| Job | Outcome | Failure | Root cause |
+|---|---|---|---|
+| `test (ubuntu-latest)` | FAILED | `ingest_admission_refuses_over_cap_and_no_headroom` at line 1123 | `post_text()` omits Content-Length; 413 declared-length check is skipped; store with 1<<60 reserve refuses every reservation as 507 |
+| `test (macos-latest)` | FAILED | same test | same cause |
+| `test (windows-latest)` | FAILED | same test | same cause |
+| `rustfmt` | FAILED | `use` ordering stale | already fixed by commit 35e455c (fmt --all) |
+
+### Changes pushed
+
+| Commit | SHA | File | Summary |
+|---|---|---|---|
+| 0a8d9d5 | `[ROB-18] Fix the 413 admission test: send Content-Length so the declared-length check fires (#721)` | `weft-server/tests/fre10b_contract.rs` | Replace `post_text()` with manual Request building with explicit Content-Length header |
+
+### Remaining work
+
+- Wait for CI to re-run on the pushed commit.
+- If the 413 test passes on all three platforms, the CI gate is green.
+- If other tests fail, diagnose and repeat.
+
+### Resume commands
+
+```bash
+cd /mnt/deepmem/wt/p12-721
+gh run list --branch p12/rob-18-body-deadline --limit 5 --json conclusion,status,databaseId,displayTitle
+gh run view <run-id> --log-failed 2>&1 | tr '\r' '\n' | grep -i 'panicked\|failures:\|error\[\|assertion'
+git diff HEAD~1 HEAD  # review last change
+```
