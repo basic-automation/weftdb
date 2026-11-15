@@ -8,7 +8,7 @@ use std::{path::Path, str::FromStr};
 
 use bigdecimal::BigDecimal;
 use tempfile::TempDir;
-use weft_physical_type::{timestamp::TimeUnit, AspectSchema, PhysicalType};
+use weft_physical_type::{AspectSchema, PhysicalType, timestamp::TimeUnit};
 
 use super::{SegmentStore, SegmentStoreOptions};
 use crate::{IngestBatch, SeriesId, SuspectFramePolicy};

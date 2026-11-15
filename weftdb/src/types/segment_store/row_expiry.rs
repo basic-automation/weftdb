@@ -75,14 +75,14 @@ pub fn is_row_expired(policy: &RowExpiryPolicy, now_ns: i64, row_ts: i64, unit: 
 				return false;
 			}
 			let age = now_unit - row_ts;
-			age > ttl as i64
+			age > *ttl as i64
 		}
 	}
 }
 
 /// Compute the cutoff timestamp (in the aspect's unit) for `policy` at `now_ns`: any
-/// row with `timestamp <= cutoff` is expired. For `NoExpiry` (or when `now - ttl` would
-/// underflow), returns `i64::MIN` so nothing is expired.
+/// row with `timestamp < cutoff` is expired (strictly less than). For `NoExpiry` (or
+/// when `now - ttl` would underflow), returns `i64::MIN` so nothing is expired.
 ///
 /// The cutoff is `floor(now_ns_as_unit - ttl)`, a **strictly less than** boundary.
 pub fn expired_cutoff(policy: &RowExpiryPolicy, now_ns: i64, unit: &TimeUnit) -> i64 {
@@ -92,10 +92,10 @@ pub fn expired_cutoff(policy: &RowExpiryPolicy, now_ns: i64, unit: &TimeUnit) ->
 			let now_unit = unit.from_nanos(now_ns);
 			// Underflow guard: if now_unit < ttl (very early epoch or huge TTL), we
 			// treat as i64::MIN so no rows are expired (they can't be older than MIN).
-			if now_unit < ttl as i64 {
+			if now_unit < *ttl as i64 {
 				i64::MIN
 			} else {
-				now_unit - ttl as i64
+				now_unit - *ttl as i64
 			}
 		}
 	}
@@ -105,7 +105,7 @@ pub fn expired_cutoff(policy: &RowExpiryPolicy, now_ns: i64, unit: &TimeUnit) ->
 pub fn raw_ttl(policy: &RowExpiryPolicy) -> Option<u64> {
 	match policy {
 		RowExpiryPolicy::NoExpiry => None,
-		RowExpiryPolicy::Ttl { ttl } => Some(ttl),
+		RowExpiryPolicy::Ttl { ttl } => Some(*ttl),
 	}
 }
 
@@ -150,15 +150,13 @@ pub struct ExpirySweep {
 	pub failed: Vec<(String, anyhow::Error)>,
 	/// Total rows counted as expired across all aspects.
 	pub rows_expired: u64,
-	/// Cursor cancelled before finishing every aspect.
-	pub cancelled: bool,
 }
 
 impl ExpirySweep {
 	/// Empty sweep (no aspects scanned, nothing expired).
 	#[must_use]
 	pub fn default() -> Self {
-		Self { aspects_cleaned: Vec::new(), busy: Vec::new(), failed: Vec::new(), rows_expired: 0u64, cancelled: false }
+		Self { aspects_cleaned: Vec::new(), busy: Vec::new(), failed: Vec::new(), rows_expired: 0u64 }
 	}
 }
 
@@ -309,15 +307,16 @@ mod tests {
 
 	#[test]
 	fn expired_cutoff_returns_correct_boundary() {
-		// TTL 10 at now=1000s → cutoff = 990 (rows with ts <= 990 are expired).
-		// But boundary is strict: row at 990 has age == TTL → visible.
-		// The cutoff is STRICTLY LESS THAN: so cutoff = 989.
+		// TTL 10 at now=1000s → cutoff = 990 = now - ttl.
+		// A row at ts=990 has age == TTL → visible (strict boundary).
+		// The cutoff is a boundary value: rows with ts < cutoff are expired;
+		// rows with ts == cutoff have age == TTL and are NOT expired.
 		let policy = RowExpiryPolicy::Ttl { ttl: 10 };
 		let unit = TimeUnit::Seconds;
 		assert_eq!(expired_cutoff(&policy, ns(1000), &unit), 990i64, "cutoff = now - ttl = 1000 - 10 = 990");
-		// Cutoff 990 means rows with ts <= 990 are expired — but at age == ttl, the
-		// strict boundary means row_ts = 990 is NOT expired. So the cutoff value
-		// must be used with strict >, not >=.
+		// The cutoff value 990, when used with strict '>' (not '>='), correctly means
+		// only rows with ts < 990 are expired. The cutoff itself is NOT a threshold
+		// that includes the boundary row.
 	}
 
 	#[test]
@@ -350,6 +349,5 @@ mod tests {
 		assert!(sweep.busy.is_empty());
 		assert!(sweep.failed.is_empty());
 		assert_eq!(sweep.rows_expired, 0);
-		assert!(!sweep.cancelled);
 	}
 }

@@ -129,7 +129,47 @@ async fn expiry_applies_per_row_not_segment() {
 	dir.close();
 }
 
-// ── Criterion 6: Sweep is idempotent and reports correctly ────────────────
+// ── Criterion 6: Sweep correctly handles the age==TTL boundary ────────
+
+#[tokio::test]
+async fn sweep_boundary_age_equals_ttl_not_expired() {
+	// Sweep must NOT count a row at the age==TTL boundary as expired.
+	// Fully-expired shortcut must use < cutoff, not <= cutoff.
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS });
+	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
+
+	// Rows at t=90 (age 10 == TTL → NOT expired) and t=89 (age 11 > TTL → expired).
+	// Same segment: min_ts=89, max_ts=90.
+	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![90, 89], vec![bd("a"), bd("b")])).await.expect("ingests");
+
+	let sweep = store.expiry_sweep(NOW_NS).await.expect("sweep");
+	assert_eq!(sweep.rows_expired, 1, "only the row at t=89 (age > TTL) is expired");
+
+	// Read path agrees: row at t=90 is visible, row at t=89 is hidden.
+	let (ts, _) = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads with expiry");
+	assert!(ts.contains(&90), "boundary row (age == TTL) visible in read path");
+	assert!(!ts.contains(&89), "row with age > TTL hidden in read path");
+
+	drop(store);
+	dir.close();
+}
+
+#[tokio::test]
+async fn sweep_segment_fully_below_cutoff_counts_all_as_expired() {
+	// A segment where max_ts < cutoff is fully expired; all rows count.
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS });
+	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
+	// Row at t=80 (age 20 > 10) — cutoff = 90, max_ts 80 < 90 → fully expired.
+	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![80], vec![bd("a")])).await.expect("ingests");
+
+	let sweep = store.expiry_sweep(NOW_NS).await.expect("sweep");
+	assert_eq!(sweep.rows_expired, 1, "fully expired segment: all rows counted");
+
+	drop(store);
+	dir.close();
+}
+
+// ── Criterion 7: Sweep is idempotent and reports correctly ────────────────
 
 #[tokio::test]
 async fn expiry_sweep_is_idempotent_and_report_only() {
@@ -150,7 +190,7 @@ async fn expiry_sweep_is_idempotent_and_report_only() {
 	dir.close();
 }
 
-// ── Criterion 7: TTL < segment close window — sweep is safe (report-only) ─
+// ── Criterion 8: TTL < segment close window — sweep is safe (report-only) ─
 // The sweep does not delete data, so it cannot invalidate any recent-window
 // query. The report accurately distinguishes "nothing expired" from
 // "K rows expired".

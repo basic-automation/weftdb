@@ -70,7 +70,7 @@ impl SegmentStore {
 		let mut newest_expired_ts: Option<i64> = None;
 
 		for row in &rows {
-			if row.desc.max_ts <= cutoff {
+			if row.desc.max_ts < cutoff {
 				// All rows in this segment are expired.
 				rows_expired += row.desc.row_count as u64;
 				match oldest_expired_ts {
