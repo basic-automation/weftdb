@@ -7064,3 +7064,53 @@ in a macro expansion, read the macro definition (or the vendored crate source) b
 assigning a verdict; a NEEDS-FIX verdict that rests on a macro's name alone is not evidence.
 This matters most for false positives here: a wrong NEEDS-FIX spends a follow-up issue and
 an unnecessary code change on a path that is already correct.
+
+## 2026-11-15 — The kdb+ benchmark exclusion is a licence term, and two claims about our own licences were wrong (recorded; no counsel review yet)
+
+Issue #383 asked for a legal review of competitor benchmark-publication terms,
+and the roadmap line for it has stood open since the phase roadmap began because
+the claim it rests on had never been written down. It is now: `docs/legal-review.md`.
+
+**What was ambiguous.** Three inherited sentences in `DECISIONS.md` and
+`docs/roadmap-notes.md` assert that kdb+ may not be benchmarked or its results
+published, and that we "inherit" those claims into any published number. None of
+the three cites a licence clause. The roadmap notes pointed at a KX
+"Benchmarking Agreement" page which is now a 404, so the only apparent consent
+instrument could not be checked either.
+
+**What I chose, and why.** I read the two KX documents that are live: the KDB On
+Demand Terms and Conditions v4 (commercial) and the Kdb+ On Demand Non-Commercial
+licence. Both say the same thing about benchmarks in different voices. The
+commercial clause binds **our customers**, not us: it says we "may not permit" a
+customer to publish benchmark results without KX's consent. That cannot be the
+source of an exclusion for our own runs, so the inherited framing was wrong about
+which party is restricted. The free Personal Edition is stricter and is the real
+reason: §1.2 forbids using the program "in a manner that produces a benchmark or
+performance comparison of any kind for publication", and §1.3 forbids publishing
+a benchmark report "in any form, whether or not accurate". Running kdb+ for a
+published comparison is therefore not merely unpublished-result-restricted — the
+activity itself is outside the licence grant. Excluding kdb+ is a licence term
+that the repository can decide for itself, so I did not hold the roadmap item
+open for counsel. Counsel is still needed for the codec patents and the Elastic
+pin, and the document says so row by row.
+
+**Two claims from inside this workstream that are retracted rather than repeated.**
+A note claimed the TUI embeds fonts under `MIT OR OFL-1.1` and that SIL OFL is
+missing from `deny.toml`. It is not on main: `weft-tui/assets/` does not exist, no
+source file mentions OFL, and no OFL string appears in `THIRD-PARTY-LICENSES.md`.
+Another claimed a `license-bundle` job fails on main with lock-file drift; the job
+is named `third-party licenses` and it was green on the latest main run checked
+2026-11-15, alongside `cargo-deny`. Both are recorded here so a follow-up issue is
+not opened against a state that does not exist.
+
+**Left as found, deliberately.** `weft-xbench/src/render.rs:39` `NOT_IN_SCOPE`
+entry 5 cites `WILLINGNESS-TO-PAY.md`, a file this repository does not contain.
+I did not invent the missing document and did not delete the reason: the row is
+flagged in `docs/legal-review.md` §3 as needing the enterprise terms read, or the
+reason retired. Touching a compiled constant's text in a documentation slice
+would also have cost a full rebuild for no legal gain.
+
+**Scope discipline.** The document stamps every row Read / Recorded / Inherited
+and names the fetch date for what it read. Anything a later reader cannot trace
+to a page or a line is marked as not verified here, including the "effective
+2026-07-16" ClickHouse AUP date, which came from an ephemeral note.
