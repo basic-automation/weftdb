@@ -27,6 +27,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   activity outright — and records two licence claims that turned out not to exist
   on main (#383).).
 
+- **Store-level row TTL/expiry cut 1 (#722).** `RowExpiryPolicy` (two variants:
+  `NoExpiry` and `Ttl { ttl: u64 }`) configurable via
+  `SegmentStoreOptions::with_expiry`. Read path honours the TTL: rows whose age
+  exceeds `now_ns - ttl` are hidden after the newer-wins merge. Sweep reports
+  expired rows per aspect (report-only, no deletion). No env var, no weft-server
+  wiring, no OpenAPI/config-schema change in this cut.
 - **Suspect-frame policy and a decode crash-loop breaker (#720, ROB-22).** Three new
   Tuning variables: `WEFT_SUSPECT_FRAME_POLICY` (closed enum: `skip`, `quarantine`,
   `fail`; default `quarantine` — a suspect frame is quarantined under its C5 class,
