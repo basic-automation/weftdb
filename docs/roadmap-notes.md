@@ -477,10 +477,28 @@ The bodies of these six lines were cut off in #99. The text below is restored fr
 
 ## Legal review
 
-Three decisions are made and recorded: kdb+/KDB-X is excluded from every published benchmark unless KX consents in writing, WeftDB's own terms are `MIT OR Apache-2.0` with contributions by DCO sign-off or the CLA, and the flagged opt-in codecs are gated. The counsel items are still open below.
+Three decisions are made and recorded: kdb+/KDB-X is excluded from every published benchmark unless KX consents in writing, WeftDB's own terms are `MIT OR Apache-2.0` with contributions by DCO sign-off or the CLA, and the flagged opt-in codecs stay off unless a build asks for them — with **no licence acknowledgement recorded anywhere**, which is the gap #386 exists to close. The counsel items are still open below.
 
 - Review each competitor's benchmark-publication terms (kdb+ especially)
-  - **Open with counsel:**
+  - **Done 2026-11-15 as a terms inventory, not a legal opinion** — [docs/legal-review.md](legal-review.md)
+    records what each vendor's terms say about publishing a benchmark, with a
+    verification level stamped on every row (Read / Recorded / Inherited), and
+    what WeftDB's own terms oblige us to do about reproducing our own published
+    numbers. The premise it corrects: the free Kdb+ On Demand licence forbids
+    running benchmarks *for publication* (§1.2) and publishing benchmark reports
+    (§1.3) outright, so excluding kdb+ is a licence term and not a conservative
+    reading of inherited claims. The commercial KDB On Demand clause binds *our
+    customers* and never us, so it cannot be the source of an exclusion for our
+    own runs. The KX Benchmarking Agreement page the roadmap notes cited is a 404;
+    the consent instrument has to be found through KX sales before any kdb+
+    number is published.
+  - **Open with counsel:** the codec patents and licences (#386 and the ungated
+    advisory codecs at `ROADMAP.md:138`), the missing `NOTICE` and
+    third-party-terms file for the Elastic-licensed `aggs-for-timeseries` pin,
+    DuckDB's trademark policy, a re-read of the live ClickHouse Acceptable Use
+    Policy before the first public ClickHouse number, and the licence reason
+    inside `NOT_IN_SCOPE` entry 5, which cites a `WILLINGNESS-TO-PAY.md` this
+    repository does not contain.
 
 ## Immediate next actions
 

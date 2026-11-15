@@ -131,7 +131,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
   - [ ] **SOA-18** 24 h acceptance run on the reference SSD, published as an artifact
   - [ ] Run the privileged power-loss validation on the acceptance commit *(owner)*
 - [ ] Legal review of competitor benchmark-publication terms + codec licenses
-  - [ ] Review each competitor's benchmark-publication terms (kdb+ especially)
+  - [x] Review each competitor's benchmark-publication terms (kdb+ especially)
   - [ ] **Open with counsel:** Amazon FOR (US 11,308,093), Tiger Data, SAP (before 6.2), **WEFTDB** trademark clearance, the benchmark policy
   - [ ] **Codec patent/licence gate (owner decisions 2026-10-08).**
     - [ ] **Default FOR codec and the Tiger Data family: with counsel.**

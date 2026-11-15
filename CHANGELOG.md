@@ -18,7 +18,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   user+mount namespaces, mounts a 1 MiB tmpfs inside a namespace on capable hosts).
 
 ### Added
-- **Panic audit documented** — `docs/panic-audit.md` (see ### Documentation).
+- **Panic audit documented** — `docs/panic-audit.md` (see ### Documentation
+- New `docs/legal-review.md`: what each engine's terms and licences say about
+  publishing a benchmark result, with the verification level of every claim
+  (read / recorded / inherited) and what our own `MIT OR Apache-2.0` terms oblige
+  us to do about reproducing our own numbers. Corrects the framing of the kdb+
+  benchmark exclusion — the free Kdb+ On Demand licence §1.2 and §1.3 forbid the
+  activity outright — and records two licence claims that turned out not to exist
+  on main (#383).).
 
 - **Suspect-frame policy and a decode crash-loop breaker (#720, ROB-22).** Three new
   Tuning variables: `WEFT_SUSPECT_FRAME_POLICY` (closed enum: `skip`, `quarantine`,
