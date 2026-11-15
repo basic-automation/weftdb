@@ -274,13 +274,15 @@ jobs:
       - name: Print summary
         shell: bash
         run: |
-          echo "## Float roundtrip A/B" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "### With float_roundtrip" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cat bench-on.txt >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "### Without float_roundtrip" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cat bench-off.txt >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Float roundtrip A/B"
+            echo ""
+            echo "### With float_roundtrip"
+            echo '```'
+            cat bench-on.txt
+            echo '```'
+            echo "### Without float_roundtrip"
+            echo '```'
+            cat bench-off.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
