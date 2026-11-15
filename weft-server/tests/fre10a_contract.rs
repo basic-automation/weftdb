@@ -89,14 +89,6 @@ fn get(uri: &str, key: Option<&str>) -> Request<Body> {
 	builder.body(Body::empty()).unwrap()
 }
 
-fn delete(uri: &str, key: Option<&str>) -> Request<Body> {
-	let mut builder = Request::builder().method("DELETE").uri(uri);
-	if let Some(key) = key {
-		builder = builder.header(header::AUTHORIZATION, format!("Bearer {key}"));
-	}
-	builder.body(Body::empty()).unwrap()
-}
-
 fn post_json(uri: &str, key: Option<&str>, body: &serde_json::Value) -> Request<Body> {
 	let mut builder = Request::builder().method("POST").uri(uri).header(header::CONTENT_TYPE, "application/json");
 	if let Some(key) = key {
@@ -111,14 +103,6 @@ fn post_text(uri: &str, key: Option<&str>, body: &str) -> Request<Body> {
 		builder = builder.header(header::AUTHORIZATION, format!("Bearer {key}"));
 	}
 	builder.body(Body::from(body.to_string())).unwrap()
-}
-
-fn post_bytes(uri: &str, key: Option<&str>, content_type: &str, body: &[u8]) -> Request<Body> {
-	let mut builder = Request::builder().method("POST").uri(uri).header(header::CONTENT_TYPE, content_type);
-	if let Some(key) = key {
-		builder = builder.header(header::AUTHORIZATION, format!("Bearer {key}"));
-	}
-	builder.body(Body::from(body.to_vec())).unwrap()
 }
 
 /// A POST that carries no body.
@@ -141,7 +125,7 @@ fn interpolate_body() -> serde_json::Value {
 	] })
 }
 
-/// For the downsample JSON endpoint — the same shape as interpolate_body
+/// For the downsample JSON endpoint — the same shape as `interpolate_body`
 /// but kept symmetric so the two endpoints can diverge their seeds if needed.
 fn downsample_body() -> serde_json::Value {
 	serde_json::json!({ "points": [
@@ -450,7 +434,7 @@ async fn interpolate_point_answers_its_frozen_shape() {
 	assert_eq!(key_set(&body), expected(&["spline", "instant", "input_points", "value", "kind", "backend", "gpu_fallback"]), "exactly the point-response keys: {body}");
 	assert_eq!(body["input_points"], 2, "{body}");
 	assert_eq!(body["gpu_fallback"], false, "{body}");
-	assert!(body["value"].as_f64().is_some_and(|v| v.is_finite()), "the interpolated value is finite: {body}");
+	assert!(body["value"].as_f64().is_some_and(f64::is_finite), "the interpolated value is finite: {body}");
 	assert!(body["kind"].as_str().is_some_and(|k| matches!(k, "raw" | "interpolated" | "extrapolated")), "every point has a known kind: {body}");
 }
 
