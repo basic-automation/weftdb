@@ -36,6 +36,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Fixed
 
+- **The settings registry caught up with the ENOSPC harness (#723).** #743 added a child
+  server process that reads `WEFT_ENOSPC_CHILD_ROOT` to find the scratch directory its
+  parent filled, but never registered the name, so the registry test that exists precisely
+  to stop that drift failed in `weft-server --lib` on every platform and turned the whole
+  test matrix red. The name is now registered as a Test-tier variable and documented with
+  it. Two `clippy::redundant_clone` errors — `weft-orchestration`'s `Distance` and
+  `weft-tui`'s `measurements` — were also cleared; both lints stayed hidden because clippy
+  stopped at the first failing crate.
 - **A `#[serial(key)]` on a test is no longer invisible to CI.** `scripts/ci/check-serial-order.py` matched
   only the plain `#[serial]` form, so the keyed form — the one that guards the process-global fault
   injectors — was never checked, and the rule it enforced ("must sit immediately above `#[test]`") was

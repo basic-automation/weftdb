@@ -200,12 +200,9 @@ impl SegmentStore {
 					// - Fail / Quarantine: propagate the error unchanged (default path).
 					// - Skip: log the skip and continue to the next segment.
 					let action = error.downcast_ref::<frame_read::FrameFaultError>().map_or(SuspectFramePolicy::Quarantine, |fault| crate::decode_failure_action(&bytes, fault.source(), self.suspect_frame_policy));
-					match action {
-						SuspectFramePolicy::Skip => {
-							tracing::warn!(aspect = aspect, path = descriptor.path.as_str(), "skipping suspect frame per WEFT_SUSPECT_FRAME_POLICY");
-							continue;
-						}
-						_ => {}
+					if action == SuspectFramePolicy::Skip {
+						tracing::warn!(aspect = aspect, path = descriptor.path.as_str(), "skipping suspect frame per WEFT_SUSPECT_FRAME_POLICY");
+						continue;
 					}
 					return Err(error);
 				}
