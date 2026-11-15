@@ -172,7 +172,25 @@ impl SegmentStore {
 			// index range + per-present-row value read) — the paged variant additionally skips whole
 			// pages disjoint from the window — instead of the whole segment; any other shape falls
 			// back to a full decode. Already filtered to `[start, end]`.
-			let (ts, vs) = frame_read::read_range(descriptor.path.as_str(), &bytes, start, end)?;
+			let (ts, vs) = match frame_read::read_range(descriptor.path.as_str(), &bytes, start, end) {
+				Ok(result) => result,
+				Err(error) => {
+					// ROB-22: consult the suspect frame policy on decode failure.
+					// The decode_failure_action distinguishes corrupt (always quarantine)
+					// from suspect (follow policy). On the interactive read path:
+					// - Fail / Quarantine: propagate the error unchanged (default path).
+					// - Skip: log the skip and continue to the next segment.
+					let action = error.downcast_ref::<frame_read::FrameFaultError>().map_or(SuspectFramePolicy::Quarantine, |fault| crate::decode_failure_action(&bytes, fault.source(), self.suspect_frame_policy));
+					match action {
+						SuspectFramePolicy::Skip => {
+							tracing::warn!(aspect = aspect, path = descriptor.path.as_str(), "skipping suspect frame per WEFT_SUSPECT_FRAME_POLICY");
+							continue;
+						}
+						_ => {}
+					}
+					return Err(error);
+				}
+			};
 			let mut rows: Vec<(i64, Option<BigDecimal>)> = Vec::with_capacity(ts.len());
 			for (t, v) in ts.into_iter().zip(vs) {
 				if start <= t && t <= end {

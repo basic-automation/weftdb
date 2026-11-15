@@ -10,8 +10,19 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
-- **Document TimescaleDB percentile internals and the like-for-like plan.** `percentile_agg()` wraps a UDDSketch at 200 buckets / 0.001 max error; the research note with source URLs and the measurement plan is at `docs/research/timescale-percentile.md` (#732).
+- **Suspect-frame policy and a decode crash-loop breaker (#720, ROB-22).** Three new
+  Tuning variables: `WEFT_SUSPECT_FRAME_POLICY` (closed enum: `skip`, `quarantine`,
+  `fail`; default `quarantine` — a suspect frame is quarantined under its C5 class,
+  preserving the pre-ROB-22 outcome); `WEFT_DECODE_BREAKER_FAILURES` (3, how many
+  consecutive decode failures trip the breaker per aspect);
+  `WEFT_DECODE_BREAKER_COOLDOWN_SECS` (300 s, how long a tripped breaker waits
+  before one trial decode is allowed). The decode breaker state is a separate map
+  with its own mutex from the maintenance `BreakerState`: a decode failure poisons a
+  file, a maintenance failure poisons a whole aspect, and the blast radii do not
+  merge. The breaker trips per segment path with a cooldown, so one corrupt frame
+  cannot spin the background decode loop forever.
 
+- **Document TimescaleDB percentile internals and the like-for-like plan.** `percentile_agg()` wraps a UDDSketch at 200 buckets / 0.001 max error; the research note with source URLs and the measurement plan is at `docs/research/timescale-percentile.md` (#732).
 - **Restore a whole store into a chosen new root over HTTP** (`POST /api/v1/storage/restore/into?label=&name=`), guarded by `WEFT_RESTORE_BASE_DIR` and a containment check that refuses destinations inside the backup base.
 
 ### Fixed
