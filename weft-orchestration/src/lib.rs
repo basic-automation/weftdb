@@ -1232,7 +1232,7 @@ fn process_correlation_signals(signals: &mut Signals, correlation: &weftdb::Corr
 
 				for (signal_type, distance) in signal_types {
 					let manifestation_id = manifestation.id().clone();
-					let signal = Signal::new(correlation.id().clone(), manifestation_id, correlation.event_id().clone(), occurrence_end, signal_type, distance.clone());
+					let signal = Signal::new(correlation.id().clone(), manifestation_id, correlation.event_id().clone(), occurrence_end, signal_type, distance);
 					signals.insert(signal);
 					signals_count += 1;
 				}

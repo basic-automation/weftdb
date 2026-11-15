@@ -34,8 +34,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Fixed
 
-- **A client disconnect during an ingest body reads as `400 bad_request`, not `408 body_timeout` (#742).** The body read now distinguishes a stream that ends before its declared `Content-Length` (peer disconnect) from one that stalls past the deadline. The disconnect produces `400 bad_request` (keeping `Code::BadRequest` — the 43-code table is frozen); the timeout stays `408 body_timeout`. A distinct `tracing::info!` line at the seam records the mismatch for operators. The commit phase is not cancellable by disconnect: the 4xx is returned *before* the `IngestPhase` scope wraps the read.
+- **The settings registry caught up with the ENOSPC harness (#723).** #743 added a child
+  server process that reads `WEFT_ENOSPC_CHILD_ROOT` to find the scratch directory its
+  parent filled, but never registered the name, so the registry test that exists precisely
+  to stop that drift failed in `weft-server --lib` on every platform and turned the whole
+  test matrix red. The name is now registered as a Test-tier variable and documented with
+  it. Two `clippy::redundant_clone` errors — `weft-orchestration`'s `Distance` and
+  `weft-tui`'s `measurements` — were also cleared; both lints stayed hidden because clippy
+  stopped at the first failing crate.
 
+- **A client disconnect during an ingest body reads as `400 bad_request`, not `408 body_timeout` (#742).** The body read now distinguishes a stream that ends before its declared `Content-Length` (peer disconnect) from one that stalls past the deadline. The disconnect produces `400 bad_request` (keeping `Code::BadRequest` — the 43-code table is frozen); the timeout stays `408 body_timeout`. A distinct `tracing::info!` line at the seam records the mismatch for operators. The commit phase is not cancellable by disconnect: the 4xx is returned *before* the `IngestPhase` scope wraps the read.
 - **A `#[serial(key)]` on a test is no longer invisible to CI.** `scripts/ci/check-serial-order.py` matched
   only the plain `#[serial]` form, so the keyed form — the one that guards the process-global fault
   injectors — was never checked, and the rule it enforced ("must sit immediately above `#[test]`") was
