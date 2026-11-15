@@ -397,13 +397,16 @@ mod tests {
 		}
 		let result = run_gpu_memory(&profile).expect("runs");
 		assert!(result.correctness.values_finite, "values must be finite: {:?}", result.correctness);
-		assert_eq!(result.correctness.actual_output_points, result.correctness.expected_output_points,
-			"output count mismatch");
+		// Deliberate, recorded relaxation: this compares the aggregate point count rather
+		// than each call's count. Per-call completeness (`complete` in `run_gpu_memory`)
+		// is only exposed inside `output_count_ok`, which also ANDs the flaky `stable`
+		// flag, and `CorrectnessReport` is built in ~19 places across the crate, so
+		// carrying a new field for it here is out of scope for a flake fix. A per-call
+		// off-by-one would have to be compensated by another call to slip past.
+		assert_eq!(result.correctness.actual_output_points, result.correctness.expected_output_points, "output count mismatch");
 		let pool = result.gpu_pool.expect("summary");
 		assert_eq!(pool.calls, 6);
-		assert!(pool.peak_idle_bytes_first_round.max(pool.peak_idle_bytes_later) <= pool.max_pool_bytes,
-			"pool exceeded its cap: peak_first={} peak_later={} cap={}",
-			pool.peak_idle_bytes_first_round, pool.peak_idle_bytes_later, pool.max_pool_bytes);
+		assert!(pool.peak_idle_bytes_first_round.max(pool.peak_idle_bytes_later) <= pool.max_pool_bytes, "pool exceeded its cap: peak_first={} peak_later={} cap={}", pool.peak_idle_bytes_first_round, pool.peak_idle_bytes_later, pool.max_pool_bytes);
 		let device = pool.device_memory.expect("device memory block");
 		assert!(!device.allocated_growth, "{device:?}");
 		assert!(device.samples == 0 || device.final_reserved_bytes >= device.final_allocated_bytes, "{device:?}");
