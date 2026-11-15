@@ -6872,3 +6872,30 @@ Rejected first: relaxing the tests to compare one platform's spelling. Both fail
 usability defects on those platforms, and a test that compares a canonical path to an un-resolved one
 would have hidden the next such defect rather than catching it. The tests now compare canonical forms
 of both sides, which is what they always meant to assert.
+
+## 2026-11-14 — Panic audit scope and verdicts (P242, #242)
+
+**Scope: every production `.rs` reachable from server request handlers, static-grep only.**
+No build or runtime test was run (and must not be — the build OOM-kills the local model
+server on this host). All verdicts are based on static analysis of the source alone.
+
+**Verdicts assigned by reachability and triggerability:**
+1. **OK, safe** — reachable from a catch boundary but verified safe by construction (e.g.,
+   SHA-256 `hash[..8]` always fits `[u8; 8]`).
+2. **OK, test-only** — behind `#[cfg(test)]`, `#[tokio::test]` or a `mod tests` block.
+3. **OK, unreachable from catch** — dead production code, control-plane-only (aborted by
+   ROB-2 before the catch layer), or daemon-only with a task restart boundary.
+4. **NEEDS-FIX** — reachable from a catch boundary and a user payload could realistically
+   trigger the panic.
+
+**Key decisions made during the audit:**
+
+| Question | Decision | Rationale |
+|----------|----------|-----------|
+| Is `bail!()` in `analyze_point` (outputs.rs:383) a NEEDS-FIX? | Yes | `bail!()` expands to `panic!()`. The function already returns `Result<Point>`, so a returned `Err` is the correct path. The caller hits this when no measurements exist for a requested aspect at a queried time — a normal condition, not a logic error. |
+| Are daemon panics marked NEEDS-FIX? | No | Daemons run under `daemons.rs` supervision: a panic kills only that async task, the supervisor restarts it. ROB-2 crash-consistency tests validate that control-plane writes survive a mid-write crash. The audit marks daemon-only sites as **OK, safe**. |
+| Is `sweep_stale_staging`'s `.unwrap()` on `duration_since` a concern? | No | Daemon-only (backup sweep) with task restart boundary. |
+| Are the `CapturedLog` / `SpanLog` `expect()` calls production code? | No | Both are defined inside `#[cfg(test)]` blocks (reconcile_daemon.rs:444, storage.rs:1351). |
+
+**Result:** 1 NEEDS-FIX found (`weftdb/src/types/database/outputs.rs:383`). GitHub issue
+`#p242-fix-outputs-bail` opened.
