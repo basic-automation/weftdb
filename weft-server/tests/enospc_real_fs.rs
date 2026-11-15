@@ -59,7 +59,8 @@ async fn router_with_impossible_reserve() -> (TempDir, Router) {
 	let dir = TempDir::new().expect("tempdir");
 	let store = Arc::new(SegmentStore::open_with_options(dir.path(), SegmentStoreOptions::default().with_disk_reserve_bytes(u64::MAX)).await.expect("opens the store"));
 	store.declare(ASPECT, &schema()).await.expect("declares the aspect");
-	let router = app_with_state(AppState::new().with_store(store));
+	let router = app_with_state(AppState::new().with_store(Arc::clone(&store)));
+	drop(store);
 	(dir, router)
 }
 
@@ -124,7 +125,8 @@ async fn enospc_real_fs_child() {
 	}
 
 	// Now the tmpfs is genuinely full. Send an ingest through the router.
-	let router = app_with_state(AppState::new().with_store(store));
+	let router = app_with_state(AppState::new().with_store(Arc::clone(&store)));
+	drop(store);
 	assert_507(router.oneshot(ingest_points_request()).await.expect("the router answers")).await;
 }
 
@@ -166,7 +168,7 @@ async fn a_real_full_filesystem_produces_enospc_end_to_end() {
 	let script = format!("set -eu\n\
 		 mount -t tmpfs -o size=1m tmpfs \"{root}\"\n\
 		 exec \"$1\" enospc_real_fs_child --exact --nocapture \
-		     --test-threads=1",);
+\t	     --test-threads=1");
 
 	let result = std::process::Command::new("unshare").args(["-Um", "-r", "sh", "-c", &script, "--", exe.to_str().unwrap()]).env(CHILD_ROOT, &root).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).output().expect("runs the namespace child");
 
