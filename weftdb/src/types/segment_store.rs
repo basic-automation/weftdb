@@ -325,6 +325,39 @@ fn window_covers_segment(descriptor: &SegmentDescriptor, start: i64, end: i64) -
 	descriptor.min_ts.zip(descriptor.max_ts).is_some_and(|(min_ts, max_ts)| start <= min_ts && max_ts <= end)
 }
 
+/// Whether any pair of descriptors has overlapping time windows, clipped to `[start, end]`.
+///
+/// Uses each descriptor's `min_ts`/`max_ts` bounds — already clipped to the query window
+/// by the index prune — and sweeps once after sorting by lower bound. Two descriptors whose
+/// clipped windows intersect means they may carry the same timestamp, so a downstream fold
+/// that deduplicates per timestamp is needed for correctness.
+///
+/// Over-triggering (reporting overlap when the actual rows are disjoint) is safe: it costs
+/// a slower fallback route. Under-triggering is a correctness bug — the predicate is
+/// deliberately conservative, relying only on the time bounds every descriptor carries.
+pub(crate) fn descriptors_overlap(descriptors: &[SegmentDescriptor], start: i64, end: i64) -> bool {
+	if descriptors.len() < 2 {
+		return false;
+	}
+	// Collect descriptors with their clipped bounds. Skip descriptors whose bounds are
+	// None (empty segments — no timestamps to overlap).
+	let mut ranges: Vec<(i64, i64)> = descriptors.iter().filter_map(|d| Some((d.min_ts?.max(start), d.max_ts?.min(end)))).collect();
+	if ranges.len() < 2 {
+		return false;
+	}
+	// Sort by lower bound.
+	ranges.sort_unstable_by_key(|(lo, _)| *lo);
+	// Sweep: if the current upper bound reaches or passes the next lower bound, they overlap.
+	let mut current_hi = ranges[0].1;
+	for &(lo, hi) in &ranges[1..] {
+		if current_hi >= lo {
+			return true;
+		}
+		current_hi = current_hi.max(hi);
+	}
+	false
+}
+
 /// [`SegmentStore::open_scoped`] found its root already open: by another process, or
 /// by another [`SegmentStore`] in this one that has not been dropped yet.
 ///
