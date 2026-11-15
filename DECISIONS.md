@@ -7214,3 +7214,44 @@ would also have cost a full rebuild for no legal gain.
 and names the fetch date for what it read. Anything a later reader cannot trace
 to a page or a line is marked as not verified here, including the "effective
 2026-07-16" ClickHouse AUP date, which came from an ephemeral note.
+
+## 2026-11-15 — The benchmark policy is written as a draft for counsel, not as a decision (#245)
+
+**What was ambiguous.** `ROADMAP.md` names the benchmark policy three times
+(lines 135, 141, 142) and every one of those lines is a counsel or owner item.
+`#245` asks for the policy. So the line to tick in a PR that writes the document
+does not exist: writing a draft is not settling the item with counsel.
+
+**What I chose.** Write `docs/benchmark-policy.md` as the engineer-facing rule
+book, marked *draft for counsel review*, and tick nothing. The document is
+deliberately operational — what an engineer may run, what a published
+comparison must carry, what stays excluded — so counsel has something concrete
+to correct instead of an abstraction. The counsel items (#384 trademark, #386
+codec patents, the package licence expression, the InfluxDB/QuestDB enterprise
+terms behind `NOT_IN_SCOPE` entry 5, the kdb+ consent route) stay open and are
+named as such in §8 of the policy.
+
+**Corrections made while writing it.** Two claims in my own first draft failed
+verification and were removed rather than kept:
+
+- It cited "`docs/benchmarks.md` (the honesty object table)". No such file
+  exists in this repository, and no honesty-object table lives in `docs/`. The
+  real locations are the gate string at `weft-xbench/src/render.rs:39` and the
+  prose at `docs/roadmap-notes.md:45`.
+- It treated `NOT_IN_SCOPE` entry 6 as being about kdb+ alone. The entry reads
+  *"kdb+ and AVEVA PI: their licences bar benchmarking or publishing results
+  without written consent."* — and **AVEVA PI has had no licence review at all**
+  in this cycle, in this repository or the last one. The policy now says so
+  plainly and puts reading those terms next to the InfluxDB enterprise-terms
+  item. An exclusion we cannot cite is safe only while nobody proposes to
+  cross it.
+
+**One point worth separating.** ClickHouse's AUP §1.5 (no use of the Services
+for developing competing products) is an independent reason not to run a hosted
+ClickHouse on company equipment; it has nothing to do with the publication
+condition in §2 that the roadmap was worried about. A policy that only addresses
+publication would leave that trap in place.
+
+**Not done here.** No `ROADMAP.md` tick, no change to the compiled
+`NOT_IN_SCOPE` text (a compiled constant is not a documentation surface), and no
+contact with KX or AVEVA — both need a human.
