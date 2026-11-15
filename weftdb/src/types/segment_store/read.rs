@@ -230,6 +230,10 @@ impl SegmentStore {
 	/// **Read with row-level expiry** (P12-722, cut 1): like [`read_time_range`](Self::read_time_range)
 	/// but filtering out rows whose age at `now_ns` exceeds the store's TTL.
 	/// The default [`NoExpiry`](row_expiry::RowExpiryPolicy::NoExpiry) returns every row.
+	///
+	/// # Errors
+	///
+	/// As [`read_time_range`](Self::read_time_range).
 	pub async fn read_time_range_with_expiry(&self, aspect: &str, start: i64, end: i64, now_ns: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
 		self.read_time_range_of_with_expiry(aspect, crate::SeriesId::UNTAGGED, start, end, now_ns).await
 	}
