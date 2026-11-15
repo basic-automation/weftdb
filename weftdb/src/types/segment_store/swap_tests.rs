@@ -119,14 +119,57 @@ async fn seal_fixture(root: &Path, op: Op) -> u64 {
 	let mut ids = Vec::new();
 	for sealed in fixture(op) {
 		let (ts, vs): (Vec<i64>, Vec<BigDecimal>) = sealed.rows.iter().map(|(t, v)| (*t, bd(v))).unzip();
-		let descriptor = match sealed.paged {
-			Some(rows_per_page) => store.seal_paged(ASPECT, &schema(), &ts, &vs, rows_per_page).await,
-			None => store.seal(ASPECT, &schema(), &ts, &vs).await,
-		};
-		ids.push(descriptor.expect("seals a fixture segment").id);
+		let descriptor = seal_fixture_segment(&store, &ts, &vs, sealed.paged).await.expect("seals a fixture segment");
+		ids.push(descriptor.id);
 	}
 	drop(store);
 	ids[1]
+}
+
+/// Seal one fixture segment of `seal_fixture`, retrying a bounded number of times when the
+/// attempt fails with `permission denied` and wrote nothing. On Windows a process aborted
+/// nearby keeps Turso's database and WAL handles open until the OS reaps its process
+/// object, and an index transaction started in that window answers `permission denied`
+/// (issue #625: `BEGIN CONCURRENT: I/O error (tempdir): permission denied`). The first fix
+/// retried only the open of a path a child had just been killed on; the same error also
+/// lands on the seal of a store that opened fine, which is what `seal_fixture` does for
+/// every case of the abort matrix. The retry is taken only when the failed attempt left no
+/// index row behind, so it cannot consume a generation that `verify_recovered` counts as a
+/// fixture — a retried seal writes the same logical segment at the same generation.
+async fn seal_fixture_segment(store: &SegmentStore, ts: &[i64], vs: &[BigDecimal], paged: Option<usize>) -> anyhow::Result<weft_physical_type::SegmentDescriptor> {
+	for attempt in 0..5u32 {
+		let rows = store.index().rows(ASPECT).await?;
+		let before = rows.len();
+		let outcome = match paged {
+			Some(rows_per_page) => store.seal_paged(ASPECT, &schema(), ts, vs, rows_per_page).await,
+			None => store.seal(ASPECT, &schema(), ts, vs).await,
+		};
+		match outcome {
+			Ok(descriptor) => return Ok(descriptor),
+			Err(error) => {
+				if !is_permission_denied(&error) {
+					return Err(error);
+				}
+				let after = store.index().rows(ASPECT).await?.len();
+				if after != before || attempt == 4 {
+					return Err(error);
+				}
+				tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+			}
+		}
+	}
+	unreachable!("every attempt returns or sleeps");
+}
+
+/// Whether `error` reports a `permission denied` I/O failure, the Windows signature of a
+/// handle the OS has not released yet. `open_store_retry` asks the same question of a
+/// `std::io::Error`; a seal reaches this code as an `anyhow::Error` whose chain carries no
+/// `std::io::Error`, so the rendered message is what identifies it.
+fn is_permission_denied(error: &anyhow::Error) -> bool {
+	if let Some(io) = error.downcast_ref::<std::io::Error>() {
+		return io.kind() == std::io::ErrorKind::PermissionDenied;
+	}
+	format!("{error:#}").contains("permission denied")
 }
 
 /// Run `op` on `store` (`target` names the segment a reconcile or split maintains),
@@ -536,7 +579,7 @@ async fn verify_recovered(root: &Path, op: Op, point: FaultPoint, label: &str) {
 	assert_eq!(rollup, derived, "{label}: the rollup matches the index");
 
 	// Maintenance goes on: the operation runs again on the recovered store.
-	let store = SegmentStore::open(root).await.unwrap_or_else(|e| panic!("{label}: the store reopens: {e:#}"));
+	let store = open_store_retry(root).await.unwrap_or_else(|e| panic!("{label}: the store reopens: {e:#}"));
 	run_again(&store, op).await.unwrap_or_else(|e| panic!("{label}: the operation after recovery: {e:#}"));
 	let rows = rows_of(&store).await.unwrap_or_else(|e| panic!("{label}: reads after the second run: {e:#}"));
 	let journal = journal_of(&store).await;
