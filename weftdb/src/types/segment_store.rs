@@ -502,10 +502,12 @@ pub const DEFAULT_MAX_DOWNSAMPLE_BUCKETS: usize = 1_000_000;
 /// 10,000 instants (1.0 plan decision 12).
 pub const DEFAULT_MAX_POINT_BATCH: usize = 10_000;
 
-/// The default suspect frame policy, [`SegmentStoreOptions::suspect_frame_policy`]:
-/// quarantine — a suspect frame is always quarantined, unchanged from the first
-/// ROB-22 deployment, so the policy is an opt-in relaxation towards `skip` or
-/// a tightening towards `fail`.
+/// The default suspect frame policy.
+///
+/// [`SegmentStoreOptions::suspect_frame_policy`] defaults to quarantine — a
+/// suspect frame is always quarantined, unchanged from the first ROB-22
+/// deployment — so the policy is an opt-in relaxation towards `skip` or a
+/// tightening towards `fail`.
 pub const DEFAULT_SUSPECT_FRAME_POLICY: SuspectFramePolicy = SuspectFramePolicy::Quarantine;
 
 impl Default for SegmentStoreOptions {
@@ -528,7 +530,7 @@ impl SegmentStoreOptions {
 	/// as it documents. Explicit: nothing in the library calls it.
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), decode_breaker: MaintenanceBreaker::decode_from_env(), suspect_frame_policy: std::env::var(SuspectFramePolicy::ENV_NAME).ok().as_deref().and_then(|v| SuspectFramePolicy::parse(v)).unwrap_or(DEFAULT_SUSPECT_FRAME_POLICY), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()), expiry: row_expiry::RowExpiryPolicy::NoExpiry }
+		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), decode_breaker: MaintenanceBreaker::decode_from_env(), suspect_frame_policy: std::env::var(SuspectFramePolicy::ENV_NAME).ok().as_deref().and_then(SuspectFramePolicy::parse).unwrap_or(DEFAULT_SUSPECT_FRAME_POLICY), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()), expiry: row_expiry::RowExpiryPolicy::NoExpiry }
 	}
 
 	/// These options with `policy` for checkpoints.
