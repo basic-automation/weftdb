@@ -8,6 +8,10 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **Restore a whole store into a chosen new root over HTTP** (`POST /api/v1/storage/restore/into?label=&name=`), guarded by `WEFT_RESTORE_BASE_DIR` and a containment check that refuses destinations inside the backup base.
+
 ### Fixed
 
 - **A `#[serial(key)]` on a test is no longer invisible to CI.** `scripts/ci/check-serial-order.py` matched
