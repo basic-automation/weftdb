@@ -49,13 +49,13 @@ async fn no_expiry_makes_no_difference_to_reads() {
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![90, 95, 100], vec![bd("1"), bd("2"), bd("3")])).await.expect("ingests rows");
 	// With NoExpiry, all rows are visible regardless of now_ns.
-	let (ts, vs) = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads with expiry");
+	let (ts, _vs) = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads with expiry");
 	let (ts2, vs2) = store.read_time_range(ASPECT, 0, 200).await.expect("reads without expiry");
 	assert_eq!(ts, ts2, "timestamps match");
 	assert_eq!(vs, vs2, "values match");
 	assert_eq!(ts, vec![90i64, 95, 100], "all three rows visible");
 	drop(store);
-	dir.close();
+	dir.close().expect("close temp dir");
 }
 
 // ── Criterion 2: TTL hides old rows ───────────────────────────────────────
@@ -71,7 +71,7 @@ async fn ttl_hides_rows_older_than_now_minus_ttl() {
 	assert_eq!(ts, vec![95i64, 100], "old rows are hidden by TTL");
 	assert_eq!(vs, vec![Some(bd("2")), Some(bd("3"))], "values match");
 	drop(store);
-	dir.close();
+	dir.close().expect("close temp dir");
 }
 
 // ── Criterion 3: Boundary — age == TTL is NOT expired ─────────────────────
@@ -86,7 +86,7 @@ async fn boundary_age_equals_ttl_is_not_expired() {
 	assert!(ts.contains(&90), "row at t=90 (age == TTL) must be visible");
 	assert!(!ts.contains(&89), "row at t=89 (age > TTL) must be hidden");
 	drop(store);
-	dir.close();
+	dir.close().expect("close temp dir");
 }
 
 // ── Criterion 4: Clock is injected, never SystemTime::now() ───────────────
@@ -108,7 +108,7 @@ async fn expiry_clock_is_injected() {
 	assert!(ts_b.contains(&95), "at now=90, t=95 is visible");
 
 	drop(store);
-	dir.close();
+	dir.close().expect("close temp dir");
 }
 
 // ── Criterion 5: Expiry applies to rows, not segments ────────────────────
@@ -126,7 +126,7 @@ async fn expiry_applies_per_row_not_segment() {
 	assert_eq!(ts, vec![95i64], "only the visible row remains");
 	assert_eq!(vs, vec![Some(bd("new"))], "only the visible value remains");
 	drop(store);
-	dir.close();
+	dir.close().expect("close temp dir");
 }
 
 // ── Criterion 6: Sweep correctly handles the age==TTL boundary ────────
@@ -151,7 +151,7 @@ async fn sweep_boundary_age_equals_ttl_not_expired() {
 	assert!(!ts.contains(&89), "row with age > TTL hidden in read path");
 
 	drop(store);
-	dir.close();
+	dir.close().expect("close temp dir");
 }
 
 #[tokio::test]
@@ -166,7 +166,7 @@ async fn sweep_segment_fully_below_cutoff_counts_all_as_expired() {
 	assert_eq!(sweep.rows_expired, 1, "fully expired segment: all rows counted");
 
 	drop(store);
-	dir.close();
+	dir.close().expect("close temp dir");
 }
 
 // ── Criterion 7: Sweep is idempotent and reports correctly ────────────────
@@ -187,7 +187,7 @@ async fn expiry_sweep_is_idempotent_and_report_only() {
 	assert_eq!(sweep2.rows_expired, sweep1.rows_expired, "second sweep reports the same count as first (idempotent)");
 
 	drop(store);
-	dir.close();
+	dir.close().expect("close temp dir");
 }
 
 // ── Criterion 8: TTL < segment close window — sweep is safe (report-only) ─
@@ -215,7 +215,7 @@ async fn ttl_smaller_than_close_window_is_safe() {
 	let (ts, _) = store.read_time_range(ASPECT, 0, 200).await.expect("reads without expiry");
 	assert_eq!(ts.len(), 2, "both rows still exist on disk");
 	drop(store);
-	dir.close();
+	dir.close().expect("close temp dir");
 }
 
 // ── RowExpiryPolicy helpers unit check (integration-level validation) ─────

@@ -4,7 +4,7 @@
 //! no OpenAPI/config-schema change.
 //!
 //! A [`RowExpiryPolicy`] says how old a row must be before reads hide it and the expiry
-//! sweep schedules it for deletion. The default is [`NoExpiry`] — every row is always
+//! sweep schedules it for deletion. The default is [`RowExpiryPolicy::NoExpiry`] — every row is always
 //! visible. When a TTL is set, a row whose age in the aspect's time unit is strictly
 //! **greater** than the policy's TTL is treated as expired: read paths filter it out, and
 //! the expiry sweep may drop it physically (cut 1 keeps this report-only for sweep).
