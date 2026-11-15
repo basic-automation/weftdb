@@ -19,11 +19,11 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use axum::{
-	Router, body::Body, http::{HeaderMap, Method, Request, StatusCode, header}
+	body::Body, http::{header, HeaderMap, Method, Request, StatusCode}, Router
 };
 use tower::ServiceExt as _;
 use weft_server::{
-	AppState, VERSION, app_with_state, auth::{AuthConfig, KeyStore, format_key_hash}, routes::{RouteEntry, Scope, build_registry}
+	app_with_state, auth::{format_key_hash, AuthConfig, KeyStore}, routes::{build_registry, RouteEntry, Scope}, AppState, VERSION
 };
 use weftdb::SegmentStore;
 
@@ -187,7 +187,7 @@ fn the_fre10a_families_are_the_frozen_size() {
 	// the frozen contract surface, and this file is where its contract gets
 	// pinned — the counts below are the reminder to extend it.
 	assert_eq!(family(Scope::Probe).len(), 4, "probe: /health, /healthz, /ready, /readyz");
-	assert_eq!(family(Scope::Metrics).len(), 5, "metrics: /metrics, /debug/profile/current, /api/v1/storage/headroom, /bench/runs, /bench/runs/{id}");
+	assert_eq!(family(Scope::Metrics).len(), 5, "metrics: /metrics, /debug/profile/current, /api/v1/storage/headroom, /bench/runs, /bench/runs/{{id}}");
 	assert_eq!(family(Scope::Compute).len(), 17, "compute: 9 interpolate + 8 downsample");
 }
 
