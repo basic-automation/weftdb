@@ -74,6 +74,8 @@ fn is_ingest_route(request: &Request<Body>) -> bool {
 /// panic that unwinds in place) and by D-S14's detached ingest task (a
 /// panic that comes back as a caught panic or a `JoinError`), so the two
 /// paths can never disagree about what a phase costs the caller.
+///
+/// // no per-phase codes: the phase is a log distinction (DECISIONS 2026-11-14)
 pub(crate) fn map_ingest_panic(phase: Option<IngestPhase>, message: &str) -> ApiError {
 	match phase {
 		Some(IngestPhase::Committing) => ApiError::server(Code::OutcomeUnknown, format!("panic while committing an ingest: {message}")),
@@ -128,8 +130,29 @@ mod tests {
 		panic!("compute exploded")
 	}
 
+	/// Panics with the phase set explicitly to [`IngestPhase::Validating`]: one of
+	/// the three pre-commit arms that must all answer `500 commit_failed`.
+	async fn validating_explodes() -> &'static str {
+		weftdb::exec::set_ingest_phase(IngestPhase::Validating);
+		panic!("validating exploded")
+	}
+
+	/// Panics with the phase set explicitly to [`IngestPhase::Encoding`]: one of
+	/// the three pre-commit arms that must all answer `500 commit_failed`.
+	async fn encoding_explodes() -> &'static str {
+		weftdb::exec::set_ingest_phase(IngestPhase::Encoding);
+		panic!("encoding exploded")
+	}
+
+	/// Panics with the phase set explicitly to [`IngestPhase::WritingFrames`]: one
+	/// of the three pre-commit arms that must all answer `500 commit_failed`.
+	async fn writing_frames_explodes() -> &'static str {
+		weftdb::exec::set_ingest_phase(IngestPhase::WritingFrames);
+		panic!("writing frames exploded")
+	}
+
 	fn panicking_router() -> Router {
-		Router::new().route("/api/v1/storage/{aspect}/points", post(seal_explodes)).route("/api/v1/storage/{aspect}/ilp", post(commit_explodes)).route("/calm", post(|| async { "fine" })).layer(axum::middleware::from_fn(catch_panic))
+		Router::new().route("/api/v1/storage/{aspect}/points", post(seal_explodes)).route("/api/v1/storage/{aspect}/ilp", post(commit_explodes)).route("/api/v1/storage/{aspect}/csv", post(validating_explodes)).route("/api/v1/storage/{aspect}/parquet", post(encoding_explodes)).route("/boom", post(writing_frames_explodes)).route("/calm", post(|| async { "fine" })).layer(axum::middleware::from_fn(catch_panic))
 	}
 
 	async fn body_json(response: Response) -> serde_json::Value {
@@ -174,6 +197,45 @@ mod tests {
 		assert_eq!(response.status(), StatusCode::OK);
 		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
 		assert_eq!(&bytes[..], b"fine");
+	}
+
+	/// Every pre-commit phase (`Validating`, `Encoding`, `WritingFrames`)
+	/// maps to `500 commit_failed` with `committed: false`. The wire error
+	/// message must NOT contain the phase name (the §4 5xx redaction rule).
+	#[tokio::test]
+	async fn a_panic_during_validating_is_commit_failed_and_phase_is_not_on_wire() {
+		let router = Router::new().route("/api/v1/storage/{aspect}/csv", post(validating_explodes)).layer(axum::middleware::from_fn(catch_panic));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/price/csv").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+		let body = body_json(response).await;
+		assert_eq!(body["code"], "commit_failed");
+		assert_eq!(body["committed"], false);
+		let wire = body.to_string();
+		assert!(!wire.contains("Validating"), "the §4 redacted sentence does not name a phase: {wire}");
+	}
+
+	#[tokio::test]
+	async fn a_panic_during_encoding_is_commit_failed_and_phase_is_not_on_wire() {
+		let router = Router::new().route("/api/v1/storage/{aspect}/csv", post(encoding_explodes)).layer(axum::middleware::from_fn(catch_panic));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/price/csv").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+		let body = body_json(response).await;
+		assert_eq!(body["code"], "commit_failed");
+		assert_eq!(body["committed"], false);
+		let wire = body.to_string();
+		assert!(!wire.contains("Encoding"), "the §4 redacted sentence does not name a phase: {wire}");
+	}
+
+	#[tokio::test]
+	async fn a_panic_during_writing_frames_is_commit_failed_and_phase_is_not_on_wire() {
+		let router = Router::new().route("/api/v1/storage/{aspect}/csv", post(writing_frames_explodes)).layer(axum::middleware::from_fn(catch_panic));
+		let response = router.oneshot(Request::builder().method("POST").uri("/api/v1/storage/price/csv").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+		let body = body_json(response).await;
+		assert_eq!(body["code"], "commit_failed");
+		assert_eq!(body["committed"], false);
+		let wire = body.to_string();
+		assert!(!wire.contains("WritingFrames"), "the §4 redacted sentence does not name a phase: {wire}");
 	}
 
 	#[test]
