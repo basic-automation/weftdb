@@ -16,8 +16,8 @@ The registry assigns each variable a **tier** that says how much it is promised.
 
 | schema_version | Change |
 |----------------|--------|
-| 1 | First versioned schema. Covers every variable the registry names (113 variables: 14 Stable, 49 Tuning, 8 Experimental, 42 Test). The machine-readable version lives in `config/schema.toml` and is authoritative; this document's `schema_version:` line must match it. The checker `scripts/config/check_schema.py` validates both against the registry at `weft-server/src/settings.rs`. |
-| 2 | One new Tuning variable (`WEFT_DISK_RESERVE_BYTES`, default 256 MiB, opt-in). Nothing renamed or removed. Three further Tuning variables were added after v2 with no version bump, following the precedent that adding a variable does not change the schema's structure: `WEFT_INGEST_BODY_TIMEOUT_SECS` (300 s ingest body deadline), `WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS` (300 s breaker cooldown) and `WEFT_MAINTENANCE_BREAKER_FAILURES` (3, breaker trip threshold). v0.3.3 added two more Tuning variables the same way: `WEFT_DATA_AUDIT` (per-measurement audit rows, off) and `WEFT_DB_IDLE_CLOSE_SECS` (300 s idle close). The ROB-21 test variable brought the total to 108. v0.3.7 added one more Tuning variable the same way: `WEFT_MVCC_CHECKPOINT_BYTES` (64 KiB MVCC checkpoint threshold), bringing the total to 109 (49 Tuning). #213 added one Stable variable the same way, `WEFT_RESTORE_BASE_DIR` (the base directory `POST /api/v1/storage/restore/into` publishes restored roots into, defaulting to the live store root's parent), bringing the total to 110 (14 Stable) as of that row. ROB-22 added three Tuning variables: `WEFT_DECODE_BREAKER_COOLDOWN_SECS` (300 s decode breaker cooldown), `WEFT_DECODE_BREAKER_FAILURES` (3, decode breaker trip threshold) and `WEFT_SUSPECT_FRAME_POLICY` (`quarantine`, the suspect-frame policy), bringing the total to 113 (49 Tuning). |
+| 1 | First versioned schema. Covers every variable the registry names (114 variables: 14 Stable, 49 Tuning, 8 Experimental, 43 Test). The machine-readable version lives in `config/schema.toml` and is authoritative; this document's `schema_version:` line must match it. The checker `scripts/config/check_schema.py` validates both against the registry at `weft-server/src/settings.rs`. |
+| 2 | One new Tuning variable (`WEFT_DISK_RESERVE_BYTES`, default 256 MiB, opt-in). Nothing renamed or removed. Three further Tuning variables were added after v2 with no version bump, following the precedent that adding a variable does not change the schema's structure: `WEFT_INGEST_BODY_TIMEOUT_SECS` (300 s ingest body deadline), `WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS` (300 s breaker cooldown) and `WEFT_MAINTENANCE_BREAKER_FAILURES` (3, breaker trip threshold). v0.3.3 added two more Tuning variables the same way: `WEFT_DATA_AUDIT` (per-measurement audit rows, off) and `WEFT_DB_IDLE_CLOSE_SECS` (300 s idle close). The ROB-21 test variable brought the total to 108. v0.3.7 added one more Tuning variable the same way: `WEFT_MVCC_CHECKPOINT_BYTES` (64 KiB MVCC checkpoint threshold), bringing the total to 109 (49 Tuning). #213 added one Stable variable the same way, `WEFT_RESTORE_BASE_DIR` (the base directory `POST /api/v1/storage/restore/into` publishes restored roots into, defaulting to the live store root's parent), bringing the total to 110 (14 Stable) as of that row. ROB-22 added three Tuning variables: `WEFT_DECODE_BREAKER_COOLDOWN_SECS` (300 s decode breaker cooldown), `WEFT_DECODE_BREAKER_FAILURES` (3, decode breaker trip threshold) and `WEFT_SUSPECT_FRAME_POLICY` (`quarantine`, the suspect-frame policy), bringing the total to 113 (49 Tuning). #743's ENOSPC harness added one Test variable, `WEFT_ENOSPC_CHILD_ROOT` (the scratch directory a test hands to the server process it spawns), bringing the total to 114 (43 Test). |
 
 ## Tier system
 
@@ -135,7 +135,7 @@ or code path behind a cargo feature.
 
 ## Test
 
-Forty-two variables. Not configuration. A test harness's private channel to the child
+Forty-three variables. Not configuration. A test harness's private channel to the child
 process it spawns, or a switch a test suite reads. Setting one on a real server does
 nothing useful — `weft-server` warns at startup. They are registered precisely so that
 this doc **cannot** carry one by accident; the env file explicitly excludes Test-tier
@@ -155,6 +155,7 @@ the database root remains.
 | `WEFT_BENCH_INTERPOLATE_POINTS` |
 | `WEFT_BTC_CSV` |
 | `WEFT_DB_NEW_CRASH_CHILD` |
+| `WEFT_ENOSPC_CHILD_ROOT` |
 | `WEFT_FAULT` |
 | `WEFT_FAULT_TEST_CHILD` |
 | `WEFT_LEGACY_CONSUMER_CRASH_CHILD` |
