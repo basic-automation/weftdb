@@ -85,7 +85,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] maint lane: **ROB-20** Maintenance resource limits, k-way merge, re-split of oversized frames
 - [x] open lane: **ROB-22** Suspect-frame policy and background-decode crash-loop breaker
 - [x] L-INGEST: **ROB-18** Two-phase ingest admission, total body deadline, panic mapping by phase
-- [ ] **FRE-10a** Contract tests: probes, compute endpoints, metrics and roles
+- [x] **FRE-10a** Contract tests: probes, compute endpoints, metrics and roles
 - [ ] **ROB-14** Cgroup-aware memory budget with per-request reservations
 - [x] Restoring *into a chosen new root* over HTTP (7.3) (#213, 2026-11-14: `POST /api/v1/storage/restore/into?label=...&name=...` into `WEFT_RESTORE_BASE_DIR`; the offline drill at `weft-server/src/restore.rs` is unchanged)
 - [ ] Store-side row-level TTL/expiry (prerequisite for the SOA-15 TTL lane)
