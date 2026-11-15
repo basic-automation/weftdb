@@ -776,8 +776,8 @@ async fn v010_compat_fre13_rollback_after_writes_loses_nothing() {
 	let Err(error) = SegmentStore::open(store_dir.path()).await else { panic!("a store with min_write_layout=99 (>SUPPORTED_LAYOUT) must be refused with IncompatibleLayout") };
 	let typed = error.downcast_ref::<StoreError>().unwrap_or_else(|| panic!("the refusal is typed as StoreError, not a sentence: {error:#}"));
 	let StoreError::IncompatibleLayout { min_write, supported } = typed else { panic!("the refusal is IncompatibleLayout, not {error:#}") };
-	assert_eq!(min_write, 99, "the error reports the tampered floor");
-	assert_eq!(supported, SUPPORTED_LAYOUT, "the error reports this build's supported layout");
+	assert_eq!(*min_write, 99, "the error reports the tampered floor");
+	assert_eq!(*supported, SUPPORTED_LAYOUT, "the error reports this build's supported layout");
 
 	// Phase 4 — restore the original marker, reopen, and verify data integrity.
 	std::fs::write(&marker_path, &original_bytes).expect("restoring the original marker");
