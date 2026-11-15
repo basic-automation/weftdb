@@ -54,6 +54,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   it. Two `clippy::redundant_clone` errors — `weft-orchestration`'s `Distance` and
   `weft-tui`'s `measurements` — were also cleared; both lints stayed hidden because clippy
   stopped at the first failing crate.
+
+- **A client disconnect during an ingest body reads as `400 bad_request`, not `408 body_timeout` (#742).** The body read now distinguishes a stream that ends before its declared `Content-Length` (peer disconnect) from one that stalls past the deadline. The disconnect produces `400 bad_request` (keeping `Code::BadRequest` — the 43-code table is frozen); the timeout stays `408 body_timeout`. A distinct `tracing::info!` line at the seam records the mismatch for operators. The commit phase is not cancellable by disconnect: the 4xx is returned *before* the `IngestPhase` scope wraps the read.
 - **A `#[serial(key)]` on a test is no longer invisible to CI.** `scripts/ci/check-serial-order.py` matched
   only the plain `#[serial]` form, so the keyed form — the one that guards the process-global fault
   injectors — was never checked, and the rule it enforced ("must sit immediately above `#[test]`") was
@@ -61,6 +63,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `#[test]` it generates, so either position in the attribute block serialises. The guard now covers both
   forms and fails when a `#[serial]` shares no attribute block with a test attribute, which is the shape
   that compiles, passes, and quietly runs concurrently with the tests it meant to exclude (#726).
+- **GPU pool bound test no longer flakes under GPU contention.**
+  `gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu` asserted `pool.stable` (which
+  fails when another process holds GPU memory during round one) via `result.correctness.passed()`.
+  Now checks the hard invariants only: every output value is finite, every call returned the expected
+  number of points, the pool never exceeds its cap, and the device allocator does not grow without
+  bound.  (#725)
 
 ## [0.3.7] - 2026-11-12
 
