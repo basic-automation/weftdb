@@ -17,7 +17,7 @@ use crate::{
 };
 
 fn bd(s: &str) -> BigDecimal {
-	BigDecimal::from_str(s).expect("parses")
+	BigDecimal::from_str(s).unwrap_or_else(|e| panic!("bd({s:?}) is not a decimal literal: {e}"))
 }
 
 const ASPECT: &str = "temp";
@@ -82,7 +82,7 @@ async fn boundary_age_equals_ttl_is_not_expired() {
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 	// Row at t=90: age = 100 - 90 = 10, which equals TTL → NOT expired.
 	// Ascending: the batch API takes timestamps in order.
-	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![89, 90], vec![bd("b"), bd("a")])).await.expect("ingests");
+	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![89, 90], vec![bd("1"), bd("2")])).await.expect("ingests");
 	let (ts, _vs) = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads with expiry");
 	assert!(ts.contains(&90), "row at t=90 (age == TTL) must be visible");
 	assert!(!ts.contains(&89), "row at t=89 (age > TTL) must be hidden");
@@ -96,7 +96,7 @@ async fn boundary_age_equals_ttl_is_not_expired() {
 async fn expiry_clock_is_injected() {
 	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
-	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![85, 95], vec![bd("x"), bd("y")])).await.expect("ingests");
+	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![85, 95], vec![bd("1"), bd("2")])).await.expect("ingests");
 
 	// With now_ns = T=100s: t=85 expires (age 15 > 10), t=95 visible.
 	let (ts_a, _) = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, ns(100)).await.expect("at now=100");
@@ -121,11 +121,11 @@ async fn expiry_applies_per_row_not_segment() {
 	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 	// One segment with rows at t=50 (expired at now=100) and t=95 (visible).
-	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![50, 95], vec![bd("old"), bd("new")])).await.expect("ingests both rows in one segment");
+	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![50, 95], vec![bd("1"), bd("2")])).await.expect("ingests both rows in one segment");
 	let (ts, vs) = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads with expiry");
 	// The expired row is filtered out, the visible row remains.
 	assert_eq!(ts, vec![95i64], "only the visible row remains");
-	assert_eq!(vs, vec![Some(bd("new"))], "only the visible value remains");
+	assert_eq!(vs, vec![Some(bd("2"))], "only the visible value remains");
 	drop(store);
 	dir.close().expect("close temp dir");
 }
@@ -142,7 +142,7 @@ async fn sweep_boundary_age_equals_ttl_not_expired() {
 	// Rows at t=90 (age 10 == TTL → NOT expired) and t=89 (age 11 > TTL → expired).
 	// Same segment: min_ts=89, max_ts=90.
 	// Ascending: the batch API takes timestamps in order.
-	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![89, 90], vec![bd("b"), bd("a")])).await.expect("ingests");
+	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![89, 90], vec![bd("1"), bd("2")])).await.expect("ingests");
 
 	let sweep = store.expiry_sweep(NOW_NS).await.expect("sweep");
 	assert_eq!(sweep.rows_expired, 1, "only the row at t=89 (age > TTL) is expired");
@@ -162,7 +162,7 @@ async fn sweep_segment_fully_below_cutoff_counts_all_as_expired() {
 	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 	// Row at t=80 (age 20 > 10) — cutoff = 90, max_ts 80 < 90 → fully expired.
-	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![80], vec![bd("a")])).await.expect("ingests");
+	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![80], vec![bd("1")])).await.expect("ingests");
 
 	let sweep = store.expiry_sweep(NOW_NS).await.expect("sweep");
 	assert_eq!(sweep.rows_expired, 1, "fully expired segment: all rows counted");
@@ -177,7 +177,7 @@ async fn sweep_segment_fully_below_cutoff_counts_all_as_expired() {
 async fn expiry_sweep_is_idempotent_and_report_only() {
 	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
-	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![50, 95, 100], vec![bd("a"), bd("b"), bd("c")])).await.expect("ingests");
+	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![50, 95, 100], vec![bd("1"), bd("2"), bd("3")])).await.expect("ingests");
 
 	// First sweep: rows at t=50 should be expired.
 	let sweep1 = store.expiry_sweep(NOW_NS).await.expect("first sweep");
@@ -202,13 +202,13 @@ async fn ttl_smaller_than_close_window_is_safe() {
 	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: 1 }).await; // 1 second TTL
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 	// All rows at t=100 are at "now", so none should be expired.
-	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![100], vec![bd("now")])).await.expect("ingests");
+	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![100], vec![bd("1")])).await.expect("ingests");
 	let sweep = store.expiry_sweep(NOW_NS).await.expect("sweep");
 	assert_eq!(sweep.rows_expired, 0, "current rows are never expired");
 	assert!(sweep.aspects_cleaned.is_empty(), "aspect not in cleaned list");
 
 	// An expired row is reported separately.
-	store.ingest(ASPECT, &IngestBatch::dense("s2", vec![95], vec![bd("old")])).await.expect("ingests an old row");
+	store.ingest(ASPECT, &IngestBatch::dense("s2", vec![95], vec![bd("2")])).await.expect("ingests an old row");
 	let sweep2 = store.expiry_sweep(NOW_NS).await.expect("second sweep");
 	assert!(sweep2.rows_expired > 0, "now an old row is found expired");
 
