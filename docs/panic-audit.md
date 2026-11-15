@@ -75,7 +75,7 @@ The audit marks a site **NEEDS-FIX** if it is reachable from an HTTP handler pat
 
 | Line | Construct | Reachability | Verdict | Notes |
 |------|-----------|--------------|---------|-------|
-| 431 | `database_metadata().unwrap()` | **OK, unreachable from catch** | Only called in the `#[cfg(test)]` block at the end of `aspect.rs`. |
+| 431 | `database_metadata().unwrap()` | **OK, unreachable from catch** | No caller exists in production or test code (zero hits for `.database_metadata()` outside the trait definition and its impl); the function is dead code. |
 
 ### `weftdb/src/types/batches/batch.rs` — `relative_analysis`
 
