@@ -8,7 +8,7 @@ use std::{path::Path, str::FromStr};
 
 use bigdecimal::BigDecimal;
 use tempfile::TempDir;
-use weft_physical_type::{AspectSchema, PhysicalType, timestamp::TimeUnit};
+use weft_physical_type::{timestamp::TimeUnit, AspectSchema, PhysicalType};
 
 use super::{SegmentStore, SegmentStoreOptions};
 use crate::{IngestBatch, SeriesId, SuspectFramePolicy};
@@ -58,6 +58,7 @@ async fn store_with_default_policy_propagates_to_open() {
 	// propagates the error (same as Fail for the interactive read path).
 	let all = store.index().all(ASPECT).await.expect("enumerates index rows");
 	assert_eq!(all.len(), 0, "empty store has no segments");
+	drop(store);
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +83,7 @@ async fn suspect_frame_policy_skip_surfaces_data_from_readable_segments() {
 	// (0, 10, 20) is lost because its frame could not be decoded.
 	assert_eq!(ts, vec![15, 25]);
 	assert_eq!(vs, vec![Some(bd("115")), Some(bd("125"))]);
+	drop(store);
 }
 
 #[tokio::test]
@@ -95,7 +97,8 @@ async fn suspect_frame_policy_skip_returns_empty_when_only_frame_is_corrupt() {
 	tokio::fs::write(&path, b"not a valid frame").await.unwrap();
 	let (ts, vs) = store.read_time_range_of(ASPECT, SeriesId::UNTAGGED, 0, 30).await.expect("read succeeds under Skip");
 	assert!(ts.is_empty(), "no rows when the only segment is skipped");
-	assert!(vs.is_empty());
+	assert!(vs.is_empty(), "no values when the only segment is skipped");
+	drop(store);
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +116,7 @@ async fn suspect_frame_policy_fail_propagates_decode_error() {
 	tokio::fs::write(&path, b"not a valid frame").await.unwrap();
 	let err = store.read_time_range_of(ASPECT, SeriesId::UNTAGGED, 0, 30).await;
 	assert!(err.is_err(), "read propagates the decode error under Fail policy");
+	drop(store);
 }
 
 // ---------------------------------------------------------------------------
@@ -132,4 +136,5 @@ async fn suspect_frame_policy_quarantine_propagates_decode_error() {
 	tokio::fs::write(&path, b"not a valid frame").await.unwrap();
 	let err = store.read_time_range_of(ASPECT, SeriesId::UNTAGGED, 0, 30).await;
 	assert!(err.is_err(), "read propagates the decode error under Quarantine policy (default)");
+	drop(store);
 }
