@@ -15,8 +15,7 @@
 //! Run: `cargo bench -p weft-server --bench json_body_cost`.
 
 use std::{
-	hint::black_box,
-	time::{Duration, Instant},
+	hint::black_box, time::{Duration, Instant}
 };
 
 use axum::{body::Body, http::Request};
@@ -66,15 +65,17 @@ fn generate_body(n: usize) -> Vec<u8> {
 	let mut state = 0x9E37_79B9_7F4A_7C15_u64;
 	let anchor = Utc.timestamp_opt(1_577_836_800, 0).single().expect("valid anchor");
 
-	let points: Vec<serde_json::Value> = (0..n).map(|i| {
-		let rnd = xorshift(&mut state);
-		let unit = (u64_to_f64(rnd >> 11) / u64_to_f64(1_u64 << 53)).mul_add(2.0, -1.0);
-		#[allow(clippy::cast_possible_truncation)]
-		let exponent = i32::try_from(xorshift(&mut state) % 35).expect("below 35") - 19;
-		let value = unit * 10_f64.powi(exponent);
-		let ts = anchor + chrono::Duration::seconds(i as i64);
-		serde_json::json!({ "timestamp": ts.to_rfc3339(), "value": value })
-	}).collect();
+	let points: Vec<serde_json::Value> = (0..n)
+		.map(|i| {
+			let rnd = xorshift(&mut state);
+			let unit = (u64_to_f64(rnd >> 11) / u64_to_f64(1_u64 << 53)).mul_add(2.0, -1.0);
+			#[allow(clippy::cast_possible_truncation)]
+			let exponent = i32::try_from(xorshift(&mut state) % 35).expect("below 35") - 19;
+			let value = unit * 10_f64.powi(exponent);
+			let ts = anchor + chrono::Duration::seconds(i as i64);
+			serde_json::json!({ "timestamp": ts.to_rfc3339(), "value": value })
+		})
+		.collect();
 
 	let end_ts = anchor + chrono::Duration::seconds(n as i64 - 1);
 	serde_json::to_vec(&serde_json::json!({
@@ -83,17 +84,13 @@ fn generate_body(n: usize) -> Vec<u8> {
 		"start": anchor.to_rfc3339(),
 		"end": end_ts.to_rfc3339(),
 		"points": points,
-	})).expect("serialises the request body")
+	}))
+	.expect("serialises the request body")
 }
 
 fn run_one(runtime: &tokio::runtime::Runtime, router: &axum::Router, body: Vec<u8>) {
 	let _ = runtime.block_on(async {
-		let request = Request::builder()
-			.method("POST")
-			.uri("/api/v1/interpolate")
-			.header("content-type", "application/json")
-			.body(Body::from(body))
-			.expect("request");
+		let request = Request::builder().method("POST").uri("/api/v1/interpolate").header("content-type", "application/json").body(Body::from(body)).expect("request");
 		let response = router.clone().oneshot(request).await.expect("the router answers");
 		assert!(response.status().is_success(), "status {}", response.status());
 		black_box(axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body").len())
