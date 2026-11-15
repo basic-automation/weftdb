@@ -387,11 +387,14 @@ async fn interpolate_json_answers_its_frozen_shape() {
 	// InterpolateResponse: spline, resolution, input_points, output_points,
 	// backend, gpu_fallback, points[].
 	assert_eq!(key_set(&body), expected(&["spline", "resolution", "input_points", "output_points", "backend", "gpu_fallback", "points"]), "exactly the interpolate keys: {body}");
-	// The tokens are the request tokens echoed back: `spline` is the
-	// `SplineSpec` serde token (lower-case) and `resolution` the
-	// `ResolutionSpec` token, so the response round-trips into a request.
-	assert_eq!(body["spline"], "cubic", "the default method: {body}");
-	assert_eq!(body["resolution"], "minutes", "the default resolution: {body}");
+	// The tokens name the method and grid that RAN, in the form the response
+	// serializes them (the `weft_interpolate` types, not the request's
+	// `SplineSpec`/`ResolutionSpec` serde tokens). A cubic spline over three
+	// points runs as a quadratic, and the response says so — the endpoint's own
+	// tests record the same thing (weft-server/src/interpolate.rs:1040-1053:
+	// "with three splimes runs a quadratic, and the response says so").
+	assert_eq!(body["spline"], "Quadratic", "the default method, degraded for three points: {body}");
+	assert_eq!(body["resolution"], "Minutes", "the default resolution: {body}");
 	assert_eq!(body["input_points"], 3, "{body}");
 	assert_eq!(body["output_points"], 3, "three aligned input minutes → three grid points: {body}");
 	assert_eq!(body["gpu_fallback"], false, "no GPU configured: {body}");
