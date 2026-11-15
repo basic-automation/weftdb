@@ -409,12 +409,18 @@ Memory and growth fixes for long-running ingest, found on a Fan Control daemon t
   `weftdb-client` Rust SDK, storage format, CLI, configuration, metrics), what the compat
   suite actually tests, and the promises the repo does not yet support. Linked from
   `README.md` and `docs/reference.md`. (#331)
-- **UPGRADING.md and the upgrade/rollback compat legs (PAC-14a).**
+- **UPGRADING.md, upgrade leg, and rollback-after-writes leg (PAC-14a).**
   [`UPGRADING.md`](UPGRADING.md) documents the layout 1→2 upgrade, rollback
   procedures and version support window. The v0.1.0 release pin in
-  `compat/releases.toml` carries `legs = ["upgrade", "rollback"]`; the upgrade
-  leg is tested by `weftdb/tests/compat_v010.rs`, and the rollback-after-writes
-  leg is documented as aspirational.
+  `compat/releases.toml` carries `legs = ["upgrade", "rollback"]`.
+  `v010_compat_fre13_upgrade_contract` in `weftdb/tests/compat_v010.rs`
+  opens the v0.1.0 fixture, migrates it to layout 2, reads known values,
+  writes new data, and verifies the write and re-open. The rollback leg is
+  expressed as `v010_compat_fre13_rollback_after_writes_loses_nothing`:
+  it writes data after upgrade, tamperes the `STORE_FORMAT` marker to
+  simulate a newer build's floor, asserts the open fails with
+  `StoreError::IncompatibleLayout`, restores the marker, and verifies
+  every row survives the refused open.
 
 - **The measurement rules are wired to the figures they govern (EVI-6, #430).**
   `tools/check_claims.py` now fails when the claims document never links

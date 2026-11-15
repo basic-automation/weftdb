@@ -7134,6 +7134,61 @@ scope creep on a PR whose mandate was contract coverage of what #681 already shi
 belong in a future slice** that also owns the error-taxonomy, config-schema, and OpenAPI updates
 a new `Code` variant requires.
 
+## 2026-11-15 — COMPAT-1: FRE-13 upgrade leg (implemented)
+
+Added `v010_compat_fre13_upgrade_contract` to `weftdb/tests/compat_v010.rs`. The test:
+
+- Opens the checked-in `compat/fixtures/v0.1.0/store` fixture (layout 1) via `CARGO_MANIFEST_DIR/../compat/fixtures/v0.1.0`
+- Asserts `migrated_from == Some(1)`, `applied` is non-empty, `created_new` is false
+- Asserts `store_format().layout_version == SUPPORTED_LAYOUT` (layout 2) after upgrade
+- Reads price at t=1767225660 (value 102, matching `expected_reads.txt`)
+- Reads temp range (60 timestamps matching the fixture)
+- Writes new flow data (timestamps 1_800_000_000+) via `seal_declared`
+- Reads old price after the write (still 102)
+- Reads new flow data back correctly
+- Drops, reopens — asserts `migrated_from == None`, `applied` is empty on second open
+- Reads old data and new data after reopen
+
+**Not covered**: leg C (rollback after writes), UPGRADING.md prose. These remain for PAC-14a.
+
+**CI execution**: the test is in `weftdb/tests/` which `cargo test --workspace` picks up. No CI
+changes needed — the `compat` job runs Python coverage checks; the actual Rust test execution
+already runs via the `test` job.
+
+**Inherited red**: clippy/rustfmt/weft-server-lib failures from `origin/main`, fixed by PR #750.
+
+Test passed when run directly:
+```
+$ compat_v010-* -- v010_compat_fre13_upgrade_contract
+test v010_compat_fre13_upgrade_contract ... ok
+```
+
+## 2026-11-15 — COMPAT-2: PAC-14a rollback leg C (implemented)
+
+Added `v010_compat_fre13_rollback_after_writes_loses_nothing` to
+`weftdb/tests/compat_v010.rs`. The test:
+
+- Opens the v0.1.0 fixture (triggers layout 1→2 upgrade), writes new flow data,
+  and closes.
+- Tampers `STORE_FORMAT` marker `min_write_layout` to `99` (above
+  `SUPPORTED_LAYOUT`), simulating what a newer binary would record.
+- Asserts the open is refused with `StoreError::IncompatibleLayout` containing
+  the tampered floor and the current supported layout.
+- Restores the original marker, reopens, and asserts:
+  - New data written before the refusal reads back correctly
+  - Old (pre-upgrade) data still reads back (price=102)
+  - `open_report()`: `migrated_from == None`, `applied` is empty.
+
+Updated `UPGRADING.md` to describe what a rollback attempt does (refuses, loses
+nothing) and reference the test. Updated `CHANGELOG.md` to list both legs as
+implemented.
+
+Test passed when run directly:
+```
+$ compat_v010-* -- v010_compat_fre13_rollback_after_writes_loses_nothing
+test v010_compat_fre13_rollback_after_writes_loses_nothing ... ok
+```
+
 ## 2026-11-14 — TimescaleDB's default percentile aggregate and the like-for-like comparison plan (#732)
 
 **The item asked: is TimescaleDB's `percentile_agg()` a UDDSketch, and what is the concrete
