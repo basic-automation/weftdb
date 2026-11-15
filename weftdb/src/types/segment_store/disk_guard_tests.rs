@@ -93,3 +93,41 @@ async fn a_disabled_guard_still_reports_headroom() {
 	assert!(!headroom.refusing());
 	assert!(!guard.is_enabled());
 }
+
+/// ROB-20 G2: a maintenance swap (overlap merge / compaction) that would leave the
+/// store's filesystem below the disk guard's reserve is refused before any byte is
+/// written. The store is unchanged afterwards.
+#[tokio::test]
+async fn a_maintenance_swap_refuses_below_the_reserve() {
+	let dir = TempDir::new().unwrap();
+	let store = store_at(dir.path(), IMPOSSIBLE).await;
+	// Seal two overlapping segments so the overlap merge tries to write an output.
+	let (ts, vs) = values(100);
+	store.seal_declared(ASPECT, &ts, &vs).await.expect("first seal");
+	store.seal_declared(ASPECT, &ts, &vs).await.expect("second seal");
+	let start_frames = frames(dir.path());
+	let start_segments = store.segment_count(ASPECT).await.unwrap();
+
+	let err = store.reconcile_overlaps(ASPECT).await.expect_err("the guard refuses");
+	assert!(matches!(err.downcast_ref::<StoreError>(), Some(StoreError::InsufficientStorage { .. })), "{err:#}");
+
+	assert_eq!(frames(dir.path()), start_frames, "no output frame was left behind");
+	assert_eq!(store.segment_count(ASPECT).await.unwrap(), start_segments, "the segment set is unchanged after the refusal");
+	drop(store);
+}
+
+/// ROB-20 G2: the same merge that the disk guard refuses above still succeeds with
+/// ample headroom, guarding against over-refusal.
+#[tokio::test]
+async fn a_maintenance_swap_succeeds_with_ample_headroom() {
+	let dir = TempDir::new().unwrap();
+	let store = store_at(dir.path(), 1).await;
+	let (ts, vs) = values(100);
+	store.seal_declared(ASPECT, &ts, &vs).await.expect("first seal");
+	store.seal_declared(ASPECT, &ts, &vs).await.expect("second seal");
+
+	let merged = store.reconcile_overlaps(ASPECT).await.expect("the merge succeeds with headroom");
+	assert_eq!(merged, 1, "two overlapping segments merge into one");
+	assert_eq!(store.segment_count(ASPECT).await.unwrap(), 1, "only one segment remains after the merge");
+	drop(store);
+}

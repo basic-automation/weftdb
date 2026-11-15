@@ -7446,3 +7446,29 @@ publication would leave that trap in place.
 **Not done here.** No `ROADMAP.md` tick, no change to the compiled
 `NOT_IN_SCOPE` text (a compiled constant is not a documentation surface), and no
 contact with KX or AVEVA — both need a human.
+
+## 2026-11-16 — ROB-20 G2: disk guard coverage for maintenance writes (#758)
+
+**What was done.** Maintenance swap outputs now go through the store's disk guard
+before any byte is written. `swap_plans` (`seal.rs:348`) calls `admit_write` with the
+sum of the members' `byte_len` (an upper-bound proxy) before the outputs are journaled
+or written, so a merge that would leave the filesystem below the reserve is refused
+with the same `InsufficientStorage` error the ingest and seal paths already produce,
+with no partial segment or catalog change left behind.
+
+**Upper-bound proxy.** The exact output byte count is not known until the frames are
+encoded, so the sum of the members' frame sizes on disk is used instead. This is
+conservative: a merge always produces fewer or equal bytes than the sum of its
+members' bytes, so the proxy never under-counts.
+
+**Tests added.** Two new tests in `disk_guard_tests.rs`:
+
+- `a_maintenance_swap_refuses_below_the_reserve` — puts the store just above the disk
+  reserve, runs an overlap merge, asserts `InsufficientStorage`, and checks the store
+  is unchanged (same segment count, same frames on disk).
+- `a_maintenance_swap_succeeds_with_ample_headroom` — the same merge succeeds with a
+  satisfiable reserve, confirming the guard does not over-refuse.
+
+**G2 only.** Slice G2 closes the disk-guard gap for maintenance writes. G1 (byte
+budget), G3 (k-way merge), G4 (resplit) and G5 (time budget) are not touched.
+`ROADMAP.md:85` stays unticked until the behaviours ship.

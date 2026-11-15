@@ -8,6 +8,15 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Maintenance swap outputs now go through the disk guard (#758).**
+  Overlap merges and compactions that would leave the store's filesystem
+  below the reserve are refused with `InsufficientStorage` before any
+  byte is written, matching the protection the ingest and seal paths
+  already had. Two new unit tests in `disk_guard_tests.rs` pin the
+  refusal and the success case.
+
 ### Testing
 
 - **Real-filesystem ENOSPC evidence (#723).** Two integration tests pin the

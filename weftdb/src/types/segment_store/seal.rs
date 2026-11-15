@@ -390,6 +390,14 @@ impl SegmentStore {
 		let count: usize = counts.iter().sum();
 		// Only keep plans (skip-identical): nothing to allocate, journal or write, so
 		// M2-M4 are skipped whole and the swap goes straight to its commit.
+		// Admit the whole output with the disk guard before any byte is written.
+		// The exact output byte count is not known until the frames are encoded,
+		// so the sum of the members' byte lengths serves as an upper-bound proxy
+		// (G2 #758). A keep plan writes nothing, so count == 0 skips the admission.
+		if count > 0 {
+			let total_output_bytes: u64 = prepared.iter().map(|plan| plan.members.iter().map(|member| member.desc.byte_len).sum()).sum();
+			self.admit_write(total_output_bytes)?;
+		}
 		let (written, mut pending) = if count == 0 {
 			(Vec::new(), PendingOutputs { store: self, aspect: aspect.to_string(), names: Vec::new() })
 		} else {

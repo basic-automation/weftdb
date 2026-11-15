@@ -66,11 +66,10 @@ two things no single-ceiling test can show:
 
 ## Known gaps (not claimed)
 
-- **Maintenance budgets (ROB-20) are open.** The plan's 7.5 chain
-  ends in ROB-20's budgets and k-way merge; that slice is parked
-  (see `DECISIONS.md`), so the maintenance class is bounded only by
-  its exclusivity (one at a time), not by a budget. This document
-  does not claim otherwise.
+- **Maintenance budgets (ROB-20) have their disk guard gap closed (G2).**
+  Maintenance swap outputs now go through the store's disk guard before any
+  byte is written (`seal.rs:swap_plans`). The byte budget (G1), k-way merge
+  (G3) and resplit (G4) are still open. See `DECISIONS.md` and #758.
 - **Resident memory has no budget (ROB-14 skipped).** Per Justin's
   2026-11-07 call, ROB-14's memory budget is skipped, not
   implemented. Host memory is bounded indirectly — per-request row
