@@ -609,6 +609,40 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
 - **NEXT — a random-access-capable Gorilla/RLE would widen the checkpoint index's reach:**
 - Publish a methodology document **before** any performance claim
 
+## Panic audit (2026-11-14, P242, #242)
+
+**Phase 14 item ticked.** Static-grep audit of every panic-capable construct in
+`weft-server/src/` and `weftdb/src/` reachable from HTTP request handlers. Methodology:
+searched for `unwrap`, `expect`, `panic!`, `unreachable!`, `todo!`, `assert!`, fallible
+array indexing, `Mutex`/`RwLock` poisoning, and `SystemTime` arithmetic, then verified
+each site's reachability and triggerability.
+
+**Catch boundary:** `panic_catch::catch_panic` middleware wraps all request handlers
+(lib.rs). Non-ingest panics → `ApiError::internal` (500). Ingest panics →
+`map_ingest_panic` per-phase retry or 400/500. Control-plane writes aborted by ROB-2
+hook before catch layer; daemon panics restart via `daemons.rs` supervisor.
+
+**Result: 13 OK-safe, 1 unreachable, ~18 test-only, 0 NEEDS-FIX.**
+
+**Cleared on review:** `weftdb/src/types/database/outputs.rs` in `analyze_point` was
+first filed as NEEDS-FIX because `bail!("No measurements found for aspect")` was taken to
+expand to `panic!()`. It is `anyhow::bail`, which expands to `return Err(anyhow!(…))`
+(`anyhow-1.0.104/src/macros.rs:58`), and the function already returns
+`anyhow::Result<Point>` — so an empty result set propagates an `Err` and the
+`.last().unwrap()` at line 402 is guarded by that same early return. Issue #748, filed from
+the mistaken premise, is closed as not-a-bug.
+
+**Other production panics are safe by construction:**
+- `hash[..8].try_into().unwrap()` — SHA-256 output guaranteed 32 bytes.
+- `NonZeroUsize::new(10_000_000).expect(...)` — literal > 0.
+- `permit.expect("the semaphore is never closed")` — accept loop semaphore never closed.
+- All `unwrap_or_else(PoisonError::into_inner)` — converts poison to `Err`, no panic.
+- All `SystemTime::now().duration_since(...)` — use `map_or(0)` or `?`, never bare unwrap.
+- Array index `[0]` in `simplify_transformation` — guarded by early returns.
+- `last().unwrap()` in compaction/simplification — guarded by `len() <= 2` early returns.
+
+**Not audited** (out of scope): `compat/`, `weft-client/`, `weft-tui/`, `weft-bench/`,
+`weft-xbench/`, `benches/` directories, `clients/`, test-only files.
 ## Host probe (run 2026-11-14 on DeepThought, before the worker starts)
 
 ```
