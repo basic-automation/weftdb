@@ -4,7 +4,7 @@
 //! FRE-10a: contract tests for the first half of the FRE-10 surface — the
 //! probe endpoints, the stateless compute endpoints (interpolate, downsample),
 //! the metrics and profile endpoints, plus the role matrix on every route in
-//! the three families and the coverage cross-check that partitions the 73-route
+//! the three families and the coverage cross-check that partitions the 74-route
 //! registry between the two FRE-10 files.
 //!
 //! The per-family suites pin each handler's response shape and media type.
@@ -14,7 +14,7 @@
 //! probes pass at anonymous, compute passes at reader, metrics passes at
 //! maintainer — and a key that is refused the scope is never allowed to reach
 //! the handler. The coverage test pins the partition: 26 routes in FRE-10a
-//! (4+5+17), 47 in FRE-10b, 73 total.
+//! (4+5+17), 48 in FRE-10b, 74 total.
 
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -182,14 +182,14 @@ fn the_contract_coverage_spans_the_whole_registry() {
 	// surface. A route added anywhere moves one of these counts, and the
 	// file that owns its scope is where its contract gets pinned.
 	let table = build_registry().table();
-	assert_eq!(table.entries().len(), 73, "the registry's whole surface");
+	assert_eq!(table.entries().len(), 74, "the registry's whole surface — was 73 before storage_restore_into (#739)");
 	let halves: [(Scope, &str); 8] = [(Scope::Probe, "fre10a"), (Scope::Metrics, "fre10a"), (Scope::Compute, "fre10a"), (Scope::Read, "fre10b"), (Scope::Ingest, "fre10b"), (Scope::Declare, "fre10b"), (Scope::Maintain, "fre10b"), (Scope::Backup, "fre10b")];
 	let mut seen = BTreeSet::new();
 	for (scope, _) in &halves {
 		assert!(seen.insert(scope), "each scope is claimed by exactly one half");
 	}
 	assert_eq!(seen.len(), Scope::ALL.len(), "every scope in the frozen table is claimed");
-	let sizes: [(Scope, usize); 8] = [(Scope::Probe, 4), (Scope::Metrics, 5), (Scope::Compute, 17), (Scope::Read, 31), (Scope::Ingest, 4), (Scope::Declare, 1), (Scope::Maintain, 9), (Scope::Backup, 2)];
+	let sizes: [(Scope, usize); 8] = [(Scope::Probe, 4), (Scope::Metrics, 5), (Scope::Compute, 17), (Scope::Read, 31), (Scope::Ingest, 4), (Scope::Declare, 1), (Scope::Maintain, 9), (Scope::Backup, 3)]; // storage_restore_into (#739) joins Backup, was 2
 	let mut total = 0;
 	for (scope, size) in sizes {
 		assert_eq!(family(scope).len(), size, "scope {} holds {size} routes", scope.as_str());
@@ -198,7 +198,7 @@ fn the_contract_coverage_spans_the_whole_registry() {
 	assert_eq!(total, table.entries().len(), "the halves sum to the registry");
 	let first_half: usize = halves.iter().filter(|(_, half)| *half == "fre10a").map(|(scope, _)| family(*scope).len()).sum();
 	let second_half: usize = halves.iter().filter(|(_, half)| *half == "fre10b").map(|(scope, _)| family(*scope).len()).sum();
-	assert_eq!((first_half, second_half), (26, 47), "fre10a 4+5+17, fre10b 31+4+1+9+2");
+	assert_eq!((first_half, second_half), (26, 48), "fre10a 4+5+17, fre10b 31+4+1+9+3");
 }
 
 // --- Gate: every route in the families ----------------------------------------
@@ -350,7 +350,7 @@ async fn ready_answers_its_frozen_shape() {
 #[tokio::test]
 async fn metrics_answers_its_frozen_shape() {
 	let router = secured_router().await.1;
-	let (status, headers, bytes) = send(router.clone(), get("/metrics", None)).await;
+	let (status, headers, bytes) = send(router.clone(), get("/metrics", Some(MAINTAINER_KEY))).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "text/plain; version=0.0.4");
 	let text = String::from_utf8(bytes).expect("metrics is text");
@@ -364,7 +364,7 @@ async fn metrics_answers_its_frozen_shape() {
 #[tokio::test]
 async fn profile_current_answers_its_frozen_shape() {
 	let router = secured_router().await.1;
-	let (status, _headers, body) = send_json(router.clone(), get("/debug/profile/current", None)).await;
+	let (status, _headers, body) = send_json(router.clone(), get("/debug/profile/current", Some(MAINTAINER_KEY))).await;
 	assert_eq!(status, StatusCode::OK, "{body}");
 	// The profile report: service identity, then a section per profiled family.
 	// Three families carry a profile today; the maintenance and backup lanes
@@ -382,7 +382,7 @@ async fn profile_current_answers_its_frozen_shape() {
 #[tokio::test]
 async fn interpolate_json_answers_its_frozen_shape() {
 	let router = secured_router().await.1;
-	let (status, _headers, body) = send_json(router.clone(), post_json("/api/v1/interpolate", None, &interpolate_body())).await;
+	let (status, _headers, body) = send_json(router.clone(), post_json("/api/v1/interpolate", Some(READER_KEY), &interpolate_body())).await;
 	assert_eq!(status, StatusCode::OK, "{body}");
 	// InterpolateResponse: spline, resolution, input_points, output_points,
 	// backend, gpu_fallback, points[].
@@ -407,7 +407,7 @@ async fn interpolate_json_answers_its_frozen_shape() {
 #[tokio::test]
 async fn downsample_json_answers_its_frozen_shape() {
 	let router = secured_router().await.1;
-	let (status, _headers, body) = send_json(router.clone(), post_json("/api/v1/downsample", None, &downsample_body())).await;
+	let (status, _headers, body) = send_json(router.clone(), post_json("/api/v1/downsample", Some(READER_KEY), &downsample_body())).await;
 	assert_eq!(status, StatusCode::OK, "{body}");
 	// DownsampleResponse: resolution, aggregations, input_points, buckets,
 	// series[], optional fill, optional tags (absent on the compute endpoint).
@@ -428,7 +428,7 @@ async fn downsample_json_answers_its_frozen_shape() {
 #[tokio::test]
 async fn interpolate_point_answers_its_frozen_shape() {
 	let router = secured_router().await.1;
-	let (status, _headers, body) = send_json(router.clone(), post_json("/api/v1/interpolate/point", None, &interpolate_point_body())).await;
+	let (status, _headers, body) = send_json(router.clone(), post_json("/api/v1/interpolate/point", Some(READER_KEY), &interpolate_point_body())).await;
 	assert_eq!(status, StatusCode::OK, "{body}");
 	// PointResponse: spline, instant, input_points, value, kind, backend, gpu_fallback.
 	assert_eq!(key_set(&body), expected(&["spline", "instant", "input_points", "value", "kind", "backend", "gpu_fallback"]), "exactly the point-response keys: {body}");
@@ -446,25 +446,25 @@ async fn compute_formats_carry_their_media_types() {
 	let json_body = interpolate_body();
 
 	// Interpolate JSON: application/json
-	let (status, headers, _) = send(router.clone(), post_json("/api/v1/interpolate", None, &json_body)).await;
+	let (status, headers, _) = send(router.clone(), post_json("/api/v1/interpolate", Some(READER_KEY), &json_body)).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "application/json");
 
 	// Interpolate CSV: text/csv
-	let (status, headers, bytes) = send(router.clone(), post_json("/api/v1/interpolate/csv", None, &json_body)).await;
+	let (status, headers, bytes) = send(router.clone(), post_json("/api/v1/interpolate/csv", Some(READER_KEY), &json_body)).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "text/csv; charset=utf-8");
 	let text = String::from_utf8(bytes).expect("CSV is text");
 	assert!(text.lines().next().is_some_and(|line| line.starts_with("timestamp,")), "the CSV starts with its column header: {text}");
 
 	// Interpolate Arrow: application/vnd.apache.arrow.stream
-	let (status, headers, bytes) = send(router.clone(), post_json("/api/v1/interpolate/arrow", None, &json_body)).await;
+	let (status, headers, bytes) = send(router.clone(), post_json("/api/v1/interpolate/arrow", Some(READER_KEY), &json_body)).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "application/vnd.apache.arrow.stream");
 	assert_eq!(&bytes[..4], &[0xff, 0xff, 0xff, 0xff], "the IPC continuation marker");
 
 	// Interpolate Parquet: application/vnd.apache.parquet
-	let (status, headers, bytes) = send(router.clone(), post_json("/api/v1/interpolate/parquet", None, &json_body)).await;
+	let (status, headers, bytes) = send(router.clone(), post_json("/api/v1/interpolate/parquet", Some(READER_KEY), &json_body)).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "application/vnd.apache.parquet");
 	assert_eq!(&bytes[..4], b"PAR1", "the Parquet file magic");
@@ -473,25 +473,25 @@ async fn compute_formats_carry_their_media_types() {
 	let downsample_body = downsample_body();
 
 	// Downsample JSON: application/json
-	let (status, headers, _) = send(router.clone(), post_json("/api/v1/downsample", None, &downsample_body)).await;
+	let (status, headers, _) = send(router.clone(), post_json("/api/v1/downsample", Some(READER_KEY), &downsample_body)).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "application/json");
 
 	// Downsample CSV
-	let (status, headers, bytes) = send(router.clone(), post_json("/api/v1/downsample/csv", None, &downsample_body)).await;
+	let (status, headers, bytes) = send(router.clone(), post_json("/api/v1/downsample/csv", Some(READER_KEY), &downsample_body)).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "text/csv; charset=utf-8");
 	let text = String::from_utf8(bytes).expect("CSV is text");
 	assert!(text.lines().next().is_some_and(|line| line.starts_with("timestamp,")), "the CSV starts with its column header: {text}");
 
 	// Downsample Arrow
-	let (status, headers, bytes) = send(router.clone(), post_json("/api/v1/downsample/arrow", None, &downsample_body)).await;
+	let (status, headers, bytes) = send(router.clone(), post_json("/api/v1/downsample/arrow", Some(READER_KEY), &downsample_body)).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "application/vnd.apache.arrow.stream");
 	assert_eq!(&bytes[..4], &[0xff, 0xff, 0xff, 0xff]);
 
 	// Downsample Parquet
-	let (status, headers, bytes) = send(router, post_json("/api/v1/downsample/parquet", None, &downsample_body)).await;
+	let (status, headers, bytes) = send(router, post_json("/api/v1/downsample/parquet", Some(READER_KEY), &downsample_body)).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "application/vnd.apache.parquet");
 	assert_eq!(&bytes[..4], b"PAR1", "the Parquet file magic");
@@ -503,45 +503,45 @@ async fn ilp_compute_formats_carry_their_media_types() {
 	let router = secured_router().await.1;
 
 	// ILP interpolate JSON: application/json
-	let (status, headers, _) = send(router.clone(), post_text("/api/v1/interpolate/ilp?field=load&precision=s", None, ILP_BODY)).await;
+	let (status, headers, _) = send(router.clone(), post_text("/api/v1/interpolate/ilp?field=load&precision=s", Some(READER_KEY), ILP_BODY)).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "application/json");
 
 	// ILP interpolate CSV
-	let (status, headers, _) = send(router.clone(), post_text("/api/v1/interpolate/ilp/csv?field=load&precision=s", None, ILP_BODY)).await;
+	let (status, headers, _) = send(router.clone(), post_text("/api/v1/interpolate/ilp/csv?field=load&precision=s", Some(READER_KEY), ILP_BODY)).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "text/csv; charset=utf-8");
 
 	// ILP interpolate Arrow
-	let (status, headers, bytes) = send(router.clone(), post_text("/api/v1/interpolate/ilp/arrow?field=load&precision=s", None, ILP_BODY)).await;
+	let (status, headers, bytes) = send(router.clone(), post_text("/api/v1/interpolate/ilp/arrow?field=load&precision=s", Some(READER_KEY), ILP_BODY)).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "application/vnd.apache.arrow.stream");
 	assert_eq!(&bytes[..4], &[0xff, 0xff, 0xff, 0xff]);
 
 	// ILP interpolate Parquet
-	let (status, headers, bytes) = send(router.clone(), post_text("/api/v1/interpolate/ilp/parquet?field=load&precision=s", None, ILP_BODY)).await;
+	let (status, headers, bytes) = send(router.clone(), post_text("/api/v1/interpolate/ilp/parquet?field=load&precision=s", Some(READER_KEY), ILP_BODY)).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "application/vnd.apache.parquet");
 	assert_eq!(&bytes[..4], b"PAR1");
 
 	// ILP downsample JSON
-	let (status, headers, _) = send(router.clone(), post_text("/api/v1/downsample/ilp?field=load&precision=s", None, ILP_BODY)).await;
+	let (status, headers, _) = send(router.clone(), post_text("/api/v1/downsample/ilp?field=load&precision=s", Some(READER_KEY), ILP_BODY)).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "application/json");
 
 	// ILP downsample CSV
-	let (status, headers, _) = send(router.clone(), post_text("/api/v1/downsample/ilp/csv?field=load&precision=s", None, ILP_BODY)).await;
+	let (status, headers, _) = send(router.clone(), post_text("/api/v1/downsample/ilp/csv?field=load&precision=s", Some(READER_KEY), ILP_BODY)).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "text/csv; charset=utf-8");
 
 	// ILP downsample Arrow
-	let (status, headers, bytes) = send(router.clone(), post_text("/api/v1/downsample/ilp/arrow?field=load&precision=s", None, ILP_BODY)).await;
+	let (status, headers, bytes) = send(router.clone(), post_text("/api/v1/downsample/ilp/arrow?field=load&precision=s", Some(READER_KEY), ILP_BODY)).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "application/vnd.apache.arrow.stream");
 	assert_eq!(&bytes[..4], &[0xff, 0xff, 0xff, 0xff]);
 
 	// ILP downsample Parquet
-	let (status, headers, bytes) = send(router, post_text("/api/v1/downsample/ilp/parquet?field=load&precision=s", None, ILP_BODY)).await;
+	let (status, headers, bytes) = send(router, post_text("/api/v1/downsample/ilp/parquet?field=load&precision=s", Some(READER_KEY), ILP_BODY)).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(headers[header::CONTENT_TYPE], "application/vnd.apache.parquet");
 	assert_eq!(&bytes[..4], b"PAR1");
