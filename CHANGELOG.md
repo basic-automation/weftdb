@@ -18,6 +18,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   user+mount namespaces, mounts a 1 MiB tmpfs inside a namespace on capable hosts).
 
 ### Added
+- **Panic audit documented** — `docs/panic-audit.md` (see ### Documentation).
 
 - **Suspect-frame policy and a decode crash-loop breaker (#720, ROB-22).** Three new
   Tuning variables: `WEFT_SUSPECT_FRAME_POLICY` (closed enum: `skip`, `quarantine`,
@@ -33,6 +34,15 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 - **Document TimescaleDB percentile internals and the like-for-like plan.** `percentile_agg()` wraps a UDDSketch at 200 buckets / 0.001 max error; the research note with source URLs and the measurement plan is at `docs/research/timescale-percentile.md` (#732).
 - **Restore a whole store into a chosen new root over HTTP** (`POST /api/v1/storage/restore/into?label=&name=`), guarded by `WEFT_RESTORE_BASE_DIR` and a containment check that refuses destinations inside the backup base.
+
+### Documentation
+
+- **Panic audit on server paths.** `docs/panic-audit.md` inventories every
+  panic-capable construct reachable from HTTP handlers, with reachability
+  verdicts (OK-safe, test-only, unreachable, needs-fix) for each site. No
+  needs-fix sites were found; the one candidate,
+  `weftdb/src/types/database/outputs.rs` in `analyze_point`, was cleared on
+  review because `anyhow::bail!` returns an `Err` rather than panicking (#242).
 
 ### Fixed
 
