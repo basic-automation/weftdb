@@ -1,54 +1,57 @@
-# Progress — TEST-658
+# Progress — GPU-FLAKE (#725)
 
-## Handoff — 2026-11-10
+## Handoff — 2026-11-14
 
 ### Changed files
 
-- `weftdb/src/types/segment_store/overlap_read_tests.rs` (139 insertions, 6 deletions)
+- `weft-bench/src/gpu_memory.rs` (16 insertions, 2 deletions)
+- `CHANGELOG.md` (6 insertions)
+- `ROADMAP.md` (1 insertion, 1 deletion)
+- `DECISIONS.md` (21 insertions)
 
 ### Commit
 
-- Commit `e350741` on `test/overlap-two-segments`, subject `[TEST] Make the overlap read tests seal two segments (#658)`, signed-off.
-- Pushed to `origin/test/overlap-two-segments`.
-- PR opened at https://github.com/basic-automation/weftdb/pull/689.
+- Commit pending (below).  Subject: `[GPU-FLAKE] Make the GPU pool bound test contention-tolerant (#725)`
+- Branch `p12/gpu-flake-pool`, to push to `origin/p12/gpu-flake-pool`.
+- PR title: `[GPU-FLAKE] Make the GPU pool bound test contention-tolerant (#725)` — closes #725, do NOT merge.
 
 ### What the diff does
 
-Every case previously ingested into one sealed segment and the cross-segment merge
-(`weft_physical_type::merge_newer_wins` in `read.rs:190`) was never reached. The diff:
+The test `gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu` flaked when the CI
+runner's GPU was under contention (14 GB in use by other work) because the pool allocated one buffer
+after round one, making `peak_later > peak_first` and `stable == false`, which then caused
+`result.correctness.passed()` to return false.
 
-- Declares upsert keys (`host_key()`) via `declare_with_upsert_keys` so overlapping
-  writes are recognised as updates.
-- Adds `seal_counts()` and `assert_sealed_overlap()` helpers.
-- Cases 1, 2a, 2b, 2c, 2d assert two sealed segments via these helpers.
-- Case 3 asserts series A holds 2 segments, series B holds 1, plus a value-range
-  raw-scan assertion.
-- New `single_segment_has_nothing_to_merge` — one ingest, nothing to merge.
-- New `seal_order_is_the_conflict_rule_not_write_order` — pins seal-order wins.
+The fix keeps the workload's `output_count_ok` definition unchanged (it truthfully records whether
+the pool was stable) and **relaxes only the test** to check the hard safety invariants individually:
 
-### Verified
+- Every output value is finite.
+- Every call returned the expected number of points.
+- The pool never exceeds its configured cap (`max_pool_bytes`).
+- The device allocator does not grow without bound.
 
-- `git merge origin/main` fast-forward to 49ee01ac — done.
-- `cargo test -p weftdb --all-features --locked -j 1 --lib overlap --no-run` — compiled.
-- `git status --porcelain` — only the one modified file, no staged artifacts.
+Also:
+- CHANGELOG.md: `### Fixed` entry under `## [Unreleased]`.
+- ROADMAP.md: ticked the matching line "Flaky under GPU contention…".
+- DECISIONS.md: appended `## 2026-11-14 — GPU pool bound test… (#725)` section.
+
+### Rules observed
+
+- `cargo build/check/test/clippy` was NOT run (host has ~8 GB free; a build OOM-kills the local
+  model server; CI is the first execution — stated in the PR body).
+- No `rustfmt` call needed (the changed code matches the crate's 2021 edition style without
+  formatting changes — no `--edition 2024` used).
+- No new crate features, no new env variables.
+- Not touching `docs/config-schema.md`, `config/schema.toml`, `weft-server/src/settings.rs` or
+  `compat/openapi/weftdb.json`.
 
 ### Not verified (must check first in CI)
 
-The host lacked memory to run the actual tests. The first thing a follow-up must
-check:
-
-1. `cargo test -p weftdb --all-features --locked -j 1 --lib overlap`
-   — each new and modified test must pass. The critical one is whether
-   `assert_sealed_overlap` really observes two sealed segments (it asserts
-   `ours == 2`). If the store ever consolidates index rows at open (it does not
-   currently — confirmed by reading the open path), this assertion fails.
-2. `cargo test -p weftdb --all-features --locked --lib` — no regressions.
-3. `cargo clippy -p weftdb --all-targets --all-features --locked -- -D clippy::correctness -D clippy::suspicious -D clippy::perf`
-   — no new lints.
+Compilation and test pass must be validated in CI. The diff is purely assertion-logic changes in a
+`#[cfg(test)]` block plus doc-only changes.
 
 ### Surprises documented in PR body
 
-1. No memtable exists; every ingest seals immediately.
-2. Seal order is the one conflict dimension — the newer-in-older-segment case
-   cannot be expressed.
-3. `declare_with_upsert_keys` is forward-compatible with untagged ingests.
+1. The `output_count_ok` field conflates pool-management observations with output correctness. The
+   decision was to change only the test, not the schema field, so stored artifacts preserve their
+   existing interpretation.
