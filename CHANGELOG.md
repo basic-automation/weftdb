@@ -18,6 +18,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   user+mount namespaces, mounts a 1 MiB tmpfs inside a namespace on capable hosts).
 
 ### Added
+- **Panic audit documented** — `docs/panic-audit.md` (see ### Documentation).
 
 - **Suspect-frame policy and a decode crash-loop breaker (#720, ROB-22).** Three new
   Tuning variables: `WEFT_SUSPECT_FRAME_POLICY` (closed enum: `skip`, `quarantine`,
@@ -32,8 +33,25 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   cannot spin the background decode loop forever.
 - **Restore a whole store into a chosen new root over HTTP** (`POST /api/v1/storage/restore/into?label=&name=`), guarded by `WEFT_RESTORE_BASE_DIR` and a containment check that refuses destinations inside the backup base.
 
+### Documentation
+
+- **Panic audit on server paths.** `docs/panic-audit.md` inventories every
+  panic-capable construct reachable from HTTP handlers, with reachability
+  verdicts (OK-safe, test-only, unreachable, needs-fix) for each site. No
+  needs-fix sites were found; the one candidate,
+  `weftdb/src/types/database/outputs.rs` in `analyze_point`, was cleared on
+  review because `anyhow::bail!` returns an `Err` rather than panicking (#242).
+
 ### Fixed
 
+- **The settings registry caught up with the ENOSPC harness (#723).** #743 added a child
+  server process that reads `WEFT_ENOSPC_CHILD_ROOT` to find the scratch directory its
+  parent filled, but never registered the name, so the registry test that exists precisely
+  to stop that drift failed in `weft-server --lib` on every platform and turned the whole
+  test matrix red. The name is now registered as a Test-tier variable and documented with
+  it. Two `clippy::redundant_clone` errors — `weft-orchestration`'s `Distance` and
+  `weft-tui`'s `measurements` — were also cleared; both lints stayed hidden because clippy
+  stopped at the first failing crate.
 - **A `#[serial(key)]` on a test is no longer invisible to CI.** `scripts/ci/check-serial-order.py` matched
   only the plain `#[serial]` form, so the keyed form — the one that guards the process-global fault
   injectors — was never checked, and the rule it enforced ("must sit immediately above `#[test]`") was
