@@ -492,6 +492,15 @@ Three decisions are made and recorded: kdb+/KDB-X is excluded from every publish
     own runs. The KX Benchmarking Agreement page the roadmap notes cited is a 404;
     the consent instrument has to be found through KX sales before any kdb+
     number is published.
+  - **Done 2026-11-15 as a draft policy** — [docs/benchmark-policy.md](benchmark-policy.md)
+    states the rules in force for engineers: self-hosted open-source servers
+    only, the replication set every published comparison must carry, the
+    `NOT_IN_SCOPE` gate treated as a legal surface (changing an entry needs a
+    citation with a fetch date in the same PR), kdb+ and AVEVA PI excluded until
+    their vendors respond, and no competitor run under an evaluation or
+    non-commercial licence without a recorded counsel sign-off. Marked **draft
+    for counsel review**: it gives counsel something concrete to correct, and it
+    settles none of the counsel items.
   - **Open with counsel:** the codec patents and licences (#386 and the ungated
     advisory codecs at `ROADMAP.md:138`), the missing `NOTICE` and
     third-party-terms file for the Elastic-licensed `aggs-for-timeseries` pin,

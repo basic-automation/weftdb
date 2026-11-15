@@ -44,7 +44,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Documentation
 
-- **Panic audit on server paths.** `docs/panic-audit.md` inventories every
+- **Benchmark policy.** `docs/benchmark-policy.md` turns the legal review into
+  rules an engineer can follow: which engines may be raced and under what
+  licence, what every published comparison must carry to be reproducible, why
+  kdb+ and AVEVA PI stay out of scope until their vendors answer, and which
+  questions are still counsel's. Marked draft for counsel review (#245); no
+  counsel item is settled by it.
+ `docs/panic-audit.md` inventories every
   panic-capable construct reachable from HTTP handlers, with reachability
   verdicts (OK-safe, test-only, unreachable, needs-fix) for each site. No
   needs-fix sites were found; the one candidate,
