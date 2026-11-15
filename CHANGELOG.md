@@ -18,6 +18,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   user+mount namespaces, mounts a 1 MiB tmpfs inside a namespace on capable hosts).
 
 ### Added
+- **Panic audit documented** — `docs/panic-audit.md` (see ### Documentation).
 
 - **Store-level row TTL/expiry cut 1 (#722).** `RowExpiryPolicy` (two variants:
   `NoExpiry` and `Ttl { ttl: u64 }`) configurable via
@@ -38,6 +39,15 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   cannot spin the background decode loop forever.
 - **Restore a whole store into a chosen new root over HTTP** (`POST /api/v1/storage/restore/into?label=&name=`), guarded by `WEFT_RESTORE_BASE_DIR` and a containment check that refuses destinations inside the backup base.
 
+### Documentation
+
+- **Panic audit on server paths.** `docs/panic-audit.md` inventories every
+  panic-capable construct reachable from HTTP handlers, with reachability
+  verdicts (OK-safe, test-only, unreachable, needs-fix) for each site. No
+  needs-fix sites were found; the one candidate,
+  `weftdb/src/types/database/outputs.rs` in `analyze_point`, was cleared on
+  review because `anyhow::bail!` returns an `Err` rather than panicking (#242).
+
 ### Fixed
 
 - **The settings registry caught up with the ENOSPC harness (#723).** #743 added a child
@@ -48,6 +58,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   it. Two `clippy::redundant_clone` errors — `weft-orchestration`'s `Distance` and
   `weft-tui`'s `measurements` — were also cleared; both lints stayed hidden because clippy
   stopped at the first failing crate.
+
+- **A client disconnect during an ingest body reads as `400 bad_request`, not `408 body_timeout` (#742).** The body read now distinguishes a stream that ends before its declared `Content-Length` (peer disconnect) from one that stalls past the deadline. The disconnect produces `400 bad_request` (keeping `Code::BadRequest` — the 43-code table is frozen); the timeout stays `408 body_timeout`. A distinct `tracing::info!` line at the seam records the mismatch for operators. The commit phase is not cancellable by disconnect: the 4xx is returned *before* the `IngestPhase` scope wraps the read.
 - **A `#[serial(key)]` on a test is no longer invisible to CI.** `scripts/ci/check-serial-order.py` matched
   only the plain `#[serial]` form, so the keyed form — the one that guards the process-global fault
   injectors — was never checked, and the rule it enforced ("must sit immediately above `#[test]`") was

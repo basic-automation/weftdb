@@ -6972,6 +6972,27 @@ usability defects on those platforms, and a test that compares a canonical path 
 would have hidden the next such defect rather than catching it. The tests now compare canonical forms
 of both sides, which is what they always meant to assert.
 
+## 2026-11-14 — A client disconnect during an ingest body is a 4xx, not a new wire code (#742)
+
+**Q:** Does a client disconnect during an ingest body need a new `Code` variant?
+
+**Evidence:** The code table at `weft-server/src/error.rs:1139` (`TABLE.len() == 43`) is a frozen contract.
+Adding one means updating `docs/config-schema.md`, `compat/openapi/weftdb.json` and the CI (
+checker in the same commit — a coordination cost with no upstream client dependency.
+The issue found no client that branches on the distinction, and the frozen 43-code table sums to
+43 because every existing variant has a client that reads it.
+
+**A:** No new `Code` variant. The existing `Code::BadRequest` (400) is the right map for a body the
+peer stopped sending — the same code the route already uses for an unreadable/truncated body
+(`ingest.rs:470`). The causes are separated at the seam (`IngestBody::from_request`, the timeout call):
+
+1. The body read succeeds but the received length is less than the declared `Content-Length` →
+   `400 bad_request` with a `tracing::info!` line recording the mismatch.
+2. The `tokio::time::timeout` fires before the stream ends → `408 body_timeout` (unchanged).
+
+The 4xx is produced in `from_request` *before* the `IngestPhase` scope wraps the read, so the §4
+5xx redaction rule (`error.rs:420-430`) cannot overwrite it.
+
 ## 2026-11-14 — Real-filesystem ENOSPC evidence (#723)
 
 **Strategy A (mount a tmpfs inside a namespace) cannot prove anything on this host.**
@@ -6989,6 +7010,7 @@ This slice pins the server's HTTP decision on top of the injectable space source
 
 **CI is the first execution.** This slice was never compiled or run locally — the host cannot
 carry a `cargo build`, so every test in `weft-server/tests/enospc_real_fs.rs` runs first in CI.
+## 2026-11-14 — ROB-20: what maintenance budgets and merging actually do today (#445)
 
 ## 2026-11-14 — Store-level row TTL/expiry cut 1 (#722)
 
@@ -7014,3 +7036,76 @@ no weft-server wiring, no OpenAPI/config-schema change.
 **CI is the first execution.** Cut 1 was never compiled or run locally — the host cannot carry
 a `cargo build`, so every test runs first in CI.
 
+**Three axes, three independent statuses.** The 1.0 plan's §6 W9 groups "Maintenance resource limits,
+k-way merge and re-splitting of oversized frames" as a single lane. The audit shows they are disjoint:
+
+| Axis | Status | Evidence `file:line` |
+|---|---|---|
+| Maintenance resource limits / budgets | **Mostly missing** — the disk guard excludes maintenance writes (`seal.rs:1093` vs no call in `swap_plans` at `seal.rs:348`); no per-op byte/memory/time budget exists; `MaintenanceBreaker` (`segment_store.rs:696`) is a circuit breaker for sweep failures, not a resource budget | `docs/maintenance-budgets-plan.md §1.1` |
+| k-way merge | **Not shipped** — the merge is pairwise serial fold (`fold_newest_wins` at `segment_store.rs:1065` calling two-pointer `merge_newer_wins` at `split.rs:147` iteratively) | `docs/maintenance-budgets-plan.md §1.2` |
+| Re-splitting of oversized frames | **Partial** — the overlap-merge split path exists (Phase 4.6, `reconcile_overlaps_with_policy` at `maint.rs:1071`), but automatic size-driven resplit is missing; `split_segment` (`maint.rs:634`) is operator-only, never called from any daemon | `docs/maintenance-budgets-plan.md §1.3` |
+
+**The cut proposed.** The plan in `docs/maintenance-budgets-plan.md` orders five slices: disk guard
+coverage for maintenance writes (G2), maintenance byte budget (G1), k-way merge (G3), automatic resplit
+of oversized frames (G4), and per-op time budget (G5). G2 is the smallest risk and the largest guard
+against data-loss; it should ship first. G4 changes the segment count and needs the most validation.
+ROADMAP.md:85 stays unticked until the behaviours ship.
+
+## 2026-11-14 — Panic audit scope and verdicts (P242, #242)
+
+**Scope: every production `.rs` reachable from server request handlers, static-grep only.**
+No build or runtime test was run (and must not be — the build OOM-kills the local model
+server on this host). All verdicts are based on static analysis of the source alone.
+
+**Verdicts assigned by reachability and triggerability:**
+1. **OK, safe** — reachable from a catch boundary but verified safe by construction (e.g.,
+   SHA-256 `hash[..8]` always fits `[u8; 8]`).
+2. **OK, test-only** — behind `#[cfg(test)]`, `#[tokio::test]` or a `mod tests` block.
+3. **OK, unreachable from catch** — dead production code, control-plane-only (aborted by
+   ROB-2 before the catch layer), or daemon-only with a task restart boundary.
+4. **NEEDS-FIX** — reachable from a catch boundary and a user payload could realistically
+   trigger the panic.
+
+**Key decisions made during the audit:**
+
+| Question | Decision | Rationale |
+|----------|----------|-----------|
+| Is `bail!()` in `analyze_point` (outputs.rs:376) a NEEDS-FIX? | No | It is `anyhow::bail`, which expands to `return Err(anyhow!(…))` (`anyhow-1.0.104/src/macros.rs:58`), and `analyze_point` returns `anyhow::Result<Point>`. An empty result set therefore propagates an `Err`; nothing panics. An earlier revision of this section said "`bail!()` expands to `panic!()`" — that was wrong; see the 2026-11-14 correction section. |
+| Are daemon panics marked NEEDS-FIX? | No | Daemons run under `daemons.rs` supervision: a panic kills only that async task, the supervisor restarts it. ROB-2 crash-consistency tests validate that control-plane writes survive a mid-write crash. The audit marks daemon-only sites as **OK, safe**. |
+| Is `sweep_stale_staging`'s `.unwrap()` on `duration_since` a concern? | No | Daemon-only (backup sweep) with task restart boundary. |
+| Are the `CapturedLog` / `SpanLog` `expect()` calls production code? | No | Both are defined inside `#[cfg(test)]` blocks (reconcile_daemon.rs:444, storage.rs:1351). |
+
+**Result:** 0 NEEDS-FIX. The one candidate (`weftdb/src/types/database/outputs.rs`) was
+cleared on review — see the correction section below. Issue #748 was filed from the
+mistaken premise and closed as not-a-bug.
+
+## 2026-11-14 — Correction: `anyhow::bail!` returns an `Err`, it does not panic (#242)
+
+**What was wrong.** The panic audit above reported one NEEDS-FIX: `bail!("No measurements
+found for aspect")` in `analyze_point`, on the stated ground that `bail!()` "expands to
+`panic!()`". It does not.
+
+**Evidence.** `weftdb/src/types/database/outputs.rs:3` imports `bail` from `anyhow`, and
+`anyhow-1.0.104/src/macros.rs:58` is:
+
+```rust
+macro_rules! bail {
+    ($msg:literal $(,)?) => {
+        return $crate::__private::Err($crate::__anyhow!($msg))
+    };
+```
+
+`analyze_point` returns `anyhow::Result<Point>`, so the site returns an `Err` that reaches
+the caller and renders as an ordinary API error. The `.first().unwrap()` / `.last().unwrap()`
+at lines 401–402 are guarded by that same early return, so they are safe by construction.
+The audit now marks the site **OK, safe**, its NEEDS-FIX count is 0, and issue #748 — the
+follow-up filed from the false premise — is closed as `not_planned`.
+
+**Why this was caught and what it means for the method.** The claim came from reading the
+macro's name, not its definition: a static grep for `bail!` finds a call site with no
+reachable body, and the audit's own rule ("backed by an actual read of the call path") was
+satisfied by an assumption about the macro instead. For any construct whose behaviour lives
+in a macro expansion, read the macro definition (or the vendored crate source) before
+assigning a verdict; a NEEDS-FIX verdict that rests on a macro's name alone is not evidence.
+This matters most for false positives here: a wrong NEEDS-FIX spends a follow-up issue and
+an unnecessary code change on a path that is already correct.
