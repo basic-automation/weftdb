@@ -7012,7 +7012,6 @@ This slice pins the server's HTTP decision on top of the injectable space source
 carry a `cargo build`, so every test in `weft-server/tests/enospc_real_fs.rs` runs first in CI.
 ## 2026-11-14 — ROB-20: what maintenance budgets and merging actually do today (#445)
 
-<<<<<<< HEAD
 ## 2026-11-14 — Store-level row TTL/expiry cut 1 (#722)
 
 **Store-wide policy only; per-aspect policies deferred to cut 2.** The `RowExpiryPolicy` enum
@@ -7036,7 +7035,7 @@ no weft-server wiring, no OpenAPI/config-schema change.
 
 **CI is the first execution.** Cut 1 was never compiled or run locally — the host cannot carry
 a `cargo build`, so every test runs first in CI.
-=======
+
 ## 2026-11-14 — GPU pool bound test: check safety invariants instead of strict stability (#725)
 
 The test `gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu` flaked when the CI
@@ -7057,7 +7056,6 @@ part of the persisted benchmark schema and conflates a pool-management observati
 correctness — but a schema change would touch every stored `BenchResult`'s interpretation.  The test
 is the right fix location because the workload function continues to report the truth (the pool was
 not stable under contention), while the test accepts that truth as valid behavior.
->>>>>>> origin/main
 
 **Three axes, three independent statuses.** The 1.0 plan's §6 W9 groups "Maintenance resource limits,
 k-way merge and re-splitting of oversized frames" as a single lane. The audit shows they are disjoint:
