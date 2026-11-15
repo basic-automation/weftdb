@@ -1980,7 +1980,7 @@ mod maint;
 mod mapped;
 mod open;
 mod read;
-mod row_expiry;
+pub mod row_expiry;
 mod seal;
 mod stats;
 

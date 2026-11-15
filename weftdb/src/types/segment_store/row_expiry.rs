@@ -101,14 +101,6 @@ pub fn expired_cutoff(policy: &RowExpiryPolicy, now_ns: i64, unit: &TimeUnit) ->
 	}
 }
 
-/// The raw TTL duration in the aspect's time unit, or `None` for no expiry.
-pub fn raw_ttl(policy: &RowExpiryPolicy) -> Option<u64> {
-	match policy {
-		RowExpiryPolicy::NoExpiry => None,
-		RowExpiryPolicy::Ttl { ttl } => Some(*ttl),
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Sweep report types
 // ---------------------------------------------------------------------------
@@ -329,15 +321,6 @@ mod tests {
 		// Negative now (before epoch) with large TTL.
 		let policy_big = RowExpiryPolicy::Ttl { ttl: 10_000_000_000_000_000 };
 		assert_eq!(expired_cutoff(&policy_big, ns(-500), &unit), i64::MIN, "very large TTL underflows");
-	}
-
-	// ── Raw TTL ──────────────────────────────────────────────────────────
-
-	#[test]
-	fn raw_ttl_returns_correct_values() {
-		assert_eq!(raw_ttl(&RowExpiryPolicy::NoExpiry), None);
-		assert_eq!(raw_ttl(&RowExpiryPolicy::Ttl { ttl: 0 }), Some(0));
-		assert_eq!(raw_ttl(&RowExpiryPolicy::Ttl { ttl: 3600 }), Some(3600));
 	}
 
 	// ── Sweep report types ───────────────────────────────────────────────

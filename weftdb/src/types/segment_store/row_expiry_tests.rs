@@ -13,7 +13,7 @@ use weft_physical_type::{timestamp::TimeUnit, AspectSchema, PhysicalType};
 
 use super::{SegmentStore, SegmentStoreOptions};
 use crate::{
-	segment_store::row_expiry::{expired_cutoff, raw_ttl, RowExpiryPolicy}, IngestBatch
+	segment_store::row_expiry::{expired_cutoff, RowExpiryPolicy}, IngestBatch
 };
 
 fn bd(s: &str) -> BigDecimal {
@@ -221,10 +221,7 @@ async fn ttl_smaller_than_close_window_is_safe() {
 // ── RowExpiryPolicy helpers unit check (integration-level validation) ─────
 
 #[tokio::test]
-async fn raw_ttl_and_expired_cutoff_work() {
-	assert_eq!(raw_ttl(&RowExpiryPolicy::NoExpiry), None);
-	assert_eq!(raw_ttl(&RowExpiryPolicy::Ttl { ttl: 3600 }), Some(3600));
-
+async fn expired_cutoff_works() {
 	let cutoff = expired_cutoff(&RowExpiryPolicy::Ttl { ttl: 10 }, ns(100), &TimeUnit::Seconds);
 	assert_eq!(cutoff, 90, "cutoff = 100 - 10");
 
