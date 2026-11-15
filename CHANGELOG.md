@@ -28,9 +28,10 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 - **Panic audit on server paths.** `docs/panic-audit.md` inventories every
   panic-capable construct reachable from HTTP handlers, with reachability
-  verdicts (OK-safe, test-only, unreachable, needs-fix) for each site. One
-  needs-fix found: `weftdb/src/types/database/outputs.rs:383` uses
-  `bail!()` instead of propagating an `Err` (#242).
+  verdicts (OK-safe, test-only, unreachable, needs-fix) for each site. No
+  needs-fix sites were found; the one candidate,
+  `weftdb/src/types/database/outputs.rs` in `analyze_point`, was cleared on
+  review because `anyhow::bail!` returns an `Err` rather than panicking (#242).
 
 ### Fixed
 

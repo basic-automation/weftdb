@@ -6944,10 +6944,42 @@ server on this host). All verdicts are based on static analysis of the source al
 
 | Question | Decision | Rationale |
 |----------|----------|-----------|
-| Is `bail!()` in `analyze_point` (outputs.rs:383) a NEEDS-FIX? | Yes | `bail!()` expands to `panic!()`. The function already returns `Result<Point>`, so a returned `Err` is the correct path. The caller hits this when no measurements exist for a requested aspect at a queried time — a normal condition, not a logic error. |
+| Is `bail!()` in `analyze_point` (outputs.rs:376) a NEEDS-FIX? | No | It is `anyhow::bail`, which expands to `return Err(anyhow!(…))` (`anyhow-1.0.104/src/macros.rs:58`), and `analyze_point` returns `anyhow::Result<Point>`. An empty result set therefore propagates an `Err`; nothing panics. An earlier revision of this section said "`bail!()` expands to `panic!()`" — that was wrong; see the 2026-11-14 correction section. |
 | Are daemon panics marked NEEDS-FIX? | No | Daemons run under `daemons.rs` supervision: a panic kills only that async task, the supervisor restarts it. ROB-2 crash-consistency tests validate that control-plane writes survive a mid-write crash. The audit marks daemon-only sites as **OK, safe**. |
 | Is `sweep_stale_staging`'s `.unwrap()` on `duration_since` a concern? | No | Daemon-only (backup sweep) with task restart boundary. |
 | Are the `CapturedLog` / `SpanLog` `expect()` calls production code? | No | Both are defined inside `#[cfg(test)]` blocks (reconcile_daemon.rs:444, storage.rs:1351). |
 
-**Result:** 1 NEEDS-FIX found (`weftdb/src/types/database/outputs.rs:383`). GitHub issue
-`#p242-fix-outputs-bail` opened.
+**Result:** 0 NEEDS-FIX. The one candidate (`weftdb/src/types/database/outputs.rs`) was
+cleared on review — see the correction section below. Issue #748 was filed from the
+mistaken premise and closed as not-a-bug.
+
+## 2026-11-14 — Correction: `anyhow::bail!` returns an `Err`, it does not panic (#242)
+
+**What was wrong.** The panic audit above reported one NEEDS-FIX: `bail!("No measurements
+found for aspect")` in `analyze_point`, on the stated ground that `bail!()` "expands to
+`panic!()`". It does not.
+
+**Evidence.** `weftdb/src/types/database/outputs.rs:3` imports `bail` from `anyhow`, and
+`anyhow-1.0.104/src/macros.rs:58` is:
+
+```rust
+macro_rules! bail {
+    ($msg:literal $(,)?) => {
+        return $crate::__private::Err($crate::__anyhow!($msg))
+    };
+```
+
+`analyze_point` returns `anyhow::Result<Point>`, so the site returns an `Err` that reaches
+the caller and renders as an ordinary API error. The `.first().unwrap()` / `.last().unwrap()`
+at lines 401–402 are guarded by that same early return, so they are safe by construction.
+The audit now marks the site **OK, safe**, its NEEDS-FIX count is 0, and issue #748 — the
+follow-up filed from the false premise — is closed as `not_planned`.
+
+**Why this was caught and what it means for the method.** The claim came from reading the
+macro's name, not its definition: a static grep for `bail!` finds a call site with no
+reachable body, and the audit's own rule ("backed by an actual read of the call path") was
+satisfied by an assumption about the macro instead. For any construct whose behaviour lives
+in a macro expansion, read the macro definition (or the vendored crate source) before
+assigning a verdict; a NEEDS-FIX verdict that rests on a macro's name alone is not evidence.
+This matters most for false positives here: a wrong NEEDS-FIX spends a follow-up issue and
+an unnecessary code change on a path that is already correct.
