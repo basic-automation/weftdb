@@ -7134,7 +7134,6 @@ scope creep on a PR whose mandate was contract coverage of what #681 already shi
 belong in a future slice** that also owns the error-taxonomy, config-schema, and OpenAPI updates
 a new `Code` variant requires.
 
-<<<<<<< HEAD
 ## 2026-11-15 — COMPAT-1: FRE-13 upgrade leg (implemented)
 
 Added `v010_compat_fre13_upgrade_contract` to `weftdb/tests/compat_v010.rs`. The test:
@@ -7189,7 +7188,7 @@ Test passed when run directly:
 $ compat_v010-* -- v010_compat_fre13_rollback_after_writes_loses_nothing
 test v010_compat_fre13_rollback_after_writes_loses_nothing ... ok
 ```
-=======
+
 ## 2026-11-14 — TimescaleDB's default percentile aggregate and the like-for-like comparison plan (#732)
 
 **The item asked: is TimescaleDB's `percentile_agg()` a UDDSketch, and what is the concrete
@@ -7220,4 +7219,3 @@ variant to `sketch_collapse` and running it on a quiet host) for the next worker
 bench builds.** The research note contains the concrete comparison plan, the primary-source
 URLs for every claim, and the closed-form estimate that the BTC corpus needs about 5
 collapses and lands near 3.2% error — against the 1% `sketch_p99` holds without collapsing.
->>>>>>> origin/main
