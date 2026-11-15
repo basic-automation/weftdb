@@ -35,7 +35,7 @@ use std::{
 
 use bigdecimal::BigDecimal;
 use weft_physical_type::{PhysicalType, TimeUnit};
-use weftdb::{SegmentStore, StoreError, SUPPORTED_LAYOUT};
+use weftdb::{SegmentStore, StoreError, StoreFormat, STORE_FORMAT_FILE, SUPPORTED_LAYOUT};
 
 /// The committed fixture set, relative to this crate.
 fn fixture() -> PathBuf {
@@ -730,6 +730,81 @@ async fn v010_compat_fre13_upgrade_contract() {
 	// New data persisted through reopen.
 	let (reopen_ts, _reopen_vals) = store2.read_time_range("flow", 1_800_000_000, 1_800_000_200).await.expect("reading post-upgrade data after reopen");
 	assert_eq!(reopen_ts, new_ts, "post-upgrade data persisted through reopen (timestamps match)");
+
+	drop(store2);
+}
+
+/// Leg C (rollback after writes) of the FRE-13 / PAC-14a upgrade contract.
+///
+/// A store opened at the current layout, written to, must refuse to be reopened
+/// by a build that does not know that layout, and the refusal must not have
+/// damaged the store: after a refused open the store still opens with the
+/// current build and every row written before the refusal reads back.
+///
+/// A real older binary cannot be invoked from a test (no v0.1.0 binary artifact
+/// is available in CI), so leg C is expressed as the layout-floor contract the
+/// store already enforces: write with the current SUPPORTED_LAYOUT, tamper the
+/// STORE_FORMAT marker's min_write_layout to a value above SUPPORTED_LAYOUT,
+/// assert the store refuses the open (StoreError::IncompatibleLayout), restore
+/// the marker, and assert the store reopens clean and the pre-refusal data
+/// reads back.  The min_write_layout tamper simulates what an older binary
+/// would see when it loads a marker from a newer build that set a higher
+/// floor; the actual v0.1.0 binary (layout 1) does not run.
+#[tokio::test]
+async fn v010_compat_fre13_rollback_after_writes_loses_nothing() {
+	let store_dir = tempfile::tempdir().expect("tempdir for the copied store");
+	copy_tree(&fixture().join("store"), store_dir.path());
+
+	// Phase 1 — open the fixture (triggers layout 1→2 upgrade), write new data.
+	let store = SegmentStore::open(store_dir.path()).await.expect("this build opens a v0.1.0 store");
+	assert_eq!(
+		store.store_format().layout_version,
+		SUPPORTED_LAYOUT,
+		"the store upgraded to SUPPORTED_LAYOUT"
+	);
+
+	let new_ts = vec![1_800_000_000i64, 1_800_000_060i64, 1_800_000_120i64];
+	let new_vals = vec![bd("200"), bd("210"), bd("220")];
+	store.seal_declared("flow", &new_ts, &new_vals).await.expect("writing new data after the upgrade");
+	drop(store);
+
+	// Phase 2 — tamper the marker so it claims a floor above SUPPORTED_LAYOUT.
+	let marker_path = store_dir.path().join(STORE_FORMAT_FILE);
+	let original_bytes = std::fs::read(&marker_path).unwrap();
+	let mut format: StoreFormat = serde_json::from_slice(&original_bytes).expect("decoding the marker into StoreFormat");
+	format.min_write_layout = 99;
+	std::fs::write(&marker_path, serde_json::to_vec(&format).expect("encoding the tampered marker")).expect("writing the tampered marker");
+
+	// Phase 3 — the open must refuse: this simulates what the real rollback
+	// scenario would do (an older binary meeting a newer build's floor).
+	let Err(error) = SegmentStore::open(store_dir.path()).await else {
+		panic!("a store with min_write_layout=99 (>SUPPORTED_LAYOUT) must be refused with IncompatibleLayout")
+	};
+	let typed = error.downcast_ref::<StoreError>().unwrap_or_else(|| {
+		panic!("the refusal is typed as StoreError, not a sentence: {error:#}")
+	});
+	let StoreError::IncompatibleLayout { min_write, supported } = typed else {
+		panic!("the refusal is IncompatibleLayout, not {error:#}")
+	};
+	assert_eq!(min_write, 99, "the error reports the tampered floor");
+	assert_eq!(supported, SUPPORTED_LAYOUT, "the error reports this build's supported layout");
+
+	// Phase 4 — restore the original marker, reopen, and verify data integrity.
+	std::fs::write(&marker_path, &original_bytes).expect("restoring the original marker");
+	let store2 = SegmentStore::open(store_dir.path()).await.expect("reopen after restoring the marker");
+
+	// New data written before the refused open reads back.
+	let (reopen_ts, _reopen_vals) = store2.read_time_range("flow", 1_800_000_000, 1_800_000_200).await.expect("reading post-upgrade data after the refused open");
+	assert_eq!(reopen_ts, new_ts, "post-upgrade data persisted through the refused open");
+
+	// Old (pre-upgrade) data still reads back.
+	let price_again = store2.read_point("price", 1_767_225_660).await.expect("reading old price after the refused open").expect("old price still exists");
+	assert_eq!(canonical(&price_again.to_string()), "102", "pre-upgrade data survived the refused open (price=102)");
+
+	// The reopen report shows no migration ran (the upgrade was already settled).
+	let report2 = store2.open_report().clone();
+	assert_eq!(report2.migrated_from, None, "the reopened store reports no migration");
+	assert!(report2.applied.is_empty(), "no migrations run on the reopened store");
 
 	drop(store2);
 }

@@ -7019,3 +7019,29 @@ Test passed when run directly:
 $ compat_v010-* -- v010_compat_fre13_upgrade_contract
 test v010_compat_fre13_upgrade_contract ... ok
 ```
+
+## 2026-11-15 — COMPAT-2: PAC-14a rollback leg C (implemented)
+
+Added `v010_compat_fre13_rollback_after_writes_loses_nothing` to
+`weftdb/tests/compat_v010.rs`. The test:
+
+- Opens the v0.1.0 fixture (triggers layout 1→2 upgrade), writes new flow data,
+  and closes.
+- Tampers `STORE_FORMAT` marker `min_write_layout` to `99` (above
+  `SUPPORTED_LAYOUT`), simulating what a newer binary would record.
+- Asserts the open is refused with `StoreError::IncompatibleLayout` containing
+  the tampered floor and the current supported layout.
+- Restores the original marker, reopens, and asserts:
+  - New data written before the refusal reads back correctly
+  - Old (pre-upgrade) data still reads back (price=102)
+  - `open_report()`: `migrated_from == None`, `applied` is empty.
+
+Updated `UPGRADING.md` to describe what a rollback attempt does (refuses, loses
+nothing) and reference the test. Updated `CHANGELOG.md` to list both legs as
+implemented.
+
+Test passed when run directly:
+```
+$ compat_v010-* -- v010_compat_fre13_rollback_after_writes_loses_nothing
+test v010_compat_fre13_rollback_after_writes_loses_nothing ... ok
+```
