@@ -1395,7 +1395,8 @@ mod tests {
 	use tempfile::TempDir;
 	use tower::ServiceExt;
 	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
-	use weftdb::SegmentStore;
+	use weftdb::exec::{current_ingest_phase, ingest_phase_scope, set_ingest_phase};
+	use weftdb::{IngestPhase, SegmentStore};
 
 	use super::check_body_truncation;
 	use crate::{app_with_state, test_support::*, AppState};
@@ -2621,5 +2622,56 @@ mod tests {
 		drop(state);
 		assert_eq!(body.reserved_bytes(), 100);
 		assert_eq!(body.bytes().len(), 100);
+	}
+
+	// ── DISCONNECT-1 P1: post-read truncation still maps to 4xx ──────────
+
+	#[tokio::test]
+	async fn check_body_truncation_inside_ingest_phase_scope_is_still_4xx() {
+		// Proves acceptance test #3 of the brief: a truncation discovered
+		// after the request has moved past the read phase — while the
+		// IngestPhase scope is Validating or later — still yields
+		// 400 bad_request, not 500 commit_failed.
+		//
+		// This is a seam test (brief option 2) because an integration test
+		// cannot force the truncation check to run after the body extractor:
+		// Phase 3 runs inside IngestBody::from_request, before any handler
+		// opens an ingest_phase_scope (which begins at commit_ingest). The
+		// seam drives check_body_truncation directly inside the scope.
+
+		// Phase: Validating (the initial scope state)
+		let err = ingest_phase_scope(async {
+			let phase = current_ingest_phase();
+			assert_eq!(phase, Some(IngestPhase::Validating), "scope starts at Validating");
+			let body = Bytes::from(vec![0u8; 50]);
+			check_body_truncation(&body, Some(100))
+		}).await.expect("scope must complete");
+
+		assert_eq!(err.code(), crate::error::Code::BadRequest);
+		assert_eq!(err.code().status(), StatusCode::BAD_REQUEST);
+		let msg = err.message();
+		assert!(msg.contains("50"), "message names received bytes");
+		assert!(msg.contains("100"), "message names declared bytes");
+
+		// Phase: Committing (after set_ingest_phase) — any pre-commit phase
+		// must also surface the 4xx rather than 500 commit_failed.
+		let err = ingest_phase_scope(async {
+			set_ingest_phase(IngestPhase::Committing);
+			let phase = current_ingest_phase();
+			assert_eq!(phase, Some(IngestPhase::Committing), "phase advanced to Committing");
+			let body = Bytes::from(vec![0u8; 30]);
+			check_body_truncation(&body, Some(200))
+		}).await.expect("scope must complete");
+
+		assert_eq!(err.code(), crate::error::Code::BadRequest);
+		assert_eq!(err.code().status(), StatusCode::BAD_REQUEST);
+		let msg = err.message();
+		assert!(msg.contains("30"), "message names received bytes");
+		assert!(msg.contains("200"), "message names declared bytes");
+
+		// Phase: None (not inside a scope) — the helper still returns 4xx.
+		let body = Bytes::from(vec![0u8; 5]);
+		let err = check_body_truncation(&body, Some(10)).expect("truncated body must produce an error");
+		assert_eq!(err.code(), crate::error::Code::BadRequest);
 	}
 }
