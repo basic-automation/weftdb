@@ -21,6 +21,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   file, a maintenance failure poisons a whole aspect, and the blast radii do not
   merge. The breaker trips per segment path with a cooldown, so one corrupt frame
   cannot spin the background decode loop forever.
+- **Restore a whole store into a chosen new root over HTTP** (`POST /api/v1/storage/restore/into?label=&name=`), guarded by `WEFT_RESTORE_BASE_DIR` and a containment check that refuses destinations inside the backup base.
 
 ### Fixed
 

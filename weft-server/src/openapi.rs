@@ -163,6 +163,9 @@ const QUARANTINE_QUERY: &[QueryParam] = &[query("aspect", false, "string", "Rest
 /// `RestoreDrillParams`: the restore drill's query half.
 const RESTORE_DRILL_QUERY: &[QueryParam] = &[query("label", true, "string", "The backup subdirectory to rehearse restoring, under the backup root, in the label grammar (`[A-Za-z0-9][A-Za-z0-9._-]{0,99}`, not ending with `.`).")];
 
+/// `RestoreIntoParams`: the restore-into endpoint's query half.
+const RESTORE_INTO_QUERY: &[QueryParam] = &[query("label", true, "string", "The backup subdirectory to restore, under the backup root, in the label grammar (`[A-Za-z0-9][A-Za-z0-9._-]{0,99}`, not ending with `.`)."), query("name", true, "string", "A single safe path segment naming the destination under the restore base directory. Non-empty, ≤ 200 bytes, `[A-Za-z0-9._-]+`, no `/`, no `\\`, no `..`, no leading `.`.")];
+
 /// `BackupParams`: the backup endpoint's query half.
 const BACKUP_QUERY: &[QueryParam] = &[query("label", false, "string", "A subdirectory name for this snapshot under the backup root, in the label grammar. Absent → a `manual-<unix_millis>` name is generated."), query("verify", false, "string", "`source` (default) cross-checks the copy against a fresh read of the live control plane — the strongest check, for a quiescent store; `snapshot` verifies the copy on its own terms, for an online backup taken while ingest continues.")];
 
@@ -360,6 +363,8 @@ fn annotation_for(operation_id: &str) -> Option<&'static OperationAnnotation> {
 		// Backup and the restore drill.
 		"storage_backup" => &OperationAnnotation { description: "Snapshot the whole store into a labelled subdirectory under the backup root, and verify the copy.", query: BACKUP_QUERY, selector: false, body: None, success: &[SuccessResponse { status: 200, media_type: JSON, schema: Some("BackupResponse"), description: "The snapshot directory, the per-database verification of the copy, the total rows and bytes, the verification mode, and how long the snapshot took." }] },
 		"storage_restore_drill" => &OperationAnnotation { description: "Rehearse restoring a backup into a throwaway directory, verify every restored database at its destination, and report what came back. The live store is never touched and nothing is overwritten.", query: RESTORE_DRILL_QUERY, selector: false, body: None, success: &[SuccessResponse { status: 200, media_type: JSON, schema: Some("RestoreDrillResponse"), description: "The backup rehearsed, the per-database verification of each restored file, the total rows and bytes, how long the rehearsal took, and whether the copy could be removed afterwards." }] },
+		// Backup and the restore into a new root.
+		"storage_restore_into" => &OperationAnnotation { description: "Restore a backup into a caller-chosen new root under the restore base directory, verify every restored database at its destination, and report what came back. The live store is never touched. Adoption is deferred to the restored root's first server open, or the offline CLI's `--adopt`.", query: RESTORE_INTO_QUERY, selector: false, body: None, success: &[SuccessResponse { status: 200, media_type: JSON, schema: Some("RestoreIntoResponse"), description: "The backup restored, the mode (whole_store or control_plane), the restored root, the per-database verification of each restored file, the total rows and bytes, and the next-step guidance." }] },
 		_ => return None,
 	};
 	Some(annotation)
@@ -1412,6 +1417,24 @@ fn add_backup_schemas(schemas: &mut Map<String, Value>) {
 			"required": ["label", "databases", "total_rows", "total_bytes", "duration_ms", "restorable"]
 		}),
 	);
+	schemas.insert(
+		"RestoreIntoResponse".to_string(),
+		json!({
+			"type": "object",
+			"description": "Response body for `POST /api/v1/storage/restore/into` — the outcome of restoring a backup into a caller-chosen new root.",
+			"properties": {
+				"backup_label": { "type": "string", "description": "The backup label that was restored." },
+				"restored_root": { "type": "string", "description": "The absolute path of the restored root directory." },
+				"mode": { "type": "string", "description": "`\"whole_store\"` or `\"control_plane\"`, chosen by the backup's manifest." },
+				"databases": { "type": "array", "items": { "$ref": "#/components/schemas/BackupDbReport" }, "description": "Per-database verification of each restored file, read back at its destination." },
+				"rows_verified": { "type": "integer", "description": "Total rows verified readable across the restored control plane." },
+				"bytes": { "type": "integer", "description": "Total on-disk size of the restored files in bytes." },
+				"elapsed_ms": { "type": "integer", "description": "Wall-clock milliseconds the restore itself took." },
+				"next_step": { "type": "string", "description": "What the operator should do next to serve the restored store." }
+			},
+			"required": ["backup_label", "restored_root", "mode", "databases", "rows_verified", "bytes", "elapsed_ms", "next_step"]
+		}),
+	);
 }
 
 /// Benchmark runs and Grafana: run manifests and the datasource protocol shapes.
@@ -2092,7 +2115,7 @@ mod tests {
 	/// here, and a POST listed here that gains a body fails here too.
 	#[test]
 	fn every_post_documents_its_body() {
-		let no_body_posts: &[&str] = &["storage_downsample_post", "storage_downsample_csv_post", "storage_downsample_arrow_post", "storage_downsample_parquet_post", "storage_reconcile_store", "storage_reconcile_aspect", "storage_squash_aspect", "storage_compact_aspect", "storage_fsck", "storage_quarantine_purge_expired", "storage_quarantine_release", "storage_quarantine_purge", "storage_backup", "storage_restore_drill"];
+		let no_body_posts: &[&str] = &["storage_downsample_post", "storage_downsample_csv_post", "storage_downsample_arrow_post", "storage_downsample_parquet_post", "storage_reconcile_store", "storage_reconcile_aspect", "storage_squash_aspect", "storage_compact_aspect", "storage_fsck", "storage_quarantine_purge_expired", "storage_quarantine_release", "storage_quarantine_purge", "storage_backup", "storage_restore_drill", "storage_restore_into"];
 		let document = generated();
 		let paths = document["paths"].as_object().expect("the document has a paths section");
 		for (path, item) in paths {

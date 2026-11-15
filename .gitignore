@@ -46,3 +46,6 @@ weft-audit.jsonl
 
 # Build/CI logs a local run wrote into the tree (#649 merged three of them).
 /*.log
+
+# Worker handoff notes are scratch, not repo content.
+.handoff-*.md
