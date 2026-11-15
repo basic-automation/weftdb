@@ -17,6 +17,16 @@
 - `cargo check --workspace` compiles cleanly (this includes the compat_v010 test file)
 - Full `cargo test --workspace` could not run on this host (memory constraints); CI will execute it
 
+### What was done in this cut
+
+- Added `v010_compat_fre13_rollback_after_writes_loses_nothing` to `compat_v010.rs` (leg C):
+  opens the v0.1.0 fixture, upgrades, writes, tampers `STORE_FORMAT` marker `min_write_layout`
+  to 99, asserts `IncompatibleLayout` refusal with the tampered floor and current supported
+  layout, restores marker, reopens, verifies new and old data survive.
+- Updated `UPGRADING.md` to describe what a rollback attempt does (refuses, loses nothing)
+  and reference the test. Updated `CHANGELOG.md` to list both legs as implemented.
+- Appended COMPAT-2 decision record to `DECISIONS.md`.
+
 ### What remains for the next cut
 - **Leg C (rollback after writes)** — not implemented, declared unsupported for 1.0
 - **UPGRADING.md prose** — operator documentation for the upgrade path
