@@ -69,7 +69,7 @@ The audit marks a site **NEEDS-FIX** if it is reachable from an HTTP handler pat
 
 | Line | Construct | Reachability | Verdict | Notes |
 |------|-----------|--------------|---------|-------|
-| 402 | `all_measurements.last().unwrap().timestamp()` | Query/analysis path via `analyze_point` | **NEEDS-FIX** | `all_measurements` is populated from paginated DB queries. After the window-expansion loop, `is_empty()` is guarded against at line 383 (`if all_measurements.is_empty() { bail! }`), so `last().unwrap()` is safe when reached. However, `bail!` (which expands to `panic!()`) itself is a hard panic; the error should be propagated as a `Result` instead. Fix: replace the `bail!` with a return that propagates an error. |
+| 402 | `all_measurements.last().unwrap().timestamp()` | Query/analysis path via `analyze_point` | **OK, safe** | `all_measurements` is populated from paginated DB queries. The `is_empty()` guard at line 376 (`if all_measurements.is_empty() { bail!(…) }`) makes the vector non-empty by line 402, so `first().unwrap()`/`last().unwrap()` cannot fire. The guard is not itself a panic: `bail!` is `anyhow::bail`, which expands to `return Err(anyhow!(…))` (see the *Cleared* section), and `analyze_point` returns `anyhow::Result<Point>`. |
 
 ### `weftdb/src/types/aspect.rs`
 
@@ -127,28 +127,42 @@ No production-path `assert!()` found outside `#[cfg(test)]` blocks.
 
 | Verdict | Count |
 |---------|-------|
-| **OK, safe** | 12 |
+| **OK, safe** | 13 |
 | **OK, unreachable from catch** | 1 (`aspect.rs:431`) |
 | **OK, test-only** | ~18 |
-| **NEEDS-FIX** | 1 (`outputs.rs:402` — `bail!` instead of returned error; also line 383) |
+| **NEEDS-FIX** | 0 |
 
 ---
 
-## Needs-fix details
+## Cleared during review
 
-### `weftdb/src/types/database/outputs.rs:383` — `bail!("No measurements found for aspect")`
+### `weftdb/src/types/database/outputs.rs:376` — `bail!("No measurements found for aspect")`
 
-**Location:** `analyze_point` method  
-**Trigger:** A query for a timestamp range that returns no measurements for a requested aspect.  
-**Fix:** Replace the `bail!` (which expands to `panic!()`) with a `return Err(...)`. This function already returns `Result<Point>`, so the path exists.  
-**Follow-up:** GitHub issue `#p242-fix-outputs-bail`.
+**Location:** `analyze_point`, which returns `anyhow::Result<Point>` (`use anyhow::{bail, Result};` at `outputs.rs:3`).
+
+An earlier revision of this audit filed this as NEEDS-FIX on the ground that `bail!`
+"expands to `panic!()`". **That is wrong**, and the correction matters: a panic here
+would be a real server defect, so the claim was checked against the macro source.
+`anyhow::bail` expands to a controlled error return — `anyhow-1.0.104/src/macros.rs:58`:
+
+```rust
+macro_rules! bail {
+    ($msg:literal $(,)?) => {
+        return $crate::__private::Err($crate::__anyhow!($msg))
+    };
+```
+
+So an empty result set propagates an `Err` to the caller, which renders it as an ordinary
+API error. There is no panic, nothing to fix, and the site is **OK, safe**.
 
 ### `weftdb/src/types/database/outputs.rs:402` — `all_measurements.last().unwrap().timestamp()`
 
 **Location:** Same `analyze_point` method, inside the same function.  
-**Trigger:** Reached only if `all_measurements` is non-empty (thanks to the guard at line 383), but depends on the guard not being a silent `panic!`. If the `bail!` is fixed to a returned error, this `.unwrap()` is safe (the non-emptiness is an invariant).  
-**Fix after bail fix:** No extra change needed — if line 383 returns an `Err`, the `.last().unwrap()` is unreachable when the Vec is empty.  
-**Follow-up:** Covered by the same issue as above.
+**Trigger:** Unreachable on an empty vector: the guard at line 376 returns an `Err` in that
+case (see above), so by line 402 `all_measurements` is non-empty and both `first().unwrap()`
+and `last().unwrap()` hold. **OK, safe.**
+
+**Follow-up:** issue #748, opened from the mistaken premise above, was closed as not-a-bug.
 
 ---
 
