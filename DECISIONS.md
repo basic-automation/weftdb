@@ -7174,7 +7174,6 @@ assigning a verdict; a NEEDS-FIX verdict that rests on a macro's name alone is n
 This matters most for false positives here: a wrong NEEDS-FIX spends a follow-up issue and
 an unnecessary code change on a path that is already correct.
 
-<<<<<<< HEAD
 ## 2026-11-14 — FRE-10a contract tests (FRE-10 half, PR #744)
 
 **Spec:** ROADMAP.md:88. "Contract tests: probes, compute endpoints, metrics and roles" — the first
@@ -7243,7 +7242,7 @@ values are derived from the handler types and the route registry rather than cop
   git commit -sm "fre10a: contract tests for probes, compute endpoints, metrics and roles (#325)" &&
   git push origin p12/fre10a-contract-tests &&
   gh pr create --base main --head p12/fre10a-contract-tests --title "FRE-10a: contract tests for probes, compute endpoints, metrics and roles" --body "Implements FRE-10a. CI is the first execution; no cargo build/check/test/clippy/miri was run locally."
-=======
+
 ## 2026-11-14 — ROB-18 closes: contract coverage pins the #681 behaviour; the client-abort code family stays out of scope (#742)
 
 **This slice delivers contract coverage, not new product code.** The two-phase ingest admission,
@@ -7301,4 +7300,3 @@ variant to `sketch_collapse` and running it on a quiet host) for the next worker
 bench builds.** The research note contains the concrete comparison plan, the primary-source
 URLs for every claim, and the closed-form estimate that the BTC corpus needs about 5
 collapses and lands near 3.2% error — against the 1% `sketch_p99` holds without collapsing.
->>>>>>> origin/main
