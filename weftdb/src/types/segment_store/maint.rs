@@ -79,44 +79,14 @@ impl SegmentStore {
 			if max_ts < cutoff {
 				// All rows in this segment are expired.
 				rows_expired += row.desc.row_count as u64;
-				match oldest_expired_ts {
-					None => oldest_expired_ts = Some(min_ts),
-					Some(old) => {
-						if min_ts < old {
-							oldest_expired_ts = Some(min_ts)
-						}
-					}
-				}
-				match newest_expired_ts {
-					None => newest_expired_ts = Some(max_ts),
-					Some(new) => {
-						if max_ts > new {
-							newest_expired_ts = Some(max_ts)
-						}
-					}
-				}
+				note_extremes(&mut oldest_expired_ts, &mut newest_expired_ts, min_ts, max_ts);
 			} else if min_ts <= cutoff {
 				// Partially expired — decode and count row by row.
 				let decoded = self.read_bound_frame(row).await?;
 				for (t, _) in decoded.timestamps.into_iter().zip(decoded.values) {
 					if row_expiry::is_row_expired(&self.expiry, now_ns, t, unit) {
 						rows_expired += 1;
-						match oldest_expired_ts {
-							None => oldest_expired_ts = Some(t),
-							Some(old) => {
-								if t < old {
-									oldest_expired_ts = Some(t)
-								}
-							}
-						}
-						match newest_expired_ts {
-							None => newest_expired_ts = Some(t),
-							Some(new) => {
-								if t > new {
-									newest_expired_ts = Some(t)
-								}
-							}
-						}
+						note_extremes(&mut oldest_expired_ts, &mut newest_expired_ts, t, t);
 					}
 				}
 			}
@@ -2044,4 +2014,10 @@ impl SegmentStore {
 		}
 		Ok(backfilled)
 	}
+}
+
+/// Fold one expired row's extent into the sweep's oldest/newest witnesses.
+fn note_extremes(oldest: &mut Option<i64>, newest: &mut Option<i64>, lo: i64, hi: i64) {
+	*oldest = Some(oldest.map_or(lo, |seen| seen.min(lo)));
+	*newest = Some(newest.map_or(hi, |seen| seen.max(hi)));
 }

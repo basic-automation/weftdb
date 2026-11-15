@@ -88,7 +88,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] **FRE-10a** Contract tests: probes, compute endpoints, metrics and roles
 - [ ] **ROB-14** Cgroup-aware memory budget with per-request reservations
 - [x] Restoring *into a chosen new root* over HTTP (7.3) (#213, 2026-11-14: `POST /api/v1/storage/restore/into?label=...&name=...` into `WEFT_RESTORE_BASE_DIR`; the offline drill at `weft-server/src/restore.rs` is unchanged)
-- [ ] Store-side row-level TTL/expiry (prerequisite for the SOA-15 TTL lane)
+- [x] Store-side row-level TTL/expiry (prerequisite for the SOA-15 TTL lane)
 - [x] Real-filesystem ENOSPC test for #656 on the injectable space source (#694 merged)
 - [ ] **Measurement bulk ingest routed through the `.weftseg` seal**
 - [x] **CI**
@@ -131,7 +131,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
   - [ ] **SOA-18** 24 h acceptance run on the reference SSD, published as an artifact
   - [ ] Run the privileged power-loss validation on the acceptance commit *(owner)*
 - [ ] Legal review of competitor benchmark-publication terms + codec licenses
-  - [ ] Review each competitor's benchmark-publication terms (kdb+ especially)
+  - [x] Review each competitor's benchmark-publication terms (kdb+ especially)
   - [ ] **Open with counsel:** Amazon FOR (US 11,308,093), Tiger Data, SAP (before 6.2), **WEFTDB** trademark clearance, the benchmark policy
   - [ ] **Codec patent/licence gate (owner decisions 2026-10-08).**
     - [ ] **Default FOR codec and the Tiger Data family: with counsel.**

@@ -237,6 +237,10 @@ impl SegmentStore {
 	/// **Read with row-level expiry of one series** (P12-722, cut 1): like
 	/// [`read_time_range_of`](Self::read_time_range_of) but filtering out rows
 	/// whose age at `now_ns` exceeds the store's TTL.
+	///
+	/// # Errors
+	///
+	/// As [`read_time_range_of`](Self::read_time_range_of).
 	pub async fn read_time_range_of_with_expiry(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64, now_ns: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
 		let (ts, vs) = self.read_time_range_of(aspect, series, start, end).await?;
 		if self.expiry == row_expiry::RowExpiryPolicy::NoExpiry {
@@ -244,15 +248,15 @@ impl SegmentStore {
 		}
 		let schema = self.require_schema(aspect).await?;
 		let unit = &schema.timestamp_unit;
-		let mut filtered_ts: Vec<i64> = Vec::with_capacity(ts.len());
-		let mut filtered_vs: Vec<Option<BigDecimal>> = Vec::with_capacity(ts.len());
+		let mut kept_ts: Vec<i64> = Vec::with_capacity(ts.len());
+		let mut kept_values: Vec<Option<BigDecimal>> = Vec::with_capacity(ts.len());
 		for (t, v) in ts.into_iter().zip(vs) {
 			if !row_expiry::is_row_expired(&self.expiry, now_ns, t, unit) {
-				filtered_ts.push(t);
-				filtered_vs.push(v);
+				kept_ts.push(t);
+				kept_values.push(v);
 			}
 		}
-		Ok((filtered_ts, filtered_vs))
+		Ok((kept_ts, kept_values))
 	}
 
 	/// **Cross-segment downsample** — reduce `aspect`'s `[start, end]` rows into
