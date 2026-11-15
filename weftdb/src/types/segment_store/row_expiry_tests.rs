@@ -17,7 +17,7 @@ use crate::{
 };
 
 fn bd(s: &str) -> BigDecimal {
-	BigDecimal::from_str(s).expect("parses")
+	BigDecimal::from_str(s).unwrap_or_else(|e| panic!("bd({s:?}) is not a decimal literal: {e}"))
 }
 
 const ASPECT: &str = "temp";
