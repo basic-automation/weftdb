@@ -395,7 +395,7 @@ impl SegmentStore {
 		// so the sum of the members' byte lengths serves as an upper-bound proxy
 		// (G2 #758). A keep plan writes nothing, so count == 0 skips the admission.
 		if count > 0 {
-			let total_output_bytes: u64 = prepared.iter().map(|plan| plan.members.iter().map(|member| member.desc.byte_len).sum()).sum();
+			let total_output_bytes: u64 = prepared.iter().flat_map(|plan| plan.members.iter().map(|member| member.desc.byte_len)).sum();
 			self.admit_write(total_output_bytes)?;
 		}
 		let (written, mut pending) = if count == 0 {
