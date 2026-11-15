@@ -757,11 +757,7 @@ async fn v010_compat_fre13_rollback_after_writes_loses_nothing() {
 
 	// Phase 1 — open the fixture (triggers layout 1→2 upgrade), write new data.
 	let store = SegmentStore::open(store_dir.path()).await.expect("this build opens a v0.1.0 store");
-	assert_eq!(
-		store.store_format().layout_version,
-		SUPPORTED_LAYOUT,
-		"the store upgraded to SUPPORTED_LAYOUT"
-	);
+	assert_eq!(store.store_format().layout_version, SUPPORTED_LAYOUT, "the store upgraded to SUPPORTED_LAYOUT");
 
 	let new_ts = vec![1_800_000_000i64, 1_800_000_060i64, 1_800_000_120i64];
 	let new_vals = vec![bd("200"), bd("210"), bd("220")];
@@ -777,15 +773,9 @@ async fn v010_compat_fre13_rollback_after_writes_loses_nothing() {
 
 	// Phase 3 — the open must refuse: this simulates what the real rollback
 	// scenario would do (an older binary meeting a newer build's floor).
-	let Err(error) = SegmentStore::open(store_dir.path()).await else {
-		panic!("a store with min_write_layout=99 (>SUPPORTED_LAYOUT) must be refused with IncompatibleLayout")
-	};
-	let typed = error.downcast_ref::<StoreError>().unwrap_or_else(|| {
-		panic!("the refusal is typed as StoreError, not a sentence: {error:#}")
-	});
-	let StoreError::IncompatibleLayout { min_write, supported } = typed else {
-		panic!("the refusal is IncompatibleLayout, not {error:#}")
-	};
+	let Err(error) = SegmentStore::open(store_dir.path()).await else { panic!("a store with min_write_layout=99 (>SUPPORTED_LAYOUT) must be refused with IncompatibleLayout") };
+	let typed = error.downcast_ref::<StoreError>().unwrap_or_else(|| panic!("the refusal is typed as StoreError, not a sentence: {error:#}"));
+	let StoreError::IncompatibleLayout { min_write, supported } = typed else { panic!("the refusal is IncompatibleLayout, not {error:#}") };
 	assert_eq!(min_write, 99, "the error reports the tampered floor");
 	assert_eq!(supported, SUPPORTED_LAYOUT, "the error reports this build's supported layout");
 
