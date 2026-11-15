@@ -7270,6 +7270,61 @@ scope creep on a PR whose mandate was contract coverage of what #681 already shi
 belong in a future slice** that also owns the error-taxonomy, config-schema, and OpenAPI updates
 a new `Code` variant requires.
 
+## 2026-11-15 — COMPAT-1: FRE-13 upgrade leg (implemented)
+
+Added `v010_compat_fre13_upgrade_contract` to `weftdb/tests/compat_v010.rs`. The test:
+
+- Opens the checked-in `compat/fixtures/v0.1.0/store` fixture (layout 1) via `CARGO_MANIFEST_DIR/../compat/fixtures/v0.1.0`
+- Asserts `migrated_from == Some(1)`, `applied` is non-empty, `created_new` is false
+- Asserts `store_format().layout_version == SUPPORTED_LAYOUT` (layout 2) after upgrade
+- Reads price at t=1767225660 (value 102, matching `expected_reads.txt`)
+- Reads temp range (60 timestamps matching the fixture)
+- Writes new flow data (timestamps 1_800_000_000+) via `seal_declared`
+- Reads old price after the write (still 102)
+- Reads new flow data back correctly
+- Drops, reopens — asserts `migrated_from == None`, `applied` is empty on second open
+- Reads old data and new data after reopen
+
+**Not covered**: leg C (rollback after writes), UPGRADING.md prose. These remain for PAC-14a.
+
+**CI execution**: the test is in `weftdb/tests/` which `cargo test --workspace` picks up. No CI
+changes needed — the `compat` job runs Python coverage checks; the actual Rust test execution
+already runs via the `test` job.
+
+**Inherited red**: clippy/rustfmt/weft-server-lib failures from `origin/main`, fixed by PR #750.
+
+Test passed when run directly:
+```
+$ compat_v010-* -- v010_compat_fre13_upgrade_contract
+test v010_compat_fre13_upgrade_contract ... ok
+```
+
+## 2026-11-15 — COMPAT-2: PAC-14a rollback leg C (implemented)
+
+Added `v010_compat_fre13_rollback_after_writes_loses_nothing` to
+`weftdb/tests/compat_v010.rs`. The test:
+
+- Opens the v0.1.0 fixture (triggers layout 1→2 upgrade), writes new flow data,
+  and closes.
+- Tampers `STORE_FORMAT` marker `min_write_layout` to `99` (above
+  `SUPPORTED_LAYOUT`), simulating what a newer binary would record.
+- Asserts the open is refused with `StoreError::IncompatibleLayout` containing
+  the tampered floor and the current supported layout.
+- Restores the original marker, reopens, and asserts:
+  - New data written before the refusal reads back correctly
+  - Old (pre-upgrade) data still reads back (price=102)
+  - `open_report()`: `migrated_from == None`, `applied` is empty.
+
+Updated `UPGRADING.md` to describe what a rollback attempt does (refuses, loses
+nothing) and reference the test. Updated `CHANGELOG.md` to list both legs as
+implemented.
+
+Test passed when run directly:
+```
+$ compat_v010-* -- v010_compat_fre13_rollback_after_writes_loses_nothing
+test v010_compat_fre13_rollback_after_writes_loses_nothing ... ok
+```
+
 ## 2026-11-14 — TimescaleDB's default percentile aggregate and the like-for-like comparison plan (#732)
 
 **The item asked: is TimescaleDB's `percentile_agg()` a UDDSketch, and what is the concrete
@@ -7300,3 +7355,94 @@ variant to `sketch_collapse` and running it on a quiet host) for the next worker
 bench builds.** The research note contains the concrete comparison plan, the primary-source
 URLs for every claim, and the closed-form estimate that the BTC corpus needs about 5
 collapses and lands near 3.2% error — against the 1% `sketch_p99` holds without collapsing.
+
+## 2026-11-15 — The kdb+ benchmark exclusion is a licence term, and two claims about our own licences were wrong (recorded; no counsel review yet)
+
+Issue #383 asked for a legal review of competitor benchmark-publication terms,
+and the roadmap line for it has stood open since the phase roadmap began because
+the claim it rests on had never been written down. It is now: `docs/legal-review.md`.
+
+**What was ambiguous.** Three inherited sentences in `DECISIONS.md` and
+`docs/roadmap-notes.md` assert that kdb+ may not be benchmarked or its results
+published, and that we "inherit" those claims into any published number. None of
+the three cites a licence clause. The roadmap notes pointed at a KX
+"Benchmarking Agreement" page which is now a 404, so the only apparent consent
+instrument could not be checked either.
+
+**What I chose, and why.** I read the two KX documents that are live: the KDB On
+Demand Terms and Conditions v4 (commercial) and the Kdb+ On Demand Non-Commercial
+licence. Both say the same thing about benchmarks in different voices. The
+commercial clause binds **our customers**, not us: it says we "may not permit" a
+customer to publish benchmark results without KX's consent. That cannot be the
+source of an exclusion for our own runs, so the inherited framing was wrong about
+which party is restricted. The free Personal Edition is stricter and is the real
+reason: §1.2 forbids using the program "in a manner that produces a benchmark or
+performance comparison of any kind for publication", and §1.3 forbids publishing
+a benchmark report "in any form, whether or not accurate". Running kdb+ for a
+published comparison is therefore not merely unpublished-result-restricted — the
+activity itself is outside the licence grant. Excluding kdb+ is a licence term
+that the repository can decide for itself, so I did not hold the roadmap item
+open for counsel. Counsel is still needed for the codec patents and the Elastic
+pin, and the document says so row by row.
+
+**Two claims from inside this workstream that are retracted rather than repeated.**
+A note claimed the TUI embeds fonts under `MIT OR OFL-1.1` and that SIL OFL is
+missing from `deny.toml`. It is not on main: `weft-tui/assets/` does not exist, no
+source file mentions OFL, and no OFL string appears in `THIRD-PARTY-LICENSES.md`.
+Another claimed a `license-bundle` job fails on main with lock-file drift; the job
+is named `third-party licenses` and it was green on the latest main run checked
+2026-11-15, alongside `cargo-deny`. Both are recorded here so a follow-up issue is
+not opened against a state that does not exist.
+
+**Left as found, deliberately.** `weft-xbench/src/render.rs:39` `NOT_IN_SCOPE`
+entry 5 cites `WILLINGNESS-TO-PAY.md`, a file this repository does not contain.
+I did not invent the missing document and did not delete the reason: the row is
+flagged in `docs/legal-review.md` §3 as needing the enterprise terms read, or the
+reason retired. Touching a compiled constant's text in a documentation slice
+would also have cost a full rebuild for no legal gain.
+
+**Scope discipline.** The document stamps every row Read / Recorded / Inherited
+and names the fetch date for what it read. Anything a later reader cannot trace
+to a page or a line is marked as not verified here, including the "effective
+2026-07-16" ClickHouse AUP date, which came from an ephemeral note.
+
+## 2026-11-15 — The benchmark policy is written as a draft for counsel, not as a decision (#245)
+
+**What was ambiguous.** `ROADMAP.md` names the benchmark policy three times
+(lines 135, 141, 142) and every one of those lines is a counsel or owner item.
+`#245` asks for the policy. So the line to tick in a PR that writes the document
+does not exist: writing a draft is not settling the item with counsel.
+
+**What I chose.** Write `docs/benchmark-policy.md` as the engineer-facing rule
+book, marked *draft for counsel review*, and tick nothing. The document is
+deliberately operational — what an engineer may run, what a published
+comparison must carry, what stays excluded — so counsel has something concrete
+to correct instead of an abstraction. The counsel items (#384 trademark, #386
+codec patents, the package licence expression, the InfluxDB/QuestDB enterprise
+terms behind `NOT_IN_SCOPE` entry 5, the kdb+ consent route) stay open and are
+named as such in §8 of the policy.
+
+**Corrections made while writing it.** Two claims in my own first draft failed
+verification and were removed rather than kept:
+
+- It cited "`docs/benchmarks.md` (the honesty object table)". No such file
+  exists in this repository, and no honesty-object table lives in `docs/`. The
+  real locations are the gate string at `weft-xbench/src/render.rs:39` and the
+  prose at `docs/roadmap-notes.md:45`.
+- It treated `NOT_IN_SCOPE` entry 6 as being about kdb+ alone. The entry reads
+  *"kdb+ and AVEVA PI: their licences bar benchmarking or publishing results
+  without written consent."* — and **AVEVA PI has had no licence review at all**
+  in this cycle, in this repository or the last one. The policy now says so
+  plainly and puts reading those terms next to the InfluxDB enterprise-terms
+  item. An exclusion we cannot cite is safe only while nobody proposes to
+  cross it.
+
+**One point worth separating.** ClickHouse's AUP §1.5 (no use of the Services
+for developing competing products) is an independent reason not to run a hosted
+ClickHouse on company equipment; it has nothing to do with the publication
+condition in §2 that the roadmap was worried about. A policy that only addresses
+publication would leave that trap in place.
+
+**Not done here.** No `ROADMAP.md` tick, no change to the compiled
+`NOT_IN_SCOPE` text (a compiled constant is not a documentation surface), and no
+contact with KX or AVEVA — both need a human.

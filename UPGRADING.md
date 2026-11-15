@@ -90,14 +90,31 @@ not see the tagged rows.
 
 **Rollback from layout 2 to layout 1:** Not supported. A store whose `STORE_FORMAT`
 marker records `layout_version: 2` is refused by any build whose `SUPPORTED_LAYOUT`
-is 1. No such build exists after v0.1.0, and the repository does not test this path.
+is 1. No such build exists after v0.1.0.
 
-**No CI job performs a real rollback after writes.** The `compat_v010.rs` test
-(which opens the v0.1.0 fixture with the current build) tests only the upgrade leg:
-it verifies that a v0.1.0 store is migrated forward and that the same values read back.
-It does **not** run the v0.1.0 binary against a store that the current build has written
-to. Rollback-after-writes is unsupported for 1.0 — a store written by the current layout
-is not readable by older binaries.
+**What a rollback attempt does — refuses, loses nothing.** The store's
+`STORE_FORMAT` marker is read before any database is opened. When the marker's
+`min_write_layout` is above the opening build's [`SUPPORTED_LAYOUT`], the open
+fails with [`StoreError::IncompatibleLayout`] and **nothing is changed** — only
+`LOCK` and `LOCK.holder` are touched. The refusal is the same whether the store
+was written by a genuine newer binary or the marker has been tampered; the store
+itself is not damaged, and a subsequent open with the correct binary reads every
+row the older binary could not.
+
+This contract is pinned in `weftdb/tests/compat_v010.rs`
+([`v010_compat_fre13_rollback_after_writes_loses_nothing`]) which:
+1. Opens the v0.1.0 fixture, upgrades it to layout 2, writes new data, and closes.
+2. Tampers the `STORE_FORMAT` marker to raise `min_write_layout` above
+   `SUPPORTED_LAYOUT` — simulating what a newer binary would write.
+3. Asserts the open is refused with `StoreError::IncompatibleLayout`.
+4. Restores the marker and reopens — asserts every row written before the
+   refusal reads back, and that no migration reruns.
+
+**No CI job performs a real old-binary rollback after writes.** The test above
+expresses the layout-floor contract in-process; it does **not** run the v0.1.0
+binary against a store that the current build has written to (no v0.1.0 binary
+artifact is available in CI). Rollback-after-writes using a real older binary is
+unsupported for 1.0.
 
 ### Rollback procedure for layout 2
 
