@@ -61,6 +61,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `#[test]` it generates, so either position in the attribute block serialises. The guard now covers both
   forms and fails when a `#[serial]` shares no attribute block with a test attribute, which is the shape
   that compiles, passes, and quietly runs concurrently with the tests it meant to exclude (#726).
+- **GPU pool bound test no longer flakes under GPU contention.**
+  `gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu` asserted `pool.stable` (which
+  fails when another process holds GPU memory during round one) via `result.correctness.passed()`.
+  Now checks the hard invariants only: every output value is finite, every call returned the expected
+  number of points, the pool never exceeds its cap, and the device allocator does not grow without
+  bound.  (#725)
 
 ## [0.3.7] - 2026-11-12
 

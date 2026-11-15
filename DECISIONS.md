@@ -7012,6 +7012,27 @@ This slice pins the server's HTTP decision on top of the injectable space source
 carry a `cargo build`, so every test in `weft-server/tests/enospc_real_fs.rs` runs first in CI.
 ## 2026-11-14 — ROB-20: what maintenance budgets and merging actually do today (#445)
 
+## 2026-11-14 — GPU pool bound test: check safety invariants instead of strict stability (#725)
+
+The test `gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu` flaked when the CI
+runner's GPU was under contention (14 GB in use by other work): the pool allocated one buffer after
+round one because round one could not allocate it, making `peak_later > peak_first` and `stable ==
+false`.  The `output_count_ok` field of the correctness report (which includes `stable`) then caused
+`result.correctness.passed()` to return false, failing the test.
+
+**Chosen: keep the workload's `output_count_ok` definition unchanged** (it truthfully records whether
+the pool was stable) and **relax only the test** to check the hard safety invariants individually:
+- every output value is finite;
+- every call returned the expected number of points;
+- the pool never exceeds its configured cap;
+- the device allocator does not grow without bound.
+
+Rejected first: changing `run_gpu_memory` to exclude `stable` from `output_count_ok`.  The field is
+part of the persisted benchmark schema and conflates a pool-management observation with output
+correctness — but a schema change would touch every stored `BenchResult`'s interpretation.  The test
+is the right fix location because the workload function continues to report the truth (the pool was
+not stable under contention), while the test accepts that truth as valid behavior.
+
 **Three axes, three independent statuses.** The 1.0 plan's §6 W9 groups "Maintenance resource limits,
 k-way merge and re-splitting of oversized frames" as a single lane. The audit shows they are disjoint:
 
