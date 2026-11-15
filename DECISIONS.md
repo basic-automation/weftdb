@@ -6990,3 +6990,32 @@ This slice pins the server's HTTP decision on top of the injectable space source
 **CI is the first execution.** This slice was never compiled or run locally — the host cannot
 carry a `cargo build`, so every test in `weft-server/tests/enospc_real_fs.rs` runs first in CI.
 
+
+## 2026-11-15 — COMPAT-1: FRE-13 upgrade leg (implemented)
+
+Added `v010_compat_fre13_upgrade_contract` to `weftdb/tests/compat_v010.rs`. The test:
+
+- Opens the checked-in `compat/fixtures/v0.1.0/store` fixture (layout 1) via `CARGO_MANIFEST_DIR/../compat/fixtures/v0.1.0`
+- Asserts `migrated_from == Some(1)`, `applied` is non-empty, `created_new` is false
+- Asserts `store_format().layout_version == SUPPORTED_LAYOUT` (layout 2) after upgrade
+- Reads price at t=1767225660 (value 102, matching `expected_reads.txt`)
+- Reads temp range (60 timestamps matching the fixture)
+- Writes new flow data (timestamps 1_800_000_000+) via `seal_declared`
+- Reads old price after the write (still 102)
+- Reads new flow data back correctly
+- Drops, reopens — asserts `migrated_from == None`, `applied` is empty on second open
+- Reads old data and new data after reopen
+
+**Not covered**: leg C (rollback after writes), UPGRADING.md prose. These remain for PAC-14a.
+
+**CI execution**: the test is in `weftdb/tests/` which `cargo test --workspace` picks up. No CI
+changes needed — the `compat` job runs Python coverage checks; the actual Rust test execution
+already runs via the `test` job.
+
+**Inherited red**: clippy/rustfmt/weft-server-lib failures from `origin/main`, fixed by PR #750.
+
+Test passed when run directly:
+```
+$ compat_v010-* -- v010_compat_fre13_upgrade_contract
+test v010_compat_fre13_upgrade_contract ... ok
+```

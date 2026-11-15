@@ -35,7 +35,7 @@ use std::{
 
 use bigdecimal::BigDecimal;
 use weft_physical_type::{PhysicalType, TimeUnit};
-use weftdb::{SegmentStore, StoreError};
+use weftdb::{SegmentStore, StoreError, SUPPORTED_LAYOUT};
 
 /// The committed fixture set, relative to this crate.
 fn fixture() -> PathBuf {
@@ -654,4 +654,82 @@ async fn the_v010_rows_mode_tree_reads_into_a_store_of_its_own_database() {
 		assert_eq!(fixture_bytes.len(), copy_bytes.len(), "reading {name} changed its length: the readable leg writes to the tree it reads");
 		assert_eq!(fixture_bytes, copy_bytes, "reading {name} changed its bytes: the readable leg writes to the tree it reads");
 	}
+}
+
+/// A `BigDecimal` literal, matching the convention in the crate's tests.
+fn bd(s: &str) -> BigDecimal {
+	s.parse().expect("a valid BigDecimal literal")
+}
+
+/// Leg A (upgrade) of the FRE-13 / PAC-14a upgrade contract: the v0.1.0 fixture store
+/// opens, migrates from layout 1 to layout 2, serves the fixture's data, accepts new
+/// writes after the upgrade, keeps old data readable, and survives a reopen.
+///
+/// What this pins that the existing tests do not: that the **checked-in compat fixture**
+/// (the same bytes `release pins` hashes) satisfies the upgrade contract, and that a
+/// write after the upgrade followed by a reopen leaves every row where this build put
+/// it. The internal `layout_upgrade.rs` test exercises the same contract on the
+/// `pre_v2_store` fixture; this one does it on what the v0.1.0 release actually wrote.
+#[tokio::test]
+async fn v010_compat_fre13_upgrade_contract() {
+	let store_dir = tempfile::tempdir().expect("tempdir for the copied store");
+	copy_tree(&fixture().join("store"), store_dir.path());
+
+	// First open — triggers layout 1→2 upgrade from the v0.1.0 fixture.
+	let store = SegmentStore::open(store_dir.path()).await.expect("this build opens a v0.1.0 store");
+	let report = store.open_report().clone();
+
+	assert_eq!(
+		report.migrated_from,
+		Some(1),
+		"a v0.1.0 root has no format marker, so the open recognises it as layout 1 \
+		 and migrates it forward; migrated_from is Some(1)"
+	);
+	assert!(!report.applied.is_empty(), "the migration ran at least one registered migration");
+	assert!(!report.created_new, "the store existed — this is not a new store");
+
+	// After migration the layout is 2.
+	assert_eq!(store.store_format().layout_version, SUPPORTED_LAYOUT, "after the upgrade the store's layout is {SUPPORTED_LAYOUT} (SUPPORTED_LAYOUT)");
+
+	// Read a known point.  The fixture's recorded reads say price=102.0000 at t=1767225660.
+	let price_at_660 = store.read_point("price", 1_767_225_660).await.expect("reading price at t=1767225660").expect("price at that timestamp exists after migration");
+	assert_eq!(canonical(&price_at_660.to_string()), "102", "price=102.0000 at t=1767225660 survived the migration");
+
+	// A range read of the fixture's temp aspect returns the expected number of rows.
+	let (temp_ts, _temp_vs) = store.read_time_range("temp", 1_767_225_600, 1_767_232_999).await.expect("reading temp range after migration");
+	assert_eq!(temp_ts.len(), 60, "temp holds 60 distinct timestamps after migration");
+
+	// Write new data at a timestamp range that does not overlap the fixture (the fixture
+	// covers ~1767225600–1767239999).
+	let new_ts = vec![1_800_000_000i64, 1_800_000_060i64, 1_800_000_120i64];
+	let new_vals = vec![bd("200"), bd("210"), bd("220")];
+	store.seal_declared("flow", &new_ts, &new_vals).await.expect("sealing new data into the upgraded store — an upgraded store is writable");
+
+	// Old data is still readable after the write.
+	let price_after_write = store.read_point("price", 1_767_225_660).await.expect("reading old price after the new write").expect("old price still exists");
+	assert_eq!(canonical(&price_after_write.to_string()), "102", "pre-upgrade data survived a new write");
+
+	// New data reads back correctly.
+	let (post_ts, post_vals): (Vec<i64>, Vec<Option<BigDecimal>>) = store.read_time_range("flow", 1_800_000_000, 1_800_000_200).await.expect("reading the just-written range");
+	assert_eq!(post_ts, new_ts, "the timestamps written after the upgrade read back correctly");
+	let expected_vals: Vec<Option<BigDecimal>> = new_vals.into_iter().map(Some).collect();
+	assert_eq!(post_vals, expected_vals, "the values written after the upgrade read back correctly");
+
+	drop(store);
+
+	// Reopen — the upgrade is complete and nothing runs on the second open.
+	let store2 = SegmentStore::open(store_dir.path()).await.expect("reopen after writing new data");
+	let report2 = store2.open_report().clone();
+	assert_eq!(report2.migrated_from, None, "a second open of the already-upgraded store reports no migration (migrated_from = None)");
+	assert!(report2.applied.is_empty(), "no migrations run on the second open");
+
+	// Old data still readable after reopen.
+	let old_again = store2.read_point("price", 1_767_225_660).await.expect("reading old price after reopen").expect("old price still exists after reopen");
+	assert_eq!(canonical(&old_again.to_string()), "102", "pre-upgrade data survived reopen");
+
+	// New data persisted through reopen.
+	let (reopen_ts, _reopen_vals) = store2.read_time_range("flow", 1_800_000_000, 1_800_000_200).await.expect("reading post-upgrade data after reopen");
+	assert_eq!(reopen_ts, new_ts, "post-upgrade data persisted through reopen (timestamps match)");
+
+	drop(store2);
 }
