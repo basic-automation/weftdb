@@ -45,7 +45,7 @@ async fn make_store(expiry: RowExpiryPolicy) -> (TempDir, SegmentStore) {
 
 #[tokio::test]
 async fn no_expiry_makes_no_difference_to_reads() {
-	let (dir, store) = make_store(RowExpiryPolicy::NoExpiry);
+	let (dir, store) = make_store(RowExpiryPolicy::NoExpiry).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![90, 95, 100], vec![bd("1"), bd("2"), bd("3")])).await.expect("ingests rows");
 	// With NoExpiry, all rows are visible regardless of now_ns.
@@ -63,7 +63,7 @@ async fn no_expiry_makes_no_difference_to_reads() {
 
 #[tokio::test]
 async fn ttl_hides_rows_older_than_now_minus_ttl() {
-	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS });
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 	// Rows at t=80 (age 20 > 10 → expired) and t=95 (age 5 ≤ 10 → visible).
 	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![80, 95, 100], vec![bd("1"), bd("2"), bd("3")])).await.expect("ingests");
@@ -78,7 +78,7 @@ async fn ttl_hides_rows_older_than_now_minus_ttl() {
 
 #[tokio::test]
 async fn boundary_age_equals_ttl_is_not_expired() {
-	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS });
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 	// Row at t=90: age = 100 - 90 = 10, which equals TTL → NOT expired.
 	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![90, 89], vec![bd("a"), bd("b")])).await.expect("ingests");
@@ -93,7 +93,7 @@ async fn boundary_age_equals_ttl_is_not_expired() {
 
 #[tokio::test]
 async fn expiry_clock_is_injected() {
-	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS });
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![85, 95], vec![bd("x"), bd("y")])).await.expect("ingests");
 
@@ -117,7 +117,7 @@ async fn expiry_clock_is_injected() {
 
 #[tokio::test]
 async fn expiry_applies_per_row_not_segment() {
-	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS });
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 	// One segment with rows at t=50 (expired at now=100) and t=95 (visible).
 	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![50, 95], vec![bd("old"), bd("new")])).await.expect("ingests both rows in one segment");
@@ -135,7 +135,7 @@ async fn expiry_applies_per_row_not_segment() {
 async fn sweep_boundary_age_equals_ttl_not_expired() {
 	// Sweep must NOT count a row at the age==TTL boundary as expired.
 	// Fully-expired shortcut must use < cutoff, not <= cutoff.
-	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS });
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 
 	// Rows at t=90 (age 10 == TTL → NOT expired) and t=89 (age 11 > TTL → expired).
@@ -157,7 +157,7 @@ async fn sweep_boundary_age_equals_ttl_not_expired() {
 #[tokio::test]
 async fn sweep_segment_fully_below_cutoff_counts_all_as_expired() {
 	// A segment where max_ts < cutoff is fully expired; all rows count.
-	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS });
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 	// Row at t=80 (age 20 > 10) — cutoff = 90, max_ts 80 < 90 → fully expired.
 	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![80], vec![bd("a")])).await.expect("ingests");
@@ -173,7 +173,7 @@ async fn sweep_segment_fully_below_cutoff_counts_all_as_expired() {
 
 #[tokio::test]
 async fn expiry_sweep_is_idempotent_and_report_only() {
-	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS });
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![50, 95, 100], vec![bd("a"), bd("b"), bd("c")])).await.expect("ingests");
 
@@ -197,7 +197,7 @@ async fn expiry_sweep_is_idempotent_and_report_only() {
 
 #[tokio::test]
 async fn ttl_smaller_than_close_window_is_safe() {
-	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: 1 }); // 1 second TTL
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: 1 }).await; // 1 second TTL
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 	// All rows at t=100 are at "now", so none should be expired.
 	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![100], vec![bd("now")])).await.expect("ingests");

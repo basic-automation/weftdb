@@ -70,26 +70,32 @@ impl SegmentStore {
 		let mut newest_expired_ts: Option<i64> = None;
 
 		for row in &rows {
-			if row.desc.max_ts < cutoff {
+			// A descriptor with no recorded extent is an empty segment, or one
+			// written before the extent was tracked. Either way there is nothing
+			// to expire, and a maintenance sweep must not panic over it.
+			let (Some(min_ts), Some(max_ts)) = (row.desc.min_ts, row.desc.max_ts) else {
+				continue;
+			};
+			if max_ts < cutoff {
 				// All rows in this segment are expired.
 				rows_expired += row.desc.row_count as u64;
 				match oldest_expired_ts {
-					None => oldest_expired_ts = Some(row.desc.min_ts),
+					None => oldest_expired_ts = Some(min_ts),
 					Some(old) => {
-						if row.desc.min_ts < old {
-							oldest_expired_ts = Some(row.desc.min_ts)
+						if min_ts < old {
+							oldest_expired_ts = Some(min_ts)
 						}
 					}
 				}
 				match newest_expired_ts {
-					None => newest_expired_ts = Some(row.desc.max_ts),
+					None => newest_expired_ts = Some(max_ts),
 					Some(new) => {
-						if row.desc.max_ts > new {
-							newest_expired_ts = Some(row.desc.max_ts)
+						if max_ts > new {
+							newest_expired_ts = Some(max_ts)
 						}
 					}
 				}
-			} else if row.desc.min_ts <= cutoff {
+			} else if min_ts <= cutoff {
 				// Partially expired — decode and count row by row.
 				let decoded = self.read_bound_frame(row).await?;
 				for (t, _) in decoded.timestamps.into_iter().zip(decoded.values) {

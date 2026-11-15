@@ -40,7 +40,7 @@ use weft_physical_type::timestamp::TimeUnit;
 ///
 /// `NoExpiry` lets every row live; `Ttl { ttl }` hides rows whose age in the aspect's
 /// time unit is strictly greater than `ttl`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowExpiryPolicy {
 	/// No expiry: every row is always visible (the default).
 	NoExpiry,
@@ -138,7 +138,7 @@ impl AspectExpirySwept {
 
 /// Store-wide expiry sweep: how many aspects were cleaned, and how many rows
 /// the sweep reported as expired.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub struct ExpirySweep {
 	/// Aspects whose expired rows were counted (and would be deleted in a later cut).
