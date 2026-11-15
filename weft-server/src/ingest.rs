@@ -1395,8 +1395,9 @@ mod tests {
 	use tempfile::TempDir;
 	use tower::ServiceExt;
 	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
-	use weftdb::exec::{current_ingest_phase, ingest_phase_scope, set_ingest_phase};
-	use weftdb::{IngestPhase, SegmentStore};
+	use weftdb::{
+		exec::{current_ingest_phase, ingest_phase_scope, set_ingest_phase}, IngestPhase, SegmentStore
+	};
 
 	use super::check_body_truncation;
 	use crate::{app_with_state, test_support::*, AppState};
@@ -2645,7 +2646,9 @@ mod tests {
 			assert_eq!(phase, Some(IngestPhase::Validating), "scope starts at Validating");
 			let body = Bytes::from(vec![0u8; 50]);
 			check_body_truncation(&body, Some(100))
-		}).await.expect("scope must complete");
+		})
+		.await
+		.expect("scope must complete");
 
 		assert_eq!(err.code(), crate::error::Code::BadRequest);
 		assert_eq!(err.code().status(), StatusCode::BAD_REQUEST);
@@ -2661,7 +2664,9 @@ mod tests {
 			assert_eq!(phase, Some(IngestPhase::Committing), "phase advanced to Committing");
 			let body = Bytes::from(vec![0u8; 30]);
 			check_body_truncation(&body, Some(200))
-		}).await.expect("scope must complete");
+		})
+		.await
+		.expect("scope must complete");
 
 		assert_eq!(err.code(), crate::error::Code::BadRequest);
 		assert_eq!(err.code().status(), StatusCode::BAD_REQUEST);
