@@ -183,7 +183,8 @@ mod tests {
 		assert!(!is_row_expired(&policy, ns(0), 0, &unit), "epoch 0 at epoch 0 is not expired");
 		assert!(!is_row_expired(&policy, ns(1_000_000), 0, &unit), "one second later at one-second-old row is not expired");
 		assert!(!is_row_expired(&policy, ns(999_999_999), 0, &unit), "row younger than ttl is not expired");
-		assert!(!is_row_expired(&policy, ns(i64::MAX), i64::MAX, &unit), "max values cause no issues");
+		// Raw nanosecond values: `ns(i64::MAX)` would overflow the multiply.
+		assert!(!is_row_expired(&policy, i64::MAX, i64::MAX, &unit), "max values cause no issues");
 	}
 
 	#[test]

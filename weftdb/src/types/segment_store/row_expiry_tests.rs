@@ -81,7 +81,8 @@ async fn boundary_age_equals_ttl_is_not_expired() {
 	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 	// Row at t=90: age = 100 - 90 = 10, which equals TTL → NOT expired.
-	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![90, 89], vec![bd("a"), bd("b")])).await.expect("ingests");
+	// Ascending: the batch API takes timestamps in order.
+	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![89, 90], vec![bd("b"), bd("a")])).await.expect("ingests");
 	let (ts, _vs) = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads with expiry");
 	assert!(ts.contains(&90), "row at t=90 (age == TTL) must be visible");
 	assert!(!ts.contains(&89), "row at t=89 (age > TTL) must be hidden");
@@ -140,7 +141,8 @@ async fn sweep_boundary_age_equals_ttl_not_expired() {
 
 	// Rows at t=90 (age 10 == TTL → NOT expired) and t=89 (age 11 > TTL → expired).
 	// Same segment: min_ts=89, max_ts=90.
-	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![90, 89], vec![bd("a"), bd("b")])).await.expect("ingests");
+	// Ascending: the batch API takes timestamps in order.
+	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![89, 90], vec![bd("b"), bd("a")])).await.expect("ingests");
 
 	let sweep = store.expiry_sweep(NOW_NS).await.expect("sweep");
 	assert_eq!(sweep.rows_expired, 1, "only the row at t=89 (age > TTL) is expired");
