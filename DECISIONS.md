@@ -6990,3 +6990,27 @@ This slice pins the server's HTTP decision on top of the injectable space source
 **CI is the first execution.** This slice was never compiled or run locally — the host cannot
 carry a `cargo build`, so every test in `weft-server/tests/enospc_real_fs.rs` runs first in CI.
 
+## 2026-11-14 — Store-level row TTL/expiry cut 1 (#722)
+
+**Store-wide policy only; per-aspect policies deferred to cut 2.** The `RowExpiryPolicy` enum
+is carried in `SegmentStoreOptions` and `SegmentStore`, so every aspect in the store shares one
+expiry setting. A future cut can add a per-aspect override that the store-wide `Ttl` relaxes to
+`NoExpiry` on some aspects.
+
+**Read-path visibility: filter after newer-wins merge.** The expiry filter runs on the
+fully-merged, deduplicated rows from `read_time_range_of`, so it sees the same canonical view
+every read path produces. This keeps the filter simple and testable without touching the inner
+frame-read layers.
+
+**Sweep is report-only in cut 1.** `expiry_sweep` iterates declared aspects, acquires the
+maintenance lock per aspect, and builds a report of expired rows without deleting any data.
+Deletion and GC are deferred to cut 2/3. The report distinguishes "fully expired segment"
+(checked by index bounds) from "partially expired segment" (decoded and counted row by row).
+
+**No env var for cut 1.** The expiry policy is configured programmatically via
+`SegmentStoreOptions::with_expiry`, and the `Default` impl sets `NoExpiry`. No env var,
+no weft-server wiring, no OpenAPI/config-schema change.
+
+**CI is the first execution.** Cut 1 was never compiled or run locally — the host cannot carry
+a `cargo build`, so every test runs first in CI.
+

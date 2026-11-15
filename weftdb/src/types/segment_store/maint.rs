@@ -4,6 +4,120 @@
 use super::*;
 
 impl SegmentStore {
+	/// **Expiry sweep** (P12-722, cut 1): visit every declared aspect, count rows that are
+	/// expired under [`expiry`](Self::expiry) at `now_ns`, and return a report.
+	///
+	/// Cut 1 is **report-only**: no rows or segments are deleted. The sweep is idempotent
+	/// (running it twice finds the same expired rows). Aspects whose maintenance breaker is
+	/// tripped or whose maintenance lock is held by another operation are skipped and
+	/// reported in [`busy`](row_expiry::ExpirySweep::busy).
+	///
+	/// # Errors
+	///
+	/// Propagates index read errors. Per-aspect failures are reported in
+	/// [`failed`](row_expiry::ExpirySweep::failed) rather than aborting the entire sweep.
+	pub async fn expiry_sweep(&self, now_ns: i64) -> Result<row_expiry::ExpirySweep> {
+		if self.expiry == row_expiry::RowExpiryPolicy::NoExpiry {
+			return Ok(row_expiry::ExpirySweep::default());
+		}
+		let aspects = self.list_declared_aspects().await?;
+		let mut sweep = row_expiry::ExpirySweep::default();
+		for aspect in &aspects {
+			if !self.breaker_permits(aspect) {
+				sweep.busy.push(aspect.clone());
+				continue;
+			}
+			if !self.decode_breaker_permits(aspect) {
+				sweep.busy.push(aspect.clone());
+				continue;
+			}
+			let Some(held) = self.sweep_maintain(aspect, None).await else {
+				sweep.busy.push(aspect.clone());
+				continue;
+			};
+			let result = self.expire_aspect_held(&held, now_ns).await;
+			match result {
+				Ok(swept) => {
+					if swept.rows_expired > 0 {
+						sweep.aspects_cleaned.push(aspect.clone());
+						sweep.rows_expired += swept.rows_expired;
+					}
+				}
+				Err(err) => {
+					sweep.failed.push((aspect.clone(), err));
+				}
+			}
+		}
+		Ok(sweep)
+	}
+
+	/// Count expired rows in one aspect under the maintenance lock `held`.
+	/// Reads the index rows, decodes segments that are partially expired, and
+	/// returns a count and the oldest/newest expired timestamps.
+	/// Cut 1: report-only, no deletion.
+	pub(crate) async fn expire_aspect_held(&self, held: &MaintGuard, now_ns: i64) -> Result<row_expiry::AspectExpirySwept> {
+		let aspect = held.aspect();
+		let schema = self.require_schema(aspect).await?;
+		let unit = &schema.timestamp_unit;
+		let cutoff = row_expiry::expired_cutoff(&self.expiry, now_ns, unit);
+		if cutoff == i64::MIN {
+			// No expiry possible (NoExpiry or underflow).
+			return Ok(row_expiry::AspectExpirySwept::default());
+		}
+		let rows = self.index.rows(aspect).await?;
+		let mut rows_expired: u64 = 0;
+		let mut oldest_expired_ts: Option<i64> = None;
+		let mut newest_expired_ts: Option<i64> = None;
+
+		for row in &rows {
+			if row.desc.max_ts <= cutoff {
+				// All rows in this segment are expired.
+				rows_expired += row.desc.row_count as u64;
+				match oldest_expired_ts {
+					None => oldest_expired_ts = Some(row.desc.min_ts),
+					Some(old) => {
+						if row.desc.min_ts < old {
+							oldest_expired_ts = Some(row.desc.min_ts)
+						}
+					}
+				}
+				match newest_expired_ts {
+					None => newest_expired_ts = Some(row.desc.max_ts),
+					Some(new) => {
+						if row.desc.max_ts > new {
+							newest_expired_ts = Some(row.desc.max_ts)
+						}
+					}
+				}
+			} else if row.desc.min_ts <= cutoff {
+				// Partially expired — decode and count row by row.
+				let decoded = self.read_bound_frame(row).await?;
+				for (t, _) in decoded.timestamps.into_iter().zip(decoded.values) {
+					if row_expiry::is_row_expired(&self.expiry, now_ns, t, unit) {
+						rows_expired += 1;
+						match oldest_expired_ts {
+							None => oldest_expired_ts = Some(t),
+							Some(old) => {
+								if t < old {
+									oldest_expired_ts = Some(t)
+								}
+							}
+						}
+						match newest_expired_ts {
+							None => newest_expired_ts = Some(t),
+							Some(new) => {
+								if t > new {
+									newest_expired_ts = Some(t)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		Ok(row_expiry::AspectExpirySwept { rows_expired, oldest_expired_ts, newest_expired_ts, completed: true })
+	}
+
 	/// Hold `aspect`'s maintenance lock until the returned guard drops, as a maintenance
 	/// operation in progress would, without running one. The hook for tests of the layers
 	/// above (`weft-server`'s `409 Conflict` and its daemon's skip), which cannot reach the

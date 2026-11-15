@@ -230,6 +230,34 @@ impl SegmentStore {
 		Ok(merged.into_iter().unzip())
 	}
 
+	/// **Read with row-level expiry** (P12-722, cut 1): like [`read_time_range`](Self::read_time_range)
+	/// but filtering out rows whose age at `now_ns` exceeds the store's TTL.
+	/// The default [`NoExpiry`](row_expiry::RowExpiryPolicy::NoExpiry) returns every row.
+	pub async fn read_time_range_with_expiry(&self, aspect: &str, start: i64, end: i64, now_ns: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
+		self.read_time_range_of_with_expiry(aspect, crate::SeriesId::UNTAGGED, start, end, now_ns).await
+	}
+
+	/// **Read with row-level expiry of one series** (P12-722, cut 1): like
+	/// [`read_time_range_of`](Self::read_time_range_of) but filtering out rows
+	/// whose age at `now_ns` exceeds the store's TTL.
+	pub async fn read_time_range_of_with_expiry(&self, aspect: &str, series: crate::SeriesId, start: i64, end: i64, now_ns: i64) -> Result<(Vec<i64>, Vec<Option<BigDecimal>>)> {
+		let (ts, vs) = self.read_time_range_of(aspect, series, start, end).await?;
+		if self.expiry == row_expiry::RowExpiryPolicy::NoExpiry {
+			return Ok((ts, vs));
+		}
+		let schema = self.require_schema(aspect).await?;
+		let unit = &schema.timestamp_unit;
+		let mut filtered_ts: Vec<i64> = Vec::with_capacity(ts.len());
+		let mut filtered_vs: Vec<Option<BigDecimal>> = Vec::with_capacity(ts.len());
+		for (t, v) in ts.into_iter().zip(vs) {
+			if !row_expiry::is_row_expired(&self.expiry, now_ns, t, unit) {
+				filtered_ts.push(t);
+				filtered_vs.push(v);
+			}
+		}
+		Ok((filtered_ts, filtered_vs))
+	}
+
 	/// **Cross-segment downsample** — reduce `aspect`'s `[start, end]` rows into
 	/// grid-aligned buckets **without ever materializing the range**.
 	///
