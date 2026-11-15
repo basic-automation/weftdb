@@ -37,6 +37,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   file, a maintenance failure poisons a whole aspect, and the blast radii do not
   merge. The breaker trips per segment path with a cooldown, so one corrupt frame
   cannot spin the background decode loop forever.
+
+- **Document TimescaleDB percentile internals and the like-for-like plan.** `percentile_agg()` wraps a UDDSketch at 200 buckets / 0.001 max error; the research note with source URLs and the measurement plan is at `docs/research/timescale-percentile.md` (#732).
 - **Restore a whole store into a chosen new root over HTTP** (`POST /api/v1/storage/restore/into?label=&name=`), guarded by `WEFT_RESTORE_BASE_DIR` and a containment check that refuses destinations inside the backup base.
 
 ### Documentation
@@ -67,6 +69,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `#[test]` it generates, so either position in the attribute block serialises. The guard now covers both
   forms and fails when a `#[serial]` shares no attribute block with a test attribute, which is the shape
   that compiles, passes, and quietly runs concurrently with the tests it meant to exclude (#726).
+- **GPU pool bound test no longer flakes under GPU contention.**
+  `gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu` asserted `pool.stable` (which
+  fails when another process holds GPU memory during round one) via `result.correctness.passed()`.
+  Now checks the hard invariants only: every output value is finite, every call returned the expected
+  number of points, the pool never exceeds its cap, and the device allocator does not grow without
+  bound.  (#725)
 
 ## [0.3.7] - 2026-11-12
 
