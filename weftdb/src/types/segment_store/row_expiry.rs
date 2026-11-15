@@ -334,8 +334,8 @@ mod tests {
 	#[test]
 	fn default_sweep_is_empty() {
 		let sweep = ExpirySweep::default();
-		assert!(sweep.aspects_cleaned.is_empty());
-		assert!(sweep.busy.is_empty());
+		assert_eq!(sweep.aspects_cleaned, [] as [AspectExpirySwept; 0]);
+		assert_eq!(sweep.busy, [] as [String; 0]);
 		assert!(sweep.failed.is_empty());
 		assert_eq!(sweep.rows_expired, 0);
 	}
