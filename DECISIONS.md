@@ -7310,3 +7310,31 @@ publication would leave that trap in place.
 **Not done here.** No `ROADMAP.md` tick, no change to the compiled
 `NOT_IN_SCOPE` text (a compiled constant is not a documentation surface), and no
 contact with KX or AVEVA — both need a human.
+
+## 2026-11-15 — What `float_roundtrip` costs a whole request (#724)
+
+**What was ambiguous.** The brief asked me to measure the whole-request cost of serde_json's
+`float_roundtrip` feature, not to re-measure the parse-only cost. The parse-only figure was
+already known: 40.0–41.7 ns/value without the feature, 57.0–59.2 with it (≈ +17 ns, ≈ 1.42×).
+The question was whether +17 ns/value moves request latency at all — i.e. whether the cost is
+visible when the values are a small part of request processing.
+
+**What I chose.** The benchmark drives `POST /api/v1/interpolate` through the real axum router
+with a body of N f64 values in the same magnitude mix as the Phase 11 measurement (1e-19..1e15,
+xorshift64, ryu-formatted by serde_json). It reports p50/p95 request latency plus ns/value:
+the same metric as Phase 11 at a different level of the stack, so the two are directly
+comparable. The A/B CI job (`float-roundtrip-a-b`) builds and runs the bench twice — once as
+shipped, once with `float_roundtrip` stripped in-job — and prints the median and delta.
+
+**What I could not answer (and the harness proves why).** The CI runner is a GitHub-hosted
+ubuntu-latest, which is not the same machine twice and does not publish its hardware model.
+The bench reports the runner's own numbers; they are not comparable across runs. The roadamp
+line is ticked only when real CI numbers exist — the bench outputs a line that `grep 'ns/value='`
+can capture, and the CI job prints it.
+
+**Harness.** `weft-server/benches/json_body_cost.rs` follows the same pattern as
+`stored_interpolate.rs` (hand-rolled, p50/p95, no criterion). Knobs: `WEFT_JBC_VALUES` and
+`WEFT_JBC_REPS`. The A/B job lives in `.github/workflows/bench-regression.yml`.
+
+**Hard rule obeyed.** `Cargo.toml` keeps `features = ["float_roundtrip"]`; the strip is
+in-job only, and the job asserts the file was never committed stripped.
