@@ -743,11 +743,11 @@ async fn v010_compat_fre13_upgrade_contract() {
 ///
 /// A real older binary cannot be invoked from a test (no v0.1.0 binary artifact
 /// is available in CI), so leg C is expressed as the layout-floor contract the
-/// store already enforces: write with the current SUPPORTED_LAYOUT, tamper the
-/// STORE_FORMAT marker's min_write_layout to a value above SUPPORTED_LAYOUT,
-/// assert the store refuses the open (StoreError::IncompatibleLayout), restore
+/// store already enforces: write with the current `SUPPORTED_LAYOUT`, tamper the
+/// `STORE_FORMAT` marker's `min_write_layout` to a value above `SUPPORTED_LAYOUT`,
+/// assert the store refuses the open (`StoreError::IncompatibleLayout`), restore
 /// the marker, and assert the store reopens clean and the pre-refusal data
-/// reads back.  The min_write_layout tamper simulates what an older binary
+/// reads back.  The `min_write_layout` tamper simulates what an older binary
 /// would see when it loads a marker from a newer build that set a higher
 /// floor; the actual v0.1.0 binary (layout 1) does not run.
 #[tokio::test]
