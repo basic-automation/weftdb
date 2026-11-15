@@ -225,7 +225,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
   - [x] A bench for the cost against `DdSketch` (2026-11-11)
   - [x] The accuracy each collapse costs on real data (2026-11-11)
   - [ ] Repeat the timing figures on a quiet host with pinned cores before citing any of them
-  - [ ] **Research (2026-11-11) — TimescaleDB's default percentile aggregate is a UDDSketch, so it is the like-for-like comparison.**
+  - [x] **Research (2026-11-11) — TimescaleDB's default percentile aggregate is a UDDSketch, so it is the like-for-like comparison.**
   - [ ] Decide whether the `sketch_p*` reductions take it (owner-gated; needs a sidecar version step)
 - [ ] **Research (2026-10-11) — the exact TWA is now a measurable differentiator.**
 - [ ] **POSITIONING ALERT — WeftDB's precision wedge now has a direct competitor (research 2026-09-23).**

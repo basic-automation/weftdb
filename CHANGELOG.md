@@ -10,6 +10,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **Document TimescaleDB percentile internals and the like-for-like plan.** `percentile_agg()` wraps a UDDSketch at 200 buckets / 0.001 max error; the research note with source URLs and the measurement plan is at `docs/research/timescale-percentile.md` (#732).
+
 - **Restore a whole store into a chosen new root over HTTP** (`POST /api/v1/storage/restore/into?label=&name=`), guarded by `WEFT_RESTORE_BASE_DIR` and a containment check that refuses destinations inside the backup base.
 
 ### Fixed

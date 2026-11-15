@@ -1,4 +1,35 @@
-# Progress — TEST-658
+# Progress — TS-PCTL (#732)
+
+## Handoff — 2026-11-14
+
+### Changed files
+
+- `docs/research/timescale-percentile.md` (created, 150 lines)
+- `docs/roadmap-notes.md` (ticked as DONE for the research item)
+- `ROADMAP.md` (ticked checkbox)
+- `CHANGELOG.md` (Added docs line)
+- `DECISIONS.md` (appended ## 2026-11-14 section)
+- `progress.md` (updated with this handoff)
+
+### Deliverables
+
+- Research note at `docs/research/timescale-percentile.md` covering:
+  - Confirmation that `percentile_agg()` wraps a UDDSketch with 200 buckets / 0.001 max error
+  - Primary-source URLs (Tiger Data docs, GitHub timescaledb-toolkit source, arXiv paper)
+  - Closed-form error estimate: BTC corpus needs ~5 collapses, reaches ~3.2% error
+  - Concrete measurement plan for the next bench run
+
+- All file changes are doc-only: no `.rs`, no `Cargo.toml`, no CI file touched.
+
+### Not done
+
+- The actual bench measurement (adding `UddSketch(0.001, 200)` variant to `sketch_collapse`) is deferred: the instructions forbid cargo build/check/test/clippy on this host (~8 GB free).
+- No training images or commit-triggers were added.
+
+### Commands run for research
+
+- `curl` on 8 URLs (Tiger Data docs, GitHub API + raw content, arXiv). All fetched successfully.
+- `git`, `grep`, `ls`, `find`, `read` inside the workspace.
 
 ## Handoff — 2026-11-10
 

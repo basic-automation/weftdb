@@ -6872,3 +6872,34 @@ Rejected first: relaxing the tests to compare one platform's spelling. Both fail
 usability defects on those platforms, and a test that compares a canonical path to an un-resolved one
 would have hidden the next such defect rather than catching it. The tests now compare canonical forms
 of both sides, which is what they always meant to assert.
+
+## 2026-11-14 — TimescaleDB's default percentile aggregate and the like-for-like comparison plan (#732)
+
+**The item asked: is TimescaleDB's `percentile_agg()` a UDDSketch, and what is the concrete
+comparison plan?**
+
+The Tiger Data docs (the rebranded Timescale docs at www.tigerdata.com) and the
+`timescaledb-toolkit` GitHub source confirm:
+
+- `percentile_agg()` calls `uddsketch` with `size = 200` and `max_error = 0.001`.
+  Source: `extension/src/uddsketch.rs:35-36` at
+  <https://github.com/timescale/timescaledb-toolkit/blob/main/extension/src/uddsketch.rs>.
+  Doc: <https://www.tigerdata.com/docs/reference/toolkit/percentile-approximation/uddsketch/percentile_agg>.
+- The `uddsketch()` page warns: "the true error may exceed this if too few buckets are provided
+  for the data distribution"
+  (<https://www.tigerdata.com/docs/reference/toolkit/percentile-approximation/uddsketch/uddsketch>).
+- `error()` returns the actual bound
+  (<https://www.tigerdata.com/docs/reference/toolkit/percentile-approximation/uddsketch/error>).
+- The implementation lives in the Toolkit extension (`pgrx`-based Rust crate), not in core
+  TimescaleDB. The UDDSketch crate is at
+  <https://github.com/timescale/timescaledb-toolkit/tree/main/crates/udd-sketch>,
+  based on <https://arxiv.org/abs/2004.08604>.
+- WeftDB already has `weft_reduce::UddSketch` (`weft-reduce/src/uniform.rs:52`) with the same
+  closed-form error bound.
+
+**Chosen: document the findings in `docs/research/timescale-percentile.md`, close the
+roadmap item as Research (DONE), and leave the measurement (adding the UddSketch(0.001, 200)
+variant to `sketch_collapse` and running it on a quiet host) for the next worker that does
+bench builds.** The research note contains the concrete comparison plan, the primary-source
+URLs for every claim, and the closed-form estimate that the BTC corpus needs about 5
+collapses and lands near 3.2% error — against the 1% `sketch_p99` holds without collapsing.
