@@ -7600,3 +7600,48 @@ and #758 stays open.
 - **Why leg C counts as a runner even though it runs no old binary.** It proves the refusal half of rollback: `weftdb/tests/compat_v010.rs:771` sets `format.min_write_layout = 99`, `:776`-`:778` assert the open fails with `StoreError::IncompatibleLayout { min_write, supported }`, and the test then restores the marker and reads its data back with this build. Running a real v0.1.0 binary against a current tree is not merely confusing but hazardous, and `compat/v010/README.md` says why: a v0.1.0 Storage-v2 root carries no `store.json` and no `segment_manifest.json` — the descriptors live in `segment_index.db` — so an old process pointed at a layout-2 store would classify it as layout 1 and could write into it. Any future `binary` runner must work on a scratch copy, read-only, and that constraint belongs to #762 rather than being buried in a tick.
 - **Correction recorded rather than rewritten.** A 2026-11 section of this file states that since 2026-11-05 every `crash matrix` job is SIGTERM'd at about nine minutes and that therefore no PR touching the paths filter can go all-green, naming #599 and #603 as blocked by it. That is no longer true: run `43759178987` on main carries `crash matrix` and its conclusion is `success`. Older sections are left as written; later agents should re-test that claim before treating a red `crash matrix` as environmental, because a genuine `crash matrix` failure is now a real signal again.
 - **Needs human.** The paid-model lanes this loop were built around are out of credits. Both `openrouter/deepseek/deepseek-v4-flash` (implementation workers, reviewer) and `openrouter/deepseek/deepseek-v4-pro-0813` (the oracle) now fail with HTTP 402 `{"message":"This request requires more credits, or fewer max_tokens…","code":402,"metadata":{"limit_source":"openrouter_credits"}}` pointing at https://openrouter.ai/settings/credits. Until someone adds credits, `parallel-worker`, `goldfish-reviewer` and `oracle` launches all die, so every slice — implementation included — runs on this host's own model, which is roughly an order of magnitude slower per change and cannot be parallelised. Two runs died mid-slice this way on 2026-11-16: worker `0b33a6e7-7453-43e4-9a60-06eecc04d819` (the `float_roundtrip` A/B follow-up on PR #760, which had pushed two commits and left the design change local) and oracle consult `a8710b0c-528d-4af8-b786-471b4333fafe` (the #742 ingest-abort wire-code decision, which is therefore still undecided and now has to be made here rather than escalated). Anyone resuming either slice must read the branch and the worktree state first: both left divergent history behind.
+
+## 2026-11-16 — Three dead dispatches: why the float A/B never reached a timing loop (#724)
+
+**What the slice changed.** Only `.github/workflows/float-roundtrip-ab.yml`, plus the two places
+that describe it (`docs/roadmap-notes.md`, the `Unreleased` changelog bullet). The workflow went
+from one job that builds the workspace twice to one job per arm on a matrix (`on`, `off`), with a
+cache key per arm, `save-always: true`, no `CARGO_BUILD_JOBS`, and the `values`/`reps` inputs
+exported as `WEFT_JBC_VALUES`/`WEFT_JBC_REPS`.
+
+**Why.** Three dispatches of the previous version — including run 43786406660 on `main` at
+`1dcdef8` — ended the same way: step 6 (the first arm) died after ~10.5 minutes with
+`The runner has received a shutdown signal` and exit 143 while still compiling, and every later
+step was skipped. No number was ever produced. The `timeout-minutes: 45` in that file was not the
+cause; the runner was reaped long before it.
+
+**The mechanism, from the logs rather than from a guess.** Two facts sit in front of the failure:
+the `rust-cache` restore step took **0 seconds**, and its post step was **skipped**. rust-cache
+saves only when a job succeeds, and this job never succeeded, so the cache never landed: every
+dispatch rebuilt roughly 600 crates from nothing, and `CARGO_BUILD_JOBS=2` — added to be polite
+about CPU — roughly doubled the wall time of that cold build. The polite setting was the thing
+killing the job.
+
+**Judgement calls, recorded as mine.** `oracle` consults are unavailable (OpenRouter 402
+`openrouter_credits`, recorded under Needs human in the 2026-11-16 #240 section), so these are my
+calls, not an escalation's. (a) **Drop `CARGO_BUILD_JOBS`.** The `test` job in `ci.yml` builds the
+whole workspace at cargo's default job count on the same runner class and completes; the A/B has no
+business throttling below what the normal gate accepts. (b) **One job per arm, cache keyed per
+arm.** The two arms link different `serde_json` builds, so a shared key would thrash; separate jobs
+also halve each job's exposure to reaping and run in parallel. (c) **`save-always: true`.** Without
+it, an arm that dies mid-build poisons the next dispatch too, because nothing is saved; with it, a
+half-finished dependency graph is still worth keeping. The design is a bet that a warm cache fits
+the runner's time budget — it is not evidence that it does.
+
+**What is still not measured.** The request-level cost of `float_roundtrip`. The parse-only numbers
+stay the only figures on record: 40.0-41.7 ns/value without the feature, 57.0-59.2 with it
+(about +17 ns, about 1.42x, Ryzen 9 7950X3D). Nothing in this section should be read as the number
+the roadmap line asks for, and the line stays unticked until an arm prints `ns/value=`.
+
+**If this version also dies.** Then the hosted runner is the limit and no amount of workflow
+restructuring fixes it: the fallback is a self-hosted runner with a warm target directory, which is
+infrastructure only the owner can provide, and the honest alternative is to close the line as
+unanswerable on this budget and say so on the issue.
+
+**Hard rules obeyed.** No local compilation, no measurement claimed, `Cargo.toml` untouched, no
+roadmap tick.
