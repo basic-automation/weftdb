@@ -67,15 +67,19 @@ two things no single-ceiling test can show:
 
 ## Known gaps (not claimed)
 
-- **Maintenance budgets (ROB-20) are half closed.** The first cut (#758) budgets
-  the plan of one overlap-reconcile pass: a group whose segments total past
-  `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` is refused `StoreError::OverBudget` before the
-  group is read, which is the memory spike the budget exists to bound. What stays open
-  is the rest of the plan's 7.5 chain — the k-way merge that would fold a group without
-  materialising it, the re-split of oversized frames, a time budget for a pass, and the
-  maintenance daemon's settings surface — and `squash`/`compact` remain unbudgeted: the
-  budget guards overlap-reconcile only. A refused pass is also still not a distinct HTTP
-  answer. This document does not claim the maintenance class is bounded by anything else.
+- **Maintenance budgets (ROB-20) are partly closed.** Two cuts are in. The
+  disk guard now covers maintenance swap outputs before a byte is written
+  (`seal.rs:swap_plans`, G2). And the first byte budget (#758, G1) refuses an
+  overlap-reconcile group whose segments total past
+  `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` with `StoreError::OverBudget` before the
+  group is read, which is the memory spike the budget exists to bound. What
+  stays open is the rest of the 7.5 chain: the k-way merge that would fold a
+  group without materialising it (G3), the re-split of oversized frames (G4), a
+  time budget for a pass (G5), and the maintenance daemon's settings surface
+  (G6). `squash` and `compact` remain unbudgeted, so the budget guards
+  overlap-reconcile only, and a refused pass is still not a distinct HTTP
+  answer (#764). This document does not claim the maintenance class is bounded
+  by anything else.
 - **Resident memory has no budget (ROB-14 skipped).** Per Justin's
   2026-11-07 call, ROB-14's memory budget is skipped, not
   implemented. Host memory is bounded indirectly — per-request row
