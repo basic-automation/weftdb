@@ -7757,3 +7757,43 @@ slice. ROADMAP's ROB-20 line stays unticked and #758 stays open until G3-G6 land
 - **No dedup and no queue enqueue were added.** Adding duplicate rejection to the bulk path under the cover of a routing change would alter observable behaviour for existing callers, and rows mode has never had it. The seal-backed paths stay clear of the per-timestamp queue (slice D-S20): the ingest commit records the aspect's change-log row in its own index transaction, which is what a batch consumer reads.
 - **`capture_new_measurement_chunk` and `replace_measurements_in_range` stay rows mode by construction, and now say so.** The chunk API takes a `&turso::Database` the caller opens — the rows-mode handle — and nothing calls it now that the bulk paths dispatch before any chunk loop. A `CompressionConfig` forces rows mode at aspect creation (`weftdb/tests/legacy_seal_tests.rs:119-125` pins it), so that surface is not going away; documenting the constraint beats leaving it implicit, because the compression path's delete-then-insert has no seal equivalent yet.
 - **Not compiled here, and not claimed.** Nothing in this slice was built: the host's RAM belongs to the model server, and CI is this quarter's Rust gate. The new `seal_backed_new_measurement_entry_points_reach_the_seal` and the rows-mode assertions in `weftdb/tests/legacy_seal_tests.rs` are written from shapes the neighbouring tests already use (`db.seal_store()` + `weftdb::legacy_seal::read_rows`, `get_measurements_count`, `get_latest_measurement`), and CI is what will say whether they pass. One assertion is load-bearing on a fact this file already records elsewhere: a seal-backed write must not open the rows-mode file at all, which is why the test asserts the per-aspect `measurements.db` never appears.
+
+## 2026-11-16 — `over_budget`: the answer a refused maintenance plan gives, and why the frozen 43-code table grew (Needs human: the plan's §4 row)
+
+- **What the issue said and what the code actually did.** #764 described an over-budget merge as
+  answering `500`. It did not: the `StoreError` classifier's fall-through arm (`weft-server/src/error.rs`,
+  the `_ => ApiError::server(Code::IncompatibleStore, …)` case) made it answer **`503 incompatible_store`**,
+  which is arguably worse — it tells an operator the store is damaged when the store refused a plan on
+  purpose. Fixed by giving it its own code rather than by changing a status class.
+- **Status: 503, and deliberately no `Retry-After`.** 409 was rejected because the request contradicts
+  nothing about the store's state; 413 and 422 were rejected because both are about the size of the
+  request or its result, and this refusal is about a server-side work budget the caller cannot touch;
+  507 belongs to disk. A 4xx would blame a caller who did nothing wrong — the ceiling is operator
+  configuration. And unlike `overloaded` there is nothing to wait for: the same call fails identically
+  until an operator raises `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` or splits the group with
+  `?split_min_bytes`, so a delay would only send the caller back into the same refusal.
+- **`details`, not `limit`.** The response carries `details.budget_bytes` and `details.planned_bytes`.
+  The `limit` field was left unset because §4 defines it as *the configured response-size ceiling that
+  refused the answer* — a single number — and this refusal is a pair. The aspect name is included
+  because the route already names the aspect in its path, so it leaks nothing.
+- **Two shapes of the same refusal.** `POST /api/v1/storage/{aspect}/reconcile` answers the status.
+  `POST /api/v1/storage/reconcile` never sees a status: the sweep collects per-aspect failures into
+  `failed: [{aspect, error}]` (`SweepFailure::list`, `weft-server/src/maintain.rs:193`, which renders
+  the whole cause chain) and answers `200`. Both now name the two byte counts — structurally in the
+  first case, in the error text in the second, because `StoreError::OverBudget`'s Display already
+  carries them.
+- **Logging: per-request `tracing::error!`, not a silent 5xx.** `ApiError::server_logged_elsewhere`
+  exists for conditions logged where they change state (the disk guard). Here nothing logs the refusal
+  at its source (`weftdb/src/types/segment_store/maint.rs` returns the error with no log), and a
+  maintenance pass is an operator- or daemon-initiated event at a low cadence, not something a client
+  can provoke per request. So the refusal gets one error line. A counter/metric for refused plans is
+  deliberately not added in this slice.
+- **Needs human:** the canonical code list is not in this repo — the enum's own header points at
+  "`basicautomation.io/projects/weftdb/docs/release-plan` §4 (C6)" (`weft-server/src/error.rs:24`, `:55`).
+  The repo-side pin moved to 44 and the wire name is registered here, but the plan page still lists 43
+  codes until that page gains the row. There is no error-code consistency checker in `scripts/`
+  (#764 guessed at `scripts/ci/check-error-consistency.sh`, which does not exist), so nothing in CI
+  would notice the drift.
+- **Not compiled here, and not claimed.** As with every Rust slice this month, the gate is CI, not a
+  local build; the local checks run were `cargo fmt --check -p weft-server`,
+  `python3 scripts/config/check_schema.py` and `python3 scripts/ci/check-serial-order.py`.
