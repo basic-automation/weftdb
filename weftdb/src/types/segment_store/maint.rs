@@ -2075,7 +2075,7 @@ fn note_extremes(oldest: &mut Option<i64>, newest: &mut Option<i64>, lo: i64, hi
 /// needs no decode. A cut is a timestamp, so [`SwapPlan::cut`] puts a whole run of equal
 /// timestamps into one output (design D17), and a cut at or below the first timestamp is a no-op
 /// and dropped. The result is sorted and deduplicated, ready to hand to `SwapPlan::cut`.
-pub(crate) fn size_driven_cuts(timestamps: &[i64], est_bytes: u64, ceiling_bytes: Option<u64>, max_outputs: usize) -> Vec<i64> {
+pub fn size_driven_cuts(timestamps: &[i64], est_bytes: u64, ceiling_bytes: Option<u64>, max_outputs: usize) -> Vec<i64> {
 	let Some(ceiling) = ceiling_bytes.filter(|ceiling| *ceiling > 0) else {
 		return Vec::new();
 	};
