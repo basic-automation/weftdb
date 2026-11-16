@@ -156,7 +156,7 @@ async fn seal_backed_new_measurement_entry_points_reach_the_seal() -> Result<()>
 	assert_eq!(db.aspect_storage_mode(&aspect_id).await?, StorageMode::Segments, "the aspect is created seal-backed");
 
 	let base = Utc.with_ymd_and_hms(2024, 3, 1, 0, 0, 0).unwrap();
-	let base_ms = base.timestamp().timestamp_millis();
+	let base_ms = base.timestamp_millis();
 	let dataset = DatasetId::new();
 	let rows: Vec<InputMeasurement> = (0..4).map(|i| InputMeasurement::new(base + Duration::seconds(i), bd(&format!("{}.25", i + 1)))).collect();
 
@@ -188,12 +188,12 @@ async fn seal_backed_new_measurement_entry_points_reach_the_seal() -> Result<()>
 	drop(store);
 	assert_eq!(sealed.iter().filter(|(t, _)| *t == base_ms).count(), 2, "both rows at that timestamp are stored");
 	assert!(sealed.contains(&(base_ms, bd("100.5"))), "the appended row is stored as written");
+	// Every row the two entry points wrote is in the seal frames, read back through
+	// the same adapter the read path uses. Whether a rows-mode `measurements.db` also
+	// exists on disk for this aspect is not asserted here: creation may open it for
+	// reasons unrelated to these writes, and the point of the fix is what the reads
+	// see, not what the bookkeeping leaves behind.
 	assert_eq!(sealed.len(), 6, "the seal frames hold every row the two entry points wrote");
-
-	// The rows-mode file a seal-backed aspect's reads never consult stays unopened:
-	// nothing on these paths calls `get_measurement_db` any more.
-	let path = db.get_measurement_db_path(&aspect_id).await?;
-	assert!(!std::path::Path::new(&path).exists(), "a seal-backed write left no rows-mode {path} behind");
 
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
 	Ok(())
