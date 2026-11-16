@@ -20,6 +20,29 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Fixed
 
+- **A seal-backed legacy aspect's bulk writes now reach the store it reads from (#232).**
+  `capture_new_measurement` and `batch_capture_new_measurements`
+  (`weftdb/src/types/database/inputs.rs`) wrote into the per-aspect rows-mode
+  `measurements.db` whatever the aspect's storage mode was, while every read of a
+  seal-backed aspect dispatches to the seal store (slice D-S19 —
+  `outputs.rs:243-251` answers the count from `aspect_stats().total_rows`,
+  `outputs.rs:1340-1351` and `database/mod.rs:1304-1307` likewise), so the call returned
+  `Ok` for rows nothing could read back. Both now take the one-transaction ingest the
+  D-S19 paths use, and an empty batch stays a no-op ahead of the dispatch rather than
+  reaching the adapter's empty-payload error. `weftdb/tests/legacy_seal_tests.rs`'s
+  `seal_backed_new_measurement_entry_points_reach_the_seal` fails on `main`, where the
+  count answers 0. Creating new aspects seal-backed by default is a separate decision,
+  filed as #768.
+- **Three documentation claims about duplicate measurement timestamps, corrected.** The
+  trait docs said `capture_new_measurement` returns an error on a duplicate, that
+  `capture_measurement` and `batch_capture_measurements` store the average of two values at
+  one timestamp, and that `batch_capture_new_measurements` skips a duplicate. None of that
+  is what the code does: rows mode creates `measurements` with no unique constraint at all,
+  only a non-unique index on `timestamp` (`weftdb/src/types/aspect.rs:511-523`), so a
+  duplicate is simply a second row, and the seal store appends and resolves equal timestamps
+  newest-first when the frames are read. `capture_new_measurement_chunk` is now documented
+  as rows-mode-only, which it has to be, since its caller hands it a rows-mode handle.
+
 - **Maintenance swap outputs now go through the disk guard (#758).**
   Overlap merges and compactions that would leave the store's filesystem
   below the reserve are refused with `InsufficientStorage` before any
