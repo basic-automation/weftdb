@@ -229,6 +229,16 @@ The licensing decisions are made. Every WeftDB crate is `MIT OR Apache-2.0`, Jus
 `splimes` 1.0 is released and WeftDB depends on it, and the control-plane engine decision is made.
 
 - **Measurement bulk ingest routed through the `.weftseg` seal**
+  *Audit 2026-11-16 (#232, part 1): the two legacy bulk writers that do not read the stored
+  range first — `capture_new_measurement` and `batch_capture_new_measurements` in
+  `weftdb/src/types/database/inputs.rs` — now route through the seal store for a seal-backed
+  aspect, the way the D-S19 paths already did. Before this they wrote the per-aspect rows-mode
+  `measurements.db`, which no seal-backed read consults, so the write was invisible: the count
+  answered 0 after a batch that had returned `Ok`. Rows mode is unchanged, and
+  `capture_new_measurement_chunk` is now documented rows-mode-only because its caller supplies
+  the rows-mode handle. The line stays unticked: new aspects are still created in rows mode
+  (`StorageMode::for_new_aspect`, `weftdb/src/types/legacy_seal.rs:126-135`), and flipping that
+  default is **#768**, which carries the ingest/read cost figure the flip needs.*
 - **B-tags**
 
 ### Security & packaging *(Phase 8 minimum)*

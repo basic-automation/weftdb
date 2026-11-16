@@ -7,6 +7,12 @@
 //! it, and widens its declared encoding when a value needs it — while an
 //! aspect created without the variable, or with a compression config,
 //! stays in rows mode.
+//!
+//! The two bulk entry points that do not read the stored range first
+//! (`capture_new_measurement`, `batch_capture_new_measurements`) route there
+//! too (#232): an un-routed write landed in the per-aspect rows-mode file that
+//! a seal-backed aspect's reads never consult, so it succeeded and read back
+//! as nothing.
 
 use std::str::FromStr;
 
@@ -124,5 +130,76 @@ async fn rows_mode_is_the_default_and_compression_forces_it() -> Result<()> {
 	let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
 	db.batch_capture_measurements(plain.id(), DatasetId::new(), vec![InputMeasurement::new(base, bd("3.5"))]).await?;
 	assert_eq!(db.get_measurements_count(&plain.id()).await?, 1);
+
+	// The un-routed bulk entry points are unchanged in rows mode (#232): every row
+	// is inserted, and a timestamp already stored is stored again — rows mode has no
+	// unique constraint to violate, and nothing averages or rejects it.
+	db.batch_capture_new_measurements(&plain.id(), &DatasetId::new(), vec![InputMeasurement::new(base + Duration::seconds(1), bd("4.5"))]).await?;
+	db.capture_new_measurement(&plain.id(), &DatasetId::new(), &InputMeasurement::new(base, bd("3.75"))).await?;
+	assert_eq!(db.get_measurements_count(&plain.id()).await?, 3, "rows mode stores every row, duplicate timestamp included");
+	assert!(db.batch_capture_new_measurements(&plain.id(), &DatasetId::new(), Vec::new()).await?.is_empty(), "an empty batch through the un-routed entry point stores nothing");
+	drop(plain);
+	Ok(())
+}
+
+/// What #232 fixes, stated as the failure it removes: on `main` these two calls
+/// returned `Ok` and the aspect's stored count stayed at zero, because the write
+/// went to the per-aspect rows-mode `measurements.db` while every read of a
+/// seal-backed aspect dispatches to the seal store (slice D-S19).
+#[serial]
+#[tokio::test]
+async fn seal_backed_new_measurement_entry_points_reach_the_seal() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "sealed_new", &splimes::Resolution::Milliseconds, None).await?.id();
+	assert_eq!(db.aspect_storage_mode(&aspect_id).await?, StorageMode::Segments, "the aspect is created seal-backed");
+
+	let base = Utc.with_ymd_and_hms(2024, 3, 1, 0, 0, 0).unwrap();
+	let base_ms = base.timestamp_millis();
+	let dataset = DatasetId::new();
+	let rows: Vec<InputMeasurement> = (0..4).map(|i| InputMeasurement::new(base + Duration::seconds(i), bd(&format!("{}.25", i + 1)))).collect();
+
+	// The bulk entry point is one ingest transaction, and a repeated call replays the
+	// store's receipt instead of storing the batch twice.
+	let tx1 = db.batch_capture_new_measurements(&aspect_id, &dataset, rows.clone()).await?;
+	assert_eq!(tx1.len(), 4, "one synthetic TxId per row of the batch");
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 4, "the batch reached the store a seal-backed aspect reads from");
+	let tx2 = db.batch_capture_new_measurements(&aspect_id, &dataset, rows.clone()).await?;
+	assert_eq!(tx2, tx1, "a repeated call replays the seal store's receipt");
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 4, "the replay stored nothing twice");
+
+	// An empty batch is a no-op, not the adapter's empty-payload error, and it is
+	// checked before the seal dispatch so both modes behave the same.
+	assert!(db.batch_capture_new_measurements(&aspect_id, &dataset, Vec::new()).await?.is_empty(), "an empty batch stores nothing and errors not");
+
+	// The single-row entry point is a one-row ingest, and the range facts it feeds
+	// (latest, boundary) see the write.
+	db.capture_new_measurement(&aspect_id, &dataset, &InputMeasurement::new(base + Duration::seconds(9), bd("9.5"))).await?;
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 5, "the single capture reaches the seal too");
+	assert_eq!(db.get_latest_measurement(&aspect_id).await?, Some(base + Duration::seconds(9)), "the aspect's latest timestamp sees it");
+
+	// Every row the two entry points wrote is in the seal frames, read back through
+	// the same adapter the read path uses. Whether a rows-mode `measurements.db` also
+	// exists on disk for this aspect is not asserted here: creation may open it for
+	// reasons unrelated to these writes, and the point of the fix is what the reads
+	// see, not what the bookkeeping leaves behind. The frames' own row total is not
+	// asserted either: nothing here compares it to anything, so a length that agreed
+	// with the rollup only by luck would fail without saying anything true.
+	let store = db.seal_store().await?;
+	let sealed = weftdb::legacy_seal::read_rows(&store, &aspect_id, None, None).await?;
+	drop(store);
+	assert!(sealed.contains(&(base_ms, bd("1.25"))), "the batch's first row is in the seal frames");
+	assert!(sealed.contains(&(base_ms + 9_000, bd("9.5"))), "the single-row write is in the seal frames, stored as written");
+
+	// A second write at a timestamp the aspect already holds reports success and adds
+	// no row. Three doc passages claimed these entry points error on a duplicate
+	// timestamp; they do not. What the store does with the row -- replaces the value
+	// there, as the seal's newer-wins merge would, or drops it -- is not settled by
+	// anything I have run, so neither is asserted. Only the count is.
+	db.capture_new_measurement(&aspect_id, &dataset, &InputMeasurement::new(base, bd("100.5"))).await?;
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 5, "a second row at a timestamp the aspect already has leaves the count where it was");
+
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
 	Ok(())
 }

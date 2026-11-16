@@ -22,6 +22,29 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Fixed
 
+- **A seal-backed legacy aspect's bulk writes now reach the store it reads from (#232).**
+  `capture_new_measurement` and `batch_capture_new_measurements`
+  (`weftdb/src/types/database/inputs.rs`) wrote into the per-aspect rows-mode
+  `measurements.db` whatever the aspect's storage mode was, while every read of a
+  seal-backed aspect dispatches to the seal store (slice D-S19 —
+  `outputs.rs:243-251` answers the count from `aspect_stats().total_rows`,
+  `outputs.rs:1340-1351` and `database/mod.rs:1304-1307` likewise), so the call returned
+  `Ok` for rows nothing could read back. Both now take the one-transaction ingest the
+  D-S19 paths use, and an empty batch stays a no-op ahead of the dispatch rather than
+  reaching the adapter's empty-payload error. `weftdb/tests/legacy_seal_tests.rs`'s
+  `seal_backed_new_measurement_entry_points_reach_the_seal` fails on `main`, where the
+  count answers 0. Creating new aspects seal-backed by default is a separate decision,
+  filed as #768.
+- **Three documentation claims about duplicate measurement timestamps, corrected.** The
+  trait docs said `capture_new_measurement` returns an error on a duplicate, that
+  `capture_measurement` and `batch_capture_measurements` store the average of two values at
+  one timestamp, and that `batch_capture_new_measurements` skips a duplicate. None of that
+  is what the code does: rows mode creates `measurements` with no unique constraint at all,
+  only a non-unique index on `timestamp` (`weftdb/src/types/aspect.rs:511-523`), so a
+  duplicate is simply a second row, and the seal store appends and resolves equal timestamps
+  newest-first when the frames are read. `capture_new_measurement_chunk` is now documented
+  as rows-mode-only, which it has to be, since its caller hands it a rows-mode handle.
+
 - **Maintenance swap outputs now go through the disk guard (#758).**
   Overlap merges and compactions that would leave the store's filesystem
   below the reserve are refused with `InsufficientStorage` before any
@@ -31,6 +54,19 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Testing
 
+- **The compatibility-leg gate maps legs to things, and carries a category for stand-ins
+  (#762).** `scripts/compat/test_leg_coverage.py` compared a pinned release's declared legs
+  against a set holding the one string `"upgrade"`, in one direction, and named no test, no
+  job and no reason — the job meant to cover the missing leg existed only as a comment. Every
+  leg of every pinned release now resolves to a **runner** (`path::identifier`, grepped for, so
+  renaming a compat test without updating the gate fails CI), a **substitute** (`rollback`: the
+  `STORE_FORMAT` marker tamper in `weftdb/tests/compat_v010.rs`, which has to say what it leaves
+  out and has to be named in `UPGRADING.md`), or a **cited absence** (`binary`, whose reason has
+  to cite repository paths that exist). Both directions are checked — a declared leg needs an
+  implementation, and an implemented leg must be declared — and the leg vocabulary is read out
+  of `compat/releases.toml`'s own field documentation instead of restated, so a leg cannot live
+  in the prose while staying invisible to the gate. The pin and `releases.LEGS` are unchanged:
+  FRE-16's rule that a pin declares only what CI executes still holds.
 - **Real-filesystem ENOSPC evidence (#723).** Two integration tests pin the
   server's `507 insufficient_storage` on top of the injectable space source #694:
   `space_source_reports_a_full_filesystem_and_the_server_says_507` (unconditional,
@@ -39,6 +75,20 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   user+mount namespaces, mounts a 1 MiB tmpfs inside a namespace on capable hosts).
 
 ### Added
+- **A maintenance pass can be told how much it may plan to fold (ROB-20 cut 1, #758).**
+  `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` (Experimental, unset by default) caps the bytes one
+  overlap-reconcile pass may plan: when a group of overlapping segments totals more than
+  the budget, the pass returns `StoreError::OverBudget { aspect, budget_bytes,
+  planned_bytes }` **before** it reads the group, because reading the group is what spikes
+  a node's memory. The refusal writes nothing and the aspect keeps the segments it had, so
+  raising the budget and running the pass again is the operator's move, and a refusal is
+  never a lost merge. The figure compared is the members' on-disk `byte_len` sum — the same
+  estimate the disk guard admits against — so it is a budget, not a measurement of what the
+  fold will cost. The same ceiling is settable as
+  `SegmentStoreOptions::with_max_maintenance_output_bytes`. It sits in `Experimental`
+  because no measurement has yet said what a right ceiling is, and `squash`, `compact` and
+  the rest of the 7.5 maintenance plan (k-way merge, re-split of oversized frames, a time
+  budget) are untouched by it.
 - **Panic audit documented** — `docs/panic-audit.md` (see ### Documentation
 - New `docs/legal-review.md`: what each engine's terms and licences say about
   publishing a benchmark result, with the verification level of every claim

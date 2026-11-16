@@ -310,9 +310,10 @@ impl Inputs for Database {
 	}
 
 	/// Capture a new measurement for a given aspect
-	/// If a measurement with the same timestamp already exists, the average of the two values is stored.
+	/// No duplicate handling: a timestamp already stored is stored again, so a range read
+	/// returns both rows. Nothing is averaged and no error is raised (#232's audit).
 	/// Uses Turso's concurrent writes feature for better performance and conflict resolution.
-	/// Also enqueues the measurement timestamp for incremental batch processing.
+	/// Also enqueues the measurement timestamp for incremental batch processing, in rows mode only.
 	///
 	/// # Errors
 	/// - if aspect not found
@@ -405,12 +406,49 @@ impl Inputs for Database {
 		.await
 	}
 
-	/// Capture new measurements for a given aspect
-	/// Simple INSERT - duplicates handled at application level
-	/// Uses Turso's concurrent writes feature for better performance.
-	/// Also enqueues the measurement timestamp for incremental batch processing.
+	/// Capture one measurement with a plain `INSERT`: no read of the stored range,
+	/// no averaging, and no rejection of a timestamp that already exists.
+	///
+	/// Rows mode cannot reject a duplicate even though the trait's older comment
+	/// said an error is returned: `measurements` is created with no unique
+	/// constraint at all, only a non-unique index on `timestamp`
+	/// (`weftdb/src/types/aspect.rs:511-523`), so a row at a timestamp that is
+	/// already stored is simply a second row. The seal behaves the same way for a
+	/// different reason: it appends, and equal timestamps are resolved when the
+	/// frames are read, newest winning.
+	///
+	/// # Seal-backed aspects (#232)
+	///
+	/// A seal-backed aspect writes the row through the seal store as a one-row
+	/// ingest and then runs the store's O(1) fragmentation gate, exactly as
+	/// [`capture_measurement`](Inputs::capture_measurement) does (slice D-S19).
+	/// The routing is not an optimization: an un-routed write went to the aspect's
+	/// rows-mode `measurements.db`, and every read of a seal-backed aspect
+	/// dispatches to the seal store, so the caller got `Ok` for a row it could
+	/// never read back. The per-timestamp queue is not touched (slice D-S20): the
+	/// ingest commit records the aspect's change-log row in its own index
+	/// transaction, which is what the batch consumer reads.
+	///
+	/// # Errors
+	/// - if aspect not found
+	/// - if unable to insert measurement into database
 	async fn capture_new_measurement(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurement: &InputMeasurement) -> Result<TxId> {
-		legacy_metadata_write(async move {
+		// Boxed on purpose: routing the sealed branch into this future pushed it past clippy's
+		// `large_futures` ceiling, and the state it carries is the seal call chain, not this
+		// function's own arguments. One heap allocation per write, against a future this size.
+		Box::pin(legacy_metadata_write(async move {
+			if self.is_seal_backed(aspect_id).await? {
+				let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
+				let rows = vec![(measurement.timestamp().timestamp_millis(), measurement.value().clone())];
+				let store = self.seal_store().await?;
+				let tx_ids = crate::legacy_seal::ingest_batch(&store, aspect_id, dataset_id, &rows).await?;
+				self.forget_cached_earliest_measurement(aspect_id).await;
+				if let Err(e) = store.squash_aspect_to_target_rows_if_fragmented(&crate::legacy_seal::aspect_key(aspect_id), crate::legacy_seal::SQUASH_TARGET_ROWS).await {
+					tracing::debug!("Failed to run the fragmentation gate after capturing a new measurement of aspect {aspect_id}; it is sealed: {e}");
+				}
+				drop(store);
+				return Ok(tx_ids.into_iter().next().unwrap_or_default());
+			}
 			let db = self.get_measurement_db(aspect_id).await?;
 			let db_path = self.get_measurement_db_path(aspect_id).await?;
 			let tx_id = TxId::new();
@@ -450,7 +488,7 @@ impl Inputs for Database {
 				return Ok(tx_id);
 			}
 			self.record_transaction(&format!("Inserted new measurement at {} for dataset {}", measurement.timestamp(), dataset_id)).await
-		})
+		}))
 		.await
 	}
 
@@ -666,8 +704,37 @@ impl Inputs for Database {
 		.await
 	}
 
-	/// Batch insert new measurements - skips duplicates (implement missing trait method)
+	/// Insert every measurement one at a time through
+	/// [`capture_new_measurement`](Inputs::capture_new_measurement), and in rows
+	/// mode skip a row whose insert failed instead of failing the call, so the
+	/// result can be shorter than the input.
+	///
+	/// Nothing here rejects duplicates. The trait's older comment said "skips
+	/// duplicates", and the implementation of that sentence is this loop: it never
+	/// reads the stored range, and rows mode has no unique constraint to violate,
+	/// so offering a timestamp twice stores it twice (#232's audit of this entry
+	/// point and of the single-capture one above).
+	///
+	/// # Seal-backed aspects (#232)
+	///
+	/// A seal-backed aspect takes the whole call as one ingest transaction in the
+	/// seal store, as [`batch_capture_measurements`](Inputs::batch_capture_measurements)
+	/// does: one commit and one change-log row (slice D-S20) rather than one
+	/// ingest per row, all-or-nothing rather than per-row skipping, and a repeated
+	/// call with the same rows replays the store's receipt instead of writing them
+	/// twice. Rows at timestamps that are already stored are still accepted, and a
+	/// call that fails returns no `TxId` at all.
+	///
+	/// An empty batch is a no-op returning an empty list, checked before the
+	/// bounds `batch_capture_sealed` needs, which answer a typed error for a batch
+	/// with no rows (ROB-5).
 	async fn batch_capture_new_measurements(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>> {
+		if input_measurements.is_empty() {
+			return Ok(Vec::new());
+		}
+		if self.is_seal_backed(aspect_id).await? {
+			return Box::pin(legacy_metadata_write(async move { self.batch_capture_sealed(aspect_id, dataset_id, &input_measurements).await })).await;
+		}
 		let mut tx_ids = Vec::new();
 		for m in input_measurements {
 			if let Ok(tx) = self.capture_new_measurement(aspect_id, dataset_id, &m).await {
@@ -677,7 +744,19 @@ impl Inputs for Database {
 		Ok(tx_ids)
 	}
 
-	/// Capture new measurement chunk (implement missing trait method - simple loop)
+	/// Insert `chunk` one row at a time into the rows-mode measurements database
+	/// opened at `db`, returning the rows that committed.
+	///
+	/// Rows mode only, and it has to be: the caller hands over the rows-mode
+	/// database handle, which is where a seal-backed aspect's rows must *not* go
+	/// (slice D-S19 dispatches its reads to the seal store). Nothing calls this
+	/// today; the bulk paths dispatch to the seal before any chunk loop runs.
+	///
+	/// # Errors
+	///
+	/// A row whose insert failed ends the call with an error after the rows
+	/// committed before it were already committed, so the caller gets no partial
+	/// list; their timestamps are queued only after the last commit.
 	async fn capture_new_measurement_chunk(&self, aspect_id: &AspectId, db: &turso::Database, db_path: &str, dataset_id: &DatasetId, chunk: &[InputMeasurement], tx_ids: &[TxId]) -> Result<Vec<TxId>> {
 		legacy_metadata_write(async move {
 			let mut successful = Vec::new();

@@ -7547,6 +7547,88 @@ criterion arguments (`--warm-up-time 1 --measurement-time 3 --sample-size 20`) a
 in-job only, and the job asserts the file was never committed stripped. No local compilation,
 no merge, no ROADMAP.md tick.
 
+## 2026-11-16 — A compat gate that maps legs to things, plus a category for stand-ins (#762) (shipped as a gate; the binary leg is still unimplemented)
+
+**Inherited state, read before touching anything.** The decision at "Rollback and binary
+compatibility: unsupported for 1.0 (FRE-16)" (2026-11-10) removed the `rollback` and `binary`
+legs from `compat/releases.toml` and from `releases.LEGS`, and explicitly rejected
+"marking the legs `unsupported` in the TOML rather than removing them, with the gate checking
+`supported`/`unsupported` states. That would add a new field and a new concept to a file with a
+single release pin, with no second user before 1.0." It also left a boundary: "the `upgrade` leg
+is the only leg with a real test (`weftdb/tests/compat_v010.rs`). The gate treats it as
+implemented." #762 does not ask to undo any of that.
+
+**What the gate could not see.** `scripts/compat/test_leg_coverage.py` held
+`IMPLEMENTED_LEGS = {"upgrade"}` and one assertion — a declared leg must be in that set. Three
+things escaped it. (a) The mapping was leg *words* to leg *words*: nothing named a test, so
+deleting or renaming the upgrade runner leaves the gate green. (b) The other direction was
+unchecked: a runner could exist for a leg no pin declares, which is how `rollback`'s real test
+(`weftdb/tests/compat_v010.rs::v010_compat_fre13_rollback_after_writes_loses_nothing`, added
+later) became invisible to the gate that was written to police exactly that. (c) The missing
+binary-leg job existed only as a comment, and `scripts/compat/releases.py` has no command that
+fetches a pinned archive — `verify-assets` needs `gh`, and a fork's CI run has no v0.1.0 release
+to download.
+
+**Chosen: leave the pin and the vocabulary exactly as FRE-16 left them, and put the third
+category in the gate.** Every leg of every pinned release is now one of exactly three statuses
+in `scripts/compat/test_leg_coverage.py`: `LEG_RUNNERS` (a runner exists; the pin **must**
+declare it), `SUBSTITUTE_RUNNERS` (CI runs a stand-in — `rollback`, covered by raising
+`STORE_FORMAT.min_write_layout` to 99 and asserting `StoreError::IncompatibleLayout` — and
+declaring it as executed would be the lie FRE-16 deleted), and `UNEXECUTABLE_LEGS` (`binary`,
+with the reason carried as data and required to cite repository paths that exist). Rules, all
+two-way: a declared leg needs a runner or a substitute; a runner-backed leg must be declared; a
+substitute-backed leg must **not** be declared; no leg may hold two statuses; every leg the pin's
+own field documentation describes must have a status for every pinned release; runner strings are
+`path::identifier` and are resolved — file exists, identifier appears in it; an absence reason
+must be a sentence, not a word, and every repository path it cites must exist.
+
+**Rejected: adding `rollback` to the pin because a test with "rollback" in its name runs.** That
+would have re-created precisely the fiction FRE-16 removed — no released binary is ever pointed at
+the candidate's store — and it would have needed `rollback` back in `releases.LEGS`, which
+invalidates `scripts/compat/test_releases.py::test_pin_block_emits_only_legs_the_gate_recognises`,
+a test that exists because `pin_block` once emitted a leg the gates rejected. The pin is
+append-only history and declares only what CI truly executes; that rule is what is valuable, and
+this slice keeps it.
+
+**Rejected in this slice: implementing `releases.py fetch`.** A fetch command that no CI job calls
+would itself be the unused-mapping pattern #762 exists to kill. Instead the gate and
+`UPGRADING.md` now carry the three pieces a real binary-leg job needs: a command that fetches a
+release archive and verifies it against the digests in `compat/releases.toml`; a scratch copy of
+the store to point an old process at, because a v0.1.0 binary classifies a layout-2 tree as
+layout 1 and writes into it; and a pinned release whose binaries can read the current layout,
+since only v0.1.0 is pinned and a new block needs a committed fixture set before
+`releases.py verify` accepts it. #762 stays open for that job.
+
+**Why the gate reads its vocabulary out of the pin file rather than restating it.**
+`_documented_legs()` scrapes the `legs` field's own documentation in `compat/releases.toml`, so a
+leg cannot survive in prose while disappearing from the gate (FRE-16's failure) nor be accepted by
+`releases.LEGS` without being described (the `pin_block` failure). Reading prose is brittle, and it
+bit immediately: the first version anchored the scan to line starts, and the leg list wraps across
+four comment lines, so it returned `{"upgrade"}` while all three legs had statuses — the
+invisible-leg failure, inside the check built to catch it. Fixed by collecting the comment block
+first and scanning the joined text; and `test_the_leg_vocabulary_read_is_complete` now pins what
+the scraper is expected to see (`{"upgrade", "rollback", "binary"}`), because a narrowing regex
+would otherwise keep every other assertion green.
+
+**Verified / not verified.** `python3 -m unittest discover -s scripts/compat -p 'test_*.py'` on
+python 3.14.8: 39 tests, all passing, plus the three negative controls run by patching the module
+in memory — deleting the `binary` absence reason, renaming a runner to
+`a_test_that_was_renamed_and_the_gate_missed` (the gate failed with `'<identifier>' not found in`
+the file's text), and putting `rollback` into `releases.LEGS` and the pin's `legs` (two failures:
+"leg 'rollback' is declared by the pin but only a stand-in covers it" and "`releases.LEGS` accepts
+['rollback'], which compat/releases.toml's own field documentation does not describe"). **No Rust
+was compiled or run on this machine** — host RAM makes a cargo build unsafe (Strata holds ~61 GB of
+124 GB) — and nothing in this slice is Rust: it is one python gate and two documents. The
+`.github/workflows/ci.yml` `compat` job (`:517`) runs both the discovery and
+`python3 scripts/compat/releases.py verify`, and `ci.yml:489` shellchecks `scripts/compat/*.sh`.
+
+**Impact.** The gate now fails when a compat test is renamed, when a leg is implemented and not
+pinned, when a stand-in is promoted to a claim, or when an absence stops being explainable. The
+pin, `releases.LEGS` and every Rust test are untouched, so no compatibility claim changed truth
+value. `UPGRADING.md` gained the runner names, the word "substitute", and the three missing pieces
+under "What is NOT guaranteed". #762 stays open: the `binary` leg is still unimplemented, and that
+is now a checked fact rather than a comment.
+
 ## 2026-11-16 — ROB-20 G2: disk guard coverage for maintenance writes (#758)
 
 **What was done.** Maintenance swap outputs now go through the store's disk
@@ -7592,6 +7674,72 @@ server), so CI is their first execution.
 (G4), the per-operation time budget (G5) and the settings surface (G6) are
 untouched. `ROADMAP.md`'s ROB-20 line stays unticked until those behaviours ship,
 and #758 stays open.
+## 2026-11-15 — A maintenance budget that refuses *before* the read (ROB-20 cut 1, #758) (shipped as a cut; the slice is not complete)
+
+ROB-20 is six cuts on one issue (#758): G1 a byte ceiling on one maintenance operation, G2
+the maintenance class against the disk guard, G3 a k-way merge, G4 re-split of oversized
+frames, G5 a time budget, G6 the settings surface. This is G1. What it does: an
+overlap-reconcile pass sums the on-disk `byte_len` of the group it is about to fold, and if
+that sum passes `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` it returns
+`StoreError::OverBudget { aspect, budget_bytes, planned_bytes }` without reading the group
+or writing anything. Three judgement calls, none of them in the issue:
+
+**Where the ceiling is enforced: planning, not writing.** `docs/maintenance-budgets-plan.md`
+describes budgets around the merge/swap step, and the obvious place to check is the swap.
+The check went into `reconcile_overlaps_held` immediately after `component_bytes` is summed
+and before `merge_members_against_first`, for a reason worth keeping: the memory a
+maintenance pass actually spikes is spent *reading* the group, so a ceiling enforced at the
+swap would bound the output and leave the spike intact. Refusing at plan time is the
+difference between a node that keeps its headroom and a node that OOMs on the way to a
+tidier store. (A second, smaller reason: the reconcile path is where G1 can land without
+touching the seal path that cut 2's disk admission edits — this repo's history shows how
+expensive those conflicts get.)
+
+**Where the knob lives: `SegmentStoreOptions`, not `ReconcileDaemonConfig`.** The plan doc
+suggests the daemon's config. A ceiling that only the daemon knows is a ceiling the
+maintenance routes, the fsck-recovery path and a library user can each walk past, so the
+field sits on `SegmentStoreOptions` beside the ROB-19 breaker and ROB-22 suspect-frame
+knobs, is copied onto the store at open, and applies to every caller of the reconcile
+entry points. Deviating from the plan doc is deliberate; if a later cut wants per-daemon
+budgets it can layer a daemon value over the store one rather than move the field.
+
+**Which tier: `Experimental`, not `Tuning`.** It ships unset (unbudgeted), and no
+measurement has said what a right ceiling is — that is precisely what the Experimental
+tier's "benefits unproven" means, and `WEFT_SEGMENT_MMAP_READS` is the precedent of another
+default-off knob parked there. A second, mechanical reason to prefer it:
+`scripts/config/check_schema.py` re-checks *every* "N Tuning"-shaped claim in the schema
+doc's version table against the live tier count, so filing a new variable under Tuning
+would make the historical version rows' prose false and force a rewrite of history. The
+convention that check enforces is that the version table's tier counts stay current; the
+honest way to satisfy it is to put genuinely unproven knobs where they belong, and to
+append a sentence naming the new variable rather than to edit the old sentences.
+
+**What the figure is, stated plainly.** `planned_bytes` is the sum of the group's segments'
+on-disk `byte_len` — the same estimate the disk guard admits against — not a prediction of
+the decoded working set or of the output size. Two consequences are accepted rather than
+papered over. A group of byte-identical segments, whose fold would write nothing new, is
+still refused once it passes the ceiling: a budget that guesses which folds are free is not
+a budget, and the operator's escape is to raise the ceiling. And the ceiling guards
+overlap-reconcile only — `squash` and `compact` remain unbudgeted, and a pass can still
+exceed the ceiling in *decoded* bytes while its on-disk sum sits under it. `docs/limits-overload-evidence.md`
+says all of this instead of claiming the maintenance class is bounded.
+
+**`0` means unbudgeted, not "no maintenance".** A malformed or zero value leaves the pass
+unbounded rather than refusing every fold. The alternative would let a typo in an
+environment file silently stop the sweeper, which is a worse failure than an unbudgeted
+pass — the same reasoning that keeps `WEFT_DISK_RESERVE_BYTES=0` meaning "guard off".
+
+**Not verified, and not claimed.** Nothing in this slice was compiled or run locally: the
+host's RAM is held by the model server, and the repo's rule for this quarter is that CI is
+the Rust gate. The five tests in
+`weftdb/src/types/segment_store/maintenance_budget_tests.rs` are written from the shapes
+`disk_guard_tests.rs` and `overlap_read_tests.rs` already use (upsert-key series so two
+overlapping sealed segments really exist, then `reconcile_overlaps`, then a byte-identical
+directory listing of `segments/` before and after), and CI is what will say whether they
+pass. Cut 2 (#761) supplies the disk half; the `OverBudget` → HTTP code mapping is filed as
+a follow-up because the frozen 43-code table is not something to widen inside a budget
+slice. ROADMAP's ROB-20 line stays unticked and #758 stays open until G3-G6 land.
+
 
 ## 2026-11-16 — Compatibility tests (#240): what that roadmap line does and does not mean (closed)
 
@@ -7600,6 +7748,29 @@ and #758 stays open.
 - **Why leg C counts as a runner even though it runs no old binary.** It proves the refusal half of rollback: `weftdb/tests/compat_v010.rs:771` sets `format.min_write_layout = 99`, `:776`-`:778` assert the open fails with `StoreError::IncompatibleLayout { min_write, supported }`, and the test then restores the marker and reads its data back with this build. Running a real v0.1.0 binary against a current tree is not merely confusing but hazardous, and `compat/v010/README.md` says why: a v0.1.0 Storage-v2 root carries no `store.json` and no `segment_manifest.json` — the descriptors live in `segment_index.db` — so an old process pointed at a layout-2 store would classify it as layout 1 and could write into it. Any future `binary` runner must work on a scratch copy, read-only, and that constraint belongs to #762 rather than being buried in a tick.
 - **Correction recorded rather than rewritten.** A 2026-11 section of this file states that since 2026-11-05 every `crash matrix` job is SIGTERM'd at about nine minutes and that therefore no PR touching the paths filter can go all-green, naming #599 and #603 as blocked by it. That is no longer true: run `43759178987` on main carries `crash matrix` and its conclusion is `success`. Older sections are left as written; later agents should re-test that claim before treating a red `crash matrix` as environmental, because a genuine `crash matrix` failure is now a real signal again.
 - **Needs human.** The paid-model lanes this loop were built around are out of credits. Both `openrouter/deepseek/deepseek-v4-flash` (implementation workers, reviewer) and `openrouter/deepseek/deepseek-v4-pro-0813` (the oracle) now fail with HTTP 402 `{"message":"This request requires more credits, or fewer max_tokens…","code":402,"metadata":{"limit_source":"openrouter_credits"}}` pointing at https://openrouter.ai/settings/credits. Until someone adds credits, `parallel-worker`, `goldfish-reviewer` and `oracle` launches all die, so every slice — implementation included — runs on this host's own model, which is roughly an order of magnitude slower per change and cannot be parallelised. Two runs died mid-slice this way on 2026-11-16: worker `0b33a6e7-7453-43e4-9a60-06eecc04d819` (the `float_roundtrip` A/B follow-up on PR #760, which had pushed two commits and left the design change local) and oracle consult `a8710b0c-528d-4af8-b786-471b4333fafe` (the #742 ingest-abort wire-code decision, which is therefore still undecided and now has to be made here rather than escalated). Anyone resuming either slice must read the branch and the worktree state first: both left divergent history behind.
+
+## 2026-11-16 — Measurement bulk ingest through the seal (#232): which reading of the roadmap line the code supports (part 1 shipped, line still unticked)
+
+- **The ambiguity, and the choice.** "Measurement bulk ingest routed through the `.weftseg` seal" reads two ways: (a) make the legacy bulk ingest entry points route through the seal store when the aspect is seal-backed, or (b) move legacy bulk ingest onto the seal by default, i.e. flip `StorageMode::for_new_aspect` (`weftdb/src/types/legacy_seal.rs:126-135`) so new aspects are seal-backed without an environment variable. Chose (a) for this PR and filed (b) as **#768**. The reason is not caution for its own sake: reading (a) names a defect that exists today under either reading, and (b) changes the storage of every new legacy aspect days before an rc freeze, which wants a measurement rather than a judgement.
+- **The defect, because it is the whole justification for the routing.** On `main`, `capture_new_measurement` (`weftdb/src/types/database/inputs.rs:412`) and `batch_capture_new_measurements` (`:670`) wrote into the per-aspect rows-mode `measurements.db` whatever the aspect's mode was, while every read of a seal-backed aspect dispatches to the seal store — `weftdb/src/types/database/outputs.rs:243-251` answers `get_measurements_count` from `store.aspect_stats().total_rows`, `outputs.rs:1340-1351` serves `get_raw_measurements` from `legacy_seal::read_measurements`, and `weftdb/src/types/database/mod.rs:1304-1307` answers `get_latest_measurement` from `seal_time_range`. The caller got `Ok` for rows it could never read back. So routing is not a performance choice here, and the new test is written to fail on `main` for exactly that reason.
+- **What the code does with a duplicate timestamp, against what three doc sites claimed.** Rows mode cannot reject anything: `weftdb/src/types/aspect.rs:511-523` (repeated at `:1184-1195`) creates `measurements (id, dataset_id, timestamp, value)` with no unique constraint and only a non-unique index on `timestamp`. A timestamp stored twice is two rows, and a range read returns both. The seal appends too, and equal timestamps are resolved when the frames are read, newest winning. The claims that a duplicate "returns an error", that two values are "averaged", and that the bulk path "skips" a duplicate were all false, and the third made the un-routed per-row loop look deliberate. Corrected at `weftdb/src/types/database/traits/inputs.rs:61` and in the `batch_capture_measurements` / `batch_capture_new_measurements` / `capture_new_measurement_chunk` docs, plus `weftdb/src/types/database/inputs.rs:313`.
+- **No dedup and no queue enqueue were added.** Adding duplicate rejection to the bulk path under the cover of a routing change would alter observable behaviour for existing callers, and rows mode has never had it. The seal-backed paths stay clear of the per-timestamp queue (slice D-S20): the ingest commit records the aspect's change-log row in its own index transaction, which is what a batch consumer reads.
+- **`capture_new_measurement_chunk` and `replace_measurements_in_range` stay rows mode by construction, and now say so.** The chunk API takes a `&turso::Database` the caller opens — the rows-mode handle — and nothing calls it now that the bulk paths dispatch before any chunk loop. A `CompressionConfig` forces rows mode at aspect creation (`weftdb/tests/legacy_seal_tests.rs:119-125` pins it), so that surface is not going away; documenting the constraint beats leaving it implicit, because the compression path's delete-then-insert has no seal equivalent yet.
+- **Not compiled here, and not claimed.** Nothing in this slice was built: the host's RAM belongs to the model server, and CI is this quarter's Rust gate. The new `seal_backed_new_measurement_entry_points_reach_the_seal` and the rows-mode assertions in `weftdb/tests/legacy_seal_tests.rs` are written from shapes the neighbouring tests already use (`db.seal_store()` + `weftdb::legacy_seal::read_rows`, `get_measurements_count`, `get_latest_measurement`), and CI is what will say whether they pass. One assertion is load-bearing on a fact this file already records elsewhere: a seal-backed write must not open the rows-mode file at all, which is why the test asserts the per-aspect `measurements.db` never appears.
+
+## 2026-11-16 — A pull request merged to main with its test job red, and what that says about the gate (Needs human)
+
+- **What happened.** PR #769 merged as `617631f` while `test (ubuntu-latest)` and `clippy` were **failing**: the test added in its own commit did not compile — `error[E0599]: no method named `timestamp_millis` found for type `i64`` at `weftdb/tests/legacy_seal_tests.rs:159`, because `base` is already a `DateTime` and `DateTime::timestamp()` returns seconds. `gh pr merge 769 --merge` returned success, so those checks are **not required** by branch protection on `main`. The fix is a one-line follow-up branch; main carried a non-compiling test target for roughly two hours.
+- **The judgement, recorded rather than acted on.** Branch protection is a repository setting, not a file, so I cannot make a red check block a merge. **Needs human:** mark `test (ubuntu-latest)`, `clippy` and `rustfmt` as required status checks for `main` (and consider `cargo package`). Until then, the honest statement about this repository is that CI reports quality; it does not gate it.
+- **Practice change for me, effective now.** `gh pr merge` succeeding is not evidence that CI was green. Read `gh pr checks` in the same turn as the merge, and treat any `fail` on a test, clippy or build job as a stop: fix on a follow-up branch before merging anything else on top. This also means earlier merges in this session should be re-checked rather than assumed green.
+
+## 2026-11-16 — What the seal actually does with a duplicate timestamp, and a test that claimed more than it knew (Done, one part open)
+
+- **What happened.** The test PR #770 added to prove the #769 routing failed on CI: `weftdb/tests/legacy_seal_tests.rs:185:5: assertion `left == right` failed: the seal appended the duplicate rather than rejecting it` with `left: 5, right: 6`. It wrote a second row at a timestamp the aspect already held and asserted the count grew. It did not. The failure was mine, and it was a claim I had never observed: the #232 notes had already recorded that three doc passages asserting a duplicate-timestamp *error* were false, and I overcorrected into asserting an append.
+- **What is now asserted, and only that.** The call reports `Ok`, the store's visible count does not change, and the seal frames contain the batch's first row and the single-row write. What the store does with the row — replaces the value at that timestamp, as the seal's newer-wins merge would, or drops the write — is stated in the test's comment as **unsettled**, and is asserted neither way. The frames' own row total is no longer asserted at all: nothing compared it to anything, so a number that agreed with the rollup by luck would have failed without saying anything true.
+- **The practice lesson, general.** A test written without a local test run may assert only what the read it uses can *distinguish*. The count came from `aspect_stats(...).total_rows` (a rollup total), which cannot tell "replaced" from "dropped" — so the assertion was out of reach of the very API it read. Where a read cannot distinguish the cases, the honest assertion is the one that holds in both, plus a comment naming what is unsettled.
+- **Main's other red, from my own #769.** `clippy` has failed on every head since `617631f` with `error: large future with a size of 25240 bytes` (42,056 bytes with `--all-features`) at `weftdb/src/types/database/inputs.rs:436:28` and `:733:5`, because CI runs `-D clippy::perf`. `Box::pin` on those two `legacy_metadata_write` futures fixes it — not `#[allow(clippy::large_futures)]`, which would keep allocating a 42 KB future per write and leave the lint unarmed for the next growth. The file already boxed two sibling sites, so the pattern was established; my routing grew the other two past the threshold. Behaviour-preserving, uncompiled here, CI will say.
+- **Still open.** What the seal does with a row at an existing timestamp deserves its own answer and a doc sentence; that is a follow-up, not this branch. Separately, one earlier CI reading cited a test named `error_taxonomy_conformance::spatial_query_on_the_real_store_with_no_spatial_index`, and that test **does not exist** on `origin/main` (881 paths in main's tree, no such file; GitHub code search finds nothing) — the reading was mis-attributed, and it is recorded here so the claim does not get repeated as fact.
 
 ## 2026-11-16 — Three dead dispatches: why the float A/B never reached a timing loop (#724)
 

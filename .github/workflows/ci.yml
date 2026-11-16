@@ -251,6 +251,13 @@ jobs:
         if: failure()
         shell: bash
         run: cargo test -p weftdb --lib --locked -- row_expiry --test-threads=1 --nocapture
+      # TEMPORARY diagnosis for the maintenance-output-budget branch (#758), same reason as
+      # the step above: re-run just the budget tests single-threaded and uncaptured when the
+      # job has already failed, so the assertion text reaches the log. Remove once green.
+      - name: "Debug: maintenance budget tests, single-threaded, uncaptured"
+        if: failure()
+        shell: bash
+        run: cargo test -p weftdb --lib --locked -- maintenance_budget --test-threads=1 --nocapture
       # The crash tests arm fault points, which only a `fault-injection` build has. The
       # workspace test above must leave the feature off (weftdb's durable_fault_disabled
       # checks that a production build keeps the points inert), so they run here, per
