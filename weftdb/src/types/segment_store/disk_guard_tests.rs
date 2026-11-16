@@ -93,3 +93,55 @@ async fn a_disabled_guard_still_reports_headroom() {
 	assert!(!headroom.refusing());
 	assert!(!guard.is_enabled());
 }
+
+/// ROB-20 G2: a maintenance swap (the overlap merge) whose output the disk guard
+/// would push below the reserve is refused before any byte is written, and the store
+/// is unchanged afterwards. The two segments are sealed under a satisfiable reserve
+/// and the store is reopened under an impossible one: the seal path has its own
+/// admission, so sealing under `IMPOSSIBLE` would refuse the seal, not the merge.
+#[tokio::test]
+async fn a_maintenance_swap_refuses_below_the_reserve() {
+	let dir = TempDir::new().unwrap();
+	let store = store_at(dir.path(), 1).await;
+	// Overlap in time but differ in content: the merge cannot take the skip-identical
+	// path, so it has to write an output and the admission is reached.
+	let (ts_a, vs_a) = values(100);
+	store.seal_declared(ASPECT, &ts_a, &vs_a).await.expect("first seal");
+	let ts_b: Vec<i64> = (50..150).collect();
+	let vs_b: Vec<BigDecimal> = ts_b.iter().map(|t| BigDecimal::from(*t)).collect();
+	store.seal_declared(ASPECT, &ts_b, &vs_b).await.expect("second seal");
+	drop(store);
+
+	let store = store_at(dir.path(), IMPOSSIBLE).await;
+	let start_frames = frames(dir.path());
+	let start_segments = store.segment_count(ASPECT).await.unwrap();
+	assert_eq!(start_segments, 2, "two overlapping segments to merge");
+
+	let err = store.reconcile_overlaps(ASPECT).await.expect_err("the guard refuses the merge before any write");
+	assert!(matches!(err.downcast_ref::<StoreError>(), Some(StoreError::InsufficientStorage { .. })), "{err:#}");
+
+	assert_eq!(frames(dir.path()), start_frames, "no output frame was left behind");
+	assert_eq!(store.segment_count(ASPECT).await.unwrap(), start_segments, "the segment set is unchanged after the refusal");
+	assert!(store.headroom().is_some_and(|headroom| headroom.refusing()), "the headroom report says the guard is refusing");
+	drop(store);
+}
+
+/// ROB-20 G2: the same merge with ample headroom still runs, so the admission is not
+/// an unconditional refusal. Partial overlap again, so this is the real write path
+/// rather than a skip-identical keep.
+#[tokio::test]
+async fn a_maintenance_swap_succeeds_with_ample_headroom() {
+	let dir = TempDir::new().unwrap();
+	let store = store_at(dir.path(), 1).await;
+	let (ts_a, vs_a) = values(100);
+	store.seal_declared(ASPECT, &ts_a, &vs_a).await.expect("first seal");
+	let ts_b: Vec<i64> = (50..150).collect();
+	let vs_b: Vec<BigDecimal> = ts_b.iter().map(|t| BigDecimal::from(*t)).collect();
+	store.seal_declared(ASPECT, &ts_b, &vs_b).await.expect("second seal");
+	assert_eq!(frames(dir.path()), 2, "two segments before the merge");
+
+	let removed = store.reconcile_overlaps(ASPECT).await.expect("the merge succeeds with headroom");
+	assert_eq!(removed, 1, "two overlapping segments leave one behind");
+	assert_eq!(store.segment_count(ASPECT).await.unwrap(), 1, "only one segment remains after the merge");
+	drop(store);
+}
