@@ -7504,30 +7504,45 @@ cfgs are not analysed locally at all.
 fault is on the branch, and the reason is not yet established. Tracked as a follow-up; the
 slice is not ticked on the roadmap until the gate is green.
 
-## 2026-11-15 — What `float_roundtrip` costs a whole request (#724)
+## 2026-11-15 — What `float_roundtrip` costs a whole request (#724) — amended 2026-11-15
 
-**What was ambiguous.** The brief asked me to measure the whole-request cost of serde_json's
-`float_roundtrip` feature, not to re-measure the parse-only cost. The parse-only figure was
-already known: 40.0–41.7 ns/value without the feature, 57.0–59.2 with it (≈ +17 ns, ≈ 1.42×).
-The question was whether +17 ns/value moves request latency at all — i.e. whether the cost is
-visible when the values are a small part of request processing.
+**What the slice added.** A request-level benchmark (`weft-server/benches/json_body_cost.rs`)
+that drives `POST /api/v1/interpolate` through the real axum router with N f64 values in the
+same magnitude mix as the Phase 11 parse-only measurement (1e-19..1e15, xorshift64,
+ryu-formatted). Reports p50/p95 request latency plus ns/value — the same metric at a different
+stack level, so the two are directly comparable if both were measured on the same hardware.
 
-**What I chose.** The benchmark drives `POST /api/v1/interpolate` through the real axum router
-with a body of N f64 values in the same magnitude mix as the Phase 11 measurement (1e-19..1e15,
-xorshift64, ryu-formatted by serde_json). It reports p50/p95 request latency plus ns/value:
-the same metric as Phase 11 at a different level of the stack, so the two are directly
-comparable. The A/B CI job (`float-roundtrip-a-b`) builds and runs the bench twice — once as
-shipped, once with `float_roundtrip` stripped in-job — and prints the median and delta.
+**What was not measured and why.** The request-level number is **not measured yet**. The
+A/B comparison (bench with and without `float_roundtrip`) is run on demand by a maintainer
+because a full-workspace A/B build does not fit the hosted runner budget — two compilations
+invalidate the dependency cache, forcing the whole workspace to build twice within 45 minutes,
+which starves the runner for CPU/memory. The bench itself compiles in normal CI (`cargo test
+--all-targets`, `cargo bench --no-run`) so any compile error still shows up on the PR.
 
-**What I could not answer (and the harness proves why).** The CI runner is a GitHub-hosted
-ubuntu-latest, which is not the same machine twice and does not publish its hardware model.
-The bench reports the runner's own numbers; they are not comparable across runs. The roadamp
-line is ticked only when real CI numbers exist — the bench outputs a line that `grep 'ns/value='`
-can capture, and the CI job prints it.
+The parse-only figures are the only numbers on record: 40.0–41.7 ns/value without the feature
+and 57.0–59.2 with it (≈ +17 ns, ≈ 1.42×, on a Ryzen 9 7950X3D).
 
-**Harness.** `weft-server/benches/json_body_cost.rs` follows the same pattern as
-`stored_interpolate.rs` (hand-rolled, p50/p95, no criterion). Knobs: `WEFT_JBC_VALUES` and
-`WEFT_JBC_REPS`. The A/B job lives in `.github/workflows/bench-regression.yml`.
+**How to run the A/B comparison.**
 
-**Hard rule obeyed.** `Cargo.toml` keeps `features = ["float_roundtrip"]`; the strip is
-in-job only, and the job asserts the file was never committed stripped.
+```
+gh workflow run float-roundtrip-ab.yml \
+  --repo basic-automation/weftdb \
+  --ref p12/float-roundtrip-req
+```
+
+Add `--field values=100000 --field reps=20` to override defaults. The numbers appear in the
+job log (`ns/value=` lines) and in `GITHUB_STEP_SUMMARY`. The workflow file is
+`.github/workflows/float-roundtrip-ab.yml`, triggered only by `workflow_dispatch`.
+
+**Decision — moved A/B to its own workflow file.** The job was originally embedded in
+`bench-regression.yml` on the same `on` trigger as the nightly regression gate, which ran it on
+every push/pull request. Two problems: (a) the full-workspace A/B build starves the hosted
+runner (two §760 attempts failed with "The hosted runner lost communication with the server"),
+and (b) `actionlint` flagged a shellcheck SC2129 in the "Print summary" step. Moved to
+`.github/workflows/float-roundtrip-ab.yml` guarded only by `workflow_dispatch`, with bounded
+criterion arguments (`--warm-up-time 1 --measurement-time 3 --sample-size 20`) and
+`CARGO_BUILD_JOBS=2` to keep CPU/memory pressure modest.
+
+**Hard rules obeyed.** `Cargo.toml` keeps `features = ["float_roundtrip"]`; the strip is
+in-job only, and the job asserts the file was never committed stripped. No local compilation,
+no merge, no ROADMAP.md tick.
