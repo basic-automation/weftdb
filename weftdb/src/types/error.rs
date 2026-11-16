@@ -362,4 +362,22 @@ pub enum StoreError {
 		/// The bytes the write needed.
 		need_bytes: u64,
 	},
+	/// A maintenance pass the store's per-operation output budget refused (ROB-20):
+	/// the group it was about to fold is larger than the budget
+	/// ([`SegmentStoreOptions::max_maintenance_output_bytes`](crate::SegmentStoreOptions::max_maintenance_output_bytes))
+	/// allows, so it was refused **before any of it was read into memory** — the read
+	/// is the spike the budget exists to bound. Nothing was written; the aspect keeps
+	/// the segments it had. Raise the budget, or cut the group smaller by hand with
+	/// the operator split, and retry. A group of byte-identical segments would write
+	/// nothing at all and is still refused, because the refusal happens before the
+	/// fold that would have proved it identical.
+	#[error("the maintenance pass on aspect {aspect:?} planned {planned_bytes} bytes of output against a {budget_bytes}-byte per-operation budget; nothing was written (raise WEFT_MAINTENANCE_MAX_OUTPUT_BYTES, or split the group by hand)")]
+	OverBudget {
+		/// The aspect the pass ran for.
+		aspect: String,
+		/// The budget in force, in bytes.
+		budget_bytes: u64,
+		/// The bytes the pass planned to fold.
+		planned_bytes: u64,
+	},
 }

@@ -18,6 +18,20 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   user+mount namespaces, mounts a 1 MiB tmpfs inside a namespace on capable hosts).
 
 ### Added
+- **A maintenance pass can be told how much it may plan to fold (ROB-20 cut 1, #758).**
+  `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` (Experimental, unset by default) caps the bytes one
+  overlap-reconcile pass may plan: when a group of overlapping segments totals more than
+  the budget, the pass returns `StoreError::OverBudget { aspect, budget_bytes,
+  planned_bytes }` **before** it reads the group, because reading the group is what spikes
+  a node's memory. The refusal writes nothing and the aspect keeps the segments it had, so
+  raising the budget and running the pass again is the operator's move, and a refusal is
+  never a lost merge. The figure compared is the members' on-disk `byte_len` sum — the same
+  estimate the disk guard admits against — so it is a budget, not a measurement of what the
+  fold will cost. The same ceiling is settable as
+  `SegmentStoreOptions::with_max_maintenance_output_bytes`. It sits in `Experimental`
+  because no measurement has yet said what a right ceiling is, and `squash`, `compact` and
+  the rest of the 7.5 maintenance plan (k-way merge, re-split of oversized frames, a time
+  budget) are untouched by it.
 - **Panic audit documented** — `docs/panic-audit.md` (see ### Documentation
 - New `docs/legal-review.md`: what each engine's terms and licences say about
   publishing a benchmark result, with the verification level of every claim

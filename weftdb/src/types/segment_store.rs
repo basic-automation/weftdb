@@ -473,6 +473,15 @@ pub struct SegmentStoreOptions {
 	/// [`from_env`](Self::from_env) reads `WEFT_DISK_RESERVE_BYTES` and falls back to
 	/// [`DEFAULT_DISK_RESERVE_BYTES`](crate::DEFAULT_DISK_RESERVE_BYTES).
 	pub disk_reserve_bytes: u64,
+	/// The largest fold one maintenance operation may plan (ROB-20): a merge group
+	/// whose members' bytes exceed it is refused with
+	/// [`StoreError::OverBudget`](crate::StoreError::OverBudget) before the group is
+	/// read, because reading it is the memory spike the budget exists to bound.
+	/// `None`, the library default, budgets nothing at all;
+	/// [`from_env`](Self::from_env) reads `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` (a
+	/// positive whole number of bytes; unset, malformed, or zero leaves the pass
+	/// unbudgeted).
+	pub max_maintenance_output_bytes: Option<u64>,
 }
 
 /// The per-aspect series cap `WEFT_MAX_SERIES_PER_ASPECT`'s value names: a positive
@@ -481,6 +490,14 @@ pub struct SegmentStoreOptions {
 /// startup, so this leniency only reaches library embedders).
 fn max_series_per_aspect_from(value: Option<&str>) -> usize {
 	value.and_then(|v| v.trim().parse::<usize>().ok()).filter(|limit| *limit > 0).unwrap_or(DEFAULT_MAX_SERIES_PER_ASPECT)
+}
+
+/// The per-operation maintenance output budget `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES`
+/// names (ROB-20): a positive whole number of bytes, or `None` (unbudgeted) when it
+/// is unset or anything else. Zero means "unbudgeted" rather than "no maintenance at
+/// all", so a mistyped zero cannot stop the sweeper.
+fn maintenance_output_budget_from(value: Option<&str>) -> Option<u64> {
+	value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|budget| *budget > 0)
 }
 
 /// The default per-aspect series cap, [`SegmentStoreOptions::max_series_per_aspect`]:
@@ -506,7 +523,7 @@ pub const DEFAULT_SUSPECT_FRAME_POLICY: SuspectFramePolicy = SuspectFramePolicy:
 
 impl Default for SegmentStoreOptions {
 	fn default() -> Self {
-		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), decode_breaker: MaintenanceBreaker::default(), suspect_frame_policy: DEFAULT_SUSPECT_FRAME_POLICY, max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT, max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: false, disk_reserve_bytes: 0 }
+		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), decode_breaker: MaintenanceBreaker::default(), suspect_frame_policy: DEFAULT_SUSPECT_FRAME_POLICY, max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT, max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: false, disk_reserve_bytes: 0, max_maintenance_output_bytes: None }
 	}
 }
 
@@ -520,11 +537,22 @@ impl SegmentStoreOptions {
 	/// `1`/`true`/`on`/`yes`, any case, off otherwise) and
 	/// `WEFT_DISK_RESERVE_BYTES` ([`disk_reserve_bytes`](Self::disk_reserve_bytes);
 	/// a non-negative whole number, else
-	/// [`DEFAULT_DISK_RESERVE_BYTES`](crate::DEFAULT_DISK_RESERVE_BYTES)), each as lenient
+	/// [`DEFAULT_DISK_RESERVE_BYTES`](crate::DEFAULT_DISK_RESERVE_BYTES)), and
+	/// `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES`
+	/// ([`max_maintenance_output_bytes`](Self::max_maintenance_output_bytes); a
+	/// positive whole number of bytes, else unbudgeted), each as lenient
 	/// as it documents. Explicit: nothing in the library calls it.
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), decode_breaker: MaintenanceBreaker::decode_from_env(), suspect_frame_policy: std::env::var(SuspectFramePolicy::ENV_NAME).ok().as_deref().and_then(SuspectFramePolicy::parse).unwrap_or(DEFAULT_SUSPECT_FRAME_POLICY), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()) }
+		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), decode_breaker: MaintenanceBreaker::decode_from_env(), suspect_frame_policy: std::env::var(SuspectFramePolicy::ENV_NAME).ok().as_deref().and_then(SuspectFramePolicy::parse).unwrap_or(DEFAULT_SUSPECT_FRAME_POLICY), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()), max_maintenance_output_bytes: maintenance_output_budget_from(std::env::var("WEFT_MAINTENANCE_MAX_OUTPUT_BYTES").ok().as_deref()) }
+	}
+
+	/// These options with `bytes` as the per-operation maintenance output budget
+	/// ([`max_maintenance_output_bytes`](Self::max_maintenance_output_bytes), ROB-20).
+	#[must_use]
+	pub const fn with_max_maintenance_output_bytes(mut self, bytes: u64) -> Self {
+		self.max_maintenance_output_bytes = Some(bytes);
+		self
 	}
 
 	/// These options with `policy` for checkpoints.
@@ -1746,6 +1774,10 @@ pub struct SegmentStore {
 	/// The disk guard every seal consults (ROB-17), from the open options
 	/// ([`SegmentStoreOptions::disk_reserve_bytes`]).
 	disk_guard: crate::DiskGuard,
+	/// The bytes one maintenance operation may plan to fold, from the open options
+	/// ([`SegmentStoreOptions::max_maintenance_output_bytes`], ROB-20); `None`
+	/// budgets nothing.
+	maintenance_output_budget: Option<u64>,
 	/// Whether the disk guard is refusing, so the store logs the change of state once
 	/// rather than every refused write (ROB-17).
 	disk_refusals: crate::RefusalLatch,
@@ -8928,3 +8960,8 @@ mod overlap_read_tests;
 /// ROB-22: the suspect frame policy reaches the store and the interactive read path honours it.
 #[cfg(test)]
 mod suspect_frame_policy_tests;
+
+/// Tests for the per-operation maintenance output budget: the byte ceiling one
+/// maintenance operation may plan (ROB-20), and what a refusal leaves behind.
+#[cfg(test)]
+mod maintenance_budget_tests;

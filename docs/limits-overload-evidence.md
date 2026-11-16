@@ -28,6 +28,7 @@ refusals, answering probes, and survival. A clone re-runs it with
 | Ingest bytes in flight | `WEFT_INGEST_MAX_INFLIGHT_BYTES` (256 MiB) | `503 overloaded` + `Retry-After: 1` | `ingest.rs`: `admission_refuses_an_ingest_over_the_inflight_budget`; battery: `two_ingests_past_the_inflight_budget_shed_the_second_and_the_first_still_seals` (concurrent half) |
 | Queries in flight | `WEFT_QUERY_MAX_INFLIGHT` (128) | `503 overloaded` + `Retry-After: 1` | `routes.rs`: `query_admission_sheds_beyond_the_cap`; battery: `query_class_sheds_on_the_production_router_and_probes_still_answer` (production wiring) |
 | Maintenance concurrency | (exclusive by definition, no knob) | `409 busy` + `Retry-After: 1` | `routes.rs`: `maintenance_admission_is_exclusive_at_the_gate`; `maintenance_busy.rs`: `the_maintenance_endpoints_answer_409_while_another_operation_holds_the_aspect` |
+| Maintenance output plan | `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` (unset: unbudgeted) | `StoreError::OverBudget` raised before the group is read; nothing is written, the aspect keeps the segments it had. No HTTP code yet, so a maintenance route that hits it answers `500` (see the follow-up issue under #758) | `segment_store/maintenance_budget_tests.rs`: `a_group_over_the_budget_is_refused_before_anything_is_read`, `a_refusal_is_not_a_lost_merge_the_same_pass_runs_once_the_budget_rises`, `the_knob_is_a_positive_byte_count_and_nothing_else` |
 | Page rows | `WEFT_MAX_PAGE_ROWS` (100,000) | `422 result_too_large` with the limit | `read_limits.rs`: `a_page_over_the_ceiling_is_refused_and_one_at_it_is_served`; battery |
 | Read rows (window) | `WEFT_MAX_READ_ROWS` (5,000,000) | `422 result_too_large` with the limit | `read_limits.rs`: `a_window_over_the_row_ceiling_is_refused_however_it_is_asked_for`; battery |
 | Downsample buckets | `WEFT_MAX_DOWNSAMPLE_BUCKETS` (1,000,000) | `422 result_too_large` with the limit | `read_limits.rs`: `a_downsample_grid_over_the_bucket_ceiling_is_refused`; battery |
@@ -66,11 +67,15 @@ two things no single-ceiling test can show:
 
 ## Known gaps (not claimed)
 
-- **Maintenance budgets (ROB-20) are open.** The plan's 7.5 chain
-  ends in ROB-20's budgets and k-way merge; that slice is parked
-  (see `DECISIONS.md`), so the maintenance class is bounded only by
-  its exclusivity (one at a time), not by a budget. This document
-  does not claim otherwise.
+- **Maintenance budgets (ROB-20) are half closed.** The first cut (#758) budgets
+  the plan of one overlap-reconcile pass: a group whose segments total past
+  `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` is refused `StoreError::OverBudget` before the
+  group is read, which is the memory spike the budget exists to bound. What stays open
+  is the rest of the plan's 7.5 chain — the k-way merge that would fold a group without
+  materialising it, the re-split of oversized frames, a time budget for a pass, and the
+  maintenance daemon's settings surface — and `squash`/`compact` remain unbudgeted: the
+  budget guards overlap-reconcile only. A refused pass is also still not a distinct HTTP
+  answer. This document does not claim the maintenance class is bounded by anything else.
 - **Resident memory has no budget (ROB-14 skipped).** Per Justin's
   2026-11-07 call, ROB-14's memory budget is skipped, not
   implemented. Host memory is bounded indirectly — per-request row
