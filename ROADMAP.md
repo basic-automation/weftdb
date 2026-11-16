@@ -104,7 +104,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 
 - [ ] **7.3 Corruption detection** (D-S12 + ROB-8/9/22 + HTTP restore)
 - [ ] **7.5 Compaction** with query consistency, cancellation, and resource limits (ROB-19/20/21)
-- [ ] **Compatibility tests** (FRE-13 + PAC-14a)
+- [x] **Compatibility tests** (FRE-13 + PAC-14a) (2026-11-16, #240: legs A and C are on main and green — run 43759178987 at `8b00486` succeeded, and all ten `weftdb/tests/compat_v010.rs` tests report `ok` in `test (ubuntu|windows|macos)`, including `v010_compat_fre13_upgrade_contract` (leg A: a store the real v0.1.0 binary wrote, read by this build) and `v010_compat_fre13_rollback_after_writes_loses_nothing` (leg C); `UPGRADING.md` and `compat/releases.toml` pin v0.1.0. The third leg those files name, `binary` — a released binary reading a store this build wrote — still has **no** runner: that gap is #762, and it is not claimed by this line.)
 - [ ] Ship honesty pages / **Honesty pages shipped** (EVI-16, EVI-17 and the owner narrative)
 - [ ] Move the T7 reference drive (`/mnt/weftbench`) to a 10 Gbps port before calibration *(owner)*
 - [x] **FRE-9b** OpenAPI: storage and operator endpoints — the last change before the beta tag
