@@ -7757,3 +7757,64 @@ slice. ROADMAP's ROB-20 line stays unticked and #758 stays open until G3-G6 land
 - **No dedup and no queue enqueue were added.** Adding duplicate rejection to the bulk path under the cover of a routing change would alter observable behaviour for existing callers, and rows mode has never had it. The seal-backed paths stay clear of the per-timestamp queue (slice D-S20): the ingest commit records the aspect's change-log row in its own index transaction, which is what a batch consumer reads.
 - **`capture_new_measurement_chunk` and `replace_measurements_in_range` stay rows mode by construction, and now say so.** The chunk API takes a `&turso::Database` the caller opens — the rows-mode handle — and nothing calls it now that the bulk paths dispatch before any chunk loop. A `CompressionConfig` forces rows mode at aspect creation (`weftdb/tests/legacy_seal_tests.rs:119-125` pins it), so that surface is not going away; documenting the constraint beats leaving it implicit, because the compression path's delete-then-insert has no seal equivalent yet.
 - **Not compiled here, and not claimed.** Nothing in this slice was built: the host's RAM belongs to the model server, and CI is this quarter's Rust gate. The new `seal_backed_new_measurement_entry_points_reach_the_seal` and the rows-mode assertions in `weftdb/tests/legacy_seal_tests.rs` are written from shapes the neighbouring tests already use (`db.seal_store()` + `weftdb::legacy_seal::read_rows`, `get_measurements_count`, `get_latest_measurement`), and CI is what will say whether they pass. One assertion is load-bearing on a fact this file already records elsewhere: a seal-backed write must not open the rows-mode file at all, which is why the test asserts the per-aspect `measurements.db` never appears.
+
+## 2026-11-16 — What a heap merge has to do with a cursor that loses, and why the pairwise fold was replaced (Open, CI pending)
+
+- **The ambiguity, and the choice.** `ROADMAP.md:85` names one line for three things — "maint
+  lane: **ROB-20** Maintenance resource limits, k-way merge, re-split of oversized frames" — and
+  issue #758 says it closes only when all of them land. G1 (the output budget, #765) and G2 (the
+  disk guard for swap outputs, #761) had already merged, and G4 (re-splitting an oversized merge
+  output) was the only piece nobody had started. I took **G3, the k-way merge**, first because it
+  is the piece with no settings surface, no OpenAPI change, no on-disk format change and no new
+  behaviour to argue about: it is meant to be a pure substitution, provable by comparing outputs.
+  The line stays unticked either way; ticking it needs G4 as well, and the PR says so rather than
+  quietly narrowing the line's meaning.
+- **What newer-wins actually requires, in one sentence a heap merge can get wrong two ways.**
+  `merge_newer_wins` (`weft-physical-type/src/split.rs:147`) drops the *whole* older run at a
+  shared instant and emits the *whole* newer run, including a run of equal timestamps inside one
+  side, and keeps a superseded frame's rows at every *other* instant. A k-way merge over `k`
+  cursors fails that if it throws a losing cursor away — its later instants vanish — and fails
+  it differently if it re-parks the loser at the instant it just lost, which re-asks the same
+  comparison forever. The implementation pops the winner, emits its run at that instant, advances
+  it to its next strictly-greater instant, and then *drains every other cursor parked at that
+  same instant forward past it* without emitting. A Python port of the same algorithm run against
+  the pairwise fold over 600 generated overlap shapes (17,270 input rows, 6,759 distinct
+  instants) reported zero differences, and a deliberately buggy "throw the loser away" variant
+  differed in 456 of those 600 rounds — which is the evidence that the equivalence test in
+  `merge_k_way_matches_the_pairwise_fold_on_every_overlap_shape` is sharp enough to notice, not
+  just large enough to pass.
+- **Tie-break by frame index, not by value.** The cursor key is
+  `(instant, Reverse(frame_index), position)` inside a `BinaryHeap` of `Reverse`, so "newest wins"
+  is one comparison rather than a post-pass, and it is the *frame* that decides, never the value:
+  comparing values would make a merge depend on magnitudes and would not match the pairwise fold,
+  which is indifferent to them. `position` is third only to keep the ordering total.
+- **A new primitive rather than a changed one.** `merge_newer_wins` stays exactly as it is: it is
+  public API (`weft-physical-type/src/lib.rs:148`), it is the two-pointer that is already optimal
+  at k = 2, and the read path still calls it (`segment_store/read.rs:224`). Rewriting it in place
+  would put the read path and PR #738 (which rewrites parts of `read.rs`) at risk for a change
+  whose whole point is that it changes nothing observable. `fold_newest_wins` is the maintenance
+  merge's fold, and that is the loop the plan called out (`docs/maintenance-budgets-plan.md`
+  slice 3).
+- **Scope cut, recorded: the read path still folds pairwise.** `segment_store/read.rs:219-224`
+  merges a segment's rows the same way `fold_newest_wins` used to. Converting it is the obvious
+  follow-up and I did not do it here: it is a hot path, #738 is moving the same file, and one PR
+  that changes one fold is reviewable while a PR that changes two is not.
+- **`use super::*` made a doc link load-bearing.** `segment_store/maint.rs` imports only
+  `use super::*;`, and its four references to `merge_newer_wins` are all inside doc comments —
+  they resolved through the parent module's `use`. Removing that import (the parent no longer
+  calls the two-pointer) would have turned them into broken intra-doc links, a warning class CI
+  treats as an error in the docs build, with nothing in the diff to explain it. The four links are
+  now written with explicit paths
+  (`[`merge_newer_wins`](weft_physical_type::merge_newer_wins)`).
+- **Not compiled, and the acceptance number is therefore not mine to report.** Nothing here was
+  built or run on this host: its RAM belongs to the model server and a `cargo` invocation has been
+  OOM-killed here (SIGKILL, exit 137). The plan's acceptance criterion is "k-way faster for
+  k > 4", and I am not quoting a number I never measured — `kway_merge.rs` asserts the two arms
+  agree before it times them, so the CI run that produces the numbers is also the run that proves
+  they are comparable. `rustfmt --check` is clean (the only formatting change it wanted was tuple
+  index spacing, which is why the peek closure destructures its cursor).
+- **Delegation is out of credits, so the next slice is mine.** The attempt to put G4 on a worker
+  died before it read a file: OpenRouter returned 402 with `limit_source: openrouter_credits`
+  ("requires up to 926081 tokens, but can only afford 721831"). G4 continues in
+  `/mnt/deepmem/wt/p12-758-g4` on `p12/rob20-g4-resplit`, with the brief at
+  `.briefs/rob20-g4-resplit.md` as the record of what that slice is meant to do.
