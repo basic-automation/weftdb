@@ -7628,3 +7628,57 @@ pin, `releases.LEGS` and every Rust test are untouched, so no compatibility clai
 value. `UPGRADING.md` gained the runner names, the word "substitute", and the three missing pieces
 under "What is NOT guaranteed". #762 stays open: the `binary` leg is still unimplemented, and that
 is now a checked fact rather than a comment.
+
+## 2026-11-16 — ROB-20 G2: disk guard coverage for maintenance writes (#758)
+
+**What was done.** Maintenance swap outputs now go through the store's disk
+guard before any byte is written. `swap_plans` (`weftdb/src/types/segment_store/seal.rs`)
+calls `admit_write` once, after the generations are counted and before any output
+is allocated, journaled or written, so an overlap merge that would leave the
+filesystem below the reserve is refused with the same `InsufficientStorage` the
+ingest and seal paths already produce, with no partial frame or catalog change
+left behind. A keep plan — the skip-identical case at
+`weftdb/src/types/segment_store/maint.rs:1174` — writes nothing, so the admission
+is skipped when the output count is zero. `swap_in` needs no second admission: it
+is step M5 of the same path (id allocation and commit), not a frame writer.
+
+**The byte figure is an estimate, not a bound.** The exact output size is unknown
+until the frames are encoded, so the admission uses the sum of the members'
+`byte_len`. A newer-wins merge carries at most the members' rows, so the figure is
+usually above the output size, but nothing in the encoder guarantees it: paging and
+encoding differences can make an output larger per row than its inputs. The
+admission therefore protects against running the filesystem dry in the normal case
+and is not a byte budget. G1's explicit `max_output_bytes` is the real bound, and
+the estimate should be revisited when G1 lands.
+
+**Tests added** (`weftdb/src/types/segment_store/disk_guard_tests.rs`):
+
+- `a_maintenance_swap_refuses_below_the_reserve` — seals two segments that overlap
+  in time but differ in content under a satisfiable reserve (1 byte), reopens the
+  same root under an impossible reserve, and asserts `reconcile_overlaps` fails with
+  `InsufficientStorage` while the frame set and segment count are unchanged. The
+  reopen matters: the seal path has its own admission, so sealing under an
+  impossible reserve would refuse the *seal*, not the merge, and the test would not
+  exercise `swap_plans` at all. The content has to differ too: identical segments
+  take the skip-identical keep plan, which writes nothing and never reaches the
+  guard.
+- `a_maintenance_swap_succeeds_with_ample_headroom` — the same partially overlapping
+  pair merges into one segment with a satisfiable reserve, so the admission is not an
+  unconditional refusal.
+
+Both tests were written against the code as read on `origin/main`; they have never
+been run locally (this machine cannot build the workspace without starving the model
+server), so CI is their first execution.
+
+**G2 only.** The byte budget (G1), k-way merge (G3), resplit of oversized frames
+(G4), the per-operation time budget (G5) and the settings surface (G6) are
+untouched. `ROADMAP.md`'s ROB-20 line stays unticked until those behaviours ship,
+and #758 stays open.
+
+## 2026-11-16 — Compatibility tests (#240): what that roadmap line does and does not mean (closed)
+
+- **What was verified before ticking.** `ROADMAP.md`'s "Compatibility tests (FRE-13 + PAC-14a)" line is now ticked on evidence, not on memory: `gh run list --workflow ci.yml --commit 8b00486a5b56521e8e1678849559a1c1b82c2c35` is run `43759178987`, `completed / success`, its `test (ubuntu-latest)`, `test (windows-latest)` and `test (macos-latest)` jobs all `success`, and the ubuntu job log shows all ten `weftdb/tests/compat_v010.rs` tests `ok` — including `v010_compat_fre13_upgrade_contract` (leg A: a Storage-v2 root the real v0.1.0 binary wrote, opened and read back by this build) and `v010_compat_fre13_rollback_after_writes_loses_nothing` (leg C). **No Rust code was written for this tick.** Both plan slices had already landed (this file's "COMPAT-1: FRE-13 upgrade leg (implemented)" and "COMPAT-2: PAC-14a rollback leg C (implemented)" sections, 2026-11-15); the line simply never received its tick through the phase restructure. That is the whole change: a tick and this note.
+- **What the line does not mean.** The third leg `compat/releases.toml` names in its own vocabulary — `binary`, a *released* binary reading a store the current build wrote — has no runner anywhere. `scripts/compat/test_leg_coverage.py` hard-codes `IMPLEMENTED_LEGS: set[str] = {"upgrade"}`, and the v0.1.0 pin declares `legs = ["upgrade"]`, so the FRE-16 gate is self-consistent but blind in one direction: it fails a pin that declares a leg with no runner, and never asks whether a runner that exists is declared. Leg C's Rust runner is therefore invisible to it. Filed as **#762**, which also owns the decision about editing an append-only pin block retroactively.
+- **Why leg C counts as a runner even though it runs no old binary.** It proves the refusal half of rollback: `weftdb/tests/compat_v010.rs:771` sets `format.min_write_layout = 99`, `:776`-`:778` assert the open fails with `StoreError::IncompatibleLayout { min_write, supported }`, and the test then restores the marker and reads its data back with this build. Running a real v0.1.0 binary against a current tree is not merely confusing but hazardous, and `compat/v010/README.md` says why: a v0.1.0 Storage-v2 root carries no `store.json` and no `segment_manifest.json` — the descriptors live in `segment_index.db` — so an old process pointed at a layout-2 store would classify it as layout 1 and could write into it. Any future `binary` runner must work on a scratch copy, read-only, and that constraint belongs to #762 rather than being buried in a tick.
+- **Correction recorded rather than rewritten.** A 2026-11 section of this file states that since 2026-11-05 every `crash matrix` job is SIGTERM'd at about nine minutes and that therefore no PR touching the paths filter can go all-green, naming #599 and #603 as blocked by it. That is no longer true: run `43759178987` on main carries `crash matrix` and its conclusion is `success`. Older sections are left as written; later agents should re-test that claim before treating a red `crash matrix` as environmental, because a genuine `crash matrix` failure is now a real signal again.
+- **Needs human.** The paid-model lanes this loop were built around are out of credits. Both `openrouter/deepseek/deepseek-v4-flash` (implementation workers, reviewer) and `openrouter/deepseek/deepseek-v4-pro-0813` (the oracle) now fail with HTTP 402 `{"message":"This request requires more credits, or fewer max_tokens…","code":402,"metadata":{"limit_source":"openrouter_credits"}}` pointing at https://openrouter.ai/settings/credits. Until someone adds credits, `parallel-worker`, `goldfish-reviewer` and `oracle` launches all die, so every slice — implementation included — runs on this host's own model, which is roughly an order of magnitude slower per change and cannot be parallelised. Two runs died mid-slice this way on 2026-11-16: worker `0b33a6e7-7453-43e4-9a60-06eecc04d819` (the `float_roundtrip` A/B follow-up on PR #760, which had pushed two commits and left the design change local) and oracle consult `a8710b0c-528d-4af8-b786-471b4333fafe` (the #742 ingest-abort wire-code decision, which is therefore still undecided and now has to be made here rather than escalated). Anyone resuming either slice must read the branch and the worktree state first: both left divergent history behind.
