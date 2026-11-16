@@ -7797,3 +7797,24 @@ slice. ROADMAP's ROB-20 line stays unticked and #758 stays open until G3-G6 land
 - **Not compiled here, and not claimed.** As with every Rust slice this month, the gate is CI, not a
   local build; the local checks run were `cargo fmt --check -p weft-server`,
   `python3 scripts/config/check_schema.py` and `python3 scripts/ci/check-serial-order.py`.
+
+## 2026-11-16 — `over_budget`: the answer a refused maintenance plan gives, and why the frozen 43-code table grew (Needs human: the plan's §4 row)
+
+- **What the issue said and what the code actually did.** #764 described an over-budget merge as
+  answering `500`. It did not: the `StoreError` classifier's fall-through arm (`weft-server/src/error.rs`,
+  the `_ => ApiError::server(Code::IncompatibleStore, …)` case) made it answer **`503 incompatible_store`**,
+  which is arguably worse — it tells an operator the store is damaged when the store refused a plan on
+  purpose. Fixed by giving it its own code rather than by changing a status class.
+- **Status: 503, and deliberately no `Retry-After`.** 409 was rejected because the request contradicts
+  nothing about the store's state; 413 and 422 were rejected because both are about the size of the
+  request or its result, and this refusal is about a server-side work budget the caller cannot touch;
+  507 belongs to disk. A 4xx would blame a caller who did nothing wrong — the ceiling is operator
+  configuration. And unlike `overloaded` there is nothing to wait for: the same call fails identically
+  until an operator raises `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` or splits the group with
+  `?split_min_bytes`, so a delay would only send the caller back into the same refusal.
+- **`details`, not `limit`.** The response carries `details.budget_bytes` and `details.planned_bytes`.
+  The `limit` field was left unset because §4 defines it as *the configured response-size ceiling that
+  refused the answer* — a single number — and this refusal is a pair. The aspect name is included
+  because the route already names the aspect in its path, so it leaks nothing.
+- **Two shapes of the same refusal.** `POST /api/v1/storage/{aspect}/reconcile` answers the status.
+  `POST /api/v1/storage/reconcile` never sees a status: the sweep collects per-aspect failures into

@@ -433,7 +433,10 @@ impl Inputs for Database {
 	/// - if aspect not found
 	/// - if unable to insert measurement into database
 	async fn capture_new_measurement(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurement: &InputMeasurement) -> Result<TxId> {
-		legacy_metadata_write(async move {
+		// Boxed on purpose: routing the sealed branch into this future pushed it past clippy's
+		// `large_futures` ceiling, and the state it carries is the seal call chain, not this
+		// function's own arguments. One heap allocation per write, against a future this size.
+		Box::pin(legacy_metadata_write(async move {
 			if self.is_seal_backed(aspect_id).await? {
 				let measurement = Measurement::from_input_measurement(dataset_id, input_measurement);
 				let rows = vec![(measurement.timestamp().timestamp_millis(), measurement.value().clone())];
@@ -485,7 +488,7 @@ impl Inputs for Database {
 				return Ok(tx_id);
 			}
 			self.record_transaction(&format!("Inserted new measurement at {} for dataset {}", measurement.timestamp(), dataset_id)).await
-		})
+		}))
 		.await
 	}
 
@@ -730,7 +733,7 @@ impl Inputs for Database {
 			return Ok(Vec::new());
 		}
 		if self.is_seal_backed(aspect_id).await? {
-			return legacy_metadata_write(async move { self.batch_capture_sealed(aspect_id, dataset_id, &input_measurements).await }).await;
+			return Box::pin(legacy_metadata_write(async move { self.batch_capture_sealed(aspect_id, dataset_id, &input_measurements).await })).await;
 		}
 		let mut tx_ids = Vec::new();
 		for m in input_measurements {
