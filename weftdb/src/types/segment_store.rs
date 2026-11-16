@@ -488,6 +488,15 @@ pub struct SegmentStoreOptions {
 	/// positive whole number of bytes; unset, malformed, or zero leaves the pass
 	/// unbudgeted).
 	pub max_maintenance_output_bytes: Option<u64>,
+	/// The largest segment frame a maintenance pass may leave behind (roadmap ROB-20 G4).
+	/// `None`, the library default, re-splits nothing: a fold that would produce one very
+	/// large frame still produces it. When set, the passes that fold segments re-cut their
+	/// merged output at timestamp boundaries so that no output frame is estimated above it;
+	/// see [`size_driven_cuts`](maint::size_driven_cuts) for the rule and its hard bound.
+	/// A seal is never cut by it. [`from_env`](Self::from_env) reads
+	/// `WEFT_MAINTENANCE_MAX_SEGMENT_BYTES` (a positive whole number of bytes; unset,
+	/// malformed, or zero leaves re-splitting off).
+	pub max_maintenance_segment_bytes: Option<u64>,
 }
 
 /// The per-aspect series cap `WEFT_MAX_SERIES_PER_ASPECT`'s value names: a positive
@@ -504,6 +513,14 @@ fn max_series_per_aspect_from(value: Option<&str>) -> usize {
 /// all", so a mistyped zero cannot stop the sweeper.
 fn maintenance_output_budget_from(value: Option<&str>) -> Option<u64> {
 	value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|budget| *budget > 0)
+}
+
+/// The segment size ceiling `WEFT_MAINTENANCE_MAX_SEGMENT_BYTES` names (roadmap ROB-20 G4):
+/// a positive whole number of bytes, or `None` (no re-splitting) when it is unset or anything
+/// else. Zero means “off” rather than “no frame may exceed zero bytes”, so a mistyped
+/// zero cannot turn every fold into a re-split.
+fn maintenance_segment_ceiling_from(value: Option<&str>) -> Option<u64> {
+	value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|ceiling| *ceiling > 0)
 }
 
 /// The default per-aspect series cap, [`SegmentStoreOptions::max_series_per_aspect`]:
@@ -529,7 +546,7 @@ pub const DEFAULT_SUSPECT_FRAME_POLICY: SuspectFramePolicy = SuspectFramePolicy:
 
 impl Default for SegmentStoreOptions {
 	fn default() -> Self {
-		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), decode_breaker: MaintenanceBreaker::default(), suspect_frame_policy: DEFAULT_SUSPECT_FRAME_POLICY, max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT, max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: false, disk_reserve_bytes: 0, expiry: row_expiry::RowExpiryPolicy::NoExpiry, max_maintenance_output_bytes: None }
+		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), decode_breaker: MaintenanceBreaker::default(), suspect_frame_policy: DEFAULT_SUSPECT_FRAME_POLICY, max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT, max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: false, disk_reserve_bytes: 0, expiry: row_expiry::RowExpiryPolicy::NoExpiry, max_maintenance_output_bytes: None, max_maintenance_segment_bytes: None }
 	}
 }
 
@@ -550,7 +567,7 @@ impl SegmentStoreOptions {
 	/// as it documents. Explicit: nothing in the library calls it.
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), decode_breaker: MaintenanceBreaker::decode_from_env(), suspect_frame_policy: std::env::var(SuspectFramePolicy::ENV_NAME).ok().as_deref().and_then(SuspectFramePolicy::parse).unwrap_or(DEFAULT_SUSPECT_FRAME_POLICY), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()), expiry: row_expiry::RowExpiryPolicy::NoExpiry, max_maintenance_output_bytes: maintenance_output_budget_from(std::env::var("WEFT_MAINTENANCE_MAX_OUTPUT_BYTES").ok().as_deref()) }
+		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), decode_breaker: MaintenanceBreaker::decode_from_env(), suspect_frame_policy: std::env::var(SuspectFramePolicy::ENV_NAME).ok().as_deref().and_then(SuspectFramePolicy::parse).unwrap_or(DEFAULT_SUSPECT_FRAME_POLICY), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()), expiry: row_expiry::RowExpiryPolicy::NoExpiry, max_maintenance_output_bytes: maintenance_output_budget_from(std::env::var("WEFT_MAINTENANCE_MAX_OUTPUT_BYTES").ok().as_deref()), max_maintenance_segment_bytes: maintenance_segment_ceiling_from(std::env::var("WEFT_MAINTENANCE_MAX_SEGMENT_BYTES").ok().as_deref()) }
 	}
 
 	/// These options with `bytes` as the per-operation maintenance output budget
@@ -558,6 +575,14 @@ impl SegmentStoreOptions {
 	#[must_use]
 	pub const fn with_max_maintenance_output_bytes(mut self, bytes: u64) -> Self {
 		self.max_maintenance_output_bytes = Some(bytes);
+		self
+	}
+
+	/// These options with `bytes` as the largest frame a maintenance pass may leave behind
+	/// ([`max_maintenance_segment_bytes`](Self::max_maintenance_segment_bytes), ROB-20 G4).
+	#[must_use]
+	pub const fn with_max_maintenance_segment_bytes(mut self, bytes: u64) -> Self {
+		self.max_maintenance_segment_bytes = Some(bytes);
 		self
 	}
 
@@ -1794,6 +1819,10 @@ pub struct SegmentStore {
 	/// ([`SegmentStoreOptions::max_maintenance_output_bytes`], ROB-20); `None`
 	/// budgets nothing.
 	maintenance_output_budget: Option<u64>,
+	/// The largest frame a maintenance pass may leave behind, from the open options
+	/// ([`SegmentStoreOptions::max_maintenance_segment_bytes`], ROB-20 G4); `None`
+	/// re-splits nothing.
+	maintenance_segment_ceiling: Option<u64>,
 	/// Whether the disk guard is refusing, so the store logs the change of state once
 	/// rather than every refused write (ROB-17).
 	disk_refusals: crate::RefusalLatch,
