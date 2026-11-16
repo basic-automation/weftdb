@@ -7504,6 +7504,49 @@ cfgs are not analysed locally at all.
 fault is on the branch, and the reason is not yet established. Tracked as a follow-up; the
 slice is not ticked on the roadmap until the gate is green.
 
+## 2026-11-15 — What `float_roundtrip` costs a whole request (#724) — amended 2026-11-15
+
+**What the slice added.** A request-level benchmark (`weft-server/benches/json_body_cost.rs`)
+that drives `POST /api/v1/interpolate` through the real axum router with N f64 values in the
+same magnitude mix as the Phase 11 parse-only measurement (1e-19..1e15, xorshift64,
+ryu-formatted). Reports p50/p95 request latency plus ns/value — the same metric at a different
+stack level, so the two are directly comparable if both were measured on the same hardware.
+
+**What was not measured and why.** The request-level number is **not measured yet**. The
+A/B comparison (bench with and without `float_roundtrip`) is run on demand by a maintainer
+because a full-workspace A/B build does not fit the hosted runner budget — two compilations
+invalidate the dependency cache, forcing the whole workspace to build twice within 45 minutes,
+which starves the runner for CPU/memory. The bench itself compiles in normal CI (`cargo test
+--all-targets`, `cargo bench --no-run`) so any compile error still shows up on the PR.
+
+The parse-only figures are the only numbers on record: 40.0–41.7 ns/value without the feature
+and 57.0–59.2 with it (≈ +17 ns, ≈ 1.42×, on a Ryzen 9 7950X3D).
+
+**How to run the A/B comparison.**
+
+```
+gh workflow run float-roundtrip-ab.yml \
+  --repo basic-automation/weftdb \
+  --ref p12/float-roundtrip-req
+```
+
+Add `--field values=100000 --field reps=20` to override defaults. The numbers appear in the
+job log (`ns/value=` lines) and in `GITHUB_STEP_SUMMARY`. The workflow file is
+`.github/workflows/float-roundtrip-ab.yml`, triggered only by `workflow_dispatch`.
+
+**Decision — moved A/B to its own workflow file.** The job was originally embedded in
+`bench-regression.yml` on the same `on` trigger as the nightly regression gate, which ran it on
+every push/pull request. Two problems: (a) the full-workspace A/B build starves the hosted
+runner (two §760 attempts failed with "The hosted runner lost communication with the server"),
+and (b) `actionlint` flagged a shellcheck SC2129 in the "Print summary" step. Moved to
+`.github/workflows/float-roundtrip-ab.yml` guarded only by `workflow_dispatch`, with bounded
+criterion arguments (`--warm-up-time 1 --measurement-time 3 --sample-size 20`) and
+`CARGO_BUILD_JOBS=2` to keep CPU/memory pressure modest.
+
+**Hard rules obeyed.** `Cargo.toml` keeps `features = ["float_roundtrip"]`; the strip is
+in-job only, and the job asserts the file was never committed stripped. No local compilation,
+no merge, no ROADMAP.md tick.
+
 ## 2026-11-15 — A maintenance budget that refuses *before* the read (ROB-20 cut 1, #758) (shipped as a cut; the slice is not complete)
 
 ROB-20 is six cuts on one issue (#758): G1 a byte ceiling on one maintenance operation, G2
