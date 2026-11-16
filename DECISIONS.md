@@ -7079,6 +7079,30 @@ This slice pins the server's HTTP decision on top of the injectable space source
 carry a `cargo build`, so every test in `weft-server/tests/enospc_real_fs.rs` runs first in CI.
 ## 2026-11-14 — ROB-20: what maintenance budgets and merging actually do today (#445)
 
+## 2026-11-14 — Store-level row TTL/expiry cut 1 (#722)
+
+**Store-wide policy only; per-aspect policies deferred to cut 2.** The `RowExpiryPolicy` enum
+is carried in `SegmentStoreOptions` and `SegmentStore`, so every aspect in the store shares one
+expiry setting. A future cut can add a per-aspect override that the store-wide `Ttl` relaxes to
+`NoExpiry` on some aspects.
+
+**Read-path visibility: filter after newer-wins merge.** The expiry filter runs on the
+fully-merged, deduplicated rows from `read_time_range_of`, so it sees the same canonical view
+every read path produces. This keeps the filter simple and testable without touching the inner
+frame-read layers.
+
+**Sweep is report-only in cut 1.** `expiry_sweep` iterates declared aspects, acquires the
+maintenance lock per aspect, and builds a report of expired rows without deleting any data.
+Deletion and GC are deferred to cut 2/3. The report distinguishes "fully expired segment"
+(checked by index bounds) from "partially expired segment" (decoded and counted row by row).
+
+**No env var for cut 1.** The expiry policy is configured programmatically via
+`SegmentStoreOptions::with_expiry`, and the `Default` impl sets `NoExpiry`. No env var,
+no weft-server wiring, no OpenAPI/config-schema change.
+
+**CI is the first execution.** Cut 1 was never compiled or run locally — the host cannot carry
+a `cargo build`, so every test runs first in CI.
+
 ## 2026-11-14 — GPU pool bound test: check safety invariants instead of strict stability (#725)
 
 The test `gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu` flaked when the CI
@@ -7446,6 +7470,39 @@ publication would leave that trap in place.
 **Not done here.** No `ROADMAP.md` tick, no change to the compiled
 `NOT_IN_SCOPE` text (a compiled constant is not a documentation surface), and no
 contact with KX or AVEVA — both need a human.
+
+## 2026-11-15 — Row-TTL Cut 1: the TTL width, and what CI can and cannot see (open)
+
+**Ambiguity.** `RowExpiryPolicy::Ttl { ttl: u64 }` and the timestamps (`i64`) have to be
+compared in one expression, and the crate forbids `clippy::pedantic`, `clippy::nursery` and
+`clippy::all`. `ttl as i64` trips `cast_possible_wrap`; the obvious widening comparison
+`u128::from(a) > u128::from(b)` does not compile because the crate needs `From<i64> for u128`,
+which std does not provide.
+
+**Choice.** Compare in `i64`: `let ttl = i64::try_from(*ttl).unwrap_or(i64::MAX);` then
+`now_unit.saturating_sub(row_ts) > ttl`. A TTL wider than the largest expressible age is
+unreachable, so saturating is total. `expired_cutoff` keeps Cut 1's documented rule that a
+cutoff below the representable range is reported as `i64::MIN` ("nothing is expired"), which is
+what the existing tests assert (`underflow: 50 < 100 -> no expiry possible`).
+`is_row_expired`/`expired_cutoff` are **not `const`**: `i64::try_from` is only
+*conditionally* const on the pinned 1.100.0-nightly (`6bb1652a02`), so the `cast_possible_wrap`
+and `missing_const_for_fn` lints cannot both be satisfied; dropping `const` is the only
+combination that passes both, and `missing_const_for_fn` does not fire afterwards.
+
+**Verification route (no local build).** RAM on this box is held by the model server, so the
+workspace is never compiled locally. Two substitutes were used: (a) a scratch no-dependency
+crate carrying the same `#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]` header from
+`weftdb/src/lib.rs` plus a stub `TimeUnit`, for ~1 second lint cycles; (b) the CI check-run
+**annotations** API, which for these jobs only ever says "Process completed with exit code 101" —
+so the job log is the only real evidence, and `gh run view --log-failed` returns nothing while the
+run is still in progress. rust-analyzer on the branch reports no errors under the **default**
+feature set, which is exactly why `feature matrix` is the interesting failure: the non-default
+cfgs are not analysed locally at all.
+
+**Status.** `p12/row-ttl-cut1` head `41d8dd4`: `rustfmt` now green; `clippy`, `msrv (1.95)`,
+`rustdoc` and (at `ce3f4a8`) `feature matrix` red, while `origin/main` is green on all four — the
+fault is on the branch, and the reason is not yet established. Tracked as a follow-up; the
+slice is not ticked on the roadmap until the gate is green.
 
 ## 2026-11-16 — ROB-20 G2: disk guard coverage for maintenance writes (#758)
 
