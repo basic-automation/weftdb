@@ -88,12 +88,21 @@ fn generate_body(n: usize) -> Vec<u8> {
 	.expect("serialises the request body")
 }
 
+/// One request through the real router, timed by the caller.
+///
+/// The failure message carries the envelope, not just the status: a refusal from this
+/// endpoint says what it rejected (an unknown field, a non-finite value, a body over
+/// the route's limit), and a bench that prints only `400` sends whoever reads the log
+/// back to the source. The status is still what decides success.
 fn run_one(runtime: &tokio::runtime::Runtime, router: &axum::Router, body: Vec<u8>) {
 	let _ = runtime.block_on(async {
 		let request = Request::builder().method("POST").uri("/api/v1/interpolate").header("content-type", "application/json").body(Body::from(body)).expect("request");
 		let response = router.clone().oneshot(request).await.expect("the router answers");
-		assert!(response.status().is_success(), "status {}", response.status());
-		black_box(axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body").len())
+		let status = response.status();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body");
+		let head = &bytes[..bytes.len().min(400)];
+		assert!(status.is_success(), "status {status}; the envelope says: {}", String::from_utf8_lossy(head));
+		black_box(bytes.len())
 	});
 }
 

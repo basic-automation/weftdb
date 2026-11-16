@@ -136,6 +136,20 @@ jobs:
           cargo bench --no-run -p weft-server --bench json_body_cost 2>&1 | tail -40
           echo "cold-or-warm build wall time: $((SECONDS - start))s"
 
+      # A tiny run first, through the same code path and the same built binary. The
+      # bench's assertion now prints the response envelope when the route refuses the
+      # body; at 100 000 values a refusal kills the step inside the timing loop, after
+      # the build has already cost minutes. Eight values cost milliseconds, so the
+      # message that explains a 400 is in the log before the expensive run begins.
+      - name: Smoke one tiny request through the same path
+        shell: bash
+        env:
+          WEFT_JBC_VALUES: "8"
+          WEFT_JBC_REPS: "1"
+        run: |
+          set -euo pipefail
+          cargo bench -p weft-server --bench json_body_cost 2>&1 | tail -20
+
       - name: Time one whole interpolate request
         id: bench
         shell: bash
