@@ -7546,3 +7546,49 @@ criterion arguments (`--warm-up-time 1 --measurement-time 3 --sample-size 20`) a
 **Hard rules obeyed.** `Cargo.toml` keeps `features = ["float_roundtrip"]`; the strip is
 in-job only, and the job asserts the file was never committed stripped. No local compilation,
 no merge, no ROADMAP.md tick.
+
+## 2026-11-16 — ROB-20 G2: disk guard coverage for maintenance writes (#758)
+
+**What was done.** Maintenance swap outputs now go through the store's disk
+guard before any byte is written. `swap_plans` (`weftdb/src/types/segment_store/seal.rs`)
+calls `admit_write` once, after the generations are counted and before any output
+is allocated, journaled or written, so an overlap merge that would leave the
+filesystem below the reserve is refused with the same `InsufficientStorage` the
+ingest and seal paths already produce, with no partial frame or catalog change
+left behind. A keep plan — the skip-identical case at
+`weftdb/src/types/segment_store/maint.rs:1174` — writes nothing, so the admission
+is skipped when the output count is zero. `swap_in` needs no second admission: it
+is step M5 of the same path (id allocation and commit), not a frame writer.
+
+**The byte figure is an estimate, not a bound.** The exact output size is unknown
+until the frames are encoded, so the admission uses the sum of the members'
+`byte_len`. A newer-wins merge carries at most the members' rows, so the figure is
+usually above the output size, but nothing in the encoder guarantees it: paging and
+encoding differences can make an output larger per row than its inputs. The
+admission therefore protects against running the filesystem dry in the normal case
+and is not a byte budget. G1's explicit `max_output_bytes` is the real bound, and
+the estimate should be revisited when G1 lands.
+
+**Tests added** (`weftdb/src/types/segment_store/disk_guard_tests.rs`):
+
+- `a_maintenance_swap_refuses_below_the_reserve` — seals two segments that overlap
+  in time but differ in content under a satisfiable reserve (1 byte), reopens the
+  same root under an impossible reserve, and asserts `reconcile_overlaps` fails with
+  `InsufficientStorage` while the frame set and segment count are unchanged. The
+  reopen matters: the seal path has its own admission, so sealing under an
+  impossible reserve would refuse the *seal*, not the merge, and the test would not
+  exercise `swap_plans` at all. The content has to differ too: identical segments
+  take the skip-identical keep plan, which writes nothing and never reaches the
+  guard.
+- `a_maintenance_swap_succeeds_with_ample_headroom` — the same partially overlapping
+  pair merges into one segment with a satisfiable reserve, so the admission is not an
+  unconditional refusal.
+
+Both tests were written against the code as read on `origin/main`; they have never
+been run locally (this machine cannot build the workspace without starving the model
+server), so CI is their first execution.
+
+**G2 only.** The byte budget (G1), k-way merge (G3), resplit of oversized frames
+(G4), the per-operation time budget (G5) and the settings surface (G6) are
+untouched. `ROADMAP.md`'s ROB-20 line stays unticked until those behaviours ship,
+and #758 stays open.
