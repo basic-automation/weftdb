@@ -43,9 +43,7 @@ async fn store_at(root: &Path, budget: Option<u64>) -> SegmentStore {
 /// it was, including no half-written frame and no staging directory. Sorted because
 /// `read_dir` gives no order of its own.
 fn segment_entries(root: &Path) -> Vec<String> {
-	let mut names = std::fs::read_dir(root.join("segments"))
-		.map(|dir| dir.filter_map(Result::ok).filter_map(|entry| entry.file_name().to_str().map(str::to_string)).collect::<Vec<_>>())
-		.unwrap_or_default();
+	let mut names = std::fs::read_dir(root.join("segments")).map(|dir| dir.filter_map(Result::ok).filter_map(|entry| entry.file_name().to_str().map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default();
 	names.sort();
 	names
 }
@@ -54,11 +52,18 @@ fn segment_entries(root: &Path) -> Vec<String> {
 /// values at the shared instants — so the reconcile pass has a component of two members to
 /// fold. This store has no open memtable: each ingest seals its own frame and records its
 /// own index row, so two ingests are two segments.
+///
+/// The two batches carry **different ingest keys**, which is not cosmetic: the ingest ledger
+/// records `(aspect, key)` with a fingerprint of the batch, and offering the same key with a
+/// different fingerprint is refused as `StoreError::IdempotencyConflict` before any frame is
+/// written (the ledger check inside `ingest`, `weftdb/src/types/segment_store/seal.rs`).
+/// Reusing one key here would test the ledger, not the budget, and the second
+/// write would never reach the segment tree.
 async fn seal_two_overlapping(store: &SegmentStore) {
 	let (ts, vs) = values(0, 1_000);
-	store.ingest(ASPECT, &IngestBatch::dense("k1", ts, vs)).await.expect("first ingest");
+	store.ingest(ASPECT, &IngestBatch::dense("budget-fixture-first", ts, vs)).await.expect("first ingest");
 	let (ts, vs) = values(500, 1_000);
-	store.ingest(ASPECT, &IngestBatch::dense("k1", ts, vs)).await.expect("second ingest");
+	store.ingest(ASPECT, &IngestBatch::dense("budget-fixture-second", ts, vs)).await.expect("second ingest");
 	assert_eq!(store.segment_count(ASPECT).await.expect("counted"), 2, "the fixture really does hold two overlapping segments");
 }
 
@@ -118,6 +123,7 @@ async fn a_refusal_is_not_a_lost_merge_the_same_pass_runs_once_the_budget_rises(
 		let store = store_at(dir.path(), Some(1)).await;
 		seal_two_overlapping(&store).await;
 		assert!(store.reconcile_overlaps(ASPECT).await.is_err(), "refused under the impossible budget");
+		drop(store);
 	}
 	// The same store, the same two segments, a budget that admits them.
 	let store = store_at(dir.path(), Some(u64::MAX)).await;
