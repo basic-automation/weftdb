@@ -247,9 +247,8 @@ impl Code {
 			Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
 			Self::ResultTooLarge | Self::ValueNotRepresentable => StatusCode::UNPROCESSABLE_ENTITY,
 			Self::Internal | Self::CommitFailed | Self::FrameUndecodable | Self::SeriesBindingMismatch => StatusCode::INTERNAL_SERVER_ERROR,
-			Self::Unconfigured | Self::NotReady | Self::IncompatibleStore | Self::AuditUnavailable | Self::Overloaded | Self::OutcomeUnknown | Self::Poisoned => StatusCode::SERVICE_UNAVAILABLE,
+			Self::Unconfigured | Self::NotReady | Self::IncompatibleStore | Self::AuditUnavailable | Self::Overloaded | Self::OutcomeUnknown | Self::Poisoned | Self::OverBudget => StatusCode::SERVICE_UNAVAILABLE,
 			Self::QueryTimeout => StatusCode::GATEWAY_TIMEOUT,
-			Self::OverBudget => StatusCode::SERVICE_UNAVAILABLE,
 			Self::InsufficientStorage => StatusCode::INSUFFICIENT_STORAGE,
 		}
 	}
