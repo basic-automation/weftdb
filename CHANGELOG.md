@@ -17,6 +17,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `503 incompatible_store` and reading like a damaged store. The store-wide sweep still reports it
   as one aspect's `failed` entry and answers `200`. The §4 error-code table on the website still
   lists 43 codes; only the repo-side pin moved (Needs human).
+- **A maintenance fold re-cuts an oversized output (`WEFT_MAINTENANCE_MAX_SEGMENT_BYTES`, #758).**
+The passes that fold segments — `reconcile_overlaps`, `squash_aspect`, `squash_to_target_rows` —
+now check the frame their swap is about to write against a ceiling, and when its size estimate
+is over it they cut that output at timestamp boundaries instead of writing one very large frame.
+The pieces are bounded at one per segment the fold replaced, so every piece keeps a member's id
+and the swap stays legal (precedence P1/P2); the rows are exactly what the fold would have
+written, and the boundary rule is even division of the merged row range. Unset (the library and
+server default) re-cuts nothing. A frame a single seal wrote is not re-cut — that stays the
+operator's `split_segment`.
+
+in
 - **Request-level benchmark for `float_roundtrip` (#724).** `weft-server/benches/json_body_cost.rs`
   drives one whole `POST /api/v1/interpolate` request with N float values in the same magnitude
   mix as the Phase 11 parse-only measurement and reports p50/p95 latency plus ns/value. A

@@ -93,7 +93,7 @@ a sweep.
 
 ### 1.3 Re-splitting of oversized frames
 
-**Partial: overlap-merge split exists; automatic resplit of oversized frames does not.**
+**Partial: overlap-merge split exists; as of the G4 cut, a fold re-cuts an oversized output of its own; a frame a single seal wrote is still not re-split automatically.**
 
 **What exists** — `reconcile_overlaps_with_policy` (`maint.rs:1071`) and its held variant:
 when an overlap component's cold prefix is large enough relative to the hot suffix,
@@ -135,7 +135,7 @@ which can be arbitrarily large.
 | G1 | Maintenance byte budget / max output size | **Missing** | No env var, no `admit_write` call in `swap_plans`; no maintenance-budget field in `SegmentStoreOptions` or daemon config | Add a `max_output_bytes` field to `ReconcileDaemonConfig` and check cumulative swap-plan bytes against it before writing | `weft-server` + `weftdb` |
 | G2 | Disk guard coverage for maintenance writes | **Missing** | `swap_plans` (`seal.rs:348`) and `swap_in` have no `disk_guard.admit_write` call | Call `disk_guard.admit_write(total_output_bytes)` before `swap_plans` executes, return `InsufficientStorage` if refused | `weftdb` |
 | G3 | k-way / n-way merge (balanced tournament) | **Missing** | `fold_newest_wins` does pairwise serial fold; `merge_newer_wins` is strictly two-pointer | Replace `fold_newest_wins`'s serial loop with a stable k-way merge via binary heap. Moves merge work from O(n·rows) to O(rows · log k) | `weft-physical-type` + `weftdb` |
-| G4 | Automatic resplit of oversized frames | **Missing** | `split_segment` is operator-only; no daemon calls it; no size threshold drives it | Add `max_segment_bytes` to daemon config; after a merge/squash/compact, if output exceeds threshold, re-split on a coarse boundary (e.g. timestamp midpoint or row-count midpoint) | `weftdb` + `weft-server` |
+| G4 | Automatic resplit of oversized frames | **Partly landed** (the G4 cut: the ceiling drives the re-cut of a fold's output inside the same swap) | `split_segment` is still operator-only; no daemon calls it; the threshold now drives the re-cut of merge/squash output only | Add `max_segment_bytes` to daemon config; after a merge/squash/compact, if output exceeds threshold, re-split on a coarse boundary (e.g. timestamp midpoint or row-count midpoint) | `weftdb` + `weft-server` |
 | G5 | Per-op time budget | **Partial** | `MaintenanceWait::Deadline` exists but daemon uses `Skip`; `MaintGuard` has no deadline enforcement | Wire `MaintenanceWait::Deadline` through the daemon sweeps; add cancellation after timeout to held operations | `weftdb` + `weft-server` |
 | G6 | Settings surface for resource budgets | **Missing** | Settings registry lists only breaker params; no `WEFT_MAINTENANCE_MAX_*` keys | Add `max_output_bytes`, `max_segment_bytes`, `max_op_timeout_secs` vars to `settings.rs` | `weft-server` |
 
@@ -225,6 +225,16 @@ can be layered later.
 **Acceptance test**: configure a small `max_segment_bytes`, set up an aspect with a single
 giant sealed segment, run compaction, assert the aspect now has multiple segments each below
 the threshold.
+
+**Landed differently, deliberately.** The cut that landed re-cuts the output of
+`reconcile_overlaps_held`, `squash_series_held` and `squash_aspect_to_target_rows_held` inside
+the `SwapPlan::cut` that already writes it, and caps the outputs at the number of segments the
+fold replaced: one output per member means every output takes a member's id (precedence P1) and
+none needs a fresh id, so the refusal that rule P2 documents cannot fire at all. The test above
+asks for the one case that cannot be done that way — a **single** giant segment, whose second
+output would need a fresh id and would be refused if any higher-id row overlapped its span. That
+case remains the operator's `split_segment`, and the plan's own risk note ("must validate that
+new-id allocation stays correct under concurrent splits") is exactly why it was left there.
 
 **Risk**: splitting a segment changes the segment count, which moves P1 precedence.
 The lowest-id rule (`SwapPlan::cut` with `cuts`) handles this correctly — the split output
