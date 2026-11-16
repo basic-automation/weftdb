@@ -137,7 +137,8 @@ async fn rows_mode_is_the_default_and_compression_forces_it() -> Result<()> {
 	db.batch_capture_new_measurements(&plain.id(), &DatasetId::new(), vec![InputMeasurement::new(base + Duration::seconds(1), bd("4.5"))]).await?;
 	db.capture_new_measurement(&plain.id(), &DatasetId::new(), &InputMeasurement::new(base, bd("3.75"))).await?;
 	assert_eq!(db.get_measurements_count(&plain.id()).await?, 3, "rows mode stores every row, duplicate timestamp included");
-	assert!(db.batch_capture_new_measurements(&plain.id(), &DatasetId::new(), Vec::new()).await?.is_empty());
+	assert!(db.batch_capture_new_measurements(&plain.id(), &DatasetId::new(), Vec::new()).await?.is_empty(), "an empty batch through the un-routed entry point stores nothing");
+	drop(plain);
 	Ok(())
 }
 
@@ -151,8 +152,7 @@ async fn seal_backed_new_measurement_entry_points_reach_the_seal() -> Result<()>
 	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
 	let (_dir, db) = setup().await?;
 	let subject = db.observe_subject("s").await?;
-	let aspect = db.track_aspect(&subject.id(), "sealed_new", &splimes::Resolution::Milliseconds, None).await?;
-	let aspect_id = aspect.id();
+	let aspect_id = db.track_aspect(&subject.id(), "sealed_new", &splimes::Resolution::Milliseconds, None).await?.id();
 	assert_eq!(db.aspect_storage_mode(&aspect_id).await?, StorageMode::Segments, "the aspect is created seal-backed");
 
 	let base = Utc.with_ymd_and_hms(2024, 3, 1, 0, 0, 0).unwrap();
