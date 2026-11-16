@@ -176,9 +176,11 @@ pub fn merge_newer_wins<V: Clone>(older: &[(i64, V)], newer: &[(i64, V)]) -> Vec
 	out
 }
 
-/// Merge `frames` — each **non-decreasing by timestamp**, the frames themselves ordered
-/// oldest frame first — into one non-decreasing run under the same **newer-wins** rule as
-/// [`merge_newer_wins`]: at an instant carried by more than one frame, every row of the
+/// Merge `frames` into one non-decreasing run under the **newer-wins** rule of
+/// [`merge_newer_wins`], in one pass over `k` cursors rather than `k` pairwise folds.
+///
+/// Each frame must be **non-decreasing by timestamp**, and the frames themselves ordered
+/// oldest frame first. At an instant carried by more than one frame, every row of the
 /// **later** frame supersedes every row of every earlier frame; rows at an instant unique
 /// to one frame are kept as they are, a within-frame run of equal timestamps included.
 /// The output is row-for-row what folding the frames pairwise would give
@@ -187,11 +189,11 @@ pub fn merge_newer_wins<V: Clone>(older: &[(i64, V)], newer: &[(i64, V)]) -> Vec
 /// prefix once per frame, which is what the maintenance merge of many overlapping members
 /// paid for (roadmap ROB-20 G3, `docs/maintenance-budgets-plan.md` slice 3).
 ///
-/// A k-way cursor over a min-heap keyed by `(timestamp, frame index)` with the frame index
-/// descending: the heap hands over the cursors parked at the next instant newest-frame
-/// first, that frame's run at the instant is emitted, and every other cursor parked at the
-/// same instant is advanced past the instant (not dropped — its later instants still have
-/// to be merged).
+/// Implementation: a k-way cursor over a min-heap keyed by `(timestamp, frame index)`,
+/// frame index descending, so the cursor parked at the next instant newest-frame first is
+/// the one handed over, its run at that instant is emitted, and every other cursor parked
+/// at the same instant is advanced past the instant — not dropped, because its later
+/// instants still have to be merged.
 #[must_use]
 pub fn merge_k_way<V: Clone>(frames: &[&[(i64, V)]]) -> Vec<(i64, V)> {
 	// `Reverse` turns the max-heap into a min-heap on the tuple; the inner
@@ -263,11 +265,11 @@ mod tests {
 	#[test]
 	fn merge_k_way_of_nothing_and_of_one_are_the_trivial_cases() {
 		let none: Vec<&[(i64, u8)]> = Vec::new();
-		assert!(merge_k_way(&none).is_empty());
+		assert_eq!(merge_k_way(&none), Vec::<(i64, u8)>::new(), "no frames merge to nothing");
 		let empty_run: &[(i64, u8)] = &[];
-		assert!(merge_k_way(&[empty_run]).is_empty(), "one frame with no rows merges to nothing");
+		assert_eq!(merge_k_way(&[empty_run]), Vec::<(i64, u8)>::new(), "one frame with no rows merges to nothing");
 		let one: &[(i64, u8)] = &[(7, 9)];
-		assert_eq!(merge_k_way(&[one]), vec![(7, 9)]);
+		assert_eq!(merge_k_way(&[one]), vec![(7, 9)], "one frame passes its rows through unchanged");
 	}
 
 	#[test]

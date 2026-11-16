@@ -1190,13 +1190,14 @@ fn series_overlap_components(rows: Vec<IndexRow>) -> Vec<Vec<IndexRow>> {
 	components
 }
 
-/// Fold the rows of `frames`, the members of a merge in ascending id order (oldest to
-/// newest), into one time-sorted run, the newest value winning at a timestamp two members
-/// share: each member's rows are sorted stably first (it may be out of order), then merged
-/// with [`merge_k_way`], which supersedes an older member's whole run of a shared timestamp
-/// and keeps a run unique to one member as it is. One heap pass replaces the pairwise fold
-/// of the prefix per member (`O(rows · k)` row moves → `O(rows + instants · log k)`,
-/// ROB-20 G3); the rows are equal either way, which is what
+/// Fold the members of a merge — `frames`, in ascending id order (oldest to newest) — into
+/// one time-sorted run, the newest value winning at a timestamp two members share.
+///
+/// Each member's rows are sorted stably first (a member may be stored out of order), then
+/// merged with [`merge_k_way`], which supersedes an older member's whole run of a shared
+/// timestamp and keeps a run unique to one member as it is. One heap pass replaces the
+/// pairwise fold of the prefix per member (`O(rows · k)` row moves →
+/// `O(rows + instants · log k)`, ROB-20 G3); the rows are equal either way, which is what
 /// `merge_k_way_matches_the_pairwise_fold_on_every_overlap_shape` pins.
 fn fold_newest_wins(frames: Vec<DecodedFrame>) -> (Vec<i64>, Vec<Option<BigDecimal>>) {
 	let mut runs: Vec<Vec<(i64, Option<BigDecimal>)>> = Vec::with_capacity(frames.len());
