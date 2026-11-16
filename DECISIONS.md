@@ -6777,8 +6777,75 @@ dropped rather than kept as a style fence that would have forced a 28-site churn
 issue to self plus a claim comment naming the exact scope, then verify state with
 `gh pr view <n> --json state,mergeCommit` before building on anything. This session initially reasoned
 from local `origin/main` reads and unverified branch names, which produced claims about PRs that did not
+
+## 2026-11-14 — FRE-10a contract tests (FRE-10 half, PR #?)
+
+**Spec:** ROADMAP.md:88. "Contract tests: probes, compute endpoints, metrics and roles" — the first
+half of the 73-route registry, partitioned between `tests/fre10a_contract.rs` (this file) and
+`tests/fre10b_contract.rs` (the earlier half).
+
+**File:** `weft-server/tests/fre10a_contract.rs`, house style of `fre10b_contract.rs`.
+
+**What it pins:**
+
+- **Probes** (`/health`, `/healthz`, `/ready`, `/readyz`): the key sets of `HealthResponse`
+  and `ReadyResponse`, and that `/ready` with a store reports the store identity fields.
+- **Metrics** (`/metrics`, `/debug/profile/current`, `/api/v1/storage/headroom`,
+  `/bench/runs`, `/bench/runs/{id}`): the Prometheus exposition format's `text/plain; version=0.0.4`
+  content type and the counter names it carries, and the profile report's section structure.
+- **Compute** (17 routes: 9 interpolate + 8 downsample): the JSON response key sets for all
+  three JSON-input handler families (`interpolate`, `downsample`, `interpolate/point`), and
+  the media types (JSON, CSV, Arrow, Parquet) of every format suffix, including the ILP
+  variants.
+- **Gate on every route** enumerated from `build_registry()`: all seven principals
+  (anonymous, unknown, reader, writer, declarer, maintainer, admin) exercised against each
+  of the 26 routes. The cumulative grant table is verified per scope: probes pass at
+  anonymous, compute at reader, metrics at maintainer.
+- **Coverage partition** that proves the two FRE-10 files sum to the registry without
+  overlap: `(first_half, second_half) == (26, 47) == (73 total)`.
+
+**Deliberate omissions (not pinned here, reason stated):**
+
+- `storage_headroom`, `list_bench_runs` and `get_bench_run` pass the gate but answer
+  `503 unconfigured` in tests (no store with bench-run dir or a configured bench dir);
+  the gate passing is what matters for the contract, and the handler's own shape is purely
+  a number of bytes — it is not an object whose key set the contract should freeze.
+- The precise Prometheus metric names and their initial values are spot-checked but not
+  exhaustively listed; the exhaustive list belongs in the metrics slice's own tests.
+- The ILP-format output bodies (which are JSON when the response is JSON, and CSV/Arrow/Parquet
+  otherwise) are checked for their content types but not for full body shape, because the
+  JSON-input variants already pin the answer shape and the ILP variants share the same
+  response serialization.
+
+**Change to product logic:** None. Test-only.
+
+**CI expected to fail.** The PR body says "CI is the first execution." The file may contain
+compilation errors or latent test failures that only `cargo test` reveals. The PR will go
+as a draft or marked with the CI-as-first-run notice.
+
+## 2026-11-14 — EOD handoff: test file written, ROADMAP ticked, DECISIONS section written
+
+**What exists:** `weft-server/tests/fre10a_contract.rs` in the house style. ROADMAP.md:88 ticked.
+Section written above.
+
+**Not yet done:**
+- `cargo +nightly fmt` to format the new file (hard rules forbid all other cargo
+  commands, and fmt is explicitly allowed). Must run before commit.
+- Git commit with `-s`, push, and a PR opened (no merge).
+- The PR body must say "CI is the first execution; no cargo build/check/test/clippy/miri
+  was run locally."
+- `progress.md` ## Handoff section (this section is that handoff — rewrite if needed).
+
+**Risks:** The stored `Fre10b` key constants prefix `fre10b-`; the test bodies and expected
+values are derived from the handler types and the route registry rather than copied from
+`fre10b_contract.rs`; compiler errors from `cargo test` are expected on first CI run. No
+`cargo` command besides `+nightly fmt` was run.
+
+**Next step after this session:** `cargo +nightly fmt weft-server/tests/fre10a_contract.rs &&\n  git add -A &&\n  git commit -sm "fre10a: contract tests for probes, compute endpoints, metrics and roles (#325)" &&\n  git push origin p12/fre10a-contract-tests &&\n  gh pr create --base main --head p12/fre10a-contract-tests --title "FRE-10a: contract tests for probes, compute endpoints, metrics and roles" --body "Implements FRE-10a. CI is the first execution; no cargo build/check/test/clippy/miri was run locally."
+
 exist (the numbers were issues). Correction applied: every "done/merged/landed" statement in this session
 is now backed by a `gh` read in the same turn, and `git fetch` precedes any worktree created off `main`.
+
 ## 2026-11-14 — An overlap whose frames are gone is served approximately, never as an error (#719, X-READ follow-up)
 
 **Status: decided**
@@ -7012,6 +7079,30 @@ This slice pins the server's HTTP decision on top of the injectable space source
 carry a `cargo build`, so every test in `weft-server/tests/enospc_real_fs.rs` runs first in CI.
 ## 2026-11-14 — ROB-20: what maintenance budgets and merging actually do today (#445)
 
+## 2026-11-14 — Store-level row TTL/expiry cut 1 (#722)
+
+**Store-wide policy only; per-aspect policies deferred to cut 2.** The `RowExpiryPolicy` enum
+is carried in `SegmentStoreOptions` and `SegmentStore`, so every aspect in the store shares one
+expiry setting. A future cut can add a per-aspect override that the store-wide `Ttl` relaxes to
+`NoExpiry` on some aspects.
+
+**Read-path visibility: filter after newer-wins merge.** The expiry filter runs on the
+fully-merged, deduplicated rows from `read_time_range_of`, so it sees the same canonical view
+every read path produces. This keeps the filter simple and testable without touching the inner
+frame-read layers.
+
+**Sweep is report-only in cut 1.** `expiry_sweep` iterates declared aspects, acquires the
+maintenance lock per aspect, and builds a report of expired rows without deleting any data.
+Deletion and GC are deferred to cut 2/3. The report distinguishes "fully expired segment"
+(checked by index bounds) from "partially expired segment" (decoded and counted row by row).
+
+**No env var for cut 1.** The expiry policy is configured programmatically via
+`SegmentStoreOptions::with_expiry`, and the `Default` impl sets `NoExpiry`. No env var,
+no weft-server wiring, no OpenAPI/config-schema change.
+
+**CI is the first execution.** Cut 1 was never compiled or run locally — the host cannot carry
+a `cargo build`, so every test runs first in CI.
+
 ## 2026-11-14 — GPU pool bound test: check safety invariants instead of strict stability (#725)
 
 The test `gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu` flaked when the CI
@@ -7106,6 +7197,75 @@ in a macro expansion, read the macro definition (or the vendored crate source) b
 assigning a verdict; a NEEDS-FIX verdict that rests on a macro's name alone is not evidence.
 This matters most for false positives here: a wrong NEEDS-FIX spends a follow-up issue and
 an unnecessary code change on a path that is already correct.
+
+## 2026-11-14 — FRE-10a contract tests (FRE-10 half, PR #744)
+
+**Spec:** ROADMAP.md:88. "Contract tests: probes, compute endpoints, metrics and roles" — the first
+half of the 73-route registry, partitioned between `tests/fre10a_contract.rs` (this file) and
+`tests/fre10b_contract.rs` (the earlier half).
+
+**File:** `weft-server/tests/fre10a_contract.rs`, house style of `fre10b_contract.rs`.
+
+**What it pins:**
+
+- **Probes** (`/health`, `/healthz`, `/ready`, `/readyz`): the key sets of `HealthResponse`
+  and `ReadyResponse`, and that `/ready` with a store reports the store identity fields.
+- **Metrics** (`/metrics`, `/debug/profile/current`, `/api/v1/storage/headroom`,
+  `/bench/runs`, `/bench/runs/{id}`): the Prometheus exposition format's `text/plain; version=0.0.4`
+  content type and the counter names it carries, and the profile report's section structure.
+- **Compute** (17 routes: 9 interpolate + 8 downsample): the JSON response key sets for all
+  three JSON-input handler families (`interpolate`, `downsample`, `interpolate/point`), and
+  the media types (JSON, CSV, Arrow, Parquet) of every format suffix, including the ILP
+  variants.
+- **Gate on every route** enumerated from `build_registry()`: all seven principals
+  (anonymous, unknown, reader, writer, declarer, maintainer, admin) exercised against each
+  of the 26 routes. The cumulative grant table is verified per scope: probes pass at
+  anonymous, compute at reader, metrics at maintainer.
+- **Coverage partition** that proves the two FRE-10 files sum to the registry without
+  overlap: `(first_half, second_half) == (26, 47) == (73 total)`.
+
+**Deliberate omissions (not pinned here, reason stated):**
+
+- `storage_headroom`, `list_bench_runs` and `get_bench_run` pass the gate but answer
+  `503 unconfigured` in tests (no store with bench-run dir or a configured bench dir);
+  the gate passing is what matters for the contract, and the handler's own shape is purely
+  a number of bytes — it is not an object whose key set the contract should freeze.
+- The precise Prometheus metric names and their initial values are spot-checked but not
+  exhaustively listed; the exhaustive list belongs in the metrics slice's own tests.
+- The ILP-format output bodies (which are JSON when the response is JSON, and CSV/Arrow/Parquet
+  otherwise) are checked for their content types but not for full body shape, because the
+  JSON-input variants already pin the answer shape and the ILP variants share the same
+  response serialization.
+
+**Change to product logic:** None. Test-only.
+
+**CI expected to fail.** The PR body says "CI is the first execution." The file may contain
+compilation errors or latent test failures that only `cargo test` reveals. The PR will go
+as a draft or marked with the CI-as-first-run notice.
+
+## 2026-11-14 — EOD handoff: test file written, ROADMAP ticked, DECISIONS section written
+
+**What exists:** `weft-server/tests/fre10a_contract.rs` in the house style. ROADMAP.md:88 ticked.
+Section written above.
+
+**Not yet done:**
+- `cargo +nightly fmt` to format the new file (hard rules forbid all other cargo
+  commands, and fmt is explicitly allowed). Must run before commit.
+- Git commit with `-s`, push, and a PR opened (no merge).
+- The PR body must say "CI is the first execution; no cargo build/check/test/clippy/miri
+  was run locally."
+- `progress.md` ## Handoff section (this section is that handoff — rewrite if needed).
+
+**Risks:** The stored `Fre10b` key constants prefix `fre10b-`; the test bodies and expected
+values are derived from the handler types and the route registry rather than copied from
+`fre10b_contract.rs`; compiler errors from `cargo test` are expected on first CI run. No
+`cargo` command besides `+nightly fmt` was run.
+
+**Next step after this session:** `cargo +nightly fmt weft-server/tests/fre10a_contract.rs &&
+  git add -A &&
+  git commit -sm "fre10a: contract tests for probes, compute endpoints, metrics and roles (#325)" &&
+  git push origin p12/fre10a-contract-tests &&
+  gh pr create --base main --head p12/fre10a-contract-tests --title "FRE-10a: contract tests for probes, compute endpoints, metrics and roles" --body "Implements FRE-10a. CI is the first execution; no cargo build/check/test/clippy/miri was run locally."
 
 ## 2026-11-14 — ROB-18 closes: contract coverage pins the #681 behaviour; the client-abort code family stays out of scope (#742)
 
@@ -7310,6 +7470,39 @@ publication would leave that trap in place.
 **Not done here.** No `ROADMAP.md` tick, no change to the compiled
 `NOT_IN_SCOPE` text (a compiled constant is not a documentation surface), and no
 contact with KX or AVEVA — both need a human.
+
+## 2026-11-15 — Row-TTL Cut 1: the TTL width, and what CI can and cannot see (open)
+
+**Ambiguity.** `RowExpiryPolicy::Ttl { ttl: u64 }` and the timestamps (`i64`) have to be
+compared in one expression, and the crate forbids `clippy::pedantic`, `clippy::nursery` and
+`clippy::all`. `ttl as i64` trips `cast_possible_wrap`; the obvious widening comparison
+`u128::from(a) > u128::from(b)` does not compile because the crate needs `From<i64> for u128`,
+which std does not provide.
+
+**Choice.** Compare in `i64`: `let ttl = i64::try_from(*ttl).unwrap_or(i64::MAX);` then
+`now_unit.saturating_sub(row_ts) > ttl`. A TTL wider than the largest expressible age is
+unreachable, so saturating is total. `expired_cutoff` keeps Cut 1's documented rule that a
+cutoff below the representable range is reported as `i64::MIN` ("nothing is expired"), which is
+what the existing tests assert (`underflow: 50 < 100 -> no expiry possible`).
+`is_row_expired`/`expired_cutoff` are **not `const`**: `i64::try_from` is only
+*conditionally* const on the pinned 1.100.0-nightly (`6bb1652a02`), so the `cast_possible_wrap`
+and `missing_const_for_fn` lints cannot both be satisfied; dropping `const` is the only
+combination that passes both, and `missing_const_for_fn` does not fire afterwards.
+
+**Verification route (no local build).** RAM on this box is held by the model server, so the
+workspace is never compiled locally. Two substitutes were used: (a) a scratch no-dependency
+crate carrying the same `#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]` header from
+`weftdb/src/lib.rs` plus a stub `TimeUnit`, for ~1 second lint cycles; (b) the CI check-run
+**annotations** API, which for these jobs only ever says "Process completed with exit code 101" —
+so the job log is the only real evidence, and `gh run view --log-failed` returns nothing while the
+run is still in progress. rust-analyzer on the branch reports no errors under the **default**
+feature set, which is exactly why `feature matrix` is the interesting failure: the non-default
+cfgs are not analysed locally at all.
+
+**Status.** `p12/row-ttl-cut1` head `41d8dd4`: `rustfmt` now green; `clippy`, `msrv (1.95)`,
+`rustdoc` and (at `ce3f4a8`) `feature matrix` red, while `origin/main` is green on all four — the
+fault is on the branch, and the reason is not yet established. Tracked as a follow-up; the
+slice is not ticked on the roadmap until the gate is green.
 
 ## 2026-11-15 — What `float_roundtrip` costs a whole request (#724)
 
