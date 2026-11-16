@@ -7674,6 +7674,72 @@ server), so CI is their first execution.
 (G4), the per-operation time budget (G5) and the settings surface (G6) are
 untouched. `ROADMAP.md`'s ROB-20 line stays unticked until those behaviours ship,
 and #758 stays open.
+## 2026-11-15 — A maintenance budget that refuses *before* the read (ROB-20 cut 1, #758) (shipped as a cut; the slice is not complete)
+
+ROB-20 is six cuts on one issue (#758): G1 a byte ceiling on one maintenance operation, G2
+the maintenance class against the disk guard, G3 a k-way merge, G4 re-split of oversized
+frames, G5 a time budget, G6 the settings surface. This is G1. What it does: an
+overlap-reconcile pass sums the on-disk `byte_len` of the group it is about to fold, and if
+that sum passes `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` it returns
+`StoreError::OverBudget { aspect, budget_bytes, planned_bytes }` without reading the group
+or writing anything. Three judgement calls, none of them in the issue:
+
+**Where the ceiling is enforced: planning, not writing.** `docs/maintenance-budgets-plan.md`
+describes budgets around the merge/swap step, and the obvious place to check is the swap.
+The check went into `reconcile_overlaps_held` immediately after `component_bytes` is summed
+and before `merge_members_against_first`, for a reason worth keeping: the memory a
+maintenance pass actually spikes is spent *reading* the group, so a ceiling enforced at the
+swap would bound the output and leave the spike intact. Refusing at plan time is the
+difference between a node that keeps its headroom and a node that OOMs on the way to a
+tidier store. (A second, smaller reason: the reconcile path is where G1 can land without
+touching the seal path that cut 2's disk admission edits — this repo's history shows how
+expensive those conflicts get.)
+
+**Where the knob lives: `SegmentStoreOptions`, not `ReconcileDaemonConfig`.** The plan doc
+suggests the daemon's config. A ceiling that only the daemon knows is a ceiling the
+maintenance routes, the fsck-recovery path and a library user can each walk past, so the
+field sits on `SegmentStoreOptions` beside the ROB-19 breaker and ROB-22 suspect-frame
+knobs, is copied onto the store at open, and applies to every caller of the reconcile
+entry points. Deviating from the plan doc is deliberate; if a later cut wants per-daemon
+budgets it can layer a daemon value over the store one rather than move the field.
+
+**Which tier: `Experimental`, not `Tuning`.** It ships unset (unbudgeted), and no
+measurement has said what a right ceiling is — that is precisely what the Experimental
+tier's "benefits unproven" means, and `WEFT_SEGMENT_MMAP_READS` is the precedent of another
+default-off knob parked there. A second, mechanical reason to prefer it:
+`scripts/config/check_schema.py` re-checks *every* "N Tuning"-shaped claim in the schema
+doc's version table against the live tier count, so filing a new variable under Tuning
+would make the historical version rows' prose false and force a rewrite of history. The
+convention that check enforces is that the version table's tier counts stay current; the
+honest way to satisfy it is to put genuinely unproven knobs where they belong, and to
+append a sentence naming the new variable rather than to edit the old sentences.
+
+**What the figure is, stated plainly.** `planned_bytes` is the sum of the group's segments'
+on-disk `byte_len` — the same estimate the disk guard admits against — not a prediction of
+the decoded working set or of the output size. Two consequences are accepted rather than
+papered over. A group of byte-identical segments, whose fold would write nothing new, is
+still refused once it passes the ceiling: a budget that guesses which folds are free is not
+a budget, and the operator's escape is to raise the ceiling. And the ceiling guards
+overlap-reconcile only — `squash` and `compact` remain unbudgeted, and a pass can still
+exceed the ceiling in *decoded* bytes while its on-disk sum sits under it. `docs/limits-overload-evidence.md`
+says all of this instead of claiming the maintenance class is bounded.
+
+**`0` means unbudgeted, not "no maintenance".** A malformed or zero value leaves the pass
+unbounded rather than refusing every fold. The alternative would let a typo in an
+environment file silently stop the sweeper, which is a worse failure than an unbudgeted
+pass — the same reasoning that keeps `WEFT_DISK_RESERVE_BYTES=0` meaning "guard off".
+
+**Not verified, and not claimed.** Nothing in this slice was compiled or run locally: the
+host's RAM is held by the model server, and the repo's rule for this quarter is that CI is
+the Rust gate. The five tests in
+`weftdb/src/types/segment_store/maintenance_budget_tests.rs` are written from the shapes
+`disk_guard_tests.rs` and `overlap_read_tests.rs` already use (upsert-key series so two
+overlapping sealed segments really exist, then `reconcile_overlaps`, then a byte-identical
+directory listing of `segments/` before and after), and CI is what will say whether they
+pass. Cut 2 (#761) supplies the disk half; the `OverBudget` → HTTP code mapping is filed as
+a follow-up because the frozen 43-code table is not something to widen inside a budget
+slice. ROADMAP's ROB-20 line stays unticked and #758 stays open until G3-G6 land.
+
 
 ## 2026-11-16 — Compatibility tests (#240): what that roadmap line does and does not mean (closed)
 

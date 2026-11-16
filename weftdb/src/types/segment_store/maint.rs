@@ -1252,6 +1252,19 @@ impl SegmentStore {
 			// Fold members oldest → newest so the most-recently-sealed value wins a tie.
 			members.sort_by_key(|member| member.desc.id);
 			let component_bytes: u64 = members.iter().map(|member| member.desc.byte_len).sum();
+			// The whole operation's planned output, before any merge (ROB-20). A component
+			// larger than the per-operation budget is refused here, which is what makes the
+			// budget mean something: the read that would have produced the memory spike never
+			// happens. Nothing has been written and no member has been marked at this point,
+			// so the refusal leaves the aspect exactly as it was.
+			//
+			// The figure is the members' on-disk bytes, the same estimate the disk guard
+			// admits against. It bounds what the pass plans to fold, not the transient decoded
+			// rows, which are larger per row than the compressed bytes: the budget is a ceiling
+			// on the operation's size, not a byte-exact prediction.
+			if let Some(budget) = self.maintenance_output_budget.filter(|budget| component_bytes > *budget) {
+				return Err(crate::StoreError::OverBudget { aspect: aspect.to_string(), budget_bytes: budget, planned_bytes: component_bytes }.into());
+			}
 			let component_rows: usize = members.iter().map(|member| member.desc.row_count).sum();
 			// The second-earliest member start: rows before it are the cold prefix (carried by
 			// one member, no cross-segment overlap). Every member has a time range.
