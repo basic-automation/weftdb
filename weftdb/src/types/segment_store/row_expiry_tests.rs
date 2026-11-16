@@ -279,7 +279,7 @@ async fn purge_drops_a_fully_expired_segment_and_keeps_a_straddling_one() {
 
 	let rows = store.index.all(ASPECT).await.expect("index after the purge");
 	assert_eq!(rows.len(), 1, "only the straddling frame keeps an index row");
-	assert_eq!(rows[0].desc.max_ts, Some(120), "the survivor is the frame that was kept");
+	assert_eq!(rows[0].max_ts, Some(120), "the survivor is the frame that was kept");
 	store.reap(super::MaintenanceWait::Skip).await.expect("reaps the retired frame");
 	let left = frames(dir.path());
 	assert_eq!(left.len(), 1, "the retired frame left the directory: {left:?}");
