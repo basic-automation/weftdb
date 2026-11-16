@@ -110,6 +110,17 @@ This contract is pinned in `weftdb/tests/compat_v010.rs`
 4. Restores the marker and reopens — asserts every row written before the
    refusal reads back, and that no migration reruns.
 
+**What the pinned legs are, and who checks that.** `compat/releases.toml` pins v0.1.0
+with `legs = ["upgrade"]`. The two tests that run that leg are
+`a_v010_store_migrates_forward_and_keeps_reading_its_own_values` (open a store v0.1.0
+wrote, and re-read every measurement its own server recorded while it held the files) and
+`v010_compat_fre13_upgrade_contract` (assert the shape of the refusal). The test above is
+a **substitute** for the `rollback` leg, not a run of it: it tampers the marker instead of
+pointing an older binary at the candidate's store. `scripts/compat/test_leg_coverage.py`
+holds that mapping as data — every leg of a pinned release is a runner, a substitute, or a
+cited absence — and greps for the names it lists, so renaming a compat test without
+updating the gate fails CI.
+
 **No CI job performs a real old-binary rollback after writes.** The test above
 expresses the layout-floor contract in-process; it does **not** run the v0.1.0
 binary against a store that the current build has written to (no v0.1.0 binary
@@ -176,7 +187,15 @@ a 1.0 compatibility promise.
 - **A real rollback-after-writes CI test.** No CI job today downloads the previous
   release's binary, writes data with the current build, and reads it back with the
   older binary. Rollback-after-writes is unsupported for 1.0: a store written by the
-  current layout is not readable by older binaries.
+  current layout is not readable by older binaries. Building that job needs three
+  things this repository does not have: a command that fetches a release archive and
+  verifies it against the digests in `compat/releases.toml` (`scripts/compat/releases.py`
+  has `verify`, `show`, `path`, `verify-assets` and `pin`, and only `verify-assets` talks
+  to GitHub); a scratch copy of the store to point the old process at, because a v0.1.0
+  binary classifies a layout-2 tree as layout 1 and writes into it; and a pinned release
+  whose binaries can read the current layout, since only v0.1.0 is pinned and a new pin
+  block needs a committed fixture set before `scripts/compat/releases.py verify` accepts
+  it. Tracked as #762.
 - **Cross-version binary compatibility for the server binary itself.** The v0.1.0
   `weft-server` binary cannot be swapped in for v0.2.x: its configuration variables,
   its command-line flags and its HTTP routes differ. The store-format compatibility

@@ -29,6 +29,19 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Testing
 
+- **The compatibility-leg gate maps legs to things, and carries a category for stand-ins
+  (#762).** `scripts/compat/test_leg_coverage.py` compared a pinned release's declared legs
+  against a set holding the one string `"upgrade"`, in one direction, and named no test, no
+  job and no reason — the job meant to cover the missing leg existed only as a comment. Every
+  leg of every pinned release now resolves to a **runner** (`path::identifier`, grepped for, so
+  renaming a compat test without updating the gate fails CI), a **substitute** (`rollback`: the
+  `STORE_FORMAT` marker tamper in `weftdb/tests/compat_v010.rs`, which has to say what it leaves
+  out and has to be named in `UPGRADING.md`), or a **cited absence** (`binary`, whose reason has
+  to cite repository paths that exist). Both directions are checked — a declared leg needs an
+  implementation, and an implemented leg must be declared — and the leg vocabulary is read out
+  of `compat/releases.toml`'s own field documentation instead of restated, so a leg cannot live
+  in the prose while staying invisible to the gate. The pin and `releases.LEGS` are unchanged:
+  FRE-16's rule that a pin declares only what CI executes still holds.
 - **Real-filesystem ENOSPC evidence (#723).** Two integration tests pin the
   server's `507 insufficient_storage` on top of the injectable space source #694:
   `space_source_reports_a_full_filesystem_and_the_server_says_507` (unconditional,

@@ -7547,6 +7547,88 @@ criterion arguments (`--warm-up-time 1 --measurement-time 3 --sample-size 20`) a
 in-job only, and the job asserts the file was never committed stripped. No local compilation,
 no merge, no ROADMAP.md tick.
 
+## 2026-11-16 — A compat gate that maps legs to things, plus a category for stand-ins (#762) (shipped as a gate; the binary leg is still unimplemented)
+
+**Inherited state, read before touching anything.** The decision at "Rollback and binary
+compatibility: unsupported for 1.0 (FRE-16)" (2026-11-10) removed the `rollback` and `binary`
+legs from `compat/releases.toml` and from `releases.LEGS`, and explicitly rejected
+"marking the legs `unsupported` in the TOML rather than removing them, with the gate checking
+`supported`/`unsupported` states. That would add a new field and a new concept to a file with a
+single release pin, with no second user before 1.0." It also left a boundary: "the `upgrade` leg
+is the only leg with a real test (`weftdb/tests/compat_v010.rs`). The gate treats it as
+implemented." #762 does not ask to undo any of that.
+
+**What the gate could not see.** `scripts/compat/test_leg_coverage.py` held
+`IMPLEMENTED_LEGS = {"upgrade"}` and one assertion — a declared leg must be in that set. Three
+things escaped it. (a) The mapping was leg *words* to leg *words*: nothing named a test, so
+deleting or renaming the upgrade runner leaves the gate green. (b) The other direction was
+unchecked: a runner could exist for a leg no pin declares, which is how `rollback`'s real test
+(`weftdb/tests/compat_v010.rs::v010_compat_fre13_rollback_after_writes_loses_nothing`, added
+later) became invisible to the gate that was written to police exactly that. (c) The missing
+binary-leg job existed only as a comment, and `scripts/compat/releases.py` has no command that
+fetches a pinned archive — `verify-assets` needs `gh`, and a fork's CI run has no v0.1.0 release
+to download.
+
+**Chosen: leave the pin and the vocabulary exactly as FRE-16 left them, and put the third
+category in the gate.** Every leg of every pinned release is now one of exactly three statuses
+in `scripts/compat/test_leg_coverage.py`: `LEG_RUNNERS` (a runner exists; the pin **must**
+declare it), `SUBSTITUTE_RUNNERS` (CI runs a stand-in — `rollback`, covered by raising
+`STORE_FORMAT.min_write_layout` to 99 and asserting `StoreError::IncompatibleLayout` — and
+declaring it as executed would be the lie FRE-16 deleted), and `UNEXECUTABLE_LEGS` (`binary`,
+with the reason carried as data and required to cite repository paths that exist). Rules, all
+two-way: a declared leg needs a runner or a substitute; a runner-backed leg must be declared; a
+substitute-backed leg must **not** be declared; no leg may hold two statuses; every leg the pin's
+own field documentation describes must have a status for every pinned release; runner strings are
+`path::identifier` and are resolved — file exists, identifier appears in it; an absence reason
+must be a sentence, not a word, and every repository path it cites must exist.
+
+**Rejected: adding `rollback` to the pin because a test with "rollback" in its name runs.** That
+would have re-created precisely the fiction FRE-16 removed — no released binary is ever pointed at
+the candidate's store — and it would have needed `rollback` back in `releases.LEGS`, which
+invalidates `scripts/compat/test_releases.py::test_pin_block_emits_only_legs_the_gate_recognises`,
+a test that exists because `pin_block` once emitted a leg the gates rejected. The pin is
+append-only history and declares only what CI truly executes; that rule is what is valuable, and
+this slice keeps it.
+
+**Rejected in this slice: implementing `releases.py fetch`.** A fetch command that no CI job calls
+would itself be the unused-mapping pattern #762 exists to kill. Instead the gate and
+`UPGRADING.md` now carry the three pieces a real binary-leg job needs: a command that fetches a
+release archive and verifies it against the digests in `compat/releases.toml`; a scratch copy of
+the store to point an old process at, because a v0.1.0 binary classifies a layout-2 tree as
+layout 1 and writes into it; and a pinned release whose binaries can read the current layout,
+since only v0.1.0 is pinned and a new block needs a committed fixture set before
+`releases.py verify` accepts it. #762 stays open for that job.
+
+**Why the gate reads its vocabulary out of the pin file rather than restating it.**
+`_documented_legs()` scrapes the `legs` field's own documentation in `compat/releases.toml`, so a
+leg cannot survive in prose while disappearing from the gate (FRE-16's failure) nor be accepted by
+`releases.LEGS` without being described (the `pin_block` failure). Reading prose is brittle, and it
+bit immediately: the first version anchored the scan to line starts, and the leg list wraps across
+four comment lines, so it returned `{"upgrade"}` while all three legs had statuses — the
+invisible-leg failure, inside the check built to catch it. Fixed by collecting the comment block
+first and scanning the joined text; and `test_the_leg_vocabulary_read_is_complete` now pins what
+the scraper is expected to see (`{"upgrade", "rollback", "binary"}`), because a narrowing regex
+would otherwise keep every other assertion green.
+
+**Verified / not verified.** `python3 -m unittest discover -s scripts/compat -p 'test_*.py'` on
+python 3.14.8: 39 tests, all passing, plus the three negative controls run by patching the module
+in memory — deleting the `binary` absence reason, renaming a runner to
+`a_test_that_was_renamed_and_the_gate_missed` (the gate failed with `'<identifier>' not found in`
+the file's text), and putting `rollback` into `releases.LEGS` and the pin's `legs` (two failures:
+"leg 'rollback' is declared by the pin but only a stand-in covers it" and "`releases.LEGS` accepts
+['rollback'], which compat/releases.toml's own field documentation does not describe"). **No Rust
+was compiled or run on this machine** — host RAM makes a cargo build unsafe (Strata holds ~61 GB of
+124 GB) — and nothing in this slice is Rust: it is one python gate and two documents. The
+`.github/workflows/ci.yml` `compat` job (`:517`) runs both the discovery and
+`python3 scripts/compat/releases.py verify`, and `ci.yml:489` shellchecks `scripts/compat/*.sh`.
+
+**Impact.** The gate now fails when a compat test is renamed, when a leg is implemented and not
+pinned, when a stand-in is promoted to a claim, or when an absence stops being explainable. The
+pin, `releases.LEGS` and every Rust test are untouched, so no compatibility claim changed truth
+value. `UPGRADING.md` gained the runner names, the word "substitute", and the three missing pieces
+under "What is NOT guaranteed". #762 stays open: the `binary` leg is still unimplemented, and that
+is now a checked fact rather than a comment.
+
 ## 2026-11-16 — ROB-20 G2: disk guard coverage for maintenance writes (#758)
 
 **What was done.** Maintenance swap outputs now go through the store's disk
@@ -7657,3 +7739,12 @@ directory listing of `segments/` before and after), and CI is what will say whet
 pass. Cut 2 (#761) supplies the disk half; the `OverBudget` → HTTP code mapping is filed as
 a follow-up because the frozen 43-code table is not something to widen inside a budget
 slice. ROADMAP's ROB-20 line stays unticked and #758 stays open until G3-G6 land.
+
+
+## 2026-11-16 — Compatibility tests (#240): what that roadmap line does and does not mean (closed)
+
+- **What was verified before ticking.** `ROADMAP.md`'s "Compatibility tests (FRE-13 + PAC-14a)" line is now ticked on evidence, not on memory: `gh run list --workflow ci.yml --commit 8b00486a5b56521e8e1678849559a1c1b82c2c35` is run `43759178987`, `completed / success`, its `test (ubuntu-latest)`, `test (windows-latest)` and `test (macos-latest)` jobs all `success`, and the ubuntu job log shows all ten `weftdb/tests/compat_v010.rs` tests `ok` — including `v010_compat_fre13_upgrade_contract` (leg A: a Storage-v2 root the real v0.1.0 binary wrote, opened and read back by this build) and `v010_compat_fre13_rollback_after_writes_loses_nothing` (leg C). **No Rust code was written for this tick.** Both plan slices had already landed (this file's "COMPAT-1: FRE-13 upgrade leg (implemented)" and "COMPAT-2: PAC-14a rollback leg C (implemented)" sections, 2026-11-15); the line simply never received its tick through the phase restructure. That is the whole change: a tick and this note.
+- **What the line does not mean.** The third leg `compat/releases.toml` names in its own vocabulary — `binary`, a *released* binary reading a store the current build wrote — has no runner anywhere. `scripts/compat/test_leg_coverage.py` hard-codes `IMPLEMENTED_LEGS: set[str] = {"upgrade"}`, and the v0.1.0 pin declares `legs = ["upgrade"]`, so the FRE-16 gate is self-consistent but blind in one direction: it fails a pin that declares a leg with no runner, and never asks whether a runner that exists is declared. Leg C's Rust runner is therefore invisible to it. Filed as **#762**, which also owns the decision about editing an append-only pin block retroactively.
+- **Why leg C counts as a runner even though it runs no old binary.** It proves the refusal half of rollback: `weftdb/tests/compat_v010.rs:771` sets `format.min_write_layout = 99`, `:776`-`:778` assert the open fails with `StoreError::IncompatibleLayout { min_write, supported }`, and the test then restores the marker and reads its data back with this build. Running a real v0.1.0 binary against a current tree is not merely confusing but hazardous, and `compat/v010/README.md` says why: a v0.1.0 Storage-v2 root carries no `store.json` and no `segment_manifest.json` — the descriptors live in `segment_index.db` — so an old process pointed at a layout-2 store would classify it as layout 1 and could write into it. Any future `binary` runner must work on a scratch copy, read-only, and that constraint belongs to #762 rather than being buried in a tick.
+- **Correction recorded rather than rewritten.** A 2026-11 section of this file states that since 2026-11-05 every `crash matrix` job is SIGTERM'd at about nine minutes and that therefore no PR touching the paths filter can go all-green, naming #599 and #603 as blocked by it. That is no longer true: run `43759178987` on main carries `crash matrix` and its conclusion is `success`. Older sections are left as written; later agents should re-test that claim before treating a red `crash matrix` as environmental, because a genuine `crash matrix` failure is now a real signal again.
+- **Needs human.** The paid-model lanes this loop were built around are out of credits. Both `openrouter/deepseek/deepseek-v4-flash` (implementation workers, reviewer) and `openrouter/deepseek/deepseek-v4-pro-0813` (the oracle) now fail with HTTP 402 `{"message":"This request requires more credits, or fewer max_tokens…","code":402,"metadata":{"limit_source":"openrouter_credits"}}` pointing at https://openrouter.ai/settings/credits. Until someone adds credits, `parallel-worker`, `goldfish-reviewer` and `oracle` launches all die, so every slice — implementation included — runs on this host's own model, which is roughly an order of magnitude slower per change and cannot be parallelised. Two runs died mid-slice this way on 2026-11-16: worker `0b33a6e7-7453-43e4-9a60-06eecc04d819` (the `float_roundtrip` A/B follow-up on PR #760, which had pushed two commits and left the design change local) and oracle consult `a8710b0c-528d-4af8-b786-471b4333fafe` (the #742 ingest-abort wire-code decision, which is therefore still undecided and now has to be made here rather than escalated). Anyone resuming either slice must read the branch and the worktree state first: both left divergent history behind.
