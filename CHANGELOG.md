@@ -18,6 +18,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   with the shipped `float_roundtrip` feature, once with it stripped in-job — and prints both
   medians and the delta. The shipped `Cargo.toml` is never modified.
 
+- **Fetching a pinned release archive (#762).** `python3 scripts/compat/releases.py fetch`
+  downloads one archive named in `compat/releases.toml` and refuses it unless the bytes hash
+  to the sha256 that pin records. `--asset` names the archive; `--extract` unpacks a tar
+  archive under the destination, refusing a member that would land outside it and any link
+  member. A `pinned release archives` job in `.github/workflows/ci.yml` runs it on every
+  pull request: the first time a published WeftDB archive has been downloaded in CI.
+
 ### Fixed
 
 - **A seal-backed legacy aspect's bulk writes now reach the store it reads from (#232).**

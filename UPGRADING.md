@@ -63,6 +63,18 @@ below.
 
 ### What happens to a layout-2 store opened by an older binary
 
+What continuous integration does and does not do with a released binary is worth stating
+here, because it bounds what the version table above has actually been measured against. The
+`pinned release archives` job in `.github/workflows/ci.yml` downloads the v0.1.0 archive for
+the runner's platform with `python3 scripts/compat/releases.py fetch --dest <dir> --extract`
+and fails if the bytes hash to anything other than the sha256 recorded in
+`compat/releases.toml`; it then checks that the archive holds a `weft-server`. It never runs
+that binary, and no job yet points an old binary at a store the candidate wrote — the
+version table's rows about older binaries are therefore reasoned from the marker protocol,
+not executed. One measured fact bears on any attempt to do that: the v0.1.0 `weft-server`
+takes no `--version` and no `--help`. Asked for either, it prints its configuration banner
+and starts listening. A leg that wants to talk to it must set its environment and speak HTTP.
+
 A v0.1.0 binary does not know about the `STORE_FORMAT` marker at all: it never reads it,
 so it would open a migrated store without refusal. **Do not run v0.1.0 on a store that
 a newer binary has opened.** The v0.1.0 binary writes frames in the old v1 frame format
@@ -184,18 +196,19 @@ a 1.0 compatibility promise.
 
 ## What is NOT guaranteed
 
-- **A real rollback-after-writes CI test.** No CI job today downloads the previous
-  release's binary, writes data with the current build, and reads it back with the
-  older binary. Rollback-after-writes is unsupported for 1.0: a store written by the
-  current layout is not readable by older binaries. Building that job needs three
-  things this repository does not have: a command that fetches a release archive and
-  verifies it against the digests in `compat/releases.toml` (`scripts/compat/releases.py`
-  has `verify`, `show`, `path`, `verify-assets` and `pin`, and only `verify-assets` talks
-  to GitHub); a scratch copy of the store to point the old process at, because a v0.1.0
-  binary classifies a layout-2 tree as layout 1 and writes into it; and a pinned release
-  whose binaries can read the current layout, since only v0.1.0 is pinned and a new pin
-  block needs a committed fixture set before `scripts/compat/releases.py verify` accepts
-  it. Tracked as #762.
+- **A real rollback-after-writes CI test.** No CI job today writes data with the current
+  build and reads it back with the previous release's binary. Rollback-after-writes is
+  unsupported for 1.0: a store written by the current layout is not readable by older
+  binaries. One of the three pieces that job needs now exists: `scripts/compat/releases.py
+  fetch` downloads a pinned archive and refuses it unless its bytes hash to the digest in
+  `compat/releases.toml`, and the `pinned release archives` job does that on every CI run.
+  Two do not. The first is a scratch copy of the store to point the old process at, because
+  a v0.1.0 binary classifies a layout-2 tree as layout 1 and writes into it — and that
+  binary answers neither `--version` nor `--help`, it prints its configuration banner and
+  starts listening, so a leg has to drive it through its environment and its HTTP endpoints.
+  The second is a pinned release whose binaries can read the current layout: only v0.1.0 is
+  pinned, and a newer pin block needs a committed fixture set of its own before
+  `scripts/compat/releases.py verify` accepts it. Tracked as #762.
 - **Cross-version binary compatibility for the server binary itself.** The v0.1.0
   `weft-server` binary cannot be swapped in for v0.2.x: its configuration variables,
   its command-line flags and its HTTP routes differ. The store-format compatibility
