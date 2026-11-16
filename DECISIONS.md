@@ -7782,3 +7782,52 @@ slice. ROADMAP's ROB-20 line stays unticked and #758 stays open until G3-G6 land
 - **The estimate is the inputs' realized bytes, summed.** That over-counts a fold that folds duplicate instants away, so division errs toward more and smaller frames. Said plainly because the plan's phrasing ("each below the threshold") is not guaranteed byte-exactly: the estimate is what the swap would have written, not what it did write.
 - **What this leaves churn-prone.** A fold under a tiny ceiling can remove 0 segments, so the next sweep sees the same component and rewrites it again. Not fixed here: the ceiling defaults to unset (re-cutting off) at the library default, in `from_env`, and in the server registry, so only an operator who sets it can reach that state, and the daemon interval bounds how often. The open question is a measurement, not a code fix: how small a frame may get before the extra segment metadata and per-read fan-out cost more than the smaller frames save. Recorded as the reason the variable is `Tier::Experimental` rather than `Tier::Tuning`.
 - **Not compiled here, and not claimed.** Nothing in this slice was built: the host's RAM belongs to the model server, and CI is this quarter's Rust gate. The API surface the new tests lean on was checked by grep instead — `IndexRow.desc: SegmentDescriptor` (`weftdb/src/types/index_txn.rs:99`), `SegmentDescriptor { row_count: usize, byte_len: u64 }` (`weft-physical-type/src/catalog.rs:66,85`), and a sibling test module already calling `store.index.rows(ASPECT)` (`tag_seal_tests.rs:51`) — and CI is what says whether they pass. The three store-level tests are written so the ceiling is the **only** difference between them and their control, and the control (`the_same_fold_writes_one_frame_when_the_ceiling_is_off`) is the one that fails on `main` if the change ever regresses into a no-op.
+
+## 2026-11-16 — A purge is a separate entry point, not a flag on the sweep (shipped)
+
+Issue #775, row-TTL cut 2. Cut 1 (#752) made expired rows invisible at read time and counted
+them in `expiry_sweep`, deliberately deleting nothing. This adds `SegmentStore::purge_expired`
+and `purge_aspect_held`, which delete, and two counters on the reports: `segments_dropped` and
+`partial_segments`.
+
+**Why a separate method rather than an option on `expiry_sweep`, or a new `RowExpiryPolicy`
+variant.** `RowExpiryPolicy` is not `#[non_exhaustive]`, so adding a variant or a field to
+`Ttl { ttl }` is a breaking change for a feature that is still half-finished; and a sweep that
+deletes when you pass the wrong flag is the kind of API that loses data in a daemon restart.
+Deleting is a different act with different consequences, so it gets a different name, and the
+caller chooses it.
+
+**Why only wholly expired frames are dropped.** The test is `desc.max_ts < cutoff`, which needs
+no decode. A frame that straddles the cutoff would have to be re-read, filtered and rewritten —
+which changes its id, its byte length and its sidecars, and can collide with the overlap
+precedence rules — so it is counted in `partial_segments` and left alone (cut 3). The
+consequence is stated plainly rather than papered over: **a TTL shorter than a segment's span
+leaves expired rows on disk**, hidden from every read that respects the TTL. That is a
+correctness-neutral residue and an operator-visible cost, which is why the report counts it.
+
+**Boundary.** `max_ts < cutoff`, strict. A frame whose newest row sits exactly at the cutoff has
+a row of age exactly `ttl`, which is not expired, so it must survive; the test
+`purge_keeps_a_frame_whose_newest_row_sits_exactly_at_the_cutoff` pins that. Cut 1 chose the
+same strictness in `is_row_expired`, and a `<=` here would silently delete live data.
+
+**Breaker asymmetry, on purpose.** `purge_expired` calls `breaker_record`; `expiry_sweep` does
+not. A report-only count cannot leave the store half-changed, so tripping on it would punish an
+operator for looking. A purge can fail after some plans committed, so an aspect whose purge
+keeps failing should trip its breaker and stop being retried every tick.
+
+**Partial success is reported, then the first error is returned.** Several segments in one aspect
+can be doomed at once, and they are dropped as one plan per series. If the third plan's swap
+conflicts, the first two are already committed: the return value is the error, but the counters
+name what actually left. An aspect that dropped three segments and then failed is neither a clean
+success nor a no-op, and pretending otherwise would understate what the operator's disk holds.
+
+**No new env var, no route, no settings entry.** A TTL remains store-configured through
+`SegmentStoreOptions::with_expiry`, and `from_env` still hard-codes `NoExpiry`. Cutting a
+destructive behaviour into the server surface — where a misconfigured variable deletes
+production history — waits for cut 3, which also carries the SOA-15 TTL lane that needs it.
+
+**Two mechanical notes for whoever edits this next.** Adding a field to a `#[non_exhaustive]`
+public struct breaks in-crate construction sites: `expire_aspect_held`'s literal had to gain the
+new fields. And `SegmentStore::index` is a private field, not an accessor, so a test in a
+submodule of `segment_store` writes `store.index.all(aspect)` — reachable, because the test
+modules are inside the defining module.

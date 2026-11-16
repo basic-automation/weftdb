@@ -9,7 +9,9 @@ impl SegmentStore {
 	/// Visit every declared aspect under the store's `expiry` policy and return a report.
 	///
 	/// Cut 1 is **report-only**: no rows or segments are deleted. The sweep is idempotent
-	/// (running it twice finds the same expired rows). Aspects whose maintenance breaker is
+	/// (running it twice finds the same expired rows).
+	/// Counting expired rows is the safe half of a TTL; physically dropping what no
+	/// read can reach is [`purge_expired`](Self::purge_expired). Aspects whose maintenance breaker is
 	/// tripped or whose maintenance lock is held by another operation are skipped and
 	/// reported in [`busy`](row_expiry::ExpirySweep::busy).
 	///
@@ -52,6 +54,145 @@ impl SegmentStore {
 		Ok(sweep)
 	}
 
+	/// **Expiry purge** (#775, cut 2): remove the segments whose every row is expired.
+	///
+	/// Same shape as [`expiry_sweep`](Self::expiry_sweep) — one pass per declared aspect, an
+	/// aspect that is busy or breaker-tripped reported rather than waited for — but it goes
+	/// through the maintenance swap, so a segment wholly past the cutoff leaves the index and
+	/// its frame is retired to the reaper. A segment that straddles the cutoff is left on
+	/// disk and counted: this pass never rewrites a frame.
+	///
+	/// It is **not** a default and no policy selects it. A TTL decides what a read may
+	/// return; only this call decides what the store keeps. Repeated calls are idempotent in
+	/// what they remove — a wholly expired segment that is gone stays gone — though a
+	/// partially expired one is counted again every pass until a later change learns to
+	/// rewrite it.
+	///
+	/// Unlike the report-only sweep, a purge records its outcome with the maintenance
+	/// breaker: an aspect whose purge keeps failing should trip the breaker rather than be
+	/// retried by every pass, because it is doing real work that can go wrong half done.
+	///
+	/// # Errors
+	///
+	/// Propagates index read errors. Per-aspect failures are reported in
+	/// [`failed`](row_expiry::ExpirySweep::failed) rather than aborting the entire sweep. A
+	/// failed aspect may already have had some segments dropped: an aspect that lost three
+	/// segments and then failed is reported in `failed` with its drops counted, because
+	/// neither "clean" nor "nothing happened" would be true of it.
+	pub async fn purge_expired(&self, now_ns: i64) -> Result<row_expiry::ExpirySweep> {
+		if self.expiry == row_expiry::RowExpiryPolicy::NoExpiry {
+			return Ok(row_expiry::ExpirySweep::default());
+		}
+		let aspects = self.list_declared_aspects().await?;
+		let mut sweep = row_expiry::ExpirySweep::default();
+		for aspect in &aspects {
+			if !self.breaker_permits(aspect) {
+				sweep.busy.push(aspect.clone());
+				continue;
+			}
+			if !self.decode_breaker_permits(aspect) {
+				sweep.busy.push(aspect.clone());
+				continue;
+			}
+			let Some(held) = self.sweep_maintain(aspect, None).await else {
+				sweep.busy.push(aspect.clone());
+				continue;
+			};
+			match self.purge_aspect_held(&held, now_ns).await {
+				Ok(swept) => {
+					self.breaker_record(aspect, false);
+					sweep.rows_expired += swept.rows_expired;
+					sweep.segments_dropped += swept.segments_dropped;
+					sweep.partial_segments += swept.partial_segments;
+					if swept.rows_expired > 0 {
+						sweep.aspects_cleaned.push(aspect.clone());
+					}
+				}
+				Err(err) => {
+					self.breaker_record(aspect, true);
+					sweep.failed.push((aspect.clone(), err));
+				}
+			}
+		}
+		Ok(sweep)
+	}
+
+	/// One aspect's purge, under the maintenance lock `held`.
+	///
+	/// Only a segment whose recorded extent ends **strictly** before the cutoff is a member:
+	/// `max_ts < cutoff` is `is_row_expired`'s test applied to the whole extent, so the
+	/// segment's newest row is expired and therefore every older row in it is. A segment with
+	/// no recorded extent is skipped, for the same reason the sweep skips one: a maintenance
+	/// pass must not guess at an extent it was never told.
+	///
+	/// Members are grouped by series, because a swap plan may not mix series.
+	pub(crate) async fn purge_aspect_held(&self, held: &MaintGuard, now_ns: i64) -> Result<row_expiry::AspectExpirySwept> {
+		self.writable()?;
+		let aspect = held.aspect();
+		let schema = self.require_schema(aspect).await?;
+		let unit = &schema.timestamp_unit;
+		let cutoff = row_expiry::expired_cutoff(&self.expiry, now_ns, unit);
+		if cutoff == i64::MIN {
+			// Nothing can be expired, so there is nothing to drop and no transaction to open.
+			return Ok(row_expiry::AspectExpirySwept::default());
+		}
+		let rows = self.index.rows(aspect).await?;
+		let mut rows_expired: u64 = 0;
+		let mut oldest_expired_ts: Option<i64> = None;
+		let mut newest_expired_ts: Option<i64> = None;
+		let mut partial_segments: u64 = 0;
+		let mut doomed: std::collections::BTreeMap<u64, Vec<IndexRow>> = std::collections::BTreeMap::new();
+		for row in &rows {
+			let (Some(min_ts), Some(max_ts)) = (row.desc.min_ts, row.desc.max_ts) else {
+				continue;
+			};
+			if max_ts < cutoff {
+				// The whole frame is past the cutoff: every row it holds is expired, so a read
+				// that respects the TTL has nothing left to lose from dropping it.
+				rows_expired += row.desc.row_count as u64;
+				note_extremes(&mut oldest_expired_ts, &mut newest_expired_ts, min_ts, max_ts);
+				doomed.entry(row.series_id).or_default().push(row.clone());
+			} else if min_ts <= cutoff {
+				// Straddles the cutoff: count the expired rows, leave the frame alone.
+				let decoded = self.read_bound_frame(row).await?;
+				let mut counted: u64 = 0;
+				for (t, _) in decoded.timestamps.into_iter().zip(decoded.values) {
+					if row_expiry::is_row_expired(&self.expiry, now_ns, t, unit) {
+						counted += 1;
+						note_extremes(&mut oldest_expired_ts, &mut newest_expired_ts, t, t);
+					}
+				}
+				if counted > 0 {
+					partial_segments += 1;
+					rows_expired += counted;
+				}
+			}
+		}
+		if doomed.is_empty() {
+			return Ok(row_expiry::AspectExpirySwept { rows_expired, segments_dropped: 0, partial_segments, oldest_expired_ts, newest_expired_ts, completed: true });
+		}
+		let plans = doomed.into_values().map(SwapPlan::purge).collect::<Vec<_>>();
+		let members = plans.iter().map(|plan| plan.members.len()).collect::<Vec<_>>();
+		let outcomes = self.swap_plans(held, &schema, plans).await?;
+		debug_assert_eq!(outcomes.len(), members.len(), "one outcome per purge plan");
+		let mut dropped: u64 = 0;
+		let mut first_error: Option<anyhow::Error> = None;
+		for (count, outcome) in members.into_iter().zip(outcomes) {
+			match outcome {
+				Ok(_) => dropped += count as u64,
+				Err(e) => {
+					if first_error.is_none() {
+						first_error = Some(e);
+					}
+				}
+			}
+		}
+		if let Some(e) = first_error {
+			return Err(e);
+		}
+		Ok(row_expiry::AspectExpirySwept { rows_expired, segments_dropped: dropped, partial_segments, oldest_expired_ts, newest_expired_ts, completed: true })
+	}
+
 	/// Count expired rows in one aspect under the maintenance lock `held`.
 	/// Reads the index rows, decodes segments that are partially expired, and
 	/// returns a count and the oldest/newest expired timestamps.
@@ -92,7 +233,7 @@ impl SegmentStore {
 				}
 			}
 		}
-		Ok(row_expiry::AspectExpirySwept { rows_expired, oldest_expired_ts, newest_expired_ts, completed: true })
+		Ok(row_expiry::AspectExpirySwept { rows_expired, segments_dropped: 0, partial_segments: 0, oldest_expired_ts, newest_expired_ts, completed: true })
 	}
 
 	/// Hold `aspect`'s maintenance lock until the returned guard drops, as a maintenance

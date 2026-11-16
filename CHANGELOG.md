@@ -10,6 +10,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**
+Where `expiry_sweep` only counts, the purge acts: a segment every row of which is older
+than the store's TTL is dropped through the same swap the maintenance passes use, so its
+index row goes, its frame is retired for the reaper to unlink, and the aspect's rollup is
+recomputed from what is left. A report now says how many segments left
+(`ExpirySweep::segments_dropped`) and how many hold both expired and live rows
+(`partial_segments`) — those are counted and left alone, so a TTL shorter than a segment's
+span leaves rows on disk that no read returns. Unlike the sweep, the purge records
+breaker outcomes: it is a maintenance operation that can fail half-done.
+
 - **A maintenance fold re-cuts an oversized output (`WEFT_MAINTENANCE_MAX_SEGMENT_BYTES`, #758).**
 The passes that fold segments — `reconcile_overlaps`, `squash_aspect`, `squash_to_target_rows` —
 now check the frame their swap is about to write against a ceiling, and when its size estimate
