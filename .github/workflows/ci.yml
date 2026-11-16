@@ -244,6 +244,13 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" != "schedule" ]; then export SKIP_SLOW_TESTS=1; fi
           cargo test --workspace --locked -- --test-threads=4
+      # TEMPORARY diagnosis for the row-TTL branch: libtest prints no failure detail
+      # blocks in these jobs, so re-run just the expiry tests single-threaded and
+      # uncaptured when the job has already failed. Remove once the cause is fixed.
+      - name: "Debug: row expiry tests, single-threaded, uncaptured"
+        if: failure()
+        shell: bash
+        run: cargo test -p weftdb --lib --locked -- row_expiry --test-threads=1 --nocapture
       # The crash tests arm fault points, which only a `fault-injection` build has. The
       # workspace test above must leave the feature off (weftdb's durable_fault_disabled
       # checks that a production build keeps the points inert), so they run here, per

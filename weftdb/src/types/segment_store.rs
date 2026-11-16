@@ -473,6 +473,12 @@ pub struct SegmentStoreOptions {
 	/// [`from_env`](Self::from_env) reads `WEFT_DISK_RESERVE_BYTES` and falls back to
 	/// [`DEFAULT_DISK_RESERVE_BYTES`](crate::DEFAULT_DISK_RESERVE_BYTES).
 	pub disk_reserve_bytes: u64,
+	/// The per-aspect row expiry policy (P12-722): whether rows older than a threshold
+	/// are hidden from read paths and reported by the expiry sweep. The default
+	/// [`NoExpiry`](row_expiry::RowExpiryPolicy::NoExpiry) keeps every row visible
+	/// regardless of age. The policy lives on the store, so every aspect shares one
+	/// policy for cut 1; per-aspect policies are deferred to cut 2.
+	pub expiry: row_expiry::RowExpiryPolicy,
 	/// The largest fold one maintenance operation may plan (ROB-20): a merge group
 	/// whose members' bytes exceed it is refused with
 	/// [`StoreError::OverBudget`](crate::StoreError::OverBudget) before the group is
@@ -523,7 +529,7 @@ pub const DEFAULT_SUSPECT_FRAME_POLICY: SuspectFramePolicy = SuspectFramePolicy:
 
 impl Default for SegmentStoreOptions {
 	fn default() -> Self {
-		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), decode_breaker: MaintenanceBreaker::default(), suspect_frame_policy: DEFAULT_SUSPECT_FRAME_POLICY, max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT, max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: false, disk_reserve_bytes: 0, max_maintenance_output_bytes: None }
+		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), decode_breaker: MaintenanceBreaker::default(), suspect_frame_policy: DEFAULT_SUSPECT_FRAME_POLICY, max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT, max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: false, disk_reserve_bytes: 0, expiry: row_expiry::RowExpiryPolicy::NoExpiry, max_maintenance_output_bytes: None }
 	}
 }
 
@@ -544,8 +550,9 @@ impl SegmentStoreOptions {
 	/// as it documents. Explicit: nothing in the library calls it.
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), decode_breaker: MaintenanceBreaker::decode_from_env(), suspect_frame_policy: std::env::var(SuspectFramePolicy::ENV_NAME).ok().as_deref().and_then(SuspectFramePolicy::parse).unwrap_or(DEFAULT_SUSPECT_FRAME_POLICY), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()), max_maintenance_output_bytes: maintenance_output_budget_from(std::env::var("WEFT_MAINTENANCE_MAX_OUTPUT_BYTES").ok().as_deref()) }
+		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), decode_breaker: MaintenanceBreaker::decode_from_env(), suspect_frame_policy: std::env::var(SuspectFramePolicy::ENV_NAME).ok().as_deref().and_then(SuspectFramePolicy::parse).unwrap_or(DEFAULT_SUSPECT_FRAME_POLICY), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()), expiry: row_expiry::RowExpiryPolicy::NoExpiry, max_maintenance_output_bytes: maintenance_output_budget_from(std::env::var("WEFT_MAINTENANCE_MAX_OUTPUT_BYTES").ok().as_deref()) }
 	}
+
 
 	/// These options with `bytes` as the per-operation maintenance output budget
 	/// ([`max_maintenance_output_bytes`](Self::max_maintenance_output_bytes), ROB-20).
@@ -630,6 +637,13 @@ impl SegmentStoreOptions {
 	#[must_use]
 	pub const fn with_mmap_reads(mut self, on: bool) -> Self {
 		self.mmap_reads = on;
+		self
+	}
+
+	/// These options with `policy` for row-level expiry (P12-722).
+	#[must_use]
+	pub const fn with_expiry(mut self, policy: row_expiry::RowExpiryPolicy) -> Self {
+		self.expiry = policy;
 		self
 	}
 
@@ -1771,6 +1785,9 @@ pub struct SegmentStore {
 	/// Whether range reads memory-map their frames, from the open options
 	/// ([`SegmentStoreOptions::mmap_reads`]); always buffered without the `mmap-reads` feature.
 	mmap_reads: bool,
+	/// The per-aspect row expiry policy (P12-722), from the open options
+	/// ([`SegmentStoreOptions::expiry`]).
+	expiry: row_expiry::RowExpiryPolicy,
 	/// The disk guard every seal consults (ROB-17), from the open options
 	/// ([`SegmentStoreOptions::disk_reserve_bytes`]).
 	disk_guard: crate::DiskGuard,
@@ -1996,6 +2013,7 @@ mod maint;
 mod mapped;
 mod open;
 mod read;
+pub mod row_expiry;
 mod seal;
 mod stats;
 
@@ -8960,6 +8978,10 @@ mod overlap_read_tests;
 /// ROB-22: the suspect frame policy reaches the store and the interactive read path honours it.
 #[cfg(test)]
 mod suspect_frame_policy_tests;
+
+/// P12-722 cut 1: store-level row expiry integration tests.
+#[cfg(test)]
+mod row_expiry_tests;
 
 /// Tests for the per-operation maintenance output budget: the byte ceiling one
 /// maintenance operation may plan (ROB-20), and what a refusal leaves behind.
