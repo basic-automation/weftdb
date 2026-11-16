@@ -988,11 +988,22 @@ impl Pipeline {
 	///
 	/// Returns an error if probability calculation fails.
 	pub async fn query_probability(&self, event_id: &EventID, signal_type: &SignalType, query_time: DateTime<Utc>) -> Result<ProbabilityResult> {
-		let sum = self.signals.probability_sum(event_id, signal_type, query_time, &self.database, &self.aspect_id).await?;
+		use futures::StreamExt;
 
-		let average = self.signals.probability_average(event_id, signal_type, query_time, &self.database, &self.aspect_id).await?;
+		// No signal predicts this event: all three are None, and nothing needs reading.
+		if !self.signals.has_event_signals(event_id, signal_type) {
+			return Ok(ProbabilityResult { sum: None, average: None, event_based: None });
+		}
 
-		let event_based = self.signals.event_probability(event_id, signal_type, query_time, &self.database, &self.aspect_id).await?;
+		// One read of each for all three measures, instead of one per measure.
+		let correlations: Vec<weftdb::Correlation> = self.database.get_correlations(&self.aspect_id).await?.filter_map(|r| async { r.ok() }).collect().await;
+		let events: Vec<weftdb::Event> = self.database.get_unprocessed_events(&self.aspect_id).await?.filter_map(|r| async { r.ok() }).collect().await;
+
+		let sum = self.signals.probability_sum_with(event_id, signal_type, query_time, &correlations)?;
+		let average = self.signals.probability_average_with(event_id, signal_type, query_time, &correlations, &events)?;
+		let event_based = self.signals.event_probability_with(event_id, signal_type, query_time, &correlations, &events)?;
+		drop(correlations);
+		drop(events);
 
 		Ok(ProbabilityResult { sum, average, event_based })
 	}

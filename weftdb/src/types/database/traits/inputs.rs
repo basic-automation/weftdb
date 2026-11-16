@@ -363,8 +363,33 @@ pub trait Inputs {
 	/// update correlation for a given aspect
 	async fn update_correlation(&self, aspect_id: &AspectId, correlation: &Correlation) -> Result<TxId>;
 
+	/// Update several correlations for a given aspect, replacing their error rates and occurrences.
+	///
+	/// The default updates them one at a time; implementations should batch the writes,
+	/// since each per-row delete scans the unindexed correlation tables. When an id repeats,
+	/// the last copy wins.
+	async fn update_correlations(&self, aspect_id: &AspectId, correlations: &[Correlation]) -> Result<TxId> {
+		let mut tx_id = TxId::new();
+		for correlation in correlations {
+			tx_id = self.update_correlation(aspect_id, correlation).await?;
+		}
+		Ok(tx_id)
+	}
+
 	/// remove correlation for a given aspect
 	async fn remove_correlation(&self, aspect_id: &AspectId, correlation_id: &CorrelationID) -> Result<TxId>;
+
+	/// Remove several correlations for a given aspect, with their error rates and occurrences.
+	///
+	/// The default removes them one at a time; implementations should batch the deletes,
+	/// since each per-row delete scans the unindexed correlation tables.
+	async fn remove_correlations(&self, aspect_id: &AspectId, correlation_ids: &[CorrelationID]) -> Result<TxId> {
+		let mut tx_id = TxId::new();
+		for correlation_id in correlation_ids {
+			tx_id = self.remove_correlation(aspect_id, correlation_id).await?;
+		}
+		Ok(tx_id)
+	}
 
 	//
 	// Unprocessed Events

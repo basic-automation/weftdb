@@ -1688,7 +1688,7 @@ impl Inputs for Database {
 				let size = i64::try_from(occurrence.size()).map_err(|_| anyhow::anyhow!("Occurrence size too large for i64"))?;
 				let database_info_json = serde_json::to_string(occurrence.database_info())?;
 				let insert_occ_sql = r"INSERT INTO correlation_occurrences (correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
-				let res = conn.as_ref().execute(insert_occ_sql, turso::params![correlation.id().to_string(), occurrence_index, occurrence.aspect().to_string(), occurrence.resolution().to_string(), size, database_info_json, occurrence.pattern_id().to_string(), occurrence.beginning().timestamp(), occurrence.end().timestamp()]).await;
+				let res = conn.as_ref().execute(insert_occ_sql, turso::params![correlation.id().to_string(), occurrence_index, occurrence.aspect().to_string(), occurrence.resolution().to_string(), size, database_info_json, occurrence.pattern_id().to_string(), occurrence.beginning().timestamp_millis(), occurrence.end().timestamp_millis()]).await;
 				match res {
 					Ok(_) => (),
 					Err(e) => {
@@ -1712,6 +1712,113 @@ impl Inputs for Database {
 			}
 
 			Ok(tx_id)
+		})
+		.await
+	}
+
+	async fn update_correlations(&self, aspect_id: &AspectId, correlations: &[Correlation]) -> Result<TxId> {
+		// Same reasoning as `remove_correlations`: the child tables have no index, so the
+		// per-correlation deletes in `update_correlation` scan them once per correlation.
+		// Here the deletes go in `IN (...)` chunks and the re-inserts in multi-row statements,
+		// all in one transaction.
+		const ID_CHUNK: usize = 256;
+		const ROW_CHUNK: usize = 100;
+		if correlations.is_empty() {
+			return Ok(TxId::new());
+		}
+		// The last copy of a repeated id wins, as it would with sequential `update_correlation` calls.
+		let mut last: std::collections::HashMap<&CorrelationID, usize> = std::collections::HashMap::with_capacity(correlations.len());
+		for (index, correlation) in correlations.iter().enumerate() {
+			last.insert(correlation.id(), index);
+		}
+		let unique: Vec<&Correlation> = correlations.iter().enumerate().filter(|(index, correlation)| last.get(correlation.id()) == Some(index)).map(|(_, correlation)| correlation).collect();
+		drop(last);
+
+		let mut error_rows: Vec<[turso::Value; 4]> = Vec::new();
+		let mut occurrence_rows: Vec<[turso::Value; 9]> = Vec::new();
+		for correlation in &unique {
+			let id = correlation.id().to_string();
+			for (signal_type, distance) in correlation.error_rate() {
+				error_rows.push([turso::Value::Text(id.clone()), turso::Value::Text(signal_type.to_string()), turso::Value::Text(distance.value().to_string()), turso::Value::Text(distance.units().to_string())]);
+			}
+			for (index, occurrence) in correlation.occurrences().iter().enumerate() {
+				let occurrence_index = i64::try_from(index).map_err(|_| anyhow::anyhow!("Occurrence index too large for i64"))?;
+				let size = i64::try_from(occurrence.size()).map_err(|_| anyhow::anyhow!("Occurrence size too large for i64"))?;
+				let database_info_json = serde_json::to_string(occurrence.database_info())?;
+				occurrence_rows.push([
+					turso::Value::Text(id.clone()),
+					turso::Value::Integer(occurrence_index),
+					turso::Value::Text(occurrence.aspect().to_string()),
+					turso::Value::Text(occurrence.resolution().to_string()),
+					turso::Value::Integer(size),
+					turso::Value::Text(database_info_json),
+					turso::Value::Text(occurrence.pattern_id().to_string()),
+					turso::Value::Integer(occurrence.beginning().timestamp_millis()),
+					turso::Value::Integer(occurrence.end().timestamp_millis()),
+				]);
+			}
+		}
+
+		legacy_metadata_write(async move {
+			let db = self.get_correlations_db(aspect_id).await?;
+			let db_path = self.get_correlations_db_path(aspect_id).await?;
+			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
+
+			let now = chrono::Utc::now().timestamp_millis();
+			let update_sql = r"UPDATE correlations SET dictionary_id = ?, subject_id = ?, aspect_id = ?, pattern_id = ?, event_id = ?, average_distance_value = ?, average_distance_units = ?, updated_at = ? WHERE id = ?";
+			for correlation in &unique {
+				let (avg_dist_value, avg_dist_units) = correlation.average_distance().map_or((None, None), |dist| (Some(dist.value().to_string()), Some(dist.units().to_string())));
+				if let Err(e) = conn.as_ref().execute(update_sql, turso::params![correlation.dictionary_id().to_string(), correlation.subject_id().to_string(), correlation.aspect_id().to_string(), correlation.pattern_id().to_string(), correlation.event_id().to_string(), avg_dist_value, avg_dist_units, now, correlation.id().to_string()]).await {
+					let id = correlation.id();
+					tracing::warn!("Failed to update correlation '{id}' for aspect {aspect_id}: {e}");
+					Self::rollback_after_error(&conn).await;
+					return Err(anyhow::anyhow!("Failed to update correlation: {e}"));
+				}
+			}
+
+			for chunk in unique.chunks(ID_CHUNK) {
+				let placeholders = vec!["?"; chunk.len()].join(", ");
+				let params: Vec<String> = chunk.iter().map(|correlation| correlation.id().to_string()).collect();
+				for table in ["correlation_error_rates", "correlation_occurrences"] {
+					let sql = format!("DELETE FROM {table} WHERE correlation_id IN ({placeholders})");
+					if let Err(e) = conn.as_ref().execute(&sql, turso::params_from_iter(params.clone())).await {
+						tracing::warn!("Failed to clear {table} for {} correlations in aspect {aspect_id}: {e}", chunk.len());
+						Self::rollback_after_error(&conn).await;
+						return Err(anyhow::anyhow!("Failed to clear {table}: {e}"));
+					}
+				}
+			}
+
+			let inserts: [(&str, &str, usize, Vec<turso::Value>); 2] = [
+				("correlation_error_rates", "(correlation_id, signal_type, error_rate_value, error_rate_units)", 4, error_rows.into_iter().flatten().collect()),
+				("correlation_occurrences", "(correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp)", 9, occurrence_rows.into_iter().flatten().collect()),
+			];
+			for (table, columns, width, values) in inserts {
+				let row = format!("({})", vec!["?"; width].join(", "));
+				for chunk in values.chunks(width * ROW_CHUNK) {
+					let sql = format!("INSERT INTO {table} {columns} VALUES {}", vec![row.as_str(); chunk.len() / width].join(", "));
+					if let Err(e) = conn.as_ref().execute(&sql, turso::params_from_iter(chunk.to_vec())).await {
+						tracing::warn!("Failed to insert {} rows into {table} for aspect {aspect_id}: {e}", chunk.len() / width);
+						Self::rollback_after_error(&conn).await;
+						return Err(anyhow::anyhow!("Failed to insert into {table}: {e}"));
+					}
+				}
+			}
+
+			Self::commit_concurrent(&conn).await?;
+
+			for correlation in &unique {
+				let cache_key = format!("correlation_{}_{}", aspect_id.as_uuid(), correlation.id().to_uuid());
+				self.cache.lock().await.store(&cache_key, (*correlation).clone()).await;
+			}
+
+			if measurement_audit_enabled() {
+				let log = format!("Updated {} correlations for aspect {aspect_id}", unique.len());
+				let _ = self.record_transaction(&log).await?;
+			}
+
+			Ok(TxId::new())
 		})
 		.await
 	}
@@ -1754,6 +1861,45 @@ impl Inputs for Database {
 
 			Self::commit_concurrent(&conn).await?;
 			let log = format!("Removed correlation {correlation_id} for aspect {aspect_id}");
+			let _ = self.record_transaction(&log).await?;
+			Ok(TxId::new())
+		})
+		.await
+	}
+
+	async fn remove_correlations(&self, aspect_id: &AspectId, correlation_ids: &[CorrelationID]) -> Result<TxId> {
+		// The correlation tables carry no index (MVCC), so every `WHERE correlation_id = ?`
+		// is a full scan. Deleting in `IN (...)` chunks costs one scan per chunk per table
+		// instead of one per correlation, which matters when clearing thousands of duplicates.
+		const CHUNK: usize = 256;
+		if correlation_ids.is_empty() {
+			return Ok(TxId::new());
+		}
+		legacy_metadata_write(async move {
+			let db = self.get_correlations_db(aspect_id).await?;
+			let db_path = self.get_correlations_db_path(aspect_id).await?;
+			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+			drop(db);
+
+			for chunk in correlation_ids.chunks(CHUNK) {
+				let placeholders = vec!["?"; chunk.len()].join(", ");
+				let params: Vec<String> = chunk.iter().map(ToString::to_string).collect();
+				for (table, column) in [("correlation_error_rates", "correlation_id"), ("correlation_occurrences", "correlation_id"), ("correlations", "id")] {
+					let sql = format!("DELETE FROM {table} WHERE {column} IN ({placeholders})");
+					if let Err(e) = conn.as_ref().execute(&sql, turso::params_from_iter(params.clone())).await {
+						tracing::warn!("Failed to delete {} correlations from {table} for aspect {aspect_id}: {e}", chunk.len());
+						Self::rollback_after_error(&conn).await;
+						return Err(anyhow::anyhow!("Failed to remove correlations from {table}: {e}"));
+					}
+				}
+			}
+
+			Self::commit_concurrent(&conn).await?;
+			for correlation_id in correlation_ids {
+				let cache_key = format!("correlation_{}_{}", aspect_id.as_uuid(), correlation_id.to_uuid());
+				self.cache.lock().await.invalidate(&cache_key).await;
+			}
+			let log = format!("Removed {} correlations for aspect {aspect_id}", correlation_ids.len());
 			let _ = self.record_transaction(&log).await?;
 			Ok(TxId::new())
 		})
