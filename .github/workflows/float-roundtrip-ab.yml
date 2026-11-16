@@ -5,18 +5,35 @@
 # is what this workflow pays for, and it pays it once per arm instead of twice in
 # one job.
 #
-# History that shapes this file: three dispatches of the one-job version ended with
+# History that shapes this file. Three dispatches of the one-job version ended with
 # `The runner has received a shutdown signal` and exit 143 while still compiling,
-# around the 11th minute, without ever reaching a timing loop. Two reasons are
-# visible in those logs: the rust-cache restore step took 0 seconds and its post
-# step was skipped, so nothing was restored and nothing was saved — the action
-# saves only when the job succeeds, and the job never succeeded — and
-# `CARGO_BUILD_JOBS=2` roughly doubled the wall time of that cold build.
+# around the 11th minute, without ever reaching a timing loop; `CARGO_BUILD_JOBS=2`
+# roughly doubled the wall time of that cold build. Splitting the arms into two jobs
+# fixed the sharing problem but not the cold build: dispatch 43809114630 shows a
+# restore step of 1 second, a post step skipped on the failed arm, and the `on` arm
+# killed with exit 143 at 9m43s — still compiling. Three separate causes, each fixed
+# below and each verified against the repository rather than inferred:
 #
-# So each arm now gets its own job with its own cache key, and the cache is saved
-# even when a later step fails: the first dispatch pays the cold build, the next
-# one resumes warm. Neither arm sets CARGO_BUILD_JOBS, matching the `test` job in
-# ci.yml, which builds the whole workspace with cargo's default job count.
+# 1. The cache never landed. `Swatinem/rust-cache` at the pinned SHA has no
+#    `save-always` input (its inputs are prefix-key, shared-key, key, add-job-id-key
+#    and add-rust-environment-hash-key), so passing it did nothing: the action saves
+#    in a post step that is skipped when the job fails, and the job never got far
+#    enough to succeed. So the cold build is paid again every dispatch.
+# 2. The cold build is unusually expensive here. `[profile.bench]` sets `lto = true`
+#    and `codegen-units = 1` (`Cargo.toml:154-157`, matching `[profile.release]`), and
+#    the release profile's `debug = true` (`Cargo.toml:143`) comes through to bench.
+#    Fat LTO with one codegen unit over ~600 crates is what runs past the point where a
+#    hosted runner is reclaimed.
+# 3. The `off` arm never built anything: its guard grepped Cargo.toml for the bare
+#    token `float_roundtrip`, which the explanatory comment at `Cargo.toml:61` also
+#    contains, so a *successful* strip was reported as a failure.
+#
+# 1 and 3 are fixed outright. 2 is fixed for this workflow only, by overriding the
+# bench profile's LTO/codegen-units/debug in the job's environment: both arms run
+# under identical settings, so the A/B delta stays the answer, while the absolute
+# nanoseconds are those of a non-LTO build and are reported as such. The shipped
+# profiles in Cargo.toml are not touched. Bump the cache key below whenever that
+# override changes, so a target directory built under the old settings is not reused.
 #
 # The `off` arm strips the feature with sed in the job only. It is never committed,
 # and the step at the end proves it.
@@ -54,6 +71,14 @@ jobs:
         arm: ["on", "off"]
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    # Cause 2 above: a cold fat-LTO single-codegen-unit build of this graph does not
+    # survive a hosted runner. opt-level stays 3, because that is what the measurement
+    # depends on; LTO, codegen-units and debug info are build cost, not measurement
+    # cost, and both arms get the same treatment. Cargo.toml itself is untouched.
+    env:
+      CARGO_PROFILE_BENCH_LTO: "false"
+      CARGO_PROFILE_BENCH_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_BENCH_DEBUG: "false"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -65,14 +90,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: ${{ steps.toolchain.outputs.version }}
-      # Keyed per arm, because the two arms link different serde_json builds, and
-      # saved even on failure: without save-always the cache never lands, and every
-      # dispatch starts from a cold 600-crate graph again.
+      # Keyed per arm, because the two arms link different serde_json builds. There is
+      # no save-always here to ask for: this action's pinned version has no such input,
+      # which is why the cache never landed before. It saves when the job succeeds, so
+      # the point of the rest of this file is to let the job succeed.
       - name: Cache the dependency graph for this arm
         uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
         with:
-          key: float-ab-${{ matrix.arm }}-${{ hashFiles('**/Cargo.lock') }}
-          save-always: true
+          key: float-ab-v2-${{ matrix.arm }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Strip float_roundtrip (in-job only — never committed)
         if: matrix.arm == 'off'
@@ -80,26 +105,48 @@ jobs:
         run: |
           set -euo pipefail
           sed -i 's/features = \["float_roundtrip"\]/features = []/' Cargo.toml
-          # grep exits 1 when the token is gone, which is the success case here.
-          if grep -q 'float_roundtrip' Cargo.toml; then
-            echo "::error::sed did not strip float_roundtrip"
+          # The guard has to name the dependency line, not the token: the comment at
+          # Cargo.toml:61 explains why the feature is on and mentions it by name, so a
+          # grep for the bare word matches a file that was stripped correctly.
+          if grep -q 'features = \["float_roundtrip"\]' Cargo.toml; then
+            echo "::error::sed did not strip float_roundtrip from the serde_json dependency"
+            grep -n 'serde_json' Cargo.toml
             exit 1
           fi
+          if git diff --quiet -- Cargo.toml; then
+            echo "::error::the strip changed nothing in Cargo.toml"
+            exit 1
+          fi
+          grep -n 'serde_json = ' Cargo.toml
           echo "float_roundtrip stripped in-job for the off arm"
+          echo "(the comment at Cargo.toml:61 naming it is still there, on purpose)"
 
       # The bench reads its size and repetition count from the environment, so the
       # workflow inputs have to be exported or they do nothing. It is a hand-rolled
       # timing loop, not criterion, so criterion flags would be ignored.
+      # Build and run are separate steps so that a log says which one the runner gave
+      # up in; a single step says only "still compiling or still running".
+      - name: Build the bench (cold on the first dispatch of a given key)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "profile: lto=${CARGO_PROFILE_BENCH_LTO} codegen-units=${CARGO_PROFILE_BENCH_CODEGEN_UNITS}"
+          echo "debug=${CARGO_PROFILE_BENCH_DEBUG}; opt-level stays 3 from Cargo.toml:154-157"
+          start=$SECONDS
+          cargo bench --no-run -p weft-server --bench json_body_cost 2>&1 | tail -40
+          echo "cold-or-warm build wall time: $((SECONDS - start))s"
+
       - name: Time one whole interpolate request
         id: bench
         shell: bash
         env:
           WEFT_JBC_VALUES: ${{ inputs.values }}
           WEFT_JBC_REPS: ${{ inputs.reps }}
+          ARM: ${{ matrix.arm }}
         run: |
           set -euo pipefail
-          cargo bench -p weft-server --bench json_body_cost 2>&1 | tee "bench-${{ matrix.arm }}.txt"
-          echo "result=$(grep -m1 'ns/value=' "bench-${{ matrix.arm }}.txt" || true)" >> "$GITHUB_OUTPUT"
+          cargo bench -p weft-server --bench json_body_cost 2>&1 | tee "bench-$ARM.txt"
+          echo "result=$(grep -m1 'ns/value=' "bench-$ARM.txt" || true)" >> "$GITHUB_OUTPUT"
 
       - name: Restore Cargo.toml (undo in-job strip)
         if: always() && matrix.arm == 'off'
@@ -126,13 +173,21 @@ jobs:
       - name: Publish this arm's numbers
         if: always()
         shell: bash
+        env:
+          ARM: ${{ matrix.arm }}
+          VALUES: ${{ inputs.values }}
+          REPS: ${{ inputs.reps }}
         run: |
           {
-            echo "## Float roundtrip A/B — arm \`${{ matrix.arm }}\`"
+            echo "## Float roundtrip A/B — arm \`$ARM\`"
             echo ""
-            echo "values=${{ inputs.values }} reps=${{ inputs.reps }}"
+            echo "values=$VALUES reps=$REPS"
             echo ""
+            echo "Built with \`lto=$CARGO_PROFILE_BENCH_LTO\`, \`codegen-units=$CARGO_PROFILE_BENCH_CODEGEN_UNITS\` and"
+            echo "\`debug=$CARGO_PROFILE_BENCH_DEBUG\` at \`opt-level = 3\` — not the shipped \`[profile.bench]\`"
+            echo "(\`lto = true\`, \`codegen-units = 1\`), which a hosted runner does not finish compiling. Both arms"
+            echo "share those settings, so the delta is the answer; the absolute nanoseconds are a non-LTO build's."
             echo '```'
-            cat "bench-${{ matrix.arm }}.txt" 2>/dev/null || echo "(no bench output — this arm never reached the timing loop)"
+            cat "bench-$ARM.txt" 2>/dev/null || echo "(no bench output — this arm never reached the timing loop)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
