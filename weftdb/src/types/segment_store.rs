@@ -492,7 +492,8 @@ pub struct SegmentStoreOptions {
 	/// `None`, the library default, re-splits nothing: a fold that would produce one very
 	/// large frame still produces it. When set, the passes that fold segments re-cut their
 	/// merged output at timestamp boundaries so that no output frame is estimated above it;
-	/// see [`size_driven_cuts`](maint::size_driven_cuts) for the rule and its hard bound.
+	/// rule and its hard bound are written out in the store's own fold paths
+	/// (`segment_store::maint`), which are the only callers.
 	/// A seal is never cut by it. [`from_env`](Self::from_env) reads
 	/// `WEFT_MAINTENANCE_MAX_SEGMENT_BYTES` (a positive whole number of bytes; unset,
 	/// malformed, or zero leaves re-splitting off).
