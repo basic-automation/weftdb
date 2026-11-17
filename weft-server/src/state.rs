@@ -263,7 +263,7 @@ impl AppState {
 	}
 
 	/// The container memory budget, present even when unbounded (it accounts every
-	/// [`Reservation`] the server makes).
+	/// [`memory_budget::Reservation`] the server makes).
 	#[must_use]
 	pub const fn memory_budget(&self) -> &MemoryBudget {
 		&self.memory_budget
