@@ -8032,6 +8032,49 @@ modules are inside the defining module.
   `start_paused`) proves that a stalled body is still a deadline and not a disconnect — the
   regression guard the whole slice is about.origin/mainorigin/mainorigin/main
 
+## 2026-11-17 — Accepting RUSTSEC-2026-0543 (chrono unmaintained) with a reason and a written deadline, not weakening the gate (shipping)
+
+**What broke, with evidence.** `cargo deny check advisories` began failing on every branch
+pushed today: `error[unmaintained]: chrono is unmaintained / The chrono crate is
+unmaintained; all versions are affected`, with `advisories FAILED` while `bans`, `licenses`
+and `sources` stayed ok, against `Cargo.lock:64` `chrono 0.4.45`. The same job was green on
+main on 2026-11-15 (`docs/legal-review.md` records that), so the advisory database moved,
+not this repository. That one job turned green pull requests red, and through "main CI
+green" it gates the beta tag (TAG-12).
+
+**Why there is no upgrade.** crates.io reports chrono `max_stable = newest = 0.4.45`, so no
+release fixes it; RustSec's own line is "Solution: No safe upgrade is available!" and its
+recommended alternatives are `jiff` and `time`. The transitive path cannot be bumped either:
+arrow's newest stable is 60.1.0 and `arrow-array 60.0.0` requires `chrono ^0.4.40`. chrono
+is a direct dependency of nine manifests (the workspace `Cargo.toml` plus `weft-bench`,
+`weft-client`, `weft-line-protocol`, `weft-orchestration`, `weft-reduce`, `weft-server`,
+`weft-tui`, `weft-xbench`, `weftdb`) and arrives transitively through
+`arrow-cast`/`arrow-cmp`/`arrow-flight` into `weft-server`.
+
+**The options, and what was rejected.** `unmaintained = "none"` would blind the gate to
+every future unmaintained dependency to fix one we chose ourselves.
+`unmaintained = "workspace"` would not help: chrono *is* a direct dependency of workspace
+members. Dropping arrow means dropping the Flight SQL surface, a product decision rather
+than a dependency one. Migrating immediately is real work across nine crates and would not
+clear the advisory while arrow still pins chrono, so it makes nothing green sooner.
+
+**The choice, and why it is not a gate weakening.** One ignore entry in the shape the file
+itself asks for — a reason that carries the date to revisit, 2027-01-31. The date is
+load-bearing as a deadline, and it is written rather than enforced because the version CI
+runs cannot hold it: the action pin is cargo-deny 0.20.2, which answers an `expiry` key with
+`error[unexpected-keys]: found 1 unexpected keys, expected: ["id", "reason"]` at
+`deny.toml:17`. cargo-deny 0.21.0 (released 2026-11-16) added `advisories.ignore[].expiry`,
+`advisories.ignore-expiry` and `advisories.ignore[].allow`; #794 bumps the pin so the
+deadline can gate instead of merely remind, and `ignore[].allow` can then stop new edges
+onto chrono. `unused-ignored-advisory = "deny"` (0.19.0 or newer, so already legal) makes an
+ignore that stops matching an error, which removes the usual way exceptions rot: an entry
+left behind after the dependency is gone. Vulnerabilities, unsound advisories, bans,
+licences, sources and yank checking are unchanged.
+
+**Follow-ups.** #791 is the migration: our own nine uses first, then the arrow path (a newer
+arrow, a patch, or a scoped `allow` list once we are off it directly). #790 records the CI
+outage. The written date keeps the revisit visible even if both issues stall; # turns it
+into a gate as soon as the pin moves to a cargo-deny that can parse `expiry`.
 ## 2026-11-17 — ROB-14 memory budget, cut 1: read, hold, account, do not enforce yet (shipped as #788)
 
 The limit is read in `weft-server`, not in `weftdb`. A container's `memory.max` is a process
@@ -8073,4 +8116,4 @@ and the documentation counts restated instead — current totals in the version 
 historical counts written as words so the checker's digit scan cannot mistake them for present
 claims — and the schema version stayed at 2, since adding a variable changes what may be set, not
 the shape of the schema. **A failing gate is answered by changing what is checked, never the
-checker.**origin/mainorigin/main
+checker.**origin/mainorigin/mainorigin/main

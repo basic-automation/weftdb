@@ -225,6 +225,16 @@ Enforcement is automated and is the reason this section can be short:
   match the lock file**; `THIRD-PARTY-NOTICE.txt` is generated from the
   `license-file` of every crate in the graph and shipped in release artefacts
   (`:425-429`). Both jobs were green on main on 2026-11-15.
+  **Update 2026-11-17:** that green state ended for the advisories check when RustSec
+  marked `chrono` unmaintained (RUSTSEC-2026-0543, "no safe upgrade"): the job now fails
+  on every branch. It is accepted in `deny.toml` with a reason naming 2027-01-31 as the
+  revisit date — a machine-enforced `expiry` needs cargo-deny 0.21.0 and CI pins 0.20.2
+  through the action, so #794 bumps that pin — and
+  `unused-ignored-advisory = "deny"` keeps a dead exception from sitting around; the
+  migration off `chrono` is #791 (filed as #790). A licensing document is the wrong place to
+  hide a dependency risk, so it is recorded here as well as in `DECISIONS.md`. The job sits
+  at `.github/workflows/ci.yml:410` on current main; the numbers above are as of the review
+  date.
 - Vendored source travels in `patches/` and is wired through `patch.crates-io`
   (`Cargo.toml:166-167`). The upstream licence travels with the patch and shows
   up in the bundle.
