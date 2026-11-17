@@ -40,6 +40,7 @@ pub struct MemoryBudget {
 /// On [`Drop`] it releases its byte count from the budget's counter, so a panic
 /// (or an early return) cannot leak the reservation.
 #[derive(Debug)]
+#[must_use = "the reservation is released the moment the guard is dropped; bind it to a name for the scope that needs the budget held"]
 pub struct Reservation {
 	/// How many bytes were reserved.
 	pub bytes: u64,
@@ -418,23 +419,26 @@ mod tests {
 	fn try_reserve_under_limit_succeeds_and_reserved_moves() {
 		let budget = MemoryBudget::new(Some(100));
 		assert_eq!(budget.reserved(), 0);
-		let _ = budget.try_reserve(40).unwrap();
+		// The guard releases the budget on Drop, so each reservation is bound to a
+		// name (an underscore prefix only silences the unused-variable lint; it does
+		// not drop early the way `let _ = …` does).
+		let _first = budget.try_reserve(40).unwrap();
 		assert_eq!(budget.reserved(), 40);
-		let _ = budget.try_reserve(30).unwrap();
+		let _second = budget.try_reserve(30).unwrap();
 		assert_eq!(budget.reserved(), 70);
 	}
 
 	#[test]
 	fn try_reserve_exactly_at_limit_succeeds() {
 		let budget = MemoryBudget::new(Some(100));
-		let _ = budget.try_reserve(100).unwrap();
+		let _at_limit = budget.try_reserve(100).unwrap();
 		assert_eq!(budget.reserved(), 100);
 	}
 
 	#[test]
 	fn try_reserve_one_byte_over_fails_with_over_budget_and_leaves_reserved_unchanged() {
 		let budget = MemoryBudget::new(Some(100));
-		let _ = budget.try_reserve(50).unwrap();
+		let _half = budget.try_reserve(50).unwrap();
 		assert_eq!(budget.reserved(), 50);
 		let err = budget.try_reserve(51).expect_err("one byte over the limit");
 		match err {
@@ -462,14 +466,14 @@ mod tests {
 	#[test]
 	fn unbounded_budget_never_fails() {
 		let budget = MemoryBudget::new(None);
-		let _ = budget.try_reserve(u64::MAX).unwrap();
+		let _max = budget.try_reserve(u64::MAX).unwrap();
 		assert_eq!(budget.reserved(), u64::MAX);
 	}
 
 	#[test]
 	fn two_concurrent_reservations_refuse_the_second_when_the_budget_is_exhausted() {
 		let budget = MemoryBudget::new(Some(100));
-		let _ = budget.try_reserve(60).unwrap();
+		let _first = budget.try_reserve(60).unwrap();
 		// The next reservation of 60 would push it to 120.
 		let err = budget.try_reserve(60).expect_err("second reserve exceeds the budget");
 		match err {
