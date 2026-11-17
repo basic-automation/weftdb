@@ -74,12 +74,6 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 
 ## Phase 12 — Close the pre-beta lanes (was W6, W8 and W9 open items)
 
-- [ ] START HERE (filed 2026-11-11 for the next run)
-- [ ] START HERE (rewritten 2026-11-11 for the next run)
-- [ ] START HERE (filed 2026-10-11 for the next run)
-- [ ] START HERE (filed 2026-10-09 for the next run)
-- [ ] (2026-10-08 list.) The 2026-10-08 run (PR `routine/dsp-2026-10-08`)
-- [ ] (2026-09-23 list; item 3 shipped 2026-10-08.) The 2026-09-23 run
 - [ ] Run D-S21's privileged power-loss validation (sudo: dm-log-writes or a QEMU hard reset) *(owner)*
 - [x] read lane: **X-READ** Read-time newer-wins merge across overlapping segments, per series
 - [x] maint lane: **ROB-20** Maintenance resource limits, k-way merge, re-split of oversized frames (byte budget #765 + disk-guard reserve #761 + per-op time budget #781; `merge_k_way` #772; output re-split #773. The time budget is honoured between swaps only, and one already-oversized segment is not auto re-split)
@@ -102,8 +96,16 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 
 ## Phase 13 — Contract candidate (was W9 gates and W11)
 
-- [ ] **7.3 Corruption detection** (D-S12 + ROB-8/9/22 + HTTP restore)
-- [ ] **7.5 Compaction** with query consistency, cancellation, and resource limits (ROB-19/20/21)
+- [x] **7.3 Corruption detection** (D-S12 + ROB-8/9/22 + HTTP restore) *(reconciled 2026-11-17 by the routine from its five parts, all shipped; the evidence tests below were re-run on `435553e` and pass. Umbrella #212's three sub-issues #213/#214/#215 are closed as completed.)*
+  - [x] D-S12 startup recovery, quarantine with TTL, the fsck endpoint and the `/ready` report (Phase 6; `POST /api/v1/storage/fsck` in `weft-server/src/routes.rs`; `startup_recovery_quarantines_a_corrupt_frame`, `fsck_rebuilds_a_row_whose_length_is_stale`)
+  - [x] ROB-8 hardened frame decoding (Phase 6; `weft-server/tests/frame_fault.rs`)
+  - [x] ROB-9 mutation harness over frames, sidecars and Parquet (Phase 10; `weft-arrow-store/tests/parquet_mutation.rs`, `weft-physical-type/tests/mutation.rs`)
+  - [x] ROB-22 suspect-frame policy and decode crash-loop breaker (Phase 12, #740; `suspect_frame_policy_tests`, `types::quarantine::tests`)
+  - [x] Restore into a chosen new root over HTTP (Phase 12, #739; `weft-server/tests/restore_into.rs`)
+- [x] **7.5 Compaction** with query consistency, cancellation, and resource limits (ROB-19/20/21) *(reconciled 2026-11-17 by the routine from its parts, all shipped; the evidence tests below were re-run on `435553e` and pass. The limits ROB-20's line states carry over: the time budget is honoured between swaps only, and one already-oversized segment is not auto re-split.)*
+  - [x] Query consistency: readers never error or see a merged member beside its output (`swap_tests::a_reader_looping_during_merges_never_errors_or_sees_a_member_beside_its_output`), with read-time newer-wins across overlapping segments (X-READ, Phase 12)
+  - [x] Cancellation: ROB-21 (`MaintenanceCancel` on the store-wide sweeps, RAII guards, maintenance metrics; `segment_store::cancel_tests`, `weft-server/tests/maintenance_busy.rs`)
+  - [x] Resource limits: ROB-19 scheduler with per-aspect breaker, and ROB-20 byte, disk-reserve and time budgets with `merge_k_way` and output re-split (#765, #761, #781, #772, #773)
 - [x] **Compatibility tests** (FRE-13 + PAC-14a) (2026-11-16, #240: legs A and C are on main and green — run 43759178987 at `8b00486` succeeded, and all ten `weftdb/tests/compat_v010.rs` tests report `ok` in `test (ubuntu|windows|macos)`, including `v010_compat_fre13_upgrade_contract` (leg A: a store the real v0.1.0 binary wrote, read by this build) and `v010_compat_fre13_rollback_after_writes_loses_nothing` (leg C); `UPGRADING.md` and `compat/releases.toml` pin v0.1.0. The third leg those files name, `binary` — a released binary reading a store this build wrote — still has **no** runner: that gap is #762, and it is not claimed by this line.)
 - [ ] Ship honesty pages / **Honesty pages shipped** (EVI-16, EVI-17 and the owner narrative)
 - [ ] Move the T7 reference drive (`/mnt/weftbench`) to a 10 Gbps port before calibration *(owner)*
