@@ -174,14 +174,32 @@ pub async fn run_ttl_lane(ttl_secs: u64, now_ns: i64) -> anyhow::Result<TtlLaneV
 
 	store.ingest(aspect, &weftdb::IngestBatch::dense("s1", all_ts, all_vs)).await?;
 
+	// Read back through the expiry-aware path BEFORE anything is deleted. The expired
+	// rows are still physically on disk here, so this is the check that the read
+	// filter hides them; a purge-first order would pass the same read even if the
+	// filter regressed, because the rows would be gone for the wrong reason.
+	anyhow::ensure!(!expired_ts.is_empty(), "TTL lane: the fixture produced no expired rows (cutoff {cutoff}), so the read-filter check would be vacuous");
+	let window_end = now_unit.saturating_add(60);
+	let (visible, _) = store.read_time_range_of_with_expiry(aspect, SeriesId::UNTAGGED, cutoff.saturating_sub(60), window_end, now_ns).await?;
+	if visible.len() != live_ts.len() {
+		return Err(anyhow::anyhow!("TTL lane: the expiry-aware read returned {} rows, expected the {} live rows, with {} expired rows hidden by the read filter", visible.len(), live_ts.len(), expired_ts.len()));
+	}
+	if let Some(t) = visible.iter().find(|t| **t < cutoff) {
+		return Err(anyhow::anyhow!("TTL lane: the expiry-aware read returned {t}, at or before the expiry cutoff {cutoff}"));
+	}
+
 	// Run expiry sweep (report-only).
 	store.expiry_sweep(now_ns).await?;
 
 	// Run purge (physical deletion).
 	let purge = store.purge_expired(now_ns).await?;
 
-	// Read back with expiry-aware read path (verifies expired rows are hidden).
-	store.read_time_range_of_with_expiry(aspect, SeriesId::UNTAGGED, 0, now_ns * 2, now_ns).await?;
+	// The same read after the purge returns the same live set, now because the
+	// expired rows were unlinked rather than because the filter hid them.
+	let (after_purge, _) = store.read_time_range_of_with_expiry(aspect, SeriesId::UNTAGGED, cutoff.saturating_sub(60), window_end, now_ns).await?;
+	if after_purge.len() != live_ts.len() {
+		return Err(anyhow::anyhow!("TTL lane: after purge_expired the read returned {} rows, expected the {} live rows", after_purge.len(), live_ts.len()));
+	}
 
 	let rowexp = RowExpiryPolicy::Ttl { ttl: ttl_secs };
 	let policy_label = TtlPolicyLabel::from(&rowexp);

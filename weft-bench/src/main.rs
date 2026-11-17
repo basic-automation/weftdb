@@ -1007,7 +1007,11 @@ fn run_soak(name: &str, seed: u64, duration_secs: u64, ticks: u64, _window_ticks
 			return ExitCode::FAILURE;
 		}
 	};
-	let ttl_verdict = match weft_bench::soak_ttl::run_ttl_lane(ttl_secs, now_ns) {
+	// `run_soak` is synchronous and runs before `main`'s own runtime exists, so the
+	// lane gets a current-thread runtime here: the same sync-to-async bridge `main`
+	// uses for the failure-matrix child. Calling an `async fn` without `block_on`
+	// would build a future and drop it, and the lane would never run.
+	let ttl_verdict = match tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(anyhow::Error::from).and_then(|rt| rt.block_on(weft_bench::soak_ttl::run_ttl_lane(ttl_secs, now_ns))) {
 		Ok(v) => v,
 		Err(e) => {
 			eprintln!("{PROG}: soak-run: TTL lane failed: {e:#}");
