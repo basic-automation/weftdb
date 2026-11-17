@@ -86,7 +86,7 @@ use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use splimes::{Point, Resolution};
 use tracing::Instrument as _;
-use weft_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptions, PagedSegment, PhysicalValue, Segment, SegmentDescriptor, SegmentIndex, SplitDecision, SplitPolicy, TimeUnit};
+use weft_physical_type::{merge_k_way, split_index, AspectSchema, FrameOptions, PagedSegment, PhysicalValue, Segment, SegmentDescriptor, SegmentIndex, SplitDecision, SplitPolicy, TimeUnit};
 use weft_reduce::{Aggregation, Bucket, PartialReduction};
 
 use crate::{
@@ -1216,19 +1216,24 @@ fn series_overlap_components(rows: Vec<IndexRow>) -> Vec<Vec<IndexRow>> {
 	components
 }
 
-/// Fold the rows of `frames`, the members of a merge in ascending id order (oldest to
-/// newest), into one time-sorted run, the newest value winning at a timestamp two members
-/// share: each member's rows are sorted stably first (it may be out of order), then merged
-/// with [`merge_newer_wins`], which supersedes the older member's whole run of a shared
-/// timestamp and keeps a run unique to one member as it is.
+/// Fold the members of a merge — `frames`, in ascending id order (oldest to newest) — into
+/// one time-sorted run, the newest value winning at a timestamp two members share.
+///
+/// Each member's rows are sorted stably first (a member may be stored out of order), then
+/// merged with [`merge_k_way`], which supersedes an older member's whole run of a shared
+/// timestamp and keeps a run unique to one member as it is. One heap pass replaces the
+/// pairwise fold of the prefix per member (`O(rows · k)` row moves →
+/// `O(rows + instants · log k)`, ROB-20 G3); the rows are equal either way, which is what
+/// `merge_k_way_matches_the_pairwise_fold_on_every_overlap_shape` pins.
 fn fold_newest_wins(frames: Vec<DecodedFrame>) -> (Vec<i64>, Vec<Option<BigDecimal>>) {
-	let mut merged: Vec<(i64, Option<BigDecimal>)> = Vec::new();
+	let mut runs: Vec<Vec<(i64, Option<BigDecimal>)>> = Vec::with_capacity(frames.len());
 	for frame in frames {
 		let mut rows: Vec<(i64, Option<BigDecimal>)> = frame.timestamps.into_iter().zip(frame.values).collect();
 		rows.sort_by_key(|(t, _)| *t);
-		merged = merge_newer_wins(&merged, &rows);
+		runs.push(rows);
 	}
-	merged.into_iter().unzip()
+	let refs: Vec<&[(i64, Option<BigDecimal>)]> = runs.iter().map(Vec::as_slice).collect();
+	merge_k_way(&refs).into_iter().unzip()
 }
 
 /// Whether two runs of rows are the same, row for row: equal timestamps, and values equal

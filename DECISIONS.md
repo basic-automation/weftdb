@@ -7243,30 +7243,6 @@ half of the 73-route registry, partitioned between `tests/fre10a_contract.rs` (t
 compilation errors or latent test failures that only `cargo test` reveals. The PR will go
 as a draft or marked with the CI-as-first-run notice.
 
-## 2026-11-14 — EOD handoff: test file written, ROADMAP ticked, DECISIONS section written
-
-**What exists:** `weft-server/tests/fre10a_contract.rs` in the house style. ROADMAP.md:88 ticked.
-Section written above.
-
-**Not yet done:**
-- `cargo +nightly fmt` to format the new file (hard rules forbid all other cargo
-  commands, and fmt is explicitly allowed). Must run before commit.
-- Git commit with `-s`, push, and a PR opened (no merge).
-- The PR body must say "CI is the first execution; no cargo build/check/test/clippy/miri
-  was run locally."
-- `progress.md` ## Handoff section (this section is that handoff — rewrite if needed).
-
-**Risks:** The stored `Fre10b` key constants prefix `fre10b-`; the test bodies and expected
-values are derived from the handler types and the route registry rather than copied from
-`fre10b_contract.rs`; compiler errors from `cargo test` are expected on first CI run. No
-`cargo` command besides `+nightly fmt` was run.
-
-**Next step after this session:** `cargo +nightly fmt weft-server/tests/fre10a_contract.rs &&
-  git add -A &&
-  git commit -sm "fre10a: contract tests for probes, compute endpoints, metrics and roles (#325)" &&
-  git push origin p12/fre10a-contract-tests &&
-  gh pr create --base main --head p12/fre10a-contract-tests --title "FRE-10a: contract tests for probes, compute endpoints, metrics and roles" --body "Implements FRE-10a. CI is the first execution; no cargo build/check/test/clippy/miri was run locally."
-
 ## 2026-11-14 — ROB-18 closes: contract coverage pins the #681 behaviour; the client-abort code family stays out of scope (#742)
 
 **This slice delivers contract coverage, not new product code.** The two-phase ingest admission,
@@ -7772,6 +7748,66 @@ slice. ROADMAP's ROB-20 line stays unticked and #758 stays open until G3-G6 land
 - **Main's other red, from my own #769.** `clippy` has failed on every head since `617631f` with `error: large future with a size of 25240 bytes` (42,056 bytes with `--all-features`) at `weftdb/src/types/database/inputs.rs:436:28` and `:733:5`, because CI runs `-D clippy::perf`. `Box::pin` on those two `legacy_metadata_write` futures fixes it — not `#[allow(clippy::large_futures)]`, which would keep allocating a 42 KB future per write and leave the lint unarmed for the next growth. The file already boxed two sibling sites, so the pattern was established; my routing grew the other two past the threshold. Behaviour-preserving, uncompiled here, CI will say.
 - **Still open.** What the seal does with a row at an existing timestamp deserves its own answer and a doc sentence; that is a follow-up, not this branch. Separately, one earlier CI reading cited a test named `error_taxonomy_conformance::spatial_query_on_the_real_store_with_no_spatial_index`, and that test **does not exist** on `origin/main` (881 paths in main's tree, no such file; GitHub code search finds nothing) — the reading was mis-attributed, and it is recorded here so the claim does not get repeated as fact.
 
+## 2026-11-16 — What a heap merge has to do with a cursor that loses, and why the pairwise fold was replaced (Open, CI pending)
+
+- **The ambiguity, and the choice.** `ROADMAP.md:85` names one line for three things — "maint
+  lane: **ROB-20** Maintenance resource limits, k-way merge, re-split of oversized frames" — and
+  issue #758 says it closes only when all of them land. G1 (the output budget, #765) and G2 (the
+  disk guard for swap outputs, #761) had already merged, and G4 (re-splitting an oversized merge
+  output) was the only piece nobody had started. I took **G3, the k-way merge**, first because it
+  is the piece with no settings surface, no OpenAPI change, no on-disk format change and no new
+  behaviour to argue about: it is meant to be a pure substitution, provable by comparing outputs.
+  The line stays unticked either way; ticking it needs G4 as well, and the PR says so rather than
+  quietly narrowing the line's meaning.
+- **What newer-wins actually requires, in one sentence a heap merge can get wrong two ways.**
+  `merge_newer_wins` (`weft-physical-type/src/split.rs:147`) drops the *whole* older run at a
+  shared instant and emits the *whole* newer run, including a run of equal timestamps inside one
+  side, and keeps a superseded frame's rows at every *other* instant. A k-way merge over `k`
+  cursors fails that if it throws a losing cursor away — its later instants vanish — and fails
+  it differently if it re-parks the loser at the instant it just lost, which re-asks the same
+  comparison forever. The implementation pops the winner, emits its run at that instant, advances
+  it to its next strictly-greater instant, and then *drains every other cursor parked at that
+  same instant forward past it* without emitting. A Python port of the same algorithm run against
+  the pairwise fold over 600 generated overlap shapes (17,270 input rows, 6,759 distinct
+  instants) reported zero differences, and a deliberately buggy "throw the loser away" variant
+  differed in 456 of those 600 rounds — which is the evidence that the equivalence test in
+  `merge_k_way_matches_the_pairwise_fold_on_every_overlap_shape` is sharp enough to notice, not
+  just large enough to pass.
+- **Tie-break by frame index, not by value.** The cursor key is
+  `(instant, Reverse(frame_index), position)` inside a `BinaryHeap` of `Reverse`, so "newest wins"
+  is one comparison rather than a post-pass, and it is the *frame* that decides, never the value:
+  comparing values would make a merge depend on magnitudes and would not match the pairwise fold,
+  which is indifferent to them. `position` is third only to keep the ordering total.
+- **A new primitive rather than a changed one.** `merge_newer_wins` stays exactly as it is: it is
+  public API (`weft-physical-type/src/lib.rs:148`), it is the two-pointer that is already optimal
+  at k = 2, and the read path still calls it (`segment_store/read.rs:224`). Rewriting it in place
+  would put the read path and PR #738 (which rewrites parts of `read.rs`) at risk for a change
+  whose whole point is that it changes nothing observable. `fold_newest_wins` is the maintenance
+  merge's fold, and that is the loop the plan called out (`docs/maintenance-budgets-plan.md`
+  slice 3).
+- **Scope cut, recorded: the read path still folds pairwise.** `segment_store/read.rs:219-224`
+  merges a segment's rows the same way `fold_newest_wins` used to. Converting it is the obvious
+  follow-up and I did not do it here: it is a hot path, #738 is moving the same file, and one PR
+  that changes one fold is reviewable while a PR that changes two is not.
+- **`use super::*` made a doc link load-bearing.** `segment_store/maint.rs` imports only
+  `use super::*;`, and its four references to `merge_newer_wins` are all inside doc comments —
+  they resolved through the parent module's `use`. Removing that import (the parent no longer
+  calls the two-pointer) would have turned them into broken intra-doc links, a warning class CI
+  treats as an error in the docs build, with nothing in the diff to explain it. The four links are
+  now written with explicit paths
+  (`[`merge_newer_wins`](weft_physical_type::merge_newer_wins)`).
+- **Not compiled, and the acceptance number is therefore not mine to report.** Nothing here was
+  built or run on this host: its RAM belongs to the model server and a `cargo` invocation has been
+  OOM-killed here (SIGKILL, exit 137). The plan's acceptance criterion is "k-way faster for
+  k > 4", and I am not quoting a number I never measured — `kway_merge.rs` asserts the two arms
+  agree before it times them, so the CI run that produces the numbers is also the run that proves
+  they are comparable. `rustfmt --check` is clean (the only formatting change it wanted was tuple
+  index spacing, which is why the peek closure destructures its cursor).
+- **Delegation is out of credits, so the next slice is mine.** The attempt to put G4 on a worker
+  died before it read a file: OpenRouter returned 402 with `limit_source: openrouter_credits`
+  ("requires up to 926081 tokens, but can only afford 721831"). G4 continues in
+  `/mnt/deepmem/wt/p12-758-g4` on `p12/rob20-g4-resplit`, with the brief at
+  `.briefs/rob20-g4-resplit.md` as the record of what that slice is meant to do.
 ## 2026-11-16 — Re-splitting an oversized frame: where the cut goes, and why the plan's acceptance case did not (ROB-20 G4, #758) (shipped as a cut; the slice is not complete)
 
 - **The ambiguity, and the choice.** `docs/maintenance-budgets-plan.md:225-227` states Slice 4's acceptance test as "configure a small `max_segment_bytes`, set up an aspect with a **single giant sealed segment**, run compaction, assert the aspect now has multiple segments each below the threshold". Chose instead to re-cut the output of a **fold** — the merge/squash swap that is already writing that aspect — and to leave a segment that one seal wrote alone. The reason is legality, not scope-creep: a fold of one member into two outputs must give the second output a **fresh** segment id, and `SwapPlan` refuses that case (`weftdb/src/types/segment_store/maint.rs:794-808`, rule **P2**: a fresh id wins precedence against *every* existing id, so the new frame would hide a higher-id row that overlaps its span, which is exactly what the overlap machinery exists to fold). The plan's own risk note says the same thing from the other side — "must validate that new-id allocation stays correct under concurrent splits".
@@ -7783,6 +7819,45 @@ slice. ROADMAP's ROB-20 line stays unticked and #758 stays open until G3-G6 land
 - **What this leaves churn-prone.** A fold under a tiny ceiling can remove 0 segments, so the next sweep sees the same component and rewrites it again. Not fixed here: the ceiling defaults to unset (re-cutting off) at the library default, in `from_env`, and in the server registry, so only an operator who sets it can reach that state, and the daemon interval bounds how often. The open question is a measurement, not a code fix: how small a frame may get before the extra segment metadata and per-read fan-out cost more than the smaller frames save. Recorded as the reason the variable is `Tier::Experimental` rather than `Tier::Tuning`.
 - **Not compiled here, and not claimed.** Nothing in this slice was built: the host's RAM belongs to the model server, and CI is this quarter's Rust gate. The API surface the new tests lean on was checked by grep instead — `IndexRow.desc: SegmentDescriptor` (`weftdb/src/types/index_txn.rs:99`), `SegmentDescriptor { row_count: usize, byte_len: u64 }` (`weft-physical-type/src/catalog.rs:66,85`), and a sibling test module already calling `store.index.rows(ASPECT)` (`tag_seal_tests.rs:51`) — and CI is what says whether they pass. The three store-level tests are written so the ceiling is the **only** difference between them and their control, and the control (`the_same_fold_writes_one_frame_when_the_ceiling_is_off`) is the one that fails on `main` if the change ever regresses into a no-op.
 
+## 2026-11-16 — `over_budget`: the answer a refused maintenance plan gives, and why the frozen 43-code table grew (Needs human: the plan's §4 row)
+
+- **What the issue said and what the code actually did.** #764 described an over-budget merge as
+  answering `500`. It did not: the `StoreError` classifier's fall-through arm (`weft-server/src/error.rs`,
+  the `_ => ApiError::server(Code::IncompatibleStore, …)` case) made it answer **`503 incompatible_store`**,
+  which is arguably worse — it tells an operator the store is damaged when the store refused a plan on
+  purpose. Fixed by giving it its own code rather than by changing a status class.
+- **Status: 503, and deliberately no `Retry-After`.** 409 was rejected because the request contradicts
+  nothing about the store's state; 413 and 422 were rejected because both are about the size of the
+  request or its result, and this refusal is about a server-side work budget the caller cannot touch;
+  507 belongs to disk. A 4xx would blame a caller who did nothing wrong — the ceiling is operator
+  configuration. And unlike `overloaded` there is nothing to wait for: the same call fails identically
+  until an operator raises `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` or splits the group with
+  `?split_min_bytes`, so a delay would only send the caller back into the same refusal.
+- **`details`, not `limit`.** The response carries `details.budget_bytes` and `details.planned_bytes`.
+  The `limit` field was left unset because §4 defines it as *the configured response-size ceiling that
+  refused the answer* — a single number — and this refusal is a pair. The aspect name is included
+  because the route already names the aspect in its path, so it leaks nothing.
+- **Two shapes of the same refusal.** `POST /api/v1/storage/{aspect}/reconcile` answers the status.
+  `POST /api/v1/storage/reconcile` never sees a status: the sweep collects per-aspect failures into
+  `failed: [{aspect, error}]` (`SweepFailure::list`, `weft-server/src/maintain.rs:193`, which renders
+  the whole cause chain) and answers `200`. Both now name the two byte counts — structurally in the
+  first case, in the error text in the second, because `StoreError::OverBudget`'s Display already
+  carries them.
+- **Logging: per-request `tracing::error!`, not a silent 5xx.** `ApiError::server_logged_elsewhere`
+  exists for conditions logged where they change state (the disk guard). Here nothing logs the refusal
+  at its source (`weftdb/src/types/segment_store/maint.rs` returns the error with no log), and a
+  maintenance pass is an operator- or daemon-initiated event at a low cadence, not something a client
+  can provoke per request. So the refusal gets one error line. A counter/metric for refused plans is
+  deliberately not added in this slice.
+- **Needs human:** the canonical code list is not in this repo — the enum's own header points at
+  "`basicautomation.io/projects/weftdb/docs/release-plan` §4 (C6)" (`weft-server/src/error.rs:24`, `:55`).
+  The repo-side pin moved to 44 and the wire name is registered here, but the plan page still lists 43
+  codes until that page gains the row. There is no error-code consistency checker in `scripts/`
+  (#764 guessed at `scripts/ci/check-error-consistency.sh`, which does not exist), so nothing in CI
+  would notice the drift.
+- **Not compiled here, and not claimed.** As with every Rust slice this month, the gate is CI, not a
+  local build; the local checks run were `cargo fmt --check -p weft-server`,
+  `python3 scripts/config/check_schema.py` and `python3 scripts/ci/check-serial-order.py`.
 ## 2026-11-16 — A purge is a separate entry point, not a flag on the sweep (shipped)
 
 Issue #775, row-TTL cut 2. Cut 1 (#752) made expired rows invisible at read time and counted
@@ -7830,4 +7905,4 @@ production history — waits for cut 3, which also carries the SOA-15 TTL lane t
 public struct breaks in-crate construction sites: `expire_aspect_held`'s literal had to gain the
 new fields. And `SegmentStore::index` is a private field, not an accessor, so a test in a
 submodule of `segment_store` writes `store.index.all(aspect)` — reachable, because the test
-modules are inside the defining module.
+modules are inside the defining module.origin/main
