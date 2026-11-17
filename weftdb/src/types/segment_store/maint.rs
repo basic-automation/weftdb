@@ -1138,7 +1138,7 @@ impl SegmentStore {
 	/// is zero and a point/range read over the merged window opens a single segment.
 	///
 	/// **Merge semantics — newer wins (upsert).** Members are folded in ascending seal
-	/// id (oldest → newest) with [`merge_newer_wins`], so at any timestamp two members
+	/// id (oldest → newest) with [`merge_newer_wins`](weft_physical_type::merge_newer_wins), so at any timestamp two members
 	/// share, the more-recently-sealed value supersedes the older one — the same
 	/// last-writer-wins answer [`read_point`](SegmentStore::read_point) already gives
 	/// across overlapping segments. This *dedups* cross-segment duplicate timestamps
@@ -1196,7 +1196,7 @@ impl SegmentStore {
 	/// but `policy` governs whether each overlap component is fully rewritten or split.
 	///
 	/// **Merge semantics — newer wins (upsert).** Every component's members are folded
-	/// oldest → newest with [`merge_newer_wins`], so at any shared timestamp the
+	/// oldest → newest with [`merge_newer_wins`](weft_physical_type::merge_newer_wins), so at any shared timestamp the
 	/// more-recently-sealed value supersedes the older one (dedup / last-writer-wins),
 	/// exactly as [`reconcile_overlaps`](SegmentStore::reconcile_overlaps) documents. The
 	/// *logical* result is identical regardless of `policy`; only the on-disk layout
@@ -1477,7 +1477,7 @@ impl SegmentStore {
 	/// segments (a growing pile of carved-off cold prefixes). Left unchecked that
 	/// fragments an aspect and multiplies the per-segment read/prune overhead. Squash is
 	/// the QuestDB-style bound on that fragmentation: it folds **every** segment of
-	/// `aspect` — in ascending seal id, [`merge_newer_wins`] so any residual shared
+	/// `aspect` — in ascending seal id, [`merge_newer_wins`](weft_physical_type::merge_newer_wins) so any residual shared
 	/// timestamp still resolves last-writer-wins — into a single time-sorted segment
 	/// (paged past 4,096 rows) under the lowest id, deleting the rest. After it, the aspect is one segment
 	/// with no cross-segment overlap. The natural trigger is a segment count past a
@@ -1685,7 +1685,7 @@ impl SegmentStore {
 	/// rather than a single giant one.
 	///
 	/// Grouping is by ascending seal id (≈ time order for append-mostly ingest); each group
-	/// merges oldest→newest via [`merge_newer_wins`] so a residual shared timestamp still
+	/// merges oldest→newest via [`merge_newer_wins`](weft_physical_type::merge_newer_wins) so a residual shared timestamp still
 	/// resolves last-writer-wins, and the merged rows are time-sorted so every output is
 	/// sorted. A `target_rows` of 0 clamps to 1, so every segment forms its own singleton
 	/// group and the call is a no-op. A single-segment group is never rewritten.

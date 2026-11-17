@@ -145,7 +145,7 @@ pub use page::{Page, PagedSegment, DEFAULT_ROWS_PER_PAGE, PAGED_SEGMENT_FORMAT_V
 pub use schema::{is_value_widening, widen_value_encoding, AspectSchema, SealError};
 pub use segment::{prune_by_time, prune_by_value, prune_present_by_time, Segment, SegmentError, SegmentStats, SEGMENT_FORMAT_VERSION};
 use serde::{Deserialize, Serialize};
-pub use split::{merge_newer_wins, split_index, SplitDecision, SplitPolicy};
+pub use split::{merge_k_way, merge_newer_wins, split_index, SplitDecision, SplitPolicy};
 pub use tags::{SeriesKey, SeriesSelector, TagError, TagSet, MAX_SERIES_KEY_BYTES, MAX_TAGS, MAX_TAG_KEY_BYTES, MAX_TAG_VALUE_BYTES, RESERVED_TAG_KEY_PREFIX, TAG_KEY_VALUE_SEPARATOR, TAG_PAIR_SEPARATOR};
 pub use timestamp::{bitpack_bytes, bitpack_decode, bitpack_encode, bitpack_width, decode_delta, decode_delta_of_delta, encode_delta, encode_delta_of_delta, first_order_violation, rle_decode, rle_encode, rle_varint_bytes, uvarint_len, zigzag_varint_bytes, zigzag_varint_len, DeltaColumn, DeltaOfDeltaColumn, TimeUnit};
 #[cfg(feature = "experimental-codecs")]
