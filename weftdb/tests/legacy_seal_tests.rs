@@ -219,7 +219,7 @@ async fn seal_backed_capture_measurement_chunk_reaches_the_seal() -> Result<()> 
 
 	let base = Utc.with_ymd_and_hms(2024, 4, 1, 0, 0, 0).unwrap();
 	let base_ms = base.timestamp_millis();
-	let rows: Vec<InputMeasurement> = (0..10).map(|i| InputMeasurement::new(base + Duration::seconds(i), bd(&format!("{}.0", i)))).collect();
+	let rows: Vec<InputMeasurement> = (0..10).map(|i| InputMeasurement::new(base + Duration::seconds(i), bd(&format!("{i}.0")))).collect();
 
 	// This entry point writes a chunk through the seal store when the aspect
 	// is seal-backed (#779). Before the fix it wrote to rows-mode measurements.db
@@ -233,7 +233,7 @@ async fn seal_backed_capture_measurement_chunk_reaches_the_seal() -> Result<()> 
 	let sealed = weftdb::legacy_seal::read_rows(&store, &aspect_id, None, None).await?;
 	drop(store);
 	for i in 0..10 {
-		assert!(sealed.contains(&(base_ms + i64::try_from(i).expect("i fits i64") * 1000, bd(&format!("{i}.0")))), "row {i} is in the seal frames");
+		assert!(sealed.contains(&(base_ms + i64::from(i) * 1000, bd(&format!("{i}.0")))), "row {i} is in the seal frames");
 	}
 
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
