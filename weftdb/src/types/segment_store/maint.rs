@@ -104,11 +104,19 @@ impl SegmentStore {
 					sweep.rows_expired += swept.rows_expired;
 					sweep.segments_dropped += swept.segments_dropped;
 					sweep.partial_segments += swept.partial_segments;
-					if swept.rows_expired > 0 {
+					// `aspects_cleaned` answers "did this purge change this aspect", so it keys on
+					// what left the store, not on the count of expired rows: a straddling frame's
+					// expired rows are counted on every pass, and reporting the aspect as cleaned
+					// each time would make a second purge look like a first one.
+					if swept.segments_dropped > 0 {
 						sweep.aspects_cleaned.push(aspect.clone());
 					}
 				}
 				Err(err) => {
+					// The partial progress of a failed purge is not folded into the counters: each
+					// swap is committed on its own, so whatever left the store is already visible in
+					// the index, and the caller learns the truth by what the next sweep finds there.
+					// The error names the aspect that stopped the pass.
 					self.breaker_record(aspect, true);
 					sweep.failed.push((aspect.clone(), err));
 				}

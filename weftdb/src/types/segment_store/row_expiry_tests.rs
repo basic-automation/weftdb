@@ -250,7 +250,7 @@ fn frames(root: &std::path::Path) -> Vec<String> {
 fn dense(from: i64, to: i64) -> IngestBatch {
 	let timestamps = (from..=to).collect::<Vec<i64>>();
 	let values = (from..=to).map(|t| bd(&t.to_string())).collect::<Vec<BigDecimal>>();
-	IngestBatch::dense(&format!("k{from}"), timestamps, values)
+	IngestBatch::dense(format!("k{from}"), timestamps, values)
 }
 
 #[tokio::test]
