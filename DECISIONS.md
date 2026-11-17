@@ -8007,6 +8007,34 @@ modules are inside the defining module.
 - **Single oversized segment deliberately not re-split**: the output-re-split ceiling (G4) splits a multi-segment merge's output, but an already-oversized segment written by a single seal is left as-is. An auto-re-split pass would need to read and rewrite it, which is the same cost as a reconcile; that is a new maintenance operation, not part of the time budget.
 - **`cancelled` reused, not an error variant**: hitting the budget is not a failure — the sweep reports `cancelled: true` and what it accomplished before the deadline, exactly as `MaintenanceCancel` already does. No entry point changes signature, no HTTP code, no `StoreError` variant.
 - **Deadline computed once per sweep**: `maintenance_deadline()` in `maint.rs` computes `Instant::now() + Duration::from_secs(env_value)` once and the held paths check `Instant::now() >= deadline` between iterations, rather than recomputing seconds in a loop that might drift under scheduler delay.origin/main
+## 2026-11-17 — ROB-14 cut 2: enforce the container memory budget on request paths (shipped)
+
+- **MemoryBudget is now consulted on the server's request paths.** Cut 1 (#787) added the
+  machinery but no call sites; cut 2 adds the `try_reserve` calls.
+- **Ingest path.** `IngestBody::from_request` (`weft-server/src/ingest.rs`) reserves against the
+  memory budget using the same `reserved_bytes` (the declared `Content-Length` or the body cap) that
+  sizes the disk guard. A refusal is `503 over_budget` with `Retry-After: 1`. The guard is held for
+  the body's lifetime via the `_memory_guard: Option<Reservation>` field.
+- **Query/read path.** Every stored-data route in `weft-server/src/storage.rs` (13 handlers)
+  reserves a conservative per-row estimate (`ESTIMATED_BYTES_PER_ROW = 64` in `read_limits.rs`, a
+  doc comment explains the sizing rule and that it is an estimate, not exact accounting). The
+  `reserve_read_memory` helper clones the budget before `drop(state)`, reads the result rows, and
+  holds the guard through serialization.
+- **Refusal mapping.** `Code::OverBudget` → `503` with wire code `over_budget`. `with_retry_after(1)`
+  tells the caller to retry after 1 second. No new `Code`, status, or wire string was added; the
+  frozen code table at `error.rs:1138` is unchanged.
+- **Unbounded escape hatch.** When neither `WEFT_MEMORY_BUDGET_BYTES` nor a readable container limit
+  bounds the process, the budget is `MemoryBudget::new(None)` and every reservation succeeds —
+  behaviour is byte-for-byte what it was before this cut. Every test under default configuration
+  passes unchanged.
+- **Fixes.** Fixed a bug in the ingest code path (inherited from the initial cut-1 cherry-pick) where
+  the memory budget refusal used `.ok()`, silently swallowing a refused reservation. The corrected
+  code returns `Err` when the budget is exhausted.
+- **Gate.** This change was not compiled locally (the host has ~4 GB free and a build OOM-kills
+  the model server). Only the following were run: `rustfmt --edition 2021 --check` on touched
+  `.rs` files, `python3 scripts/ci/check-serial-order.py`, `python3 scripts/config/check_schema.py`
+  (both pre-existing warnings, unchanged by this cut), `git diff --check`.
+
 ## 2026-11-16 — Naming the client abort without widening the frozen code table (shipped)
 
 - **The issue's premise was stale.** #742 described a disconnect and a deadline both ending up as

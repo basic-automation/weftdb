@@ -59,7 +59,7 @@ use weft_line_protocol::TimestampPrecision;
 use weft_physical_type::{first_order_violation, TimeUnit, PAGED_SEGMENT_FORMAT_VERSION, SEGMENT_FORMAT_VERSION};
 
 use crate::{
-	error::{self, ApiError, StrictQuery, TaggedQuery}, panic_catch, state::AppState
+	error::{self, ApiError, StrictQuery, TaggedQuery}, memory_budget::Reservation, panic_catch, state::AppState
 };
 
 /// Environment variable naming the one body cap for the ingest routes
@@ -341,6 +341,10 @@ impl Default for IngestConfig {
 pub struct IngestBody {
 	bytes: Bytes,
 	reserved_bytes: u64,
+	/// The memory budget reservation held for the body's lifetime (ROB-14 cut 2).
+	/// Released on [`Drop`] when the struct is destroyed, which happens after the
+	/// handler has finished using the body.
+	_memory_guard: Option<Reservation>,
 }
 
 impl IngestBody {
@@ -510,7 +514,17 @@ impl FromRequest<AppState> for IngestBody {
 		if let Some(err) = check_body_truncation(&body, declared) {
 			return Err(err);
 		}
-		Ok(Self { bytes: body, reserved_bytes })
+		// Phase 1b — memory budget. The same `reserved_bytes` (the declared
+		// Content-Length or the body cap) bounds what the server must
+		// buffer in memory while reading the body. The reservation is held
+		// for the body's lifetime (ROB-14 cut 2).
+		let memory_guard = match state.memory_budget().try_reserve(reserved_bytes) {
+			Ok(guard) => Some(guard),
+			Err(_err) => {
+				return Err(ApiError::new(error::Code::OverBudget, "the memory budget is exhausted; retry after in-flight requests complete").with_retry_after(1));
+			}
+		};
+		Ok(Self { bytes: body, reserved_bytes, _memory_guard: memory_guard })
 	}
 }
 
