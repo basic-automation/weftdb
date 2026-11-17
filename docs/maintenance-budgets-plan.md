@@ -15,11 +15,11 @@ neither of which is a maintenance budget in the conventional sense:
 | Disk guard (ROB-17) | [`seal.rs:1093-1106`](../weftdb/src/types/segment_store/seal.rs#L1093) — `admit_write` | Only **ingest/seal writes**, **not** maintenance swap outputs | `disk_reserve_bytes: 0` = off (library); `WEFT_DISK_RESERVE_BYTES` env (server) |
 | Maintenance breaker (ROB-19) | [`segment_store.rs:696-738`](../weftdb/src/types/segment_store.rs#L696) — `MaintenanceBreaker`; [`settings.rs:147-148`](../weft-server/src/settings.rs#L147) — registry entry | Consecutive **sweep failures** per aspect, not resource consumption | `failure_threshold=3`, `cooldown=300s` (`WEFT_MAINTENANCE_BREAKER_FAILURES` / `WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS`) |
 
-**Disk guard exclusion** — `swap_plans` (`seal.rs:348`) and `swap_in` (the low-level writer)
-never call `disk_guard.admit_write`. Grep pattern `admit_write` searched across the entire
-`segment_store/` directory: the only call site is `seal.rs:1096`, inside `seal_declared` and its
-callers (`seal_declared_many`, `seal_imported`). A maintenance swap that enlarges the store
-while free space is below the reserve will succeed and risk ENOSPC.
+**Disk guard (G2, shipped as [#761](https://github.com/basic-automation/weftdb/pull/761))** — `swap_plans` (`seal.rs:348`)
+calls `disk_guard.admit_write(total_output_bytes)` at line 399, so a maintenance swap whose
+output would take the filesystem past the configured reserve is refused with
+`InsufficientStorage` before any frame is written. The admission covers all planned swaps in
+one call (`swap_in` is step M5 of `swap_plans`, not a separate writer).
 
 **No memory budget** — no env var or configuration field limits the working-set of a
 maintenance merge (decoded frames in memory). The merge reads every member's full frame
@@ -30,62 +30,36 @@ sweeps use) simply skips a busy aspect; `MaintenanceWait::Deadline(duration)` ex
 never passed by the daemon. There is no per-aspect time-cap on how long a merge/split/compact
 may run.
 
-**Settings registry** (`settings.rs:140-152`) registers `WEFT_MAINTENANCE_BREAKER_COOLDOWN_SECS`
-and `WEFT_MAINTENANCE_BREAKER_FAILURES`. No `WEFT_MAINTENANCE_*` key controls a byte, row, or
-time budget for the operation itself.
+**Settings registry (G1/G4 landed, G6 partly updated)** — `settings.rs:125-138` now registers
+`WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` (G1, [#765](https://github.com/basic-automation/weftdb/pull/765)) and
+`WEFT_MAINTENANCE_MAX_SEGMENT_BYTES` (G4, [#773](https://github.com/basic-automation/weftdb/pull/773)),
+both at `Tier::Experimental`. The tier-list test at `settings.rs:576` asserts they are experimental.
+`WEFT_MAINTENANCE_MAX_OP_TIMEOUT_SECS` does not exist — G5 is still open.
 
 **Enforcement summary (per criterion)**:
 
 | Criterion | Status | Evidence |
 |---|---|---|
-| Byte budget (max bytes per merge output) | **Missing** — no env var or struct field; swap output writes what the merge produces | `seal.rs:348` `swap_plans`; no `admit_write` call; search `max_bytes`, `budget`, `quota` across `segment_store/` (zero maintenance hits) |
-| Time budget (max wall-clock per maintenance op) | **Missing** — `MaintenanceWait` deadline exists but daemon uses `Skip` | `reconcile_daemon.rs:426-430` daemon passes `MaintenanceWait::Skip`; no per-op timeout in `MaintGuard` |
+| Byte budget (max bytes per merge output) | **Shipped** [#765](https://github.com/basic-automation/weftdb/pull/765) | `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` at `settings.rs:137`; `StoreError::OverBudget` at `segment_store.rs:484`; `admit_write` refusal at `seal.rs:399`; HTTP `503 over_budget` at `error.rs:1014` |
+| Time budget (max wall-clock per maintenance op) | **Missing** — `MaintenanceWait` deadline exists but daemon uses `Skip` | `reconcile_daemon.rs:426-430` daemon passes `MaintenanceWait::Skip`; no per-op timeout in `MaintGuard`; no `WEFT_MAINTENANCE_MAX_OP_*` setting |
 | Memory budget (max decoded rows/frames in flight) | **Missing** — `merge_members` loads all members' full frames | `read.rs:40-45` `merge_members` reads every member; no chunking/gating |
-| Disk-guard coverage for maintenance writes | **Missing** — only ingress/seal writes are guarded | `seal.rs:1093` vs no call in `swap_plans` or `swap_in` |
+| Disk-guard coverage for maintenance writes | **Shipped** [#761](https://github.com/basic-automation/weftdb/pull/761) | `swap_plans` (`seal.rs:348`) calls `admit_write` at `:399`; test `a_maintenance_swap_refuses_below_the_reserve` guards it |
 
 ### 1.2 k-way merge
 
-**Shipped: pairwise (two-way) serial fold, not n-way.**
+**Shipped: [#772](https://github.com/basic-automation/weftdb/pull/772) (merged at `52c3a702`).**
 
-The merge primitive, `merge_newer_wins` at
-[`split.rs:147-177`](../weft-physical-type/src/split.rs#L147), is a classic two-pointer
-merge of two sorted runs:
+The merge primitive `merge_k_way` at
+[`split.rs:192-242`](../weft-physical-type/src/split.rs#L192) is a
+k-way cursor over a min-heap keyed by `(timestamp, frame_index)`, handling new-wins ordering at
+shared timestamps. The pairwise `merge_newer_wins` remains as the two-element case but all
+three call sites (`reconcile_overlaps_held`, `squash_series_held`,
+`squash_aspect_to_target_rows_held`) now go through `fold_newest_wins` which calls
+`merge_k_way` at [`segment_store.rs:1236`](../weftdb/src/types/segment_store.rs#L1236).
 
-```rust
-pub fn merge_newer_wins<V: Clone>(older: &[(i64, V)], newer: &[(i64, V)]) -> Vec<(i64, V)> {
-    // two-pointer merge, O(len(older) + len(newer))
-}
-```
-
-The caller, `fold_newest_wins` at
-[`segment_store.rs:1065-1073`](../weftdb/src/types/segment_store.rs#L1065),
-calls it **iteratively** — not as a balanced tree or priority queue:
-
-```rust
-fn fold_newest_wins(frames: Vec<DecodedFrame>) -> (Vec<i64>, Vec<Option<BigDecimal>>) {
-    let mut merged = Vec::new();
-    for frame in frames {
-        let rows = /* sort by timestamp */;
-        merged = merge_newer_wins(&merged, &rows);
-    }
-    merged.into_iter().unzip()
-}
-```
-
-Every call path that merges more than two members uses this same serial fold:
-
-- **Overlap merge** — `reconcile_overlaps_held` (`maint.rs:1080`): groups overlapping
-  segments into components (≥ 2), sorts by id, and calls `merge_members_against_first`
-  which internally calls `fold_newest_wins`/`merge_newer_wins`.
-- **Squash** — `squash_series_held` (`maint.rs:1340`): folds every segment of a series
-  into one via `merge_members_against_first`.
-- **Compaction** — `squash_aspect_to_target_rows_held` (`maint.rs:1521`): greedily groups
-  consecutive segments and folds each group.
-
-**No k-way / n-way merge exists.** A merge of `n` members runs `n` rounds of two-way
-merges, writing the accumulator each time. The accumulator grows monotonically (all timestamps
-from earlier members are carried forward), so the last round does `O(n·rows)` work where a
-balanced k-way would do `O(rows · log k)` comparisons.
+A merge of `n` members now runs `O(rows · log n)` comparisons instead of `O(n·rows)`.
+The output is provably identical to the old serial two-way fold (verified by benchmark-test
+`merge_k_way_matches_the_pairwise_fold_on_every_overlap_shape` at `kway_merge.rs:42`).
 
 **Fan-in limit**: none. The component or group size determines how many members are folded.
 In practice capped by the number of overlapping segments an aspect accumulates before
@@ -132,115 +106,52 @@ which can be arbitrarily large.
 
 | # | Accepted behaviour | Status | Evidence | Smallest closure slice | Crate |
 |---|---|---|---|---|---|
-| G1 | Maintenance byte budget / max output size | **Missing** | No env var, no `admit_write` call in `swap_plans`; no maintenance-budget field in `SegmentStoreOptions` or daemon config | Add a `max_output_bytes` field to `ReconcileDaemonConfig` and check cumulative swap-plan bytes against it before writing | `weft-server` + `weftdb` |
-| G2 | Disk guard coverage for maintenance writes | **Missing** | `swap_plans` (`seal.rs:348`) and `swap_in` have no `disk_guard.admit_write` call | Call `disk_guard.admit_write(total_output_bytes)` before `swap_plans` executes, return `InsufficientStorage` if refused | `weftdb` |
-| G3 | k-way / n-way merge (balanced tournament) | **Missing** | `fold_newest_wins` does pairwise serial fold; `merge_newer_wins` is strictly two-pointer | Replace `fold_newest_wins`'s serial loop with a stable k-way merge via binary heap. Moves merge work from O(n·rows) to O(rows · log k) | `weft-physical-type` + `weftdb` |
-| G4 | Automatic resplit of oversized frames | **Partly landed** (the G4 cut: the ceiling drives the re-cut of a fold's output inside the same swap) | `split_segment` is still operator-only; no daemon calls it; the threshold now drives the re-cut of merge/squash output only | Add `max_segment_bytes` to daemon config; after a merge/squash/compact, if output exceeds threshold, re-split on a coarse boundary (e.g. timestamp midpoint or row-count midpoint) | `weftdb` + `weft-server` |
-| G5 | Per-op time budget | **Partial** | `MaintenanceWait::Deadline` exists but daemon uses `Skip`; `MaintGuard` has no deadline enforcement | Wire `MaintenanceWait::Deadline` through the daemon sweeps; add cancellation after timeout to held operations | `weftdb` + `weft-server` |
-| G6 | Settings surface for resource budgets | **Missing** | Settings registry lists only breaker params; no `WEFT_MAINTENANCE_MAX_*` keys | Add `max_output_bytes`, `max_segment_bytes`, `max_op_timeout_secs` vars to `settings.rs` | `weft-server` |
+| G1 | Maintenance byte budget / max output size | **Shipped** [#765](https://github.com/basic-automation/weftdb/pull/765) | `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` at `settings.rs:137`; `StoreError::OverBudget` at `segment_store.rs:484`; `admit_write` refusal at `seal.rs:399`; HTTP `503 over_budget` with `details.budget_bytes`/`details.planned_bytes` at `error.rs:1014` | — (shipped) | `weft-server` + `weftdb` |
+| G2 | Disk guard coverage for maintenance writes | **Shipped** [#761](https://github.com/basic-automation/weftdb/pull/761) | `swap_plans` (`seal.rs:348`) calls `admit_write(total_output_bytes)` at `:399`; test `a_maintenance_swap_refuses_below_the_reserve` guards it | — (shipped) | `weftdb` |
+| G3 | k-way / n-way merge (balanced tournament) | **Shipped** [#772](https://github.com/basic-automation/weftdb/pull/772) (merged at `52c3a702`) | `merge_k_way` at `split.rs:198`; used in `fold_newest_wins` at `segment_store.rs:1236`; benchmark `kway_merge` verifies output matches pairwise fold | — (shipped) | `weft-physical-type` + `weftdb` |
+| G4 | Automatic resplit of oversized frames | **Shipped** [#773](https://github.com/basic-automation/weftdb/pull/773) | `size_driven_cuts` at `maint.rs:2078` called from `reconcile_overlaps_held` (`:1298`), `squash_series_held` (`:1545`), `squash_aspect_to_target_rows_held` (`:1760`); `WEFT_MAINTENANCE_MAX_SEGMENT_BYTES` at `settings.rs:138` | — (shipped, but single-segment auto-split remains operator-only) | `weftdb` + `weft-server` |
+| G5 | Per-op time budget | **Missing** — `MaintenanceWait::Deadline` exists but daemon uses `Skip`; `MaintGuard` has no deadline enforcement | No `WEFT_MAINTENANCE_MAX_OP_*` key; no deadline-enforcement call in sweeps | Wire `MaintenanceWait::Deadline` through the daemon sweeps; add cancellation after timeout to held operations | `weftdb` + `weft-server` |
+| G6 | Settings surface for resource budgets | **Partly landed** — `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` and `WEFT_MAINTENANCE_MAX_SEGMENT_BYTES` exist at `settings.rs:137-138` (Tier::Experimental); `max_op_timeout_secs` still missing | Settings registry lists two `WEFT_MAINTENANCE_MAX_*` keys; tier-list test at `settings.rs:576` asserts them as experimental | Add `max_op_timeout_secs` when G5 is tackled | `weft-server` |
 
 ---
 
 ## 3. Plan / ordered slices
 
-### Slice 1 — Disk guard coverage for maintenance writes (G2)
+### ~~Slice 1 — Disk guard coverage for maintenance writes (G2)~~ **SHIPPED** [#761](https://github.com/basic-automation/weftdb/pull/761)
 
-**Goal**: prevent maintenance swap outputs from writing past the disk reserve.
-
-**Files**:
-- `weftdb/src/types/segment_store/seal.rs` — insert `disk_guard.admit_write(total_bytes)` at
-  the top of `swap_plans`, before the transaction loop.
-- `weftdb/src/types/segment_store/maint.rs` — compute `total_bytes` from `SwapPlan` members'
-  `byte_len`, or from the output frame's estimated size.
-
-**Acceptance test**: a test that fills the store to just above the reserve, then triggers an
-overlap merge — before the fix it writes (hits ENOSPC or succeeds dangerously), after it
-returns `InsufficientStorage`.
-
-**Risk**: a merge that cannot write its output because of the disk guard will fail the
-entire aspect's merge. The per-aspect breaker already handles this (consecutive failure →
-skip). Low risk.
+`swap_plans` (`seal.rs:348`) now calls `disk_guard.admit_write(total_output_bytes)` at `:399`.
+Test `a_maintenance_swap_refuses_below_the_reserve` guards it.
 
 **On-disk format**: no change.
 
-### Slice 2 — Maintenance byte budget (G1)
+### ~~Slice 2 — Maintenance byte budget (G1)~~ **SHIPPED** [#765](https://github.com/basic-automation/weftdb/pull/765)
 
-**Goal**: cap the byte size of a single maintenance operation's output.
-
-**Files**:
-- `weft-server/src/startup/daemons.rs` — add `max_output_bytes` to `ReconcileDaemonConfig`.
-- `weft-server/src/settings.rs` — add `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` registry entry.
-- `weftdb/src/types/segment_store/maint.rs` — thread a `max_output_bytes` parameter through
-  the merge path; skip a component/group when its total member bytes would exceed the cap,
-  leaving it for a subsequent pass after the daemon re-reads the index.
-
-**Acceptance test**: set a small `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES`, seal data that would
-exceed it, verify the overlap merge passes without rewriting the oversized component.
-
-**Risk**: skipping large groups means they stay large until an operator acts. Must be
-documented as an advisory cap, not a hard split trigger. Low risk.
+`WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` at `settings.rs:137`, `StoreError::OverBudget` refusal at
+`segment_store.rs:484`, `admit_write` at `seal.rs:399`, HTTP `503 over_budget` at `error.rs:1014`.
 
 **On-disk format**: no change.
 
-### Slice 3 — k-way merge (G3)
+### ~~Slice 3 — k-way merge (G3)~~ **SHIPPED** [#772](https://github.com/basic-automation/weftdb/pull/772)
 
-**Goal**: replace the serial two-way fold with a stable k-way merge using a binary heap on
-`(timestamp, frame_index)`.
-
-**Files**:
-- `weft-physical-type/src/split.rs` or new file — add `pub fn merge_k_way<V: Clone>(frames: &[&[(i64, V)]]) -> Vec<(i64, V)>`.
-- `weftdb/src/types/segment_store.rs` — replace the loop in `fold_newest_wins` with a call to
-  `merge_k_way`.
-- Optionally thread `V` generically through frame-decoded types.
-
-**Acceptance test**: property-test that the k-way output matches the serial-fold output for
-any set of frames (same timestamps, same value at each timestamp). Benchmark that k-way is
-faster for k > 4 on realistic frame sizes.
-
-**Risk**: the existing merge is simple and well-tested. A k-way implementation must handle the
-newer-wins semantic (at a shared timestamp, the newest frame's rows supersede). In a heap
-this means draining all heap entries that share the minimum timestamp from the newest frame
-first, then the older frames. The behaviour at equal timestamps must match `merge_newer_wins`
-exactly.
+`merge_k_way` at `split.rs:192-242`; `fold_newest_wins` calls it at `segment_store.rs:1236`.
+Benchmark `kway_merge` verifies output matches pairwise fold.
 
 **On-disk format**: no change (output is the same rows).
 
-### Slice 4 — Automatic resplit of oversized frames (G4)
+### ~~Slice 4 — Automatic resplit of oversized frames (G4)~~ **SHIPPED** [#773](https://github.com/basic-automation/weftdb/pull/773)
 
-**Goal**: after a merge/squash/compact produces an output frame larger than a threshold,
-split it into two (or more) roughly equal-sized frames on a natural boundary.
-
-**Files**:
-- `weftdb/src/types/segment_store/maint.rs` — add a `max_segment_bytes` parameter to
-  `reconcile_overlaps_held`, `squash_series_held`, `squash_aspect_to_target_rows_held`.
-  After creating the `SwapPlan`, check the output byte estimate against the threshold; if
-  exceeded, call `split_frame` (or a new helper) to produce two `SwapPlan`s instead of one.
-- `weft-server/src/startup/daemons.rs` — thread `max_segment_bytes` from config.
-- `weft-server/src/settings.rs` — register `WEFT_MAINTENANCE_MAX_SEGMENT_BYTES`.
-
-**Boundary heuristic**: split at `row_count / 2` (by timestamp). This is coarse but
-deterministic. A more sophisticated heuristic (byte-accurate estimate from codec + row count)
-can be layered later.
-
-**Acceptance test**: configure a small `max_segment_bytes`, set up an aspect with a single
-giant sealed segment, run compaction, assert the aspect now has multiple segments each below
-the threshold.
+`size_driven_cuts` at `maint.rs:2078` called from all three fold sites (`:1298`, `:1545`, `:1760`).
+`WEFT_MAINTENANCE_MAX_SEGMENT_BYTES` at `settings.rs:138`.
 
 **Landed differently, deliberately.** The cut that landed re-cuts the output of
 `reconcile_overlaps_held`, `squash_series_held` and `squash_aspect_to_target_rows_held` inside
 the `SwapPlan::cut` that already writes it, and caps the outputs at the number of segments the
 fold replaced: one output per member means every output takes a member's id (precedence P1) and
-none needs a fresh id, so the refusal that rule P2 documents cannot fire at all. The test above
-asks for the one case that cannot be done that way — a **single** giant segment, whose second
-output would need a fresh id and would be refused if any higher-id row overlapped its span. That
-case remains the operator's `split_segment`, and the plan's own risk note ("must validate that
-new-id allocation stays correct under concurrent splits") is exactly why it was left there.
-
-**Risk**: splitting a segment changes the segment count, which moves P1 precedence.
-The lowest-id rule (`SwapPlan::cut` with `cuts`) handles this correctly — the split output
-lives under the lowest id and a new id. The segment count increases, which the squash pass
-is designed to bound. Medium risk — must validate that new-id allocation stays correct under
-concurrent splits.
+none needs a fresh id, so the refusal that rule P2 documents cannot fire at all. The unwritten
+test above asks for the one case that cannot be done that way — a **single** giant segment, whose
+second output would need a fresh id and would be refused if any higher-id row overlapped its
+span. That case remains the operator's `split_segment`, and the plan's own risk note was exactly
+why it was left there.
 
 **On-disk format**: no change (segments are already frame-structured).
 
@@ -318,13 +229,15 @@ unchanged.
 
 The 1.0-plan's Phase 6 W9 wording *"Maintenance resource limits, k-way merge and re-splitting
 of oversized frames"* groups three behaviours as if they are a single lane. The audit shows
-they are **three independent axes**, each with a different shipping status:
+they are **three independent axes**:
 
-| Wording | Status today |
+| Wording | Status now (post-ROB-20) |
 |---|---|
-| Resource limits | Most mechanisms missing (disk guard excludes maint; no byte/time/memory budgets) |
-| k-way merge | Not shipped; pairwise serial fold only |
-| Re-splitting of oversized frames | Only the overlap-split path (Phase 4.6) exists; automatic size-driven resplit is missing |
+| Resource limits | **Partly shipped.** Disk-guard coverage (G2, #761) and byte budget (G1, #765) are on main.
+  Per-op time budget (G5) and memory budget remain missing. |
+| k-way merge | **Shipped** [#772](https://github.com/basic-automation/weftdb/pull/772) — `merge_k_way` at `split.rs:198`. |
+| Re-splitting of oversized frames | **Shipped** [#773](https://github.com/basic-automation/weftdb/pull/773) — auto-recut of fold outputs
+  under `WEFT_MAINTENANCE_MAX_SEGMENT_BYTES`. A single-segment auto-split remains operator-only. |
 
 The roadmap line at `ROADMAP.md:85` reflects the same grouping and cannot be ticked until
-all three are shipped or the wording is revised.
+G5 and the memory budget are closed, or the wording is revised to match the narrower scope.
