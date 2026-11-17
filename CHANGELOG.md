@@ -57,6 +57,8 @@ origin/main
 
 ### Changed
 
+- **The supply-chain gate now carries one dated exception (#790).** `cargo deny check advisories` started failing on every branch, including main, when RustSec marked `chrono` unmaintained (RUSTSEC-2026-0543) and said no safe upgrade exists: 0.4.45 is the newest release, and arrow 60.1.0 requires chrono ^0.4.40, so neither our direct uses nor the `arrow-flight` path can move off it. The advisory is accepted in `deny.toml` with a written reason naming 2027-01-31 as the revisit date, so the gate stays meaningful for everything else and the exception cannot outlive its intent in silence; an ignore that no longer matches an advisory is now itself an error. A machine-enforced `expiry` on the ignore needs cargo-deny 0.21.0 while CI pins 0.20.2 through the action, so the date is written for now and #794 bumps that pin. Moving time handling to `time` or `jiff` is #791.
+
 - **A client that aborts the request body answers `400 bad_request` with a labelled message and `details.reason: "client_disconnect"` (#742).** Both detection sites (body-stream transport error and premature EOF short of Content-Length) now produce the same wire answer instead of different text; the raw transport error is kept off the wire. The deadline timeout (`408 body_timeout`) is unchanged.
 - **Request-level benchmark for `float_roundtrip` (#724).** `weft-server/benches/json_body_cost.rs`
   drives one whole `POST /api/v1/interpolate` request with N float values in the same magnitude
