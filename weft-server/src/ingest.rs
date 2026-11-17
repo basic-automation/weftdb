@@ -2693,13 +2693,13 @@ mod tests {
 		let request = Request::builder().method("POST").uri("/api/v1/storage/price/points").body(Body::from_stream(stream)).unwrap();
 		let err = super::IngestBody::from_request(request, &state).await.expect_err("an aborted stream must be refused");
 		drop(state);
+		use axum::response::IntoResponse;
 
 		assert_eq!(err.code(), crate::error::Code::BadRequest);
 		assert_eq!(err.code().status(), StatusCode::BAD_REQUEST);
 		assert_eq!(err.message(), "the client disconnected before completing the request body");
 		// Render the error through its response path and verify the raw
 		// transport error text does not leak onto the wire.
-		use axum::response::IntoResponse;
 		let response = err.into_response();
 		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("the body is small");
 		let text_body = String::from_utf8_lossy(&bytes);
