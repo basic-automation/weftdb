@@ -28,6 +28,10 @@
 //!   the store ([`SegmentStore::squash_aspect_to_target_rows`](weftdb::SegmentStore::squash_aspect_to_target_rows)) and is killed a seeded number of
 //!   milliseconds in. The reopened store must hold every row exactly, whatever share of the
 //!   compaction committed; then the compaction reruns and the rows must still read back exactly.
+//! - **`corrupt-segment-tagged`** (TAG-12) — the same byte flip in a store of the [`TAGGED_SERIES`]
+//!   tagged series. Every row any series still serves must be its own series' right value, the
+//!   rows a series no longer returns must be under a quarantine record, and since a segment belongs
+//!   to one series, at most one series may lose rows.
 //! - **`corrupt-segment`** — no process dies: the harness seals the corpus, closes the store, flips
 //!   one seeded byte in one seeded segment file, and reopens it. A read may fail, or the damaged
 //!   segment may be quarantined (the store's open-time recovery does this), but a value read back
@@ -71,11 +75,13 @@ pub enum Failure {
 	KillCompactionTagged,
 	/// Flip one byte of one segment file of a closed store.
 	CorruptSegment,
+	/// Flip one byte of one segment file of a closed store of several tagged series.
+	CorruptSegmentTagged,
 }
 
 impl Failure {
 	/// Every failure, in the order a `--failure all` run takes them.
-	pub const ALL: [Self; 5] = [Self::KillIngest, Self::KillIngestTagged, Self::KillCompaction, Self::KillCompactionTagged, Self::CorruptSegment];
+	pub const ALL: [Self; 6] = [Self::KillIngest, Self::KillIngestTagged, Self::KillCompaction, Self::KillCompactionTagged, Self::CorruptSegment, Self::CorruptSegmentTagged];
 
 	/// The name the CLI and the report use.
 	#[must_use]
@@ -86,6 +92,7 @@ impl Failure {
 			Self::KillCompaction => "kill-compaction",
 			Self::KillCompactionTagged => "kill-compaction-tagged",
 			Self::CorruptSegment => "corrupt-segment",
+			Self::CorruptSegmentTagged => "corrupt-segment-tagged",
 		}
 	}
 
@@ -167,10 +174,8 @@ pub async fn run_failure(failure: Failure, profile: &IngestProfile, timestamps: 
 				drop(store);
 				(recovery, held, ok, format!("killed after {acked} acknowledged rows; reopened holding {held}"))
 			}
-			// Boxed: the tagged rep's future is large enough to push every caller of `run_failure` over
-			// clippy's `large_futures` ceiling if it were held inline.
-			Failure::KillIngestTagged => Box::pin(kill_ingest_tagged(profile, &tiled, value_scale, params, &root, &mut rng)).await?,
-			Failure::KillCompactionTagged => Box::pin(kill_compaction_tagged(profile, &tiled, value_scale, params, &root, &mut rng)).await?,
+			// Boxed: inline, the tagged reps' futures push callers past clippy's `large_futures`.
+			Failure::KillIngestTagged | Failure::KillCompactionTagged | Failure::CorruptSegmentTagged => Box::pin(tagged_rep(failure, profile, &tiled, value_scale, params, &root, &mut rng)).await?,
 			Failure::KillCompaction => {
 				seal(&root, &profile.aspect, value_scale, &tiled, params.rows, batch).await?;
 				let kill_ms = rng.random_range(0..=u64::try_from(params.kill_within.as_millis()).unwrap_or(u64::MAX));
@@ -405,11 +410,21 @@ async fn kill_ingest_tagged(profile: &IngestProfile, tiled: &Tiled<'_>, value_sc
 	Ok((recovery, total, ok, format!("killed after {} acknowledged ingests across {TAGGED_SERIES} series (series {in_flight} in flight); reopened holding {held:?} of acknowledged {acked:?}", acks.len())))
 }
 
-/// `kill-compaction-tagged`: one rep. Returns the reopen time, the rows held across every series,
+/// One rep of a tagged failure (TAG-12): the reopen time, the rows held across every series,
 /// whether the store passed, and the rep's note.
-async fn kill_compaction_tagged(profile: &IngestProfile, tiled: &Tiled<'_>, value_scale: u8, params: &FailureParams, root: &Path, rng: &mut ChaCha8Rng) -> anyhow::Result<(u64, u64, bool, String)> {
-	let (n, batch, rows, aspect) = (tiled.timestamps.len() as u64, profile.batch_rows as u64, params.rows, profile.aspect.as_str());
-	// Batch-major, so each series' segments interleave with the others' in the store.
+async fn tagged_rep(failure: Failure, profile: &IngestProfile, tiled: &Tiled<'_>, value_scale: u8, params: &FailureParams, root: &Path, rng: &mut ChaCha8Rng) -> anyhow::Result<(u64, u64, bool, String)> {
+	match failure {
+		Failure::KillIngestTagged => kill_ingest_tagged(profile, tiled, value_scale, params, root, rng).await,
+		Failure::KillCompactionTagged => kill_compaction_tagged(profile, tiled, value_scale, params, root, rng).await,
+		Failure::CorruptSegmentTagged => corrupt_segment_tagged(profile, tiled, value_scale, params, root, rng).await,
+		Failure::KillIngest | Failure::KillCompaction | Failure::CorruptSegment => anyhow::bail!("{} is not a tagged failure", failure.as_str()),
+	}
+}
+
+/// Ingest rows `0..rows` into every tagged series of a fresh store at `root`, batch by batch so
+/// the series' segments interleave, then close it.
+async fn seal_tagged(root: &Path, aspect: &str, value_scale: u8, tiled: &Tiled<'_>, rows: u64, batch: u64) -> anyhow::Result<()> {
+	let n = tiled.timestamps.len() as u64;
 	let store = declared(root, aspect, value_scale).await?;
 	let mut at = 0;
 	while at < rows {
@@ -420,6 +435,70 @@ async fn kill_compaction_tagged(profile: &IngestProfile, tiled: &Tiled<'_>, valu
 		at = end;
 	}
 	drop(store);
+	Ok(())
+}
+
+/// `corrupt-segment-tagged`: one rep. Returns the reopen time, the rows served across every
+/// series, whether the store passed, and the rep's note.
+async fn corrupt_segment_tagged(profile: &IngestProfile, tiled: &Tiled<'_>, value_scale: u8, params: &FailureParams, root: &Path, rng: &mut ChaCha8Rng) -> anyhow::Result<(u64, u64, bool, String)> {
+	let (rows, aspect) = (params.rows, profile.aspect.as_str());
+	seal_tagged(root, aspect, value_scale, tiled, rows, profile.batch_rows as u64).await?;
+	let mut files: Vec<PathBuf> = walk(&root.join("segments"))?;
+	files.sort();
+	anyhow::ensure!(!files.is_empty(), "the sealed store has no segment files under {}", root.join("segments").display());
+	let file = &files[rng.random_range(0..files.len())];
+	let mut bytes = std::fs::read(file)?;
+	let at = rng.random_range(0..bytes.len());
+	bytes[at] ^= 0x5A;
+	std::fs::write(file, &bytes)?;
+	let t0 = Instant::now();
+	let store = open(root).await?;
+	let recovery = span_ns(t0);
+	let quarantined = store.quarantine_list(Some(aspect)).await.map_err(|e| anyhow::anyhow!("cannot list quarantine: {e:#}"))?.len();
+	let (start, end) = (tiled.timestamp(0)?, tiled.timestamp(rows - 1)?);
+	let (mut ok, mut served, mut losing) = (true, 0_u64, 0_u64);
+	let mut outcomes = Vec::with_capacity(usize::try_from(TAGGED_SERIES)?);
+	for s in 0..TAGGED_SERIES {
+		let selector = SeriesSelector::exact([("host", Some(series_host(s)))]).map_err(|e| anyhow::anyhow!("series {s}: {e}"))?;
+		let read = match store.resolve_series(aspect, &selector).await {
+			Ok(Some(id)) => store.read_time_range_of(aspect, id, start, end).await,
+			Ok(None) => Ok((Vec::new(), Vec::new())),
+			Err(e) => Err(e),
+		};
+		match read {
+			Ok((ts, vs)) => {
+				// Whatever a series still serves must be its own right value at that timestamp.
+				let mut right = ts.len() == vs.len();
+				for (t, v) in ts.iter().zip(&vs) {
+					let i = (0..rows).find(|&i| tiled.timestamp(i).is_ok_and(|want| want == *t));
+					right &= match i {
+						Some(i) => v.as_ref() == Some(&series_value(tiled, s, i)?),
+						None => false,
+					};
+				}
+				let lost = rows - ts.len() as u64;
+				ok &= right && (lost == 0 || quarantined > 0);
+				losing += u64::from(lost > 0);
+				served += ts.len() as u64;
+				outcomes.push(format!("{}: {} served, {lost} lost", series_host(s), ts.len()));
+			}
+			Err(e) => {
+				losing += 1;
+				outcomes.push(format!("{}: read refused ({e})", series_host(s)));
+			}
+		}
+	}
+	// One flipped file belongs to one series: no other series may lose anything.
+	ok &= losing <= 1;
+	drop(store);
+	Ok((recovery, served, ok, format!("byte {at} of {} flipped; {quarantined} segment(s) quarantined at open; {}", file.file_name().unwrap_or_default().to_string_lossy(), outcomes.join("; "))))
+}
+
+/// `kill-compaction-tagged`: one rep. Returns the reopen time, the rows held across every series,
+/// whether the store passed, and the rep's note.
+async fn kill_compaction_tagged(profile: &IngestProfile, tiled: &Tiled<'_>, value_scale: u8, params: &FailureParams, root: &Path, rng: &mut ChaCha8Rng) -> anyhow::Result<(u64, u64, bool, String)> {
+	let (batch, rows, aspect) = (profile.batch_rows as u64, params.rows, profile.aspect.as_str());
+	seal_tagged(root, aspect, value_scale, tiled, rows, batch).await?;
 	let kill_ms = rng.random_range(0..=u64::try_from(params.kill_within.as_millis()).unwrap_or(u64::MAX));
 	let mut child = spawn(&params.exe, &["compact", path(root), aspect, &params.compact_to.to_string()])?;
 	read_until(&mut child, |line| (line == "compacting").then_some(()), |seen| !seen.is_empty())?;

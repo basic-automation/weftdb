@@ -2606,7 +2606,7 @@ INGEST OPTIONS (with --ingest):
                              Then compact the store to segments of ROWS rows and ask
                              the same windows again, as `-compacted` results that must
                              answer exactly as before (post-compaction reads)
-        --failure <kill-ingest|kill-ingest-tagged|kill-compaction|kill-compaction-tagged|corrupt-segment|all>
+        --failure <kill-ingest|kill-ingest-tagged|kill-compaction|kill-compaction-tagged|corrupt-segment|corrupt-segment-tagged|all>
                              Failure tests instead: a child process (this binary) seals
                              the corpus, or compacts a store of it, and is SIGKILLed at
                              a seeded point; or one seeded byte of a closed store's
@@ -2823,10 +2823,11 @@ mod tests {
 	#[test]
 	fn failure_takes_a_test_or_all_and_stands_alone() {
 		let cli = expect_run(&["--ingest", "--uci", "u.txt", "--failure", "all", "--failure-rows", "2M", "--failure-reps", "3"]);
-		assert_eq!((cli.failure.len(), cli.failure_rows, cli.failure_reps), (5, 2_000_000, 3));
+		assert_eq!((cli.failure.len(), cli.failure_rows, cli.failure_reps), (6, 2_000_000, 3));
 		assert_eq!(expect_run(&["--ingest", "--uci", "u.txt", "--failure", "kill-ingest"]).failure, [weft_bench::failure::Failure::KillIngest]);
 		assert_eq!(expect_run(&["--ingest", "--uci", "u.txt", "--failure", "kill-ingest-tagged"]).failure, [weft_bench::failure::Failure::KillIngestTagged]);
 		assert_eq!(expect_run(&["--ingest", "--uci", "u.txt", "--failure", "kill-compaction-tagged"]).failure, [weft_bench::failure::Failure::KillCompactionTagged]);
+		assert_eq!(expect_run(&["--ingest", "--uci", "u.txt", "--failure", "corrupt-segment-tagged"]).failure, [weft_bench::failure::Failure::CorruptSegmentTagged]);
 		for bad in [&["--ingest", "--uci", "u.txt", "--failure", "power-loss"][..], &["--failure", "kill-ingest"][..], &["--ingest", "--uci", "u.txt", "--failure", "all", "--query-mix", "3"][..]] {
 			assert!(run_cli(bad).is_err(), "{bad:?}");
 		}

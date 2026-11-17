@@ -4,7 +4,8 @@
 # Two matrices, one verdict:
 #   1. The subprocess SIGKILL soak: `weft-bench --crash-matrix` runs every
 #      failure test (kill-ingest, kill-ingest-tagged, kill-compaction,
-#      kill-compaction-tagged, corrupt-segment) at every matrix seed, and fails if any cell's reopened store misbehaves.
+#      kill-compaction-tagged, corrupt-segment, corrupt-segment-tagged) at
+#      every matrix seed, and fails if any cell's reopened store misbehaves.
 #   2. The fault-injection crash matrix: `weftdb`'s `swap_tests` crash matrix
 #      (errors, power cuts and aborts at every swap point), the orchestration
 #      legacy-queue crash test, and the server's poisoned-ready test — the
