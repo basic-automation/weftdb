@@ -162,6 +162,13 @@ pub enum Code {
 	OutcomeUnknown,
 	/// The store is poisoned and refuses work until an operator intervenes.
 	Poisoned,
+	// A maintenance pass’s own output plan exceeded the operator’s per-operation byte
+	// budget (`WEFT_MAINTENANCE_MAX_OUTPUT_BYTES`), so the pass was refused before it read
+	// anything and the aspect kept the segments it had. A 5xx because nothing about the request
+	// is wrong: the ceiling is operator configuration, and only raising it or splitting the group
+	// by hand lets the same call through. Unlike `overloaded` this carries no `Retry-After` —
+	// waiting changes nothing, so a delay would only send the caller back into the identical refusal.
+	OverBudget,
 	// ── 504 ────────────────────────────────────────────────────────────────────────
 	/// The query or ingest exceeded its deadline.
 	QueryTimeout,
@@ -217,6 +224,7 @@ impl Code {
 			Self::OutcomeUnknown => "outcome_unknown",
 			Self::Poisoned => "poisoned",
 			Self::QueryTimeout => "query_timeout",
+			Self::OverBudget => "over_budget",
 			Self::InsufficientStorage => "insufficient_storage",
 		}
 	}
@@ -239,7 +247,7 @@ impl Code {
 			Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
 			Self::ResultTooLarge | Self::ValueNotRepresentable => StatusCode::UNPROCESSABLE_ENTITY,
 			Self::Internal | Self::CommitFailed | Self::FrameUndecodable | Self::SeriesBindingMismatch => StatusCode::INTERNAL_SERVER_ERROR,
-			Self::Unconfigured | Self::NotReady | Self::IncompatibleStore | Self::AuditUnavailable | Self::Overloaded | Self::OutcomeUnknown | Self::Poisoned => StatusCode::SERVICE_UNAVAILABLE,
+			Self::Unconfigured | Self::NotReady | Self::IncompatibleStore | Self::AuditUnavailable | Self::Overloaded | Self::OutcomeUnknown | Self::Poisoned | Self::OverBudget => StatusCode::SERVICE_UNAVAILABLE,
 			Self::QueryTimeout => StatusCode::GATEWAY_TIMEOUT,
 			Self::InsufficientStorage => StatusCode::INSUFFICIENT_STORAGE,
 		}
@@ -262,6 +270,7 @@ impl Code {
 			Self::OutcomeUnknown => "the server cannot say whether the write committed",
 			Self::Poisoned => "the store is quarantined and needs an operator",
 			Self::QueryTimeout => "the server gave up on the operation at its deadline",
+			Self::OverBudget => "a maintenance plan was refused before it read anything, and nothing was written",
 			Self::InsufficientStorage => "the server's filesystem cannot take the write safely",
 			// A 4xx message is written for the caller and is never a cause string, so it is
 			// sent as the call site wrote it.
@@ -997,6 +1006,12 @@ pub(crate) fn classify_typed(err: &anyhow::Error) -> Option<ApiError> {
 			// the operator, since the numbers describe the host, not the request.
 			// The store logs the refusal once per change of state, so this answer does not
 			// log again per request (ROB-17).
+			// ROB-20: a refused plan is logged per request here because the store raises it with no log
+			// of its own, and a maintenance pass is operator- or daemon-initiated, not something a client
+			// can provoke at will. The two byte counts go out in `details`: the sentence a 5xx sends
+			// cannot carry them, and `limit` stays unset because §4 defines it as the single ceiling
+			// that refused an answer, not a pair.
+			weftdb::StoreError::OverBudget { aspect, budget_bytes, planned_bytes } => ApiError::server(Code::OverBudget, e.to_string()).with_details(serde_json::json!({"aspect": aspect, "budget_bytes": budget_bytes, "planned_bytes": planned_bytes})),
 			weftdb::StoreError::InsufficientStorage { .. } => ApiError::server_logged_elsewhere(Code::InsufficientStorage, e.to_string()),
 			_ => ApiError::server(Code::IncompatibleStore, e.to_string()),
 		});
@@ -1125,18 +1140,18 @@ mod tests {
 	/// Every code in the table, with the status and the wire name the plan's §4 table gives
 	/// it. A new code is added to the plan's table and here together — that pairing is the
 	/// contract, and `the_table_is_the_plan_table` is what enforces it.
-	const TABLE: &[(Code, StatusCode, &str)] = &[(Code::BadRequest, StatusCode::BAD_REQUEST, "bad_request"), (Code::InvalidJson, StatusCode::BAD_REQUEST, "invalid_json"), (Code::InvalidAspectName, StatusCode::BAD_REQUEST, "invalid_aspect_name"), (Code::DecimalOutOfRange, StatusCode::BAD_REQUEST, "decimal_out_of_range"), (Code::NotFinite, StatusCode::BAD_REQUEST, "not_finite"), (Code::CredentialsInQuery, StatusCode::BAD_REQUEST, "credentials_in_query"), (Code::InvalidTag, StatusCode::BAD_REQUEST, "invalid_tag"), (Code::AmbiguousSeries, StatusCode::BAD_REQUEST, "ambiguous_series"), (Code::TagsUnsupported, StatusCode::BAD_REQUEST, "tags_unsupported"), (Code::SeriesLimit, StatusCode::BAD_REQUEST, "series_limit"), (Code::Unauthenticated, StatusCode::UNAUTHORIZED, "unauthenticated"), (Code::Forbidden, StatusCode::FORBIDDEN, "forbidden"), (Code::HostNotAllowed, StatusCode::FORBIDDEN, "host_not_allowed"), (Code::CrossOriginWrite, StatusCode::FORBIDDEN, "cross_origin_write"), (Code::ProxiedRequestRequiresAuth, StatusCode::FORBIDDEN, "proxied_request_requires_auth"), (Code::RouteNotFound, StatusCode::NOT_FOUND, "route_not_found"), (Code::AspectNotFound, StatusCode::NOT_FOUND, "aspect_not_found"), (Code::RunNotFound, StatusCode::NOT_FOUND, "run_not_found"), (Code::MethodNotAllowed, StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"), (Code::BodyTimeout, StatusCode::REQUEST_TIMEOUT, "body_timeout"), (Code::SchemaConflict, StatusCode::CONFLICT, "schema_conflict"), (Code::AlreadyExists, StatusCode::CONFLICT, "already_exists"), (Code::Busy, StatusCode::CONFLICT, "busy"), (Code::IdempotencyConflict, StatusCode::CONFLICT, "idempotency_conflict"), (Code::CursorStale, StatusCode::GONE, "cursor_stale"), (Code::PayloadTooLarge, StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"), (Code::TooManyRows, StatusCode::PAYLOAD_TOO_LARGE, "too_many_rows"), (Code::UnsupportedMediaType, StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type"), (Code::ResultTooLarge, StatusCode::UNPROCESSABLE_ENTITY, "result_too_large"), (Code::ValueNotRepresentable, StatusCode::UNPROCESSABLE_ENTITY, "value_not_representable"), (Code::Internal, StatusCode::INTERNAL_SERVER_ERROR, "internal"), (Code::CommitFailed, StatusCode::INTERNAL_SERVER_ERROR, "commit_failed"), (Code::FrameUndecodable, StatusCode::INTERNAL_SERVER_ERROR, "frame_undecodable"), (Code::SeriesBindingMismatch, StatusCode::INTERNAL_SERVER_ERROR, "series_binding_mismatch"), (Code::Unconfigured, StatusCode::SERVICE_UNAVAILABLE, "unconfigured"), (Code::NotReady, StatusCode::SERVICE_UNAVAILABLE, "not_ready"), (Code::IncompatibleStore, StatusCode::SERVICE_UNAVAILABLE, "incompatible_store"), (Code::AuditUnavailable, StatusCode::SERVICE_UNAVAILABLE, "audit_unavailable"), (Code::Overloaded, StatusCode::SERVICE_UNAVAILABLE, "overloaded"), (Code::OutcomeUnknown, StatusCode::SERVICE_UNAVAILABLE, "outcome_unknown"), (Code::Poisoned, StatusCode::SERVICE_UNAVAILABLE, "poisoned"), (Code::QueryTimeout, StatusCode::GATEWAY_TIMEOUT, "query_timeout"), (Code::InsufficientStorage, StatusCode::INSUFFICIENT_STORAGE, "insufficient_storage")];
+	const TABLE: &[(Code, StatusCode, &str)] = &[(Code::BadRequest, StatusCode::BAD_REQUEST, "bad_request"), (Code::InvalidJson, StatusCode::BAD_REQUEST, "invalid_json"), (Code::InvalidAspectName, StatusCode::BAD_REQUEST, "invalid_aspect_name"), (Code::DecimalOutOfRange, StatusCode::BAD_REQUEST, "decimal_out_of_range"), (Code::NotFinite, StatusCode::BAD_REQUEST, "not_finite"), (Code::CredentialsInQuery, StatusCode::BAD_REQUEST, "credentials_in_query"), (Code::InvalidTag, StatusCode::BAD_REQUEST, "invalid_tag"), (Code::AmbiguousSeries, StatusCode::BAD_REQUEST, "ambiguous_series"), (Code::TagsUnsupported, StatusCode::BAD_REQUEST, "tags_unsupported"), (Code::SeriesLimit, StatusCode::BAD_REQUEST, "series_limit"), (Code::Unauthenticated, StatusCode::UNAUTHORIZED, "unauthenticated"), (Code::Forbidden, StatusCode::FORBIDDEN, "forbidden"), (Code::HostNotAllowed, StatusCode::FORBIDDEN, "host_not_allowed"), (Code::CrossOriginWrite, StatusCode::FORBIDDEN, "cross_origin_write"), (Code::ProxiedRequestRequiresAuth, StatusCode::FORBIDDEN, "proxied_request_requires_auth"), (Code::RouteNotFound, StatusCode::NOT_FOUND, "route_not_found"), (Code::AspectNotFound, StatusCode::NOT_FOUND, "aspect_not_found"), (Code::RunNotFound, StatusCode::NOT_FOUND, "run_not_found"), (Code::MethodNotAllowed, StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed"), (Code::BodyTimeout, StatusCode::REQUEST_TIMEOUT, "body_timeout"), (Code::SchemaConflict, StatusCode::CONFLICT, "schema_conflict"), (Code::AlreadyExists, StatusCode::CONFLICT, "already_exists"), (Code::Busy, StatusCode::CONFLICT, "busy"), (Code::IdempotencyConflict, StatusCode::CONFLICT, "idempotency_conflict"), (Code::CursorStale, StatusCode::GONE, "cursor_stale"), (Code::PayloadTooLarge, StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"), (Code::TooManyRows, StatusCode::PAYLOAD_TOO_LARGE, "too_many_rows"), (Code::UnsupportedMediaType, StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type"), (Code::ResultTooLarge, StatusCode::UNPROCESSABLE_ENTITY, "result_too_large"), (Code::ValueNotRepresentable, StatusCode::UNPROCESSABLE_ENTITY, "value_not_representable"), (Code::Internal, StatusCode::INTERNAL_SERVER_ERROR, "internal"), (Code::CommitFailed, StatusCode::INTERNAL_SERVER_ERROR, "commit_failed"), (Code::FrameUndecodable, StatusCode::INTERNAL_SERVER_ERROR, "frame_undecodable"), (Code::SeriesBindingMismatch, StatusCode::INTERNAL_SERVER_ERROR, "series_binding_mismatch"), (Code::Unconfigured, StatusCode::SERVICE_UNAVAILABLE, "unconfigured"), (Code::NotReady, StatusCode::SERVICE_UNAVAILABLE, "not_ready"), (Code::IncompatibleStore, StatusCode::SERVICE_UNAVAILABLE, "incompatible_store"), (Code::AuditUnavailable, StatusCode::SERVICE_UNAVAILABLE, "audit_unavailable"), (Code::Overloaded, StatusCode::SERVICE_UNAVAILABLE, "overloaded"), (Code::OutcomeUnknown, StatusCode::SERVICE_UNAVAILABLE, "outcome_unknown"), (Code::Poisoned, StatusCode::SERVICE_UNAVAILABLE, "poisoned"), (Code::OverBudget, StatusCode::SERVICE_UNAVAILABLE, "over_budget"), (Code::QueryTimeout, StatusCode::GATEWAY_TIMEOUT, "query_timeout"), (Code::InsufficientStorage, StatusCode::INSUFFICIENT_STORAGE, "insufficient_storage")];
 
 	async fn json_of(response: Response) -> Value {
 		let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024).await.expect("the envelope fits");
 		serde_json::from_slice(&bytes).expect("the envelope is JSON")
 	}
 
-	/// The table is the plan's table: 43 codes, each with §4's status and §4's spelling
+	/// The table is the plan's table: 44 codes, each with §4's status and §4's spelling
 	/// (`run_not_found` joined the 42 with the Phase 3 bench-run routes).
 	#[test]
 	fn the_table_is_the_plan_table() {
-		assert_eq!(TABLE.len(), 43, "§4 lists 43 codes; a new code goes into the plan's table and here together");
+		assert_eq!(TABLE.len(), 44, "§4 lists 44 codes; a new code goes into the plan's table and here together");
 		for &(code, status, name) in TABLE {
 			assert_eq!(code.status(), status, "`{name}` must be sent with {status}");
 			assert_eq!(code.as_str(), name, "the wire name is the plan's spelling");
@@ -1180,6 +1195,26 @@ mod tests {
 		assert!(refusal.message.is_empty(), "a 5xx carries no host numbers to the client: {:?}", refusal.message);
 	}
 
+	/// ROB-20’s maintenance budget answers for itself (#764). Before the code existed the
+	/// classifier’s fall-through made a refused plan read as a damaged store, which sends an
+	/// operator to the source rather than to the two numbers that disagree.
+	#[tokio::test]
+	async fn over_budget_names_its_ceiling_and_its_plan() {
+		let refused = anyhow::Error::new(weftdb::StoreError::OverBudget { aspect: "cpu.util".to_string(), budget_bytes: 4096, planned_bytes: 900_000 }).context("maintenance reconcile of aspect \"cpu.util\"");
+		let refusal = classify_typed(&refused).expect("the maintenance budget has its own code");
+		assert_eq!((refusal.code(), refusal.code().status()), (Code::OverBudget, StatusCode::SERVICE_UNAVAILABLE));
+		let response = refusal.into_response();
+		// No `Retry-After` by design: the plan fails identically until an operator moves the ceiling,
+		// and §4 pairs the header with `busy` and `overloaded`, where waiting can help.
+		assert!(!response.headers().contains_key("retry-after"), "a refused plan is not a busy server");
+		let body = json_of(response).await;
+		assert_eq!(body["code"], "over_budget");
+		assert_eq!(body["error"], "a maintenance plan was refused before it read anything, and nothing was written", "a 5xx sends its sentence, never the cause string");
+		assert_eq!(body["details"]["budget_bytes"], 4096, "the ceiling the operator set is the point of the answer");
+		assert_eq!(body["details"]["planned_bytes"], 900_000, "and so is the size the pass would have needed");
+		assert_eq!(body["details"]["aspect"], "cpu.util", "the route already names the aspect in its path");
+	}
+
 	/// A store read whose selector matched several series (TAG-8) is the plan's
 	/// `400 ambiguous_series`, and an ingest naming a reserved `__` tag key is
 	/// `400 invalid_tag`, both read from the type.
@@ -1219,7 +1254,7 @@ mod tests {
 			seen.push(sentence);
 			assert!(!sentence.contains('/') && !sentence.contains(':'), "`{name}`'s sentence names a path or subsystem: {sentence}");
 		}
-		assert_eq!(seen.len(), 13, "13 of the table's codes are 5xx");
+		assert_eq!(seen.len(), 14, "14 of the table's codes are 5xx");
 	}
 
 	#[tokio::test]

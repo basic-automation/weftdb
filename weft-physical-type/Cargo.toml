@@ -56,6 +56,10 @@ name = "pointread"
 harness = false
 
 [[bench]]
+name = "kway_merge"
+harness = false
+
+[[bench]]
 name = "dodsearch"
 harness = false
 

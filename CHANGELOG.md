@@ -10,6 +10,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **A refused maintenance plan has its own HTTP answer (#764).** `StoreError::OverBudget` — an
+  overlaps merge whose segments total more than `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES`, refused before
+  the group is read — now answers **`503 over_budget`** with `details.budget_bytes` and
+  `details.planned_bytes` and no `Retry-After`, instead of falling through to
+  `503 incompatible_store` and reading like a damaged store. The store-wide sweep still reports it
+  as one aspect's `failed` entry and answers `200`. The §4 error-code table on the website still
+  lists 43 codes; only the repo-side pin moved (Needs human).
 - **A maintenance fold re-cuts an oversized output (`WEFT_MAINTENANCE_MAX_SEGMENT_BYTES`, #758).**
 The passes that fold segments — `reconcile_overlaps`, `squash_aspect`, `squash_to_target_rows` —
 now check the frame their swap is about to write against a ceiling, and when its size estimate
@@ -20,6 +27,7 @@ written, and the boundary rule is even division of the merged row range. Unset (
 server default) re-cuts nothing. A frame a single seal wrote is not re-cut — that stays the
 operator's `split_segment`.
 
+in
 - **Request-level benchmark for `float_roundtrip` (#724).** `weft-server/benches/json_body_cost.rs`
   drives one whole `POST /api/v1/interpolate` request with N float values in the same magnitude
   mix as the Phase 11 parse-only measurement and reports p50/p95 latency plus ns/value. A
@@ -33,7 +41,23 @@ operator's `split_segment`.
   to the sha256 that pin records. `--asset` names the archive; `--extract` unpacks a tar
   archive under the destination, refusing a member that would land outside it and any link
   member. A `pinned release archives` job in `.github/workflows/ci.yml` runs it on every
-  pull request: the first time a published WeftDB archive has been downloaded in CI.
+  pull request: the first time a published WeftDB archive has been downloaded in CI.### Changed
+
+- **A maintenance merge of overlapping frames now folds them in one heap pass instead of k
+  pairwise rounds (#758, ROB-20 G3).** `merge_k_way` (`weft-physical-type/src/split.rs`) merges
+  `k` timestamp-sorted runs in a single pass over `k` cursors, and `fold_newest_wins`
+  (`weftdb/src/types/segment_store.rs`) builds those runs and calls it. The loop it replaces
+  folded the merged prefix against each member in turn, which cloned the whole prefix again on
+  every round. The rule at a shared timestamp is unchanged — the newest member's rows
+  supersede every older member's rows at that instant, while a member's own rows at other
+  instants survive and a run of equal timestamps inside one member is kept as written — so the
+  merged rows are meant to be identical either way. `split.rs`'s tests compare the two arms
+  over 600 generated overlap shapes plus the hand cases, and
+  `weft-physical-type/benches/kway_merge.rs` times both arms at k = 2, 4, 8, 16, 32 and asserts
+  they agree before timing. No number from that bench has been reported yet: nothing in this
+  slice was compiled or run on the author's machine, so CI is the gate and the speedup is a
+  claim CI has to confirm.
+origin/main
 
 ### Fixed
 
