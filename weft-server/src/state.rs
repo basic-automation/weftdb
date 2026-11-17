@@ -257,7 +257,7 @@ impl AppState {
 	/// Attach a [`MemoryBudget`] read from the environment; the binary passes
 	/// the budget it composed from the cgroup limit and `WEFT_MEMORY_BUDGET_BYTES`.
 	#[must_use]
-	pub const fn with_memory_budget(mut self, budget: MemoryBudget) -> Self {
+	pub fn with_memory_budget(mut self, budget: MemoryBudget) -> Self {
 		self.memory_budget = budget;
 		self
 	}
