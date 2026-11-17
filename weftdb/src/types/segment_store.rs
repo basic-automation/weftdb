@@ -86,7 +86,7 @@ use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use splimes::{Point, Resolution};
 use tracing::Instrument as _;
-use weft_physical_type::{merge_newer_wins, split_index, AspectSchema, FrameOptions, PagedSegment, PhysicalValue, Segment, SegmentDescriptor, SegmentIndex, SplitDecision, SplitPolicy, TimeUnit};
+use weft_physical_type::{merge_k_way, split_index, AspectSchema, FrameOptions, PagedSegment, PhysicalValue, Segment, SegmentDescriptor, SegmentIndex, SplitDecision, SplitPolicy, TimeUnit};
 use weft_reduce::{Aggregation, Bucket, PartialReduction};
 
 use crate::{
@@ -488,6 +488,16 @@ pub struct SegmentStoreOptions {
 	/// positive whole number of bytes; unset, malformed, or zero leaves the pass
 	/// unbudgeted).
 	pub max_maintenance_output_bytes: Option<u64>,
+	/// The largest segment frame a maintenance pass may leave behind (roadmap ROB-20 G4).
+	/// `None`, the library default, re-splits nothing: a fold that would produce one very
+	/// large frame still produces it. When set, the passes that fold segments re-cut their
+	/// merged output at timestamp boundaries so that no output frame is estimated above it;
+	/// rule and its hard bound are written out in the store's own fold paths
+	/// (`segment_store::maint`), which are the only callers.
+	/// A seal is never cut by it. [`from_env`](Self::from_env) reads
+	/// `WEFT_MAINTENANCE_MAX_SEGMENT_BYTES` (a positive whole number of bytes; unset,
+	/// malformed, or zero leaves re-splitting off).
+	pub max_maintenance_segment_bytes: Option<u64>,
 }
 
 /// The per-aspect series cap `WEFT_MAX_SERIES_PER_ASPECT`'s value names: a positive
@@ -504,6 +514,14 @@ fn max_series_per_aspect_from(value: Option<&str>) -> usize {
 /// all", so a mistyped zero cannot stop the sweeper.
 fn maintenance_output_budget_from(value: Option<&str>) -> Option<u64> {
 	value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|budget| *budget > 0)
+}
+
+/// The segment size ceiling `WEFT_MAINTENANCE_MAX_SEGMENT_BYTES` names (roadmap ROB-20 G4):
+/// a positive whole number of bytes, or `None` (no re-splitting) when it is unset or anything
+/// else. Zero means “off” rather than “no frame may exceed zero bytes”, so a mistyped
+/// zero cannot turn every fold into a re-split.
+fn maintenance_segment_ceiling_from(value: Option<&str>) -> Option<u64> {
+	value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|ceiling| *ceiling > 0)
 }
 
 /// The default per-aspect series cap, [`SegmentStoreOptions::max_series_per_aspect`]:
@@ -529,7 +547,7 @@ pub const DEFAULT_SUSPECT_FRAME_POLICY: SuspectFramePolicy = SuspectFramePolicy:
 
 impl Default for SegmentStoreOptions {
 	fn default() -> Self {
-		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), decode_breaker: MaintenanceBreaker::default(), suspect_frame_policy: DEFAULT_SUSPECT_FRAME_POLICY, max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT, max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: false, disk_reserve_bytes: 0, expiry: row_expiry::RowExpiryPolicy::NoExpiry, max_maintenance_output_bytes: None }
+		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), decode_breaker: MaintenanceBreaker::default(), suspect_frame_policy: DEFAULT_SUSPECT_FRAME_POLICY, max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT, max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: false, disk_reserve_bytes: 0, expiry: row_expiry::RowExpiryPolicy::NoExpiry, max_maintenance_output_bytes: None, max_maintenance_segment_bytes: None }
 	}
 }
 
@@ -550,7 +568,7 @@ impl SegmentStoreOptions {
 	/// as it documents. Explicit: nothing in the library calls it.
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), decode_breaker: MaintenanceBreaker::decode_from_env(), suspect_frame_policy: std::env::var(SuspectFramePolicy::ENV_NAME).ok().as_deref().and_then(SuspectFramePolicy::parse).unwrap_or(DEFAULT_SUSPECT_FRAME_POLICY), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()), expiry: row_expiry::RowExpiryPolicy::NoExpiry, max_maintenance_output_bytes: maintenance_output_budget_from(std::env::var("WEFT_MAINTENANCE_MAX_OUTPUT_BYTES").ok().as_deref()) }
+		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), decode_breaker: MaintenanceBreaker::decode_from_env(), suspect_frame_policy: std::env::var(SuspectFramePolicy::ENV_NAME).ok().as_deref().and_then(SuspectFramePolicy::parse).unwrap_or(DEFAULT_SUSPECT_FRAME_POLICY), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()), expiry: row_expiry::RowExpiryPolicy::NoExpiry, max_maintenance_output_bytes: maintenance_output_budget_from(std::env::var("WEFT_MAINTENANCE_MAX_OUTPUT_BYTES").ok().as_deref()), max_maintenance_segment_bytes: maintenance_segment_ceiling_from(std::env::var("WEFT_MAINTENANCE_MAX_SEGMENT_BYTES").ok().as_deref()) }
 	}
 
 	/// These options with `bytes` as the per-operation maintenance output budget
@@ -558,6 +576,14 @@ impl SegmentStoreOptions {
 	#[must_use]
 	pub const fn with_max_maintenance_output_bytes(mut self, bytes: u64) -> Self {
 		self.max_maintenance_output_bytes = Some(bytes);
+		self
+	}
+
+	/// These options with `bytes` as the largest frame a maintenance pass may leave behind
+	/// ([`max_maintenance_segment_bytes`](Self::max_maintenance_segment_bytes), ROB-20 G4).
+	#[must_use]
+	pub const fn with_max_maintenance_segment_bytes(mut self, bytes: u64) -> Self {
+		self.max_maintenance_segment_bytes = Some(bytes);
 		self
 	}
 
@@ -1190,19 +1216,24 @@ fn series_overlap_components(rows: Vec<IndexRow>) -> Vec<Vec<IndexRow>> {
 	components
 }
 
-/// Fold the rows of `frames`, the members of a merge in ascending id order (oldest to
-/// newest), into one time-sorted run, the newest value winning at a timestamp two members
-/// share: each member's rows are sorted stably first (it may be out of order), then merged
-/// with [`merge_newer_wins`], which supersedes the older member's whole run of a shared
-/// timestamp and keeps a run unique to one member as it is.
+/// Fold the members of a merge — `frames`, in ascending id order (oldest to newest) — into
+/// one time-sorted run, the newest value winning at a timestamp two members share.
+///
+/// Each member's rows are sorted stably first (a member may be stored out of order), then
+/// merged with [`merge_k_way`], which supersedes an older member's whole run of a shared
+/// timestamp and keeps a run unique to one member as it is. One heap pass replaces the
+/// pairwise fold of the prefix per member (`O(rows · k)` row moves →
+/// `O(rows + instants · log k)`, ROB-20 G3); the rows are equal either way, which is what
+/// `merge_k_way_matches_the_pairwise_fold_on_every_overlap_shape` pins.
 fn fold_newest_wins(frames: Vec<DecodedFrame>) -> (Vec<i64>, Vec<Option<BigDecimal>>) {
-	let mut merged: Vec<(i64, Option<BigDecimal>)> = Vec::new();
+	let mut runs: Vec<Vec<(i64, Option<BigDecimal>)>> = Vec::with_capacity(frames.len());
 	for frame in frames {
 		let mut rows: Vec<(i64, Option<BigDecimal>)> = frame.timestamps.into_iter().zip(frame.values).collect();
 		rows.sort_by_key(|(t, _)| *t);
-		merged = merge_newer_wins(&merged, &rows);
+		runs.push(rows);
 	}
-	merged.into_iter().unzip()
+	let refs: Vec<&[(i64, Option<BigDecimal>)]> = runs.iter().map(Vec::as_slice).collect();
+	merge_k_way(&refs).into_iter().unzip()
 }
 
 /// Whether two runs of rows are the same, row for row: equal timestamps, and values equal
@@ -1794,6 +1825,10 @@ pub struct SegmentStore {
 	/// ([`SegmentStoreOptions::max_maintenance_output_bytes`], ROB-20); `None`
 	/// budgets nothing.
 	maintenance_output_budget: Option<u64>,
+	/// The largest frame a maintenance pass may leave behind, from the open options
+	/// ([`SegmentStoreOptions::max_maintenance_segment_bytes`], ROB-20 G4); `None`
+	/// re-splits nothing.
+	maintenance_segment_ceiling: Option<u64>,
 	/// Whether the disk guard is refusing, so the store logs the change of state once
 	/// rather than every refused write (ROB-17).
 	disk_refusals: crate::RefusalLatch,

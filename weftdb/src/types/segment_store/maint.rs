@@ -1138,7 +1138,7 @@ impl SegmentStore {
 	/// is zero and a point/range read over the merged window opens a single segment.
 	///
 	/// **Merge semantics — newer wins (upsert).** Members are folded in ascending seal
-	/// id (oldest → newest) with [`merge_newer_wins`], so at any timestamp two members
+	/// id (oldest → newest) with [`merge_newer_wins`](weft_physical_type::merge_newer_wins), so at any timestamp two members
 	/// share, the more-recently-sealed value supersedes the older one — the same
 	/// last-writer-wins answer [`read_point`](SegmentStore::read_point) already gives
 	/// across overlapping segments. This *dedups* cross-segment duplicate timestamps
@@ -1196,7 +1196,7 @@ impl SegmentStore {
 	/// but `policy` governs whether each overlap component is fully rewritten or split.
 	///
 	/// **Merge semantics — newer wins (upsert).** Every component's members are folded
-	/// oldest → newest with [`merge_newer_wins`], so at any shared timestamp the
+	/// oldest → newest with [`merge_newer_wins`](weft_physical_type::merge_newer_wins), so at any shared timestamp the
 	/// more-recently-sealed value supersedes the older one (dedup / last-writer-wins),
 	/// exactly as [`reconcile_overlaps`](SegmentStore::reconcile_overlaps) documents. The
 	/// *logical* result is identical regardless of `policy`; only the on-disk layout
@@ -1291,9 +1291,18 @@ impl SegmentStore {
 			// Full rewrite: one output under the lowest member id. Split: the cold
 			// prefix under the lowest id and the merged hot suffix under the next lowest (P1),
 			// cut at the timestamp where the suffix starts; the two are disjoint in time.
-			let cuts: &[i64] = if split { &[cold_boundary] } else { &[] };
+			// ROB-20 G4: an output frame estimated above the store's segment ceiling is re-cut at
+			// row-range boundaries, one output per member at most, which is what keeps the swap
+			// legal (`size_driven_cuts`). These cuts are merged with the cold/hot boundary the
+			// split decision asked for, because both cut the same output.
+			let mut cuts = size_driven_cuts(&all_ts, component_bytes, self.maintenance_segment_ceiling, members.len());
+			if split {
+				cuts.push(cold_boundary);
+			}
+			cuts.sort_unstable();
+			cuts.dedup();
 			let rows_per_page = merge_rows_per_page(all_ts.len());
-			let plan = SwapPlan::cut(members, all_ts, all_values, rows_per_page, cuts);
+			let plan = SwapPlan::cut(members, all_ts, all_values, rows_per_page, &cuts);
 			removed += plan.removes();
 			self.swap_plan(held, &schema, plan).await?;
 		}
@@ -1468,7 +1477,7 @@ impl SegmentStore {
 	/// segments (a growing pile of carved-off cold prefixes). Left unchecked that
 	/// fragments an aspect and multiplies the per-segment read/prune overhead. Squash is
 	/// the QuestDB-style bound on that fragmentation: it folds **every** segment of
-	/// `aspect` — in ascending seal id, [`merge_newer_wins`] so any residual shared
+	/// `aspect` — in ascending seal id, [`merge_newer_wins`](weft_physical_type::merge_newer_wins) so any residual shared
 	/// timestamp still resolves last-writer-wins — into a single time-sorted segment
 	/// (paged past 4,096 rows) under the lowest id, deleting the rest. After it, the aspect is one segment
 	/// with no cross-segment overlap. The natural trigger is a segment count past a
@@ -1530,8 +1539,12 @@ impl SegmentStore {
 			};
 			// Fold oldest → newest so the most-recently-sealed value wins any residual tie.
 			let (all_ts, all_values) = self.merge_members(&members).await?;
+			// ROB-20 G4: the group's inputs estimate its output; over the ceiling, the output is
+			// re-cut at row-range boundaries, one output per member at most.
+			let group_bytes: u64 = members.iter().map(|member| member.desc.byte_len).sum();
+			let cuts = size_driven_cuts(&all_ts, group_bytes, self.maintenance_segment_ceiling, members.len());
 			let rows_per_page = merge_rows_per_page(all_ts.len());
-			let plan = SwapPlan::cut(members, all_ts, all_values, rows_per_page, &[]);
+			let plan = SwapPlan::cut(members, all_ts, all_values, rows_per_page, &cuts);
 			let plan_removes = plan.removes();
 			self.swap_plan(held, schema, plan).await?;
 			removed += plan_removes;
@@ -1672,7 +1685,7 @@ impl SegmentStore {
 	/// rather than a single giant one.
 	///
 	/// Grouping is by ascending seal id (≈ time order for append-mostly ingest); each group
-	/// merges oldest→newest via [`merge_newer_wins`] so a residual shared timestamp still
+	/// merges oldest→newest via [`merge_newer_wins`](weft_physical_type::merge_newer_wins) so a residual shared timestamp still
 	/// resolves last-writer-wins, and the merged rows are time-sorted so every output is
 	/// sorted. A `target_rows` of 0 clamps to 1, so every segment forms its own singleton
 	/// group and the call is a no-op. A single-segment group is never rewritten.
@@ -1738,9 +1751,15 @@ impl SegmentStore {
 			}
 			// One swap per group: its members folded oldest → newest (the most-recently-sealed
 			// value wins any residual tie) into one output under the group's lowest id.
+			// ROB-20 G4: over the store's segment ceiling that one output is re-cut at
+			// row-range boundaries, one output per member at most, which is also what keeps the
+			// swap legal (rule P2). A squash that would leave a giant frame leaves several
+			// bounded ones, and removes correspondingly fewer segments.
 			let (all_ts, all_values) = self.merge_members(&members).await?;
+			let group_bytes: u64 = members.iter().map(|member| member.desc.byte_len).sum();
+			let cuts = size_driven_cuts(&all_ts, group_bytes, self.maintenance_segment_ceiling, members.len());
 			let rows_per_page = merge_rows_per_page(all_ts.len());
-			let plan = SwapPlan::cut(members, all_ts, all_values, rows_per_page, &[]);
+			let plan = SwapPlan::cut(members, all_ts, all_values, rows_per_page, &cuts);
 			removed += plan.removes();
 			self.swap_plan(held, &schema, plan).await?;
 		}
@@ -2034,4 +2053,44 @@ impl SegmentStore {
 fn note_extremes(oldest: &mut Option<i64>, newest: &mut Option<i64>, lo: i64, hi: i64) {
 	*oldest = Some(oldest.map_or(lo, |seen| seen.min(lo)));
 	*newest = Some(newest.map_or(hi, |seen| seen.max(hi)));
+}
+
+/// The timestamps to cut a merged maintenance output at, so that no output frame is estimated
+/// above the store's segment ceiling (roadmap ROB-20 G4).
+///
+/// [`SegmentStoreOptions::max_maintenance_segment_bytes`] is that ceiling and `est_bytes` estimates the output's size and is deliberately the **sum of
+/// the inputs' realized sizes**, which over-counts a fold (a fold usually writes fewer bytes
+/// than the segments it consumed): the error is towards more, smaller frames, never fewer.
+///
+/// `max_outputs` bounds how many outputs the plan may carry, and every caller passes the number
+/// of segments it is replacing. That cap, not the ceiling, decides how far one merge may be
+/// divided, and it is what keeps the swap legal: with one output per member each output takes a
+/// member's id under precedence rule **P1** and none needs a fresh id, so the refusal that
+/// [`SwapPlan`]'s rule **P2** documents (an extra output whose span an outranking row overlaps)
+/// cannot fire at all. A single segment already larger than the ceiling is therefore **not**
+/// re-split here; only a fold of two or more is. That is the part of G4 a fold cannot do, and it
+/// is why the operator-facing split stays a separate call.
+///
+/// Cuts are chosen by **even division of the merged row range**: coarse, deterministic, and it
+/// needs no decode. A cut is a timestamp, so [`SwapPlan::cut`] puts a whole run of equal
+/// timestamps into one output (design D17), and a cut at or below the first timestamp is a no-op
+/// and dropped. The result is sorted and deduplicated, ready to hand to `SwapPlan::cut`.
+pub fn size_driven_cuts(timestamps: &[i64], est_bytes: u64, ceiling_bytes: Option<u64>, max_outputs: usize) -> Vec<i64> {
+	let Some(ceiling) = ceiling_bytes.filter(|ceiling| *ceiling > 0) else {
+		return Vec::new();
+	};
+	// A fold of one row, or a plan allowed only one output, has nowhere to cut.
+	if timestamps.len() < 2 || max_outputs < 2 {
+		return Vec::new();
+	}
+	let rows = timestamps.len() as u64;
+	let pieces = est_bytes.div_ceil(ceiling).min(max_outputs as u64).min(rows);
+	if pieces < 2 {
+		return Vec::new();
+	}
+	let first = timestamps[0];
+	let mut cuts: Vec<i64> = (1..pieces).map(|piece| usize::try_from(piece * rows / pieces).unwrap_or(usize::MAX)).filter(|at| *at < timestamps.len()).map(|at| timestamps[at]).filter(|cut| *cut > first).collect();
+	cuts.sort_unstable();
+	cuts.dedup();
+	cuts
 }
