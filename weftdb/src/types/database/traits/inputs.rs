@@ -172,11 +172,17 @@ pub trait Inputs {
 
 	/// Capture a chunk of measurements - generates `TxIds` internally
 	///
+	/// On a seal-backed aspect (slice D-S19, #232 follow-up: this entry point
+	/// was not yet routed), the whole chunk is one ingest transaction in the seal
+	/// store, all-or-nothing, and a repeated call replays the store's receipt, the
+	/// way [`batch_capture_measurements`](Self::batch_capture_measurements) does.
+	///
 	/// # Errors
 	///
-	/// The chunk's timestamps are queued only after its rows are committed, so an error
-	/// from the enqueue fails the call although the rows are stored; an MVCC conflict with
-	/// a consumer dequeuing the same entries is retried first, as for
+	/// The chunk's timestamps are queued only after its rows are committed (rows
+	/// mode only, because seal mode has no per-timestamp queue), so an error from
+	/// the enqueue fails the call although the rows are stored; an MVCC conflict
+	/// with a consumer dequeuing the same entries is retried first, as for
 	/// [`capture_new_measurement`](Self::capture_new_measurement).
 	async fn capture_measurement_chunk(&self, aspect_id: &AspectId, dataset_id: DatasetId, chunk: &[InputMeasurement]) -> Result<Vec<TxId>>;
 

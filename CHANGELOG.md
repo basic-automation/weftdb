@@ -10,6 +10,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**
+  Store-wide maintenance sweeps — threshold reconcile, hot/cold reconcile, squash over threshold,
+  squash to target rows, many-aspect squash — check a per-sweep deadline between components, groups,
+  series and aspects. When the deadline passes, the sweep stops before the next swap, marks its
+  [`cancelled`](weftdb::ReconcileSweep::cancelled) field `true`, and reports what it accomplished
+  so far. An already-committed swap is never aborted. Set via the environment variable
+  `WEFT_MAINTENANCE_MAX_OP_SECONDS` (Tier::Experimental); unset or `0` means unbounded.
 - **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**
 Where `expiry_sweep` only counts, the purge acts: a segment every row of which is older
 than the store's TTL is dropped through the same swap the maintenance passes use, so its
@@ -19,6 +26,7 @@ recomputed from what is left. A report now says how many segments left
 (`partial_segments`) — those are counted and left alone, so a TTL shorter than a segment's
 span leaves rows on disk that no read returns. Unlike the sweep, the purge records
 breaker outcomes: it is a maintenance operation that can fail half-done.
+origin/main
 - **A refused maintenance plan has its own HTTP answer (#764).** `StoreError::OverBudget` — an
   overlaps merge whose segments total more than `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES`, refused before
   the group is read — now answers **`503 over_budget`** with `details.budget_bytes` and
@@ -41,10 +49,12 @@ in
 - **Request-level benchmark for `float_roundtrip` (#724).** `weft-server/benches/json_body_cost.rs`
   drives one whole `POST /api/v1/interpolate` request with N float values in the same magnitude
   mix as the Phase 11 parse-only measurement and reports p50/p95 latency plus ns/value. A
-  `float-roundtrip-a-b` job in its own workflow (`.github/workflows/float-roundtrip-ab.yml`,
-  `workflow_dispatch` only) builds and runs it twice — once
-  with the shipped `float_roundtrip` feature, once with it stripped in-job — and prints both
-  medians and the delta. The shipped `Cargo.toml` is never modified.
+  `float roundtrip A/B` workflow (`.github/workflows/float-roundtrip-ab.yml`,
+  `workflow_dispatch` only) builds and runs it once per matrix arm — `on` (the shipped
+  `float_roundtrip` feature) and `off` (stripped in-job) — each in its own job with its own
+  dependency-cache key, because the feature flip invalidates the cache the arms would share.
+  The `values`/`reps` inputs reach the bench through `WEFT_JBC_VALUES`/`WEFT_JBC_REPS`. The
+  shipped `Cargo.toml` is never modified, and a step asserts that.
 
 - **Fetching a pinned release archive (#762).** `python3 scripts/compat/releases.py fetch`
   downloads one archive named in `compat/releases.toml` and refuses it unless the bytes hash

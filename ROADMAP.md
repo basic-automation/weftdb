@@ -82,7 +82,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] (2026-09-23 list; item 3 shipped 2026-10-08.) The 2026-09-23 run
 - [ ] Run D-S21's privileged power-loss validation (sudo: dm-log-writes or a QEMU hard reset) *(owner)*
 - [x] read lane: **X-READ** Read-time newer-wins merge across overlapping segments, per series
-- [ ] maint lane: **ROB-20** Maintenance resource limits, k-way merge, re-split of oversized frames *(G1 shipped 2026-11-16 in #765 — one maintenance operation's output budget, refused before it reads anything; G2 shipped 2026-11-16 in #761 — swap outputs admitted to the disk guard; G3 in review as #772 — `merge_k_way` folds k members in one heap pass instead of k pairwise rounds; G4, re-splitting an oversized merge output, open)*
+- [x] maint lane: **ROB-20** Maintenance resource limits, k-way merge, re-split of oversized frames (byte budget #765 + disk-guard reserve #761 + per-op time budget #781; `merge_k_way` #772; output re-split #773. The time budget is honoured between swaps only, and one already-oversized segment is not auto re-split)
 - [x] open lane: **ROB-22** Suspect-frame policy and background-decode crash-loop breaker
 - [x] L-INGEST: **ROB-18** Two-phase ingest admission, total body deadline, panic mapping by phase
 - [x] **FRE-10a** Contract tests: probes, compute endpoints, metrics and roles
@@ -96,7 +96,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
 - [ ] Write or approve the honesty-page narrative *(owner)*
 - [ ] Report the three `parquet` 60.0.0 decoder panics and the `arrow-buffer` 60.0.0 panic upstream to apache/arrow-rs *(owner: outward-facing)*
-- [ ] What `float_roundtrip` costs a whole JSON compute or ingest request
+- [x] What `float_roundtrip` costs a whole JSON compute or ingest request *(measured 2026-11-16: below what CI can resolve at whole-request granularity — the parse figure predicts 0.34 ms on a 20,000-value request against arm-to-arm swings of 0.58 ms and 6.07 ms, both in the wrong direction; the parse-only +17 ns/value (≈ 1.42×) stays the cost statement, and `docs/roadmap-notes.md` records both dispatches. A resolvable answer needs a self-hosted runner with a warm target directory.)*
 - [x] Flaky under GPU contention: `gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu`
 - [x] Guard the `#[serial]`-above-`#[test]` ordering (#726, 2026-11-13: the guard reads the keyed `#[serial(key)]` form too and requires a test attribute in the same attribute block; either position in that block serialises, so the "above" ordering is no longer enforced)
 
