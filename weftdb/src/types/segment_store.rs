@@ -1370,6 +1370,20 @@ impl SwapPlan {
 	/// A delete-only plan over `members` (Phase 4.6 skip-identical): the lowest-id member
 	/// is kept as it is, since its rows are already what a fold of every member gives, and
 	/// the others are deleted. No frame is written.
+	/// A delete-only plan over `members` (row-TTL cut 2, #775): every member leaves the
+	/// index and no frame is written, because a read that respects the TTL returns no row of
+	/// theirs. Unlike a keep plan this one keeps nothing, so **no member claims an id and no
+	/// output needs one** — there is no new row to outrank an existing one, so precedence
+	/// cannot be violated. Everything is left over, which is what `removes` already counts.
+	///
+	/// The caller guarantees the members are doomed as a whole: a segment whose recorded
+	/// extent ends before the expiry cutoff. A segment that straddles the cutoff is not a
+	/// purge member, because dropping it would delete live rows.
+	fn purge(mut members: Vec<IndexRow>) -> Self {
+		members.sort_by_key(|member| member.desc.id);
+		Self { members, outputs: Vec::new(), keep: false }
+	}
+
 	fn keep(mut members: Vec<IndexRow>) -> Self {
 		members.sort_by_key(|member| member.desc.id);
 		Self { members, outputs: Vec::new(), keep: true }

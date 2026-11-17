@@ -17,7 +17,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   [`cancelled`](weftdb::ReconcileSweep::cancelled) field `true`, and reports what it accomplished
   so far. An already-committed swap is never aborted. Set via the environment variable
   `WEFT_MAINTENANCE_MAX_OP_SECONDS` (Tier::Experimental); unset or `0` means unbounded.
-
+- **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**
+Where `expiry_sweep` only counts, the purge acts: a segment every row of which is older
+than the store's TTL is dropped through the same swap the maintenance passes use, so its
+index row goes, its frame is retired for the reaper to unlink, and the aspect's rollup is
+recomputed from what is left. A report now says how many segments left
+(`ExpirySweep::segments_dropped`) and how many hold both expired and live rows
+(`partial_segments`) — those are counted and left alone, so a TTL shorter than a segment's
+span leaves rows on disk that no read returns. Unlike the sweep, the purge records
+breaker outcomes: it is a maintenance operation that can fail half-done.
+origin/main
 - **A refused maintenance plan has its own HTTP answer (#764).** `StoreError::OverBudget` — an
   overlaps merge whose segments total more than `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES`, refused before
   the group is read — now answers **`503 over_budget`** with `details.budget_bytes` and
@@ -25,6 +34,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `503 incompatible_store` and reading like a damaged store. The store-wide sweep still reports it
   as one aspect's `failed` entry and answers `200`. The §4 error-code table on the website still
   lists 43 codes; only the repo-side pin moved (Needs human).
+origin/main
 - **A maintenance fold re-cuts an oversized output (`WEFT_MAINTENANCE_MAX_SEGMENT_BYTES`, #758).**
 The passes that fold segments — `reconcile_overlaps`, `squash_aspect`, `squash_to_target_rows` —
 now check the frame their swap is about to write against a ceiling, and when its size estimate
