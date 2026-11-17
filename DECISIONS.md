@@ -8064,7 +8064,7 @@ load-bearing as a deadline, and it is written rather than enforced because the v
 runs cannot hold it: the action pin is cargo-deny 0.20.2, which answers an `expiry` key with
 `error[unexpected-keys]: found 1 unexpected keys, expected: ["id", "reason"]` at
 `deny.toml:17`. cargo-deny 0.21.0 (released 2026-11-16) added `advisories.ignore[].expiry`,
-`advisories.ignore-expiry` and `advisories.ignore[].allow`; # bumps the pin so the
+`advisories.ignore-expiry` and `advisories.ignore[].allow`; #794 bumps the pin so the
 deadline can gate instead of merely remind, and `ignore[].allow` can then stop new edges
 onto chrono. `unused-ignored-advisory = "deny"` (0.19.0 or newer, so already legal) makes an
 ignore that stops matching an error, which removes the usual way exceptions rot: an entry

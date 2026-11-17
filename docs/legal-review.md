@@ -229,7 +229,7 @@ Enforcement is automated and is the reason this section can be short:
   marked `chrono` unmaintained (RUSTSEC-2026-0543, "no safe upgrade"): the job now fails
   on every branch. It is accepted in `deny.toml` with a reason naming 2027-01-31 as the
   revisit date — a machine-enforced `expiry` needs cargo-deny 0.21.0 and CI pins 0.20.2
-  through the action, so # bumps that pin — and
+  through the action, so #794 bumps that pin — and
   `unused-ignored-advisory = "deny"` keeps a dead exception from sitting around; the
   migration off `chrono` is #791 (filed as #790). A licensing document is the wrong place to
   hide a dependency risk, so it is recorded here as well as in `DECISIONS.md`. The job sits
