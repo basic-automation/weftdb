@@ -729,3 +729,24 @@ test that completes normally without setting the env var.
 
 Env var: `WEFT_MAINTENANCE_MAX_OP_SECONDS` (`Tier::Experimental`), parsed at
 `SegmentStoreOptions::from_env()` in `segment_store.rs:538-539`. Unset = unbounded.
+
+## Routine run (2026-11-17): 7.3/7.5 reconcile, TAG-12 multi-series crash cell, Turso and TSBS research
+
+**Reconcile.** 7.3 and 7.5 were ticked from their parts, each pinned by a test re-run on `435553e` (47 passed); see DECISIONS 2026-11-17. The six empty routine wrappers at the top of Phase 12 were deleted; their prose stays above under *Immediate next actions*.
+
+**TAG-12, the multi-series crash matrix.** Three new cells in `Failure::ALL` (now six), so `--crash-matrix`, `scripts/crash-matrix.sh` and `crash-matrix.yml` pick them up with no wiring. All three use three series `host=s0..s2` of one aspect, each storing corpus value + series number, so a row from the wrong series reads wrong. The checks are per series (`resolve_series` + `read_time_range_of`).
+- `kill-ingest-tagged`: SIGKILL after a seeded number of acknowledged tagged ingests. Each series holds exactly its acknowledged rows (only the in-flight series may hold one batch more), then everything resumes to whole.
+- `kill-compaction-tagged`: SIGKILL a seeded number of ms into compacting interleaved series. `fsck` is clean, every series is exact, and a rerun stays exact.
+- `corrupt-segment-tagged`: one flipped byte. Served rows are right, losses are quarantined, and at most one series loses rows. Every observed run quarantined the flipped segment and lost 5 rows from one series only.
+- Each cell fails a wrong-series mutant (`crash_matrix_tests` for the ingest cell; the real CLI for the other two).
+- **Not measured:** the matrix's CI wall-clock. The tagged cells do about 3× the ingest work of their untagged twins, and `scripts/crash-matrix.sh` defaults to `--rows 100000 --reps 2 --seeds 3`. The first `crash-matrix.yml` run after merge is the measurement; if it runs long, lower `--rows` for the tagged cells instead of dropping them.
+- **Runtime evidence:** this run's scratch dir `/mnt/deepmem/Development/weftdb-routine/runs/20261117-025714/` (logs `test-weft-bench-full-3.log`, `good-compaction.log`, `mutant-compaction.log`, `good-corrupt.log`, `mutant-corrupt.log`). The reopen times in those logs come from spinning disk on a box at load 24–33, so they are not a performance figure.
+
+**Research: the non-Linux SIGKILL exclusion still stands.** [tursodatabase/turso#7480](https://github.com/tursodatabase/turso/issues/7480) (an MVCC checkpoint truncates the logical log before the WAL, and the store then refuses to open with `Corrupt("WAL has committed frames but logical log header is missing")`) is **open**, last updated 2026-11-13. A commenter confirmed that a plain SIGKILL during an ordinary `wal_checkpoint(TRUNCATE)` reaches the state. The candidate fix, [turso#9770](https://github.com/tursodatabase/turso/pull/9770) ("complete an interrupted TRUNCATE checkpoint when the log is empty"), is **open and unmerged** (updated 2026-11-16). A maintainer's interim advice is to open such databases in experimental passive-checkpoint mode ([turso#9749](https://github.com/tursodatabase/turso/issues/9749), also open). `crash_matrix_tests.rs` deliberately does not take that route. The [release list](https://github.com/tursodatabase/turso/releases) has v0.8.3 as latest stable and v0.8.4-pre.3 (2026-11-12) and v0.9.0-pre.2 as pre-releases; this workspace pins `turso` 0.8.1. Nothing here clears the exclusion. Re-check when #9770 merges and ships in a stable release.
+
+**Research: what the TSBS half of TAG-12 has to run.** The [TSBS README](https://github.com/timescale/tsbs) (repo active, pushed 2026-11-16) defines the devops/cpu-only queries over the `hostname` tag: `single-groupby-{1,5}-{1,8}-{1,12}` (MAX of 1 or 5 metrics for 1 or 8 hosts, every 5 min, over 1 or 12 h), `double-groupby-{1,5,all}` (mean per host per hour over 24 h), `high-cpu-{1,all}`, `lastpoint` and `groupby-orderby-limit`. `weft-xbench --tsbs` keeps only `host_0`'s `usage_user` today, so the suite needs the whole file ingested tagged by `hostname`. That is now possible (TAG-11), and the `8`-host variants are the fan-out case.
+
+**Next (tomorrow).** Every TAG-12 sub-item left needs either a quiet host or a spec:
+1. TSBS `single-groupby-1-1-1` and `lastpoint` as the first two tag-grouped queries in `weft-xbench`, after ingesting the whole TSBS file tagged by `hostname`.
+2. The fan-out benchmark. Both (1) and (2) are benchmarks, so they need a quiet host; this run's load average was 24–33 on 16 cores with the model server resident.
+3. "Tagged fixtures and freeze docs" needs the owner to say what it means. The tagged frame golden already exists (`weft-physical-type/tests/golden/frame_v7_envelope_series_key.bin`); a tagged whole-store compat fixture beside `weftdb/tests/fixtures/pre_v2_store` is the likely reading.

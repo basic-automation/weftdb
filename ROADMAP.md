@@ -113,6 +113,11 @@ The phase also cleared the remaining loose ends. The stale README status was fix
   - [x] Extend the release tag grammar to `vX.Y.Z-beta.N` (`TAG_RE` in `scripts/release/verify.sh`)
 - [x] **FRE-10b** Contract tests: storage and operator endpoints, plus coverage
 - [ ] **TAG-12** Multi-series crash matrix, fan-out and TSBS benchmarks, fixtures, freeze docs
+  - [x] Multi-series ingest crash cell: `kill-ingest-tagged` in `Failure::ALL` (2026-11-17, `routine/weftdb-2026-11-17`: three tagged series of one aspect, per-series acknowledged-rows and exactness gate, resume to whole; `crash_matrix_tests` passes it at seeds 5 and 6, and a wrong-series read mutant fails it. Linux only, like the other SIGKILL cells, until tursodatabase/turso#7480 is fixed)
+  - [x] Tagged `kill-compaction` and `corrupt-segment` cells (2026-11-17, `routine/weftdb-2026-11-17`: `kill-compaction-tagged` (every series exact after a SIGKILLed compaction, `fsck` clean, rerun exact) and `corrupt-segment-tagged` (served rows are their own series' values, losses are quarantined, at most one series loses rows); each fails a wrong-series mutant through the CLI. The matrix is six cells, and its CI runtime with the three tagged cells is not yet measured)
+  - [ ] Fan-out benchmark (one tagged write or read across many series)
+  - [ ] TSBS tag-grouped query suite in `weft-xbench` (`--tsbs` reads only `host_0` today; `single-groupby-*`, `double-groupby-*`, `lastpoint`, `high-cpu-*` group by `hostname`)
+  - [ ] Tagged fixtures and freeze docs
 - [x] **ROB-24** Limits and overload evidence; frozen configuration documentation
 - [ ] **SOA-15** part 2: TTL lane
 
