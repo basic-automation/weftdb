@@ -10,7 +10,33 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
-- **A refused maintenance plan has its own HTTP answer (#764).**
+- **A refused maintenance plan has its own HTTP answer (#764).**- **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**
+Where `expiry_sweep` only counts, the purge acts: a segment every row of which is older
+than the store's TTL is dropped through the same swap the maintenance passes use, so its
+index row goes, its frame is retired for the reaper to unlink, and the aspect's rollup is
+recomputed from what is left. A report now says how many segments left
+(`ExpirySweep::segments_dropped`) and how many hold both expired and live rows
+(`partial_segments`) — those are counted and left alone, so a TTL shorter than a segment's
+span leaves rows on disk that no read returns. Unlike the sweep, the purge records
+breaker outcomes: it is a maintenance operation that can fail half-done.
+- **A refused maintenance plan has its own HTTP answer (#764).** `StoreError::OverBudget` — an
+  overlaps merge whose segments total more than `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES`, refused before
+  the group is read — now answers **`503 over_budget`** with `details.budget_bytes` and
+  `details.planned_bytes` and no `Retry-After`, instead of falling through to
+  `503 incompatible_store` and reading like a damaged store. The store-wide sweep still reports it
+  as one aspect's `failed` entry and answers `200`. The §4 error-code table on the website still
+  lists 43 codes; only the repo-side pin moved (Needs human).
+origin/main
+- **A maintenance fold re-cuts an oversized output (`WEFT_MAINTENANCE_MAX_SEGMENT_BYTES`, #758).**
+The passes that fold segments — `reconcile_overlaps`, `squash_aspect`, `squash_to_target_rows` —
+now check the frame their swap is about to write against a ceiling, and when its size estimate
+is over it they cut that output at timestamp boundaries instead of writing one very large frame.
+The pieces are bounded at one per segment the fold replaced, so every piece keeps a member's id
+and the swap stays legal (precedence P1/P2); the rows are exactly what the fold would have
+written, and the boundary rule is even division of the merged row range. Unset (the library and
+server default) re-cuts nothing. A frame a single seal wrote is not re-cut — that stays the
+operator's `split_segment`.
+origin/main
 
 ### Changed
 

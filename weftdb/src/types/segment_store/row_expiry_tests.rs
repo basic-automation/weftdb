@@ -230,3 +230,132 @@ async fn expired_cutoff_works() {
 	let no_cutoff = expired_cutoff(&RowExpiryPolicy::NoExpiry, ns(100), &TimeUnit::Seconds);
 	assert_eq!(no_cutoff, i64::MIN, "NoExpiry cutoff is MIN");
 }
+
+// ── Cut 2 (#775): a purge removes the frames no read can use any more ────────
+//
+// The read-path filter of cut 1 made expired rows invisible; a purge makes the
+// frames that hold *only* such rows leave the store. A frame that straddles the
+// cutoff is counted and left alone — rewriting it is cut 3 — so a report says
+// both what went and what could not go.
+
+/// Everything under `segments/`, sorted: what a purge must physically remove and what it
+/// must leave alone. Sorted because `read_dir` gives no order of its own.
+fn frames(root: &std::path::Path) -> Vec<String> {
+	let mut names = std::fs::read_dir(root.join("segments")).map(|dir| dir.filter_map(Result::ok).filter_map(|entry| entry.file_name().to_str().map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default();
+	names.sort();
+	names
+}
+
+/// Dense batch of the instants `from..=to`, each valued by its own instant.
+fn dense(from: i64, to: i64) -> IngestBatch {
+	let timestamps = (from..=to).collect::<Vec<i64>>();
+	let values = (from..=to).map(|t| bd(&t.to_string())).collect::<Vec<BigDecimal>>();
+	IngestBatch::dense(format!("k{from}"), timestamps, values)
+}
+
+#[tokio::test]
+async fn purge_drops_a_fully_expired_segment_and_keeps_a_straddling_one() {
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
+	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
+	// The cutoff at NOW_NS is instant 90. Frame A ends at 79, so a read that respects the
+	// TTL has nothing left to lose from dropping it whole.
+	store.ingest(ASPECT, &dense(60, 79)).await.expect("ingests the wholly expired batch");
+	// Frame B straddles it: 85..=89 are expired, 90..=120 are not.
+	store.ingest(ASPECT, &dense(85, 120)).await.expect("ingests the straddling batch");
+	assert_eq!(store.index.all(ASPECT).await.expect("index").len(), 2, "each ingest seals its own frame");
+	assert_eq!(frames(dir.path()).len(), 2, "two frames on disk");
+
+	let before = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads before the purge");
+	let sweep = store.purge_expired(NOW_NS).await.expect("purges");
+	assert!(sweep.busy.is_empty() && sweep.failed.is_empty(), "the aspect was neither busy nor failing: {:?}", sweep.failed.iter().map(|(aspect, err)| (aspect.clone(), err.to_string())).collect::<Vec<_>>());
+	assert_eq!(sweep.segments_dropped, 1, "the wholly expired frame goes");
+	assert_eq!(sweep.partial_segments, 1, "the straddling frame is counted, not rewritten");
+	assert_eq!(sweep.rows_expired, 20 + 5, "the dropped frame's twenty rows plus the five expired rows inside the frame left behind");
+	assert!(sweep.aspects_cleaned.contains(&ASPECT.to_string()), "the aspect is reported as cleaned");
+
+	let after = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads after the purge");
+	assert_eq!(before, after, "dropping a frame no read could use changes no answer");
+	assert_eq!(after.0.first().copied(), Some(90), "the first visible row is the first one at or past the cutoff");
+
+	let rows = store.index.all(ASPECT).await.expect("index after the purge");
+	assert_eq!(rows.len(), 1, "only the straddling frame keeps an index row");
+	assert_eq!(rows[0].max_ts, Some(120), "the survivor is the frame that was kept");
+	store.reap(super::MaintenanceWait::Skip).await.expect("reaps the retired frame");
+	let left = frames(dir.path());
+	assert_eq!(left.len(), 1, "the retired frame left the directory: {left:?}");
+
+	// Idempotence in what it removes; the residue of a straddling frame is still counted,
+	// because counting is not what a purge does to the store.
+	let again = store.purge_expired(NOW_NS).await.expect("purges a second time");
+	assert_eq!(again.segments_dropped, 0, "a purge that already ran drops nothing twice");
+	assert_eq!(again.partial_segments, 1, "the straddling frame is still there to be counted");
+	assert_eq!(again.rows_expired, 5, "and its expired rows are still expired");
+	assert_eq!(again.aspects_cleaned, Vec::<String>::new(), "nothing cleaned, so nothing reported cleaned");
+	assert_eq!(store.index.all(ASPECT).await.expect("index after the second purge").len(), 1, "the second pass wrote nothing");
+
+	drop(store);
+	dir.close().expect("close temp dir");
+}
+
+#[tokio::test]
+async fn purge_keeps_a_frame_whose_newest_row_sits_exactly_at_the_cutoff() {
+	// The shortcut is `max_ts < cutoff`, not `<=`: the row at the cutoff has age equal to
+	// the TTL, which is not expired, so the frame that ends there must survive.
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
+	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
+	store.ingest(ASPECT, &dense(80, 90)).await.expect("ingests a batch ending at the cutoff");
+	let sweep = store.purge_expired(NOW_NS).await.expect("purges");
+	assert_eq!(sweep.segments_dropped, 0, "the newest row is at the cutoff, so nothing may be dropped");
+	assert_eq!(sweep.partial_segments, 1, "the frame still straddles, and is counted as residue");
+	assert_eq!(sweep.rows_expired, 10, "80..=89 are expired; 90 is not");
+	assert_eq!(store.index.all(ASPECT).await.expect("index").len(), 1, "the frame keeps its index row");
+	assert_eq!(frames(dir.path()).len(), 1, "the frame stays on disk");
+	drop(store);
+	dir.close().expect("close temp dir");
+}
+
+#[tokio::test]
+async fn purge_writes_nothing_when_nothing_can_be_expired() {
+	// No policy at all: the purge answers the empty report and opens no transaction.
+	let (dir, store) = make_store(RowExpiryPolicy::NoExpiry).await;
+	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
+	store.ingest(ASPECT, &dense(1, 5)).await.expect("ingests");
+	let sweep = store.purge_expired(NOW_NS).await.expect("purges a NoExpiry store");
+	assert_eq!(sweep.segments_dropped, 0, "a store with no TTL drops nothing");
+	assert_eq!(sweep.rows_expired, 0, "and counts nothing expired");
+	assert_eq!(sweep.aspects_cleaned, Vec::<String>::new(), "no aspect was touched");
+
+	// A TTL longer than the store's whole history: the cutoff is not representable, which
+	// is the same answer as no expiry.
+	let (dir2, store2) = make_store(RowExpiryPolicy::Ttl { ttl: 1_000_000 }).await;
+	store2.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
+	store2.ingest(ASPECT, &dense(1, 5)).await.expect("ingests");
+	assert_eq!(expired_cutoff(&RowExpiryPolicy::Ttl { ttl: 1_000_000 }, NOW_NS, &TimeUnit::Seconds), i64::MIN, "the cutoff cannot be represented, so nothing is expired");
+	let sweep = store2.purge_expired(NOW_NS).await.expect("purges a store whose TTL exceeds its history");
+	assert_eq!(sweep.segments_dropped, 0, "an unrepresentable cutoff drops nothing");
+	assert_eq!(store2.index().all(ASPECT).await.expect("index").len(), 1, "the frame keeps its index row");
+	assert_eq!(frames(dir.path()).len(), 1, "the first store's directory is untouched");
+	assert_eq!(frames(dir2.path()).len(), 1, "and so is the second's");
+
+	drop(store);
+	dir.close().expect("close temp dir");
+	drop(store2);
+	dir2.close().expect("close second temp dir");
+}
+
+#[tokio::test]
+async fn purge_clears_every_aspect_it_is_asked_to() {
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
+	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
+	store.declare("other", &schema(TimeUnit::Seconds)).await.expect("declares the second aspect");
+	store.ingest(ASPECT, &dense(50, 69)).await.expect("ingests into the first aspect");
+	store.ingest("other", &dense(55, 69)).await.expect("ingests into the second aspect");
+	let sweep = store.purge_expired(NOW_NS).await.expect("purges both aspects");
+	assert_eq!(sweep.segments_dropped, 2, "one wholly expired frame per aspect");
+	assert_eq!(sweep.rows_expired, 20 + 15, "both frames' rows count as expired");
+	assert_eq!(sweep.aspects_cleaned.len(), 2, "both aspects are reported");
+	assert_eq!(store.index.all(ASPECT).await.expect("index").len(), 0, "the first aspect keeps no frame");
+	assert_eq!(store.index.all("other").await.expect("index").len(), 0, "and so does the second");
+	drop(store);
+	dir.close().expect("close temp dir");
+}
