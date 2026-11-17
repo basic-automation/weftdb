@@ -82,7 +82,18 @@ origin/main
   member. A `pinned release archives` job in `.github/workflows/ci.yml` runs it on every
   pull request: the first time a published WeftDB archive has been downloaded in CI.### Changed
 
-- **A maintenance merge of overlapping frames now folds them in one heap pass instead of k
+- **A new legacy aspect is seal-backed by default (#768).** `WEFT_LEGACY_DEFAULT_STORAGE`
+  used to be the opt-in for the seal store: left unset, a new aspect went to the per-aspect
+  rows-mode `measurements.db`. Unset is now seal-backed and `rows` is the explicit opt-out, so
+  the bulk-ingest path routed in #769 is the path a fresh deployment takes. Only the mode of an
+  aspect that does not exist yet changes: `StorageMode::parse` still reads an existing aspect's
+  stored mode the historical way, `NULL` included, so there is no migration, no back-fill and no
+  read change. A compression config still forces rows mode, because compression deletes ranges.
+  The door is one-way in both senses: a store holding seal-backed aspects cannot be read by
+  0.3.7 or earlier, which know no `aspects.storage_mode` column and answer **zero measurements**
+  for such an aspect rather than refusing it. Neither the column nor the seal-backed aspect has
+  ever shipped, so no released build created one; pin `WEFT_LEGACY_DEFAULT_STORAGE=rows` on a
+  deployment that must stay rollable to an older build.- **A maintenance merge of overlapping frames now folds them in one heap pass instead of k
   pairwise rounds (#758, ROB-20 G3).** `merge_k_way` (`weft-physical-type/src/split.rs`) merges
   `k` timestamp-sorted runs in a single pass over `k` cursors, and `fold_newest_wins`
   (`weftdb/src/types/segment_store.rs`) builds those runs and calls it. The loop it replaces
