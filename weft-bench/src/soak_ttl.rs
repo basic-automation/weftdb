@@ -270,9 +270,14 @@ mod tests {
 		// an empty TtlExpirySweepReport.
 		let sweep = ExpirySweep::default();
 		let report: TtlExpirySweepReport = sweep.into();
-		assert_eq!(report.aspects_cleaned, Vec::new());
-		assert_eq!(report.busy, Vec::new());
-		assert_eq!(report.failed, Vec::new());
+		// The element type has to be spelled out: `Vec::new()` alone is ambiguous here
+		// because `String: PartialEq<_>` has impls in several of this crate's
+		// dependencies (`bytes`, `serde_json`), and the `assert_is_empty` lint that
+		// CI denies forbids the `assert!(x.is_empty())` form instead. Clippy's own
+		// suggestion form is `[] as [T; 0]`; the typed `Vec` reads better and infers.
+		assert_eq!(report.aspects_cleaned, Vec::<String>::new());
+		assert_eq!(report.busy, Vec::<String>::new());
+		assert_eq!(report.failed, Vec::<(String, String)>::new());
 		assert_eq!(report.rows_expired, 0);
 		assert_eq!(report.segments_dropped, 0);
 		assert_eq!(report.partial_segments, 0);
