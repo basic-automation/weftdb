@@ -48,10 +48,12 @@ in
 - **Request-level benchmark for `float_roundtrip` (#724).** `weft-server/benches/json_body_cost.rs`
   drives one whole `POST /api/v1/interpolate` request with N float values in the same magnitude
   mix as the Phase 11 parse-only measurement and reports p50/p95 latency plus ns/value. A
-  `float-roundtrip-a-b` job in its own workflow (`.github/workflows/float-roundtrip-ab.yml`,
-  `workflow_dispatch` only) builds and runs it twice — once
-  with the shipped `float_roundtrip` feature, once with it stripped in-job — and prints both
-  medians and the delta. The shipped `Cargo.toml` is never modified.
+  `float roundtrip A/B` workflow (`.github/workflows/float-roundtrip-ab.yml`,
+  `workflow_dispatch` only) builds and runs it once per matrix arm — `on` (the shipped
+  `float_roundtrip` feature) and `off` (stripped in-job) — each in its own job with its own
+  dependency-cache key, because the feature flip invalidates the cache the arms would share.
+  The `values`/`reps` inputs reach the bench through `WEFT_JBC_VALUES`/`WEFT_JBC_REPS`. The
+  shipped `Cargo.toml` is never modified, and a step asserts that.
 
 - **Fetching a pinned release archive (#762).** `python3 scripts/compat/releases.py fetch`
   downloads one archive named in `compat/releases.toml` and refuses it unless the bytes hash
