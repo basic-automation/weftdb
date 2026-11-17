@@ -4,6 +4,45 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-17 — SOA-15 part 2: the TTL lane opens its own store; it does not use the soak NullServer (ISSUE #727)
+
+**Context.** The 1.0 plan names SOA-15 part 2 as an exercise of the store's row-level TTL
+mechanism inside the soak harness. The soak already opens a `SegmentStore` under a
+`NullServer` (no HTTP, no daemon process), and every other lane — oracle, derived-read,
+backup, upgrade — operates through that server or through the existing library runner.
+SOA-15's TTL lane is the first lane that needs a *different* store configuration (the
+`RowExpiryPolicy::Ttl` variant and non-zero TTL), and it needs the expiry path the
+soak's main store never uses (the soak runs with `NoExpiry` and never ages out rows).
+
+**Chosen: the lane opens its own temporary `SegmentStore` with the target expiry policy,
+ingests a fixed set of rows, runs the sweep and purge, and records the verdict —
+then discards the store.** The lane runs between the last `record_step` and `harness.finish()`.
+The `run_ttl_lane()` function in `weft_bunch::soak_ttl` drives the whole sequence:
+configure a TTL, open, declare, ingest rows that straddle the cutoff, sweep, purge,
+read-back with the expiry-aware read path, close, report.
+
+**Rejected: making the soak's main store switch to a TTL policy for the lane.** The soak
+harness owns its store for many ticks and many lanes; changing its expiry mid-run would
+interfere with the oracle, derived-read and backup lanes' assumptions, and the
+`SegmentStoreOptions` are frozen at open time. A separate store is the cleanest isolation.
+
+**Rejected: running the TTL lane over HTTP.** The soak harness uses `NullServer` (no port,
+no process). Wiring a real server for the TTL lane alone would add complexity and CI
+infrastructure without exercising any HTTP expiry path (the reader already won't need one:
+`purge_expired` is a library call, not an endpoint). The lane tells the reader what it
+did in its report section.
+
+**Rejected: retaining the store after the lane finishes.** The lane is a one-shot check.
+Retaining the store would add state the soak harness does not need. The tempdir is
+dropped after the verdict is recorded.
+
+**Not vacuous.** The `NoExpiry` store reports 0 expired rows; the TTL store reports >0.
+The acceptance tests pin both.
+
+**Recorded in the soak run.** The verdict appears as `SoakRun::ttl` (v8 schema),
+serialised alongside the oracle, derived-read, backup and upgrade verdicts.
+The honesty section renders it.
+
 ## 2026-11-10 — `weft-orchestration` stays published; the residue is documentation and one stale member (REL-496)
 
 **The item offered two options — publish `weft-orchestration` or mark it `publish = false` —

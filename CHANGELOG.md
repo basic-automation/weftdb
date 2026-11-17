@@ -181,6 +181,7 @@ origin/main
 
 - **Document TimescaleDB percentile internals and the like-for-like plan.** `percentile_agg()` wraps a UDDSketch at 200 buckets / 0.001 max error; the research note with source URLs and the measurement plan is at `docs/research/timescale-percentile.md` (#732).
 - **Restore a whole store into a chosen new root over HTTP** (`POST /api/v1/storage/restore/into?label=&name=`), guarded by `WEFT_RESTORE_BASE_DIR` and a containment check that refuses destinations inside the backup base.
+- **SOA-15 part 2: TTL lane (#727).** The nightly soak now drives a store-side TTL lane: it opens a temporary `SegmentStore` with a configured TTL, ingests rows that straddle the expiry cutoff, runs `expiry_sweep` + `purge_expired`, and records the outcome on the soak record as `TtlLaneVerdict`. The lane is not vacuous: a `NoExpiry` store reports 0 expired rows while a TTL store with aged rows reports >0. Acceptance tests cover both cases, store round-trip exact counts, and the verdict's JSON round-trip. The honesty section renders the verdict, and the soak.yml comment reflects that the lane is active.
 
 ### Documentation
 
