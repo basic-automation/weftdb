@@ -7869,3 +7869,28 @@ origin/main
   local build; the local checks run were `cargo fmt --check -p weft-server`,
   `python3 scripts/config/check_schema.py` and `python3 scripts/ci/check-serial-order.py`.
 - **Not compiled here, and not claimed.** Nothing in this slice was built: the host's RAM belongs to the model server, and CI is this quarter's Rust gate. The API surface the new tests lean on was checked by grep instead — `IndexRow.desc: SegmentDescriptor` (`weftdb/src/types/index_txn.rs:99`), `SegmentDescriptor { row_count: usize, byte_len: u64 }` (`weft-physical-type/src/catalog.rs:66,85`), and a sibling test module already calling `store.index.rows(ASPECT)` (`tag_seal_tests.rs:51`) — and CI is what says whether they pass. The three store-level tests are written so the ceiling is the **only** difference between them and their control, and the control (`the_same_fold_writes_one_frame_when_the_ceiling_is_off`) is the one that fails on `main` if the change ever regresses into a no-op.inorigin/main
+
+## 2026-11-16 — Naming the client abort without widening the frozen code table (shipped)
+
+- **The issue's premise was stale.** #742 described a disconnect and a deadline both ending up as
+  `408 body_timeout`. By the time the issue was filed, ROB-18 (merged) already distinguished three
+  outcomes: a deadline expiry (`ingest.rs:505-511`), a body-stream transport error (`ingest.rs:489`,
+  mapped to `400 bad_request`), and a premature EOF below the declared `Content-Length`
+  (`ingest.rs:446-457`, `check_body_truncation`). The real defect was narrower: two different
+  `bad_request` messages described the same condition (`client_disconnect`), and the stream-error arm
+  put a raw transport error string on the wire.
+- **A new `Code` variant was rejected.** The error-code table is a frozen 43-entry wire contract
+  (`TABLE` at `weft-server/src/error.rs:1138`, pinned at `assert_eq!(TABLE.len(), 43)`). A code the
+  caller cannot act on (an aborted client cannot read the answer) does not earn a slot in the
+  table. A non-standard `499` was also rejected because every `Code` carries a standard `StatusCode`
+  and the `status` method derives it from the variant (`ingest-server-failure` non-standard codes
+  break that invariant).
+- **The distinction lives in `details.reason`.** Both detection sites now produce the same labelled
+  wire answer: `400 bad_request` with message `"the client disconnected before completing the request
+  body"` and `details: {"reason": "client_disconnect"}`. The raw transport error goes to
+  `tracing::warn!` (`ingest.rs:489`, the stream-error arm) and `tracing::info!` (`ingest.rs:450`,
+  `check_body_truncation`), never onto the wire. The deadline arm (`ingest.rs:505-511`) stays
+  `408 body_timeout` untouched.
+- **Four tests added,** one of which (`a_body_that_never_finishes_is_a_deadline_not_a_disconnect`,
+  `start_paused`) proves that a stalled body is still a deadline and not a disconnect — the
+  regression guard the whole slice is about.

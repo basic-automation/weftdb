@@ -448,7 +448,7 @@ pub(crate) fn check_body_truncation(body: &Bytes, declared: Option<u64>) -> Opti
 		let received = body.len() as u64;
 		if received < declared {
 			tracing::info!(declared, received, "ingest body ended before its declared Content-Length; client disconnected");
-			return Some(ApiError::bad_request(format!("the request body ended after {received} bytes but declared {declared} bytes: the client disconnected before completing the body")));
+			return Some(ApiError::bad_request("the client disconnected before completing the request body").with_details(serde_json::json!({"reason": "client_disconnect"})));
 		}
 	}
 	None
@@ -486,7 +486,10 @@ impl FromRequest<AppState> for IngestBody {
 			let mut stream = request.into_body().into_data_stream();
 			let mut buffered: Vec<u8> = Vec::new();
 			while let Some(chunk) = stream.next().await {
-				let chunk = chunk.map_err(|err| ApiError::bad_request(format!("the request body could not be read: {err}")))?;
+				let chunk = chunk.map_err(|err| {
+					tracing::warn!(%err, "ingest body aborted by client");
+					ApiError::bad_request("the client disconnected before completing the request body").with_details(serde_json::json!({"reason": "client_disconnect"}))
+				})?;
 				if buffered.len() + chunk.len() > cap {
 					return Err(ApiError::new(error::Code::PayloadTooLarge, format!("the request body exceeds this route's {cap}-byte limit (`{MAX_INGEST_BYTES_ENV}`)")).with_limit(cap as u64));
 				}
@@ -2564,15 +2567,12 @@ mod tests {
 	#[test]
 	fn check_body_truncation_returns_4xx_when_body_is_shorter_than_declared() {
 		// The peer ended the stream before delivering the declared bytes.
-		// The helper returns a 400 bad_request.
+		// The helper returns a 400 bad_request with the contract message.
 		let body = Bytes::from(vec![0u8; 50]);
 		let err = check_body_truncation(&body, Some(100)).expect("truncated body must produce an error");
 		assert_eq!(err.code(), crate::error::Code::BadRequest);
 		assert_eq!(err.code().status(), StatusCode::BAD_REQUEST);
-		let msg = err.message();
-		assert!(msg.contains("50"), "message names received bytes");
-		assert!(msg.contains("100"), "message names declared bytes");
-		assert!(msg.contains("client disconnected"), "message names the cause");
+		assert_eq!(err.message(), "the client disconnected before completing the request body");
 	}
 
 	#[tokio::test]
@@ -2591,9 +2591,7 @@ mod tests {
 		drop(state);
 		assert_eq!(err.code(), crate::error::Code::BadRequest);
 		assert_eq!(err.code().status(), StatusCode::BAD_REQUEST);
-		let msg = err.message();
-		assert!(msg.contains("10"), "message must name received bytes");
-		assert!(msg.contains("100"), "message must name declared bytes");
+		assert_eq!(err.message(), "the client disconnected before completing the request body", "the message is the contract string");
 	}
 
 	#[tokio::test]
@@ -2652,9 +2650,7 @@ mod tests {
 
 		assert_eq!(err.code(), crate::error::Code::BadRequest);
 		assert_eq!(err.code().status(), StatusCode::BAD_REQUEST);
-		let msg = err.message();
-		assert!(msg.contains("50"), "message names received bytes");
-		assert!(msg.contains("100"), "message names declared bytes");
+		assert_eq!(err.message(), "the client disconnected before completing the request body");
 
 		// Phase: Committing (after set_ingest_phase) — any pre-commit phase
 		// must also surface the 4xx rather than 500 commit_failed.
@@ -2670,13 +2666,92 @@ mod tests {
 
 		assert_eq!(err.code(), crate::error::Code::BadRequest);
 		assert_eq!(err.code().status(), StatusCode::BAD_REQUEST);
-		let msg = err.message();
-		assert!(msg.contains("30"), "message names received bytes");
-		assert!(msg.contains("200"), "message names declared bytes");
+		assert_eq!(err.message(), "the client disconnected before completing the request body");
 
 		// Phase: None (not inside a scope) — the helper still returns 4xx.
 		let body = Bytes::from(vec![0u8; 5]);
 		let err = check_body_truncation(&body, Some(10)).expect("truncated body must produce an error");
 		assert_eq!(err.code(), crate::error::Code::BadRequest);
+		assert_eq!(err.message(), "the client disconnected before completing the request body");
+	}
+
+	// ── BODY-ABORT: new contract tests ───────────────────────────────────
+
+	#[tokio::test]
+	async fn an_aborted_body_stream_answers_bad_request_client_disconnect() {
+		// A stream that yields `Some(Ok(_))` then `Some(Err(io::Error))`
+		// produces 400 bad_request with details.reason == "client_disconnect".
+		// The raw transport error text must NOT appear anywhere in the body.
+		use std::io;
+
+		use axum::extract::FromRequest as _;
+
+		let io_error = io::Error::new(io::ErrorKind::ConnectionReset, "connection reset by peer");
+		let stream = futures::stream::iter([Ok(Bytes::from("partial")), Err(io_error)]);
+		let config = super::IngestConfig::with_body_timeout_secs(60);
+		let state = AppState::new().with_ingest_config(config);
+		let request = Request::builder().method("POST").uri("/api/v1/storage/price/points").body(Body::from_stream(stream)).unwrap();
+		let err = super::IngestBody::from_request(request, &state).await.expect_err("an aborted stream must be refused");
+		drop(state);
+
+		assert_eq!(err.code(), crate::error::Code::BadRequest);
+		assert_eq!(err.code().status(), StatusCode::BAD_REQUEST);
+		assert_eq!(err.message(), "the client disconnected before completing the request body");
+		// Render the error through its response path and verify the raw
+		// transport error text does not leak onto the wire.
+		use axum::response::IntoResponse;
+		let response = err.into_response();
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("the body is small");
+		let text_body = String::from_utf8_lossy(&bytes);
+		assert!(!text_body.contains("ConnectionReset"), "raw io error leaked into the body: {text_body}");
+		assert!(!text_body.contains("connection reset by peer"), "raw io error display leaked into the body: {text_body}");
+	}
+
+	#[tokio::test]
+	async fn a_short_body_below_declared_content_length_answers_client_disconnect() {
+		// Header `content-length: 1000` but body is "short" — the truncation
+		// check fires with the contract message and details.reason.
+		use axum::extract::FromRequest as _;
+
+		let config = super::IngestConfig::with_body_timeout_secs(60);
+		let state = AppState::new().with_ingest_config(config);
+		let request = Request::builder().method("POST").uri("/api/v1/storage/price/points").header("content-length", "1000").body(Body::from("short")).unwrap();
+		let err = super::IngestBody::from_request(request, &state).await.expect_err("a short body must be refused");
+		drop(state);
+
+		assert_eq!(err.code(), crate::error::Code::BadRequest);
+		assert_eq!(err.code().status(), StatusCode::BAD_REQUEST);
+		assert_eq!(err.message(), "the client disconnected before completing the request body");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_body_that_never_finishes_is_a_deadline_not_a_disconnect() {
+		// Regression guard: a stream that never yields must produce
+		// 408 body_timeout with code == "body_timeout", not client_disconnect.
+		use axum::extract::FromRequest as _;
+
+		let config = super::IngestConfig::with_body_timeout_secs(3600);
+		let state = AppState::new().with_ingest_config(config);
+		let request = Request::builder().method("POST").uri("/api/v1/storage/price/points").body(Body::from_stream(futures::stream::pending::<Result<Bytes, std::io::Error>>())).unwrap();
+		let err = super::IngestBody::from_request(request, &state).await.expect_err("a body that never finishes must time out");
+		drop(state);
+
+		assert_eq!(err.code(), crate::error::Code::BodyTimeout);
+		assert_eq!(err.code().status(), StatusCode::REQUEST_TIMEOUT);
+		assert_ne!(err.message(), "the client disconnected before completing the request body", "a stalled body is a deadline, not a disconnect");
+	}
+
+	#[tokio::test]
+	async fn a_complete_chunked_body_is_not_flagged() {
+		// A stream that ends cleanly (None) with no Content-Length must
+		// pass the truncation check; it is not a client_disconnect.
+		use axum::extract::FromRequest as _;
+
+		let config = super::IngestConfig::with_body_timeout_secs(60);
+		let state = AppState::new().with_ingest_config(config);
+		let body = super::IngestBody::from_request(Request::builder().method("POST").uri("/api/v1/storage/price/points").body(Body::from("complete")).unwrap(), &state).await.expect("a complete body with no Content-Length passes");
+		drop(state);
+
+		assert_eq!(body.bytes(), "complete");
 	}
 }
