@@ -28,6 +28,7 @@ fn isolate_data_dir() -> Result<()> {
 	};
 	let path = dir.path().to_str().ok_or_else(|| anyhow::anyhow!("temp data dir is not valid UTF-8"))?;
 	std::env::set_var("WEFT_DATA_DIR", path);
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "rows"); // #768 flipped the default; this suite drives the legacy rows-mode path
 	Ok(())
 }
 

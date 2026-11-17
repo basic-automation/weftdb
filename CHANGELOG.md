@@ -82,7 +82,18 @@ origin/main
   member. A `pinned release archives` job in `.github/workflows/ci.yml` runs it on every
   pull request: the first time a published WeftDB archive has been downloaded in CI.### Changed
 
-- **A maintenance merge of overlapping frames now folds them in one heap pass instead of k
+- **A new legacy aspect is seal-backed by default (#768).** `WEFT_LEGACY_DEFAULT_STORAGE`
+  used to be the opt-in for the seal store: left unset, a new aspect went to the per-aspect
+  rows-mode `measurements.db`. Unset is now seal-backed and `rows` is the explicit opt-out, so
+  the bulk-ingest path routed in #769 is the path a fresh deployment takes. Only the mode of an
+  aspect that does not exist yet changes: `StorageMode::parse` still reads an existing aspect's
+  stored mode the historical way, `NULL` included, so there is no migration, no back-fill and no
+  read change. A compression config still forces rows mode, because compression deletes ranges.
+  The door is one-way in both senses: a store holding seal-backed aspects cannot be read by
+  0.3.7 or earlier, which know no `aspects.storage_mode` column and answer **zero measurements**
+  for such an aspect rather than refusing it. Neither the column nor the seal-backed aspect has
+  ever shipped, so no released build created one; pin `WEFT_LEGACY_DEFAULT_STORAGE=rows` on a
+  deployment that must stay rollable to an older build.- **A maintenance merge of overlapping frames now folds them in one heap pass instead of k
   pairwise rounds (#758, ROB-20 G3).** `merge_k_way` (`weft-physical-type/src/split.rs`) merges
   `k` timestamp-sorted runs in a single pass over `k` cursors, and `fold_newest_wins`
   (`weftdb/src/types/segment_store.rs`) builds those runs and calls it. The loop it replaces
@@ -196,6 +207,7 @@ origin/main
 
 - **Document TimescaleDB percentile internals and the like-for-like plan.** `percentile_agg()` wraps a UDDSketch at 200 buckets / 0.001 max error; the research note with source URLs and the measurement plan is at `docs/research/timescale-percentile.md` (#732).
 - **Restore a whole store into a chosen new root over HTTP** (`POST /api/v1/storage/restore/into?label=&name=`), guarded by `WEFT_RESTORE_BASE_DIR` and a containment check that refuses destinations inside the backup base.
+- **SOA-15 part 2: TTL lane (#727).** The nightly soak now drives a store-side TTL lane: it opens a temporary `SegmentStore` with a configured TTL, ingests rows that straddle the expiry cutoff, runs `expiry_sweep` + `purge_expired`, and records the outcome on the soak record as `TtlLaneVerdict`. The lane is not vacuous: a `NoExpiry` store reports 0 expired rows while a TTL store with aged rows reports >0. Acceptance tests cover both cases, store round-trip exact counts, and the verdict's JSON round-trip. The honesty section renders the verdict, and the soak.yml comment reflects that the lane is active.
 
 ### Documentation
 

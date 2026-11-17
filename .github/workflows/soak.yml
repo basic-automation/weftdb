@@ -30,8 +30,9 @@ name: soak nightly
 #
 # **Linux only**: the soak starts a real server and exercises it over HTTP;
 # a Windows or macOS runner would need a different server path. The TTL lane
-# is recorded as not-tested because the store has no row-level TTL mechanism
-# (see the honesty section output and PR body).
+# (SOA-15, part 2) exercises the store's row-level TTL mechanism via a direct
+# store lane (not HTTP, because the harness uses NullServer). The verdict is
+# recorded on the run alongside oracle, derived-read, backup, and upgrade verdicts.
 #
 # **No automatic merge to main** - this workflow runs on schedule and on
 # workflow_dispatch only, never on push or pull_request.

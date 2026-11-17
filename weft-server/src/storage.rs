@@ -1316,12 +1316,13 @@ pub(crate) async fn storage_downsample_inner(state: AppState, aspect: &str, para
 	// accounted while they are built and while they are serialized. A request that
 	// names neither bound is not refused on a number it never gave: its grid is
 	// checked, and reserved, on the count the reduction actually produces, below.
-	let mut mem_guard = None;
-	if let (Some(start), Some(end)) = (params.start, params.end) {
+	let mem_guard = if let (Some(start), Some(end)) = (params.start, params.end) {
 		let grid = read_limits::grid_buckets(i128::from(bound_nanos(start)?), i128::from(bound_nanos(end)?), width.step_nanos());
 		limits.check_downsample_buckets(grid)?;
-		mem_guard = reserve_read_memory(&budget, usize::try_from(grid).unwrap_or(usize::MAX))?;
-	}
+		reserve_read_memory(&budget, usize::try_from(grid).unwrap_or(usize::MAX))?
+	} else {
+		None
+	};
 
 	let target = resolve_target(&store, aspect, selector).await?;
 	let span = tracing::info_span!("downsample.range", %aspect, start, end, resolution = %width, buckets = tracing::field::Empty);

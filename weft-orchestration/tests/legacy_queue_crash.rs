@@ -80,6 +80,7 @@ impl Store {
 	async fn new(tag: &str) -> Result<Self> {
 		let dir = tempfile::tempdir()?;
 		std::env::set_var("WEFT_DATA_DIR", dir.path().to_str().context("temp data dir is not valid UTF-8")?);
+		std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "rows"); // #768 flipped the default; this suite drives the legacy rows-mode path
 		let name = format!("{tag}_{}", Uuid::new_v4().simple());
 		let db = Database::new(&name).await?;
 		let subject = db.observe_subject("subject").await?;

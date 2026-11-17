@@ -123,7 +123,9 @@ async fn seal_backed_ingest_feeds_the_change_log_not_the_queue() -> Result<()> {
 #[serial]
 #[tokio::test]
 async fn rows_mode_ingest_still_feeds_the_queue_and_no_change_log() -> Result<()> {
-	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	// Rows mode is the opt-out since #768 flipped the default, so the premise this
+	// test guards is stated rather than left to an absent variable.
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "rows");
 	let (_dir, db) = setup().await?;
 	let subject = db.observe_subject("s").await?;
 	let aspect = db.track_aspect(&subject.id(), "plain", &splimes::Resolution::Milliseconds, None).await?;
