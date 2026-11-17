@@ -55,8 +55,8 @@ use crate::{
 /// container memory budget (ROB-14 cut 2).
 ///
 /// The per-row cost is a conservative estimate ([`ESTIMATED_BYTES_PER_ROW`])
-/// covering a timestamp (i64, 8 bytes) and a BigDecimal value (~32 bytes)
-/// plus Vec and growth overhead. The real response memory is format-dependent
+/// covering a timestamp (i64, 8 bytes) and a `BigDecimal` value (~32 bytes)
+/// plus `Vec` and growth overhead. The real response memory is format-dependent
 /// (Arrow, CSV, JSON) and would be more expensive to compute than the budget
 /// it guards.
 ///
