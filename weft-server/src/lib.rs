@@ -74,8 +74,6 @@ pub mod interpolate;
 /// reason as [`import_rows_mode`]: its parsing and file handling are testable.
 pub mod keygen;
 pub mod maintain;
-/// ROB-14's memory budget: hold the container's memory limit in server state
-/// with an RAII reservation guard (cut 1, read + account, do not enforce yet).
 pub mod memory_budget;
 pub mod metrics;
 mod num;

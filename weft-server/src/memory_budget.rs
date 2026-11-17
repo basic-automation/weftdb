@@ -358,7 +358,7 @@ mod tests {
 		let dir = TempDir::new().unwrap();
 		let base = Path::new(dir.path());
 		// Write v2 memory.max.
-		std::fs::write(base.join("memory.max"), "4294967296");
+		std::fs::write(base.join("memory.max"), "4294967296").expect("write the v2 memory.max fixture");
 		assert_eq!(read_cgroup_limit_at(base), Some(4_294_967_296));
 	}
 
@@ -367,8 +367,8 @@ mod tests {
 		let dir = TempDir::new().unwrap();
 		let base = Path::new(dir.path());
 		// Write v1 memory.limit_in_bytes.
-		std::fs::create_dir(base.join("memory"));
-		std::fs::write(base.join("memory").join("memory.limit_in_bytes"), "8589934592");
+		std::fs::create_dir(base.join("memory")).expect("create the v1 cgroup fixture directory");
+		std::fs::write(base.join("memory").join("memory.limit_in_bytes"), "8589934592").expect("write the v1 memory.limit_in_bytes fixture");
 		assert_eq!(read_cgroup_limit_at(base), Some(8_589_934_592));
 	}
 
@@ -376,7 +376,7 @@ mod tests {
 	fn read_cgroup_limit_at_returns_none_for_max_value() {
 		let dir = TempDir::new().unwrap();
 		let base = Path::new(dir.path());
-		std::fs::write(base.join("memory.max"), "max\n");
+		std::fs::write(base.join("memory.max"), "max\n").expect("write the unbounded memory.max fixture");
 		assert_eq!(read_cgroup_limit_at(base), None);
 	}
 
