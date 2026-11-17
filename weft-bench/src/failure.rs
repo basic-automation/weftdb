@@ -10,6 +10,14 @@
 //!   flight. The reopened store must hold every acknowledged row, at most the one batch in flight
 //!   beyond them, each exactly; then the ingest resumes from what the store holds and must finish
 //!   whole.
+//! - **`kill-ingest-tagged`** (TAG-12, the multi-series crash cell) — the same kill, but the child
+//!   ingests every batch into [`TAGGED_SERIES`] tagged series of one aspect (`host=s0`, `host=s1`,
+//!   …, each offset by its series number so a row read from the wrong series is a wrong value),
+//!   through the tagged [`SegmentStore::ingest`](weftdb::SegmentStore::ingest) path, and reports
+//!   each ingest as it returns. It is killed once a seeded number of ingests are acknowledged.
+//!   Each series of the reopened store must hold exactly its own acknowledged rows, and only the
+//!   one series whose ingest was in flight may hold that one batch beyond them; then every series
+//!   resumes from what it holds and must finish whole.
 //! - **`kill-compaction`** — the harness seals the corpus in small batches, and the child compacts
 //!   the store ([`SegmentStore::squash_aspect_to_target_rows`](weftdb::SegmentStore::squash_aspect_to_target_rows)) and is killed a seeded number of
 //!   milliseconds in. The reopened store must hold every row exactly, whatever share of the
@@ -32,7 +40,7 @@ use bigdecimal::BigDecimal;
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
-use weftdb::SegmentStore;
+use weftdb::{IngestBatch, SegmentStore, SeriesSelector, TagSet};
 
 use crate::{
 	ingest::{span_ns, IngestProfile, Tiled}, schema::{BenchResult, ColdWarm, CorrectnessReport, DatasetMeta, ResultDigest, TimingBreakdown, SCHEMA_VERSION}, stats::LatencyStats
@@ -49,6 +57,8 @@ pub const CHILD_COMMAND: &str = "__failure-child";
 pub enum Failure {
 	/// `SIGKILL` the process sealing batches.
 	KillIngest,
+	/// `SIGKILL` the process ingesting batches into several tagged series of one aspect.
+	KillIngestTagged,
 	/// `SIGKILL` the process compacting the store.
 	KillCompaction,
 	/// Flip one byte of one segment file of a closed store.
@@ -57,13 +67,14 @@ pub enum Failure {
 
 impl Failure {
 	/// Every failure, in the order a `--failure all` run takes them.
-	pub const ALL: [Self; 3] = [Self::KillIngest, Self::KillCompaction, Self::CorruptSegment];
+	pub const ALL: [Self; 4] = [Self::KillIngest, Self::KillIngestTagged, Self::KillCompaction, Self::CorruptSegment];
 
 	/// The name the CLI and the report use.
 	#[must_use]
 	pub const fn as_str(self) -> &'static str {
 		match self {
 			Self::KillIngest => "kill-ingest",
+			Self::KillIngestTagged => "kill-ingest-tagged",
 			Self::KillCompaction => "kill-compaction",
 			Self::CorruptSegment => "corrupt-segment",
 		}
@@ -138,7 +149,7 @@ pub async fn run_failure(failure: Failure, profile: &IngestProfile, timestamps: 
 				// Resume from what the store holds: the ingest must finish whole.
 				let mut at = held;
 				while at < params.rows {
-					let end = (at + batch).min(params.rows).min((at / timestamps.len() as u64 + 1) * timestamps.len() as u64);
+					let end = batch_end(at, batch, params.rows, timestamps.len() as u64);
 					let (chunk_ts, chunk_values) = tiled.window(at, end)?;
 					store.seal_declared(&profile.aspect, &chunk_ts, chunk_values).await.map_err(|e| anyhow::anyhow!("cannot resume the ingest at row {at}: {e:#}"))?;
 					at = end;
@@ -147,6 +158,9 @@ pub async fn run_failure(failure: Failure, profile: &IngestProfile, timestamps: 
 				drop(store);
 				(recovery, held, ok, format!("killed after {acked} acknowledged rows; reopened holding {held}"))
 			}
+			// Boxed: the tagged rep's future is large enough to push every caller of `run_failure` over
+			// clippy's `large_futures` ceiling if it were held inline.
+			Failure::KillIngestTagged => Box::pin(kill_ingest_tagged(profile, &tiled, value_scale, params, &root, &mut rng)).await?,
 			Failure::KillCompaction => {
 				seal(&root, &profile.aspect, value_scale, &tiled, params.rows, batch).await?;
 				let kill_ms = rng.random_range(0..=u64::try_from(params.kill_within.as_millis()).unwrap_or(u64::MAX));
@@ -209,9 +223,11 @@ pub async fn run_failure(failure: Failure, profile: &IngestProfile, timestamps: 
 	Ok(BenchResult { schema_version: SCHEMA_VERSION, profile: format!("{}-{}", profile.name, failure.as_str()), adapter: "weftdb".to_string(), workload: WORKLOAD_FAILURE.to_string(), reps: samples.len(), dataset: DatasetMeta { input_points: usize::try_from(params.rows)?, output_points: samples.len(), irregular: false, missingness_fraction: 0.0, seed: params.seed, signal_shape: None }, latency: LatencyStats::from_samples(&samples), latency_ci: None, throughput_points_per_sec: 0.0, timing: TimingBreakdown { dataset_generation_ns: 0, measured_ns, end_to_end_ns: span_ns(started) }, correctness: CorrectnessReport { output_count_ok: passed, expected_output_points: samples.len(), actual_output_points: samples.len(), values_finite: true, result_sha256: Some(digest.finish()) }, accuracy: None, storage: None, cold_warm: ColdWarm::from_samples(&samples), gpu_pool: None, adapter_info: None, growth: None, online: None, compressed_query: None, analytics: None, samples_ns: samples, between_run: None, gpu_economics: None })
 }
 
-/// The child process: `ingest ROOT ASPECT SCALE UCI COLUMN CORPUS_ROWS ROWS BATCH` or
-/// `compact ROOT ASPECT TARGET_ROWS`. It reports progress on stdout, one line at a time, and is
-/// meant to be killed.
+/// The child process, which reports progress on stdout one line at a time and is meant to be killed.
+///
+/// Its modes are `ingest ROOT ASPECT SCALE UCI COLUMN CORPUS_ROWS ROWS BATCH`,
+/// `ingest-tagged ROOT ASPECT SCALE UCI COLUMN CORPUS_ROWS ROWS BATCH SERIES` and
+/// `compact ROOT ASPECT TARGET_ROWS`.
 ///
 /// # Errors
 ///
@@ -227,10 +243,28 @@ pub async fn child(args: &[String]) -> anyhow::Result<()> {
 			let (rows, batch, n): (u64, u64, u64) = (rows.parse()?, batch.parse()?, corpus.timestamps.len() as u64);
 			let mut at = 0;
 			while at < rows {
-				let end = (at + batch).min(rows).min((at / n + 1) * n);
+				let end = batch_end(at, batch, rows, n);
 				let (chunk_ts, chunk_values) = tiled.window(at, end)?;
 				store.seal_declared(aspect, &chunk_ts, chunk_values).await.map_err(|e| anyhow::anyhow!("{e:#}"))?;
 				say(&format!("sealed {end}"))?;
+				at = end;
+			}
+			drop(store);
+		}
+		[mode, root, aspect, scale, uci, column, corpus_rows, rows, batch, series] if mode == "ingest-tagged" => {
+			let corpus = crate::uci::load_uci_corpus(Path::new(uci), column, corpus_rows.parse()?)?;
+			anyhow::ensure!(corpus.timestamps.len() >= 2, "{uci}: the corpus needs at least two rows");
+			let stride = corpus.timestamps[1] - corpus.timestamps[0];
+			let tiled = Tiled { timestamps: &corpus.timestamps, values: &corpus.values, period: corpus.timestamps[corpus.timestamps.len() - 1] - corpus.timestamps[0] + stride };
+			let store = declared(Path::new(root), aspect, scale.parse()?).await?;
+			let (rows, batch, series, n): (u64, u64, u64, u64) = (rows.parse()?, batch.parse()?, series.parse()?, corpus.timestamps.len() as u64);
+			let mut at = 0;
+			while at < rows {
+				let end = batch_end(at, batch, rows, n);
+				for s in 0..series {
+					ingest_series(&store, aspect, &tiled, s, at, end).await?;
+					say(&format!("sealed {s} {end}"))?;
+				}
 				at = end;
 			}
 			drop(store);
@@ -242,9 +276,123 @@ pub async fn child(args: &[String]) -> anyhow::Result<()> {
 			drop(store);
 			say("compacted")?;
 		}
-		_ => anyhow::bail!("{CHILD_COMMAND}: expected `ingest ROOT ASPECT SCALE UCI COLUMN CORPUS_ROWS ROWS BATCH` or `compact ROOT ASPECT TARGET_ROWS`"),
+		_ => anyhow::bail!("{CHILD_COMMAND}: expected `ingest ROOT ASPECT SCALE UCI COLUMN CORPUS_ROWS ROWS BATCH`, `ingest-tagged ROOT ASPECT SCALE UCI COLUMN CORPUS_ROWS ROWS BATCH SERIES` or `compact ROOT ASPECT TARGET_ROWS`"),
 	}
 	Ok(())
+}
+
+/// Series a `kill-ingest-tagged` test writes into its one aspect.
+pub const TAGGED_SERIES: u64 = 3;
+
+/// The end of the batch that starts at row `at`: `batch` rows, cut at `rows` and at the end of the
+/// corpus tile (`n` rows), so one batch never wraps the corpus. The child and the harness both cut
+/// batches here, so the harness knows exactly where the batch in flight would have ended.
+const fn batch_end(at: u64, batch: u64, rows: u64, n: u64) -> u64 {
+	let end = at.saturating_add(batch);
+	let tile_end = (at / n + 1) * n;
+	let end = if end < rows { end } else { rows };
+	if end < tile_end {
+		end
+	} else {
+		tile_end
+	}
+}
+
+/// The tag value of series `s`.
+fn series_host(s: u64) -> String {
+	format!("s{s}")
+}
+
+/// Corpus row `i` as series `s` stores it: the corpus value plus `s`, so each series holds
+/// different values and a row served from the wrong series cannot read back as right.
+fn series_value(tiled: &Tiled<'_>, s: u64, i: u64) -> anyhow::Result<BigDecimal> {
+	let n = tiled.timestamps.len() as u64;
+	Ok(&tiled.values[usize::try_from(i % n)?] + BigDecimal::from(s))
+}
+
+/// Ingest rows `at..end` into series `s` through the tagged ingest path. The idempotency key names
+/// the series and the first row, so a batch offered again after a crash replays, never doubles.
+async fn ingest_series(store: &SegmentStore, aspect: &str, tiled: &Tiled<'_>, s: u64, at: u64, end: u64) -> anyhow::Result<()> {
+	let (chunk_ts, _) = tiled.window(at, end)?;
+	let values = (at..end).map(|i| series_value(tiled, s, i)).collect::<anyhow::Result<Vec<_>>>()?;
+	let groups = TagSet::from_pairs([("host", series_host(s))]).map_err(|e| anyhow::anyhow!("series {s}: {e}"))?;
+	let batch = IngestBatch::dense(format!("{}-{at}", series_host(s)), chunk_ts, values).with_groups(groups);
+	store.ingest(aspect, &batch).await.map_err(|e| anyhow::anyhow!("cannot ingest rows {at}..{end} into series {s}: {e:#}"))?;
+	Ok(())
+}
+
+/// The rows series `s` holds of `0..rows`, and whether they are exactly rows `0..held` of that
+/// series and nothing else. A series the catalog does not hold yet holds nothing.
+async fn series_held(store: &SegmentStore, aspect: &str, tiled: &Tiled<'_>, s: u64, rows: u64) -> anyhow::Result<(u64, bool)> {
+	let selector = SeriesSelector::exact([("host", Some(series_host(s)))]).map_err(|e| anyhow::anyhow!("series {s}: {e}"))?;
+	let Some(id) = store.resolve_series(aspect, &selector).await.map_err(|e| anyhow::anyhow!("cannot resolve series {s}: {e:#}"))? else {
+		return Ok((0, true));
+	};
+	let (start, end) = (tiled.timestamp(0)?, tiled.timestamp(rows - 1)?);
+	let (ts, vs) = store.read_time_range_of(aspect, id, start, end).await.map_err(|e| anyhow::anyhow!("cannot read series {s}: {e:#}"))?;
+	let mut exact = ts.len() == vs.len();
+	for (i, (t, v)) in ts.iter().zip(&vs).enumerate() {
+		let i = i as u64;
+		exact &= *t == tiled.timestamp(i)? && v.as_ref() == Some(&series_value(tiled, s, i)?);
+	}
+	Ok((ts.len() as u64, exact))
+}
+
+/// `kill-ingest-tagged`: one rep. Returns the reopen time, the rows held across every series,
+/// whether the store passed, and the rep's note.
+async fn kill_ingest_tagged(profile: &IngestProfile, tiled: &Tiled<'_>, value_scale: u8, params: &FailureParams, root: &Path, rng: &mut ChaCha8Rng) -> anyhow::Result<(u64, u64, bool, String)> {
+	let (n, batch, rows) = (tiled.timestamps.len() as u64, profile.batch_rows as u64, params.rows);
+	let mut batches = 0_u64;
+	let mut at = 0;
+	while at < rows {
+		at = batch_end(at, batch, rows, n);
+		batches += 1;
+	}
+	let ingests = batches * TAGGED_SERIES;
+	let kill_after = rng.random_range(1..=ingests.saturating_sub(1).max(1));
+	let mut child = spawn(&params.exe, &["ingest-tagged", path(root), &profile.aspect, &value_scale.to_string(), path(&params.uci), &params.column, &params.corpus_rows.to_string(), &rows.to_string(), &batch.to_string(), &TAGGED_SERIES.to_string()])?;
+	let parse = |line: &str| {
+		let (s, end) = line.strip_prefix("sealed ")?.split_once(' ')?;
+		Some((s.parse::<u64>().ok()?, end.parse::<u64>().ok()?))
+	};
+	let acks = read_until(&mut child, parse, |acks| acks.len() as u64 >= kill_after)?;
+	// SIGKILL while the next ingest is in flight.
+	child.kill()?;
+	child.wait()?;
+	let mut acked = vec![0_u64; usize::try_from(TAGGED_SERIES)?];
+	for &(s, end) in &acks {
+		acked[usize::try_from(s)?] = end;
+	}
+	// The child ingests series 0, 1, … for each batch in turn, so the one in flight follows the
+	// last one acknowledged, and starts where that series' acknowledged rows end.
+	let in_flight = acks.last().map_or(0, |&(s, _)| (s + 1) % TAGGED_SERIES);
+	let t0 = Instant::now();
+	let store = open(root).await?;
+	let recovery = span_ns(t0);
+	let mut ok = true;
+	let mut held = Vec::with_capacity(acked.len());
+	for (s, &acked_rows) in (0..TAGGED_SERIES).zip(&acked) {
+		let (rows_held, exact) = series_held(&store, &profile.aspect, tiled, s, rows).await?;
+		let allowed = rows_held == acked_rows || (s == in_flight && rows_held == batch_end(acked_rows, batch, rows, n));
+		ok &= allowed && exact;
+		held.push(rows_held);
+	}
+	// Resume every series from what it holds: each must finish whole.
+	for (s, &from) in (0..TAGGED_SERIES).zip(&held) {
+		let mut at = from;
+		while at < rows {
+			let end = batch_end(at, batch, rows, n);
+			ingest_series(&store, &profile.aspect, tiled, s, at, end).await?;
+			at = end;
+		}
+	}
+	for s in 0..TAGGED_SERIES {
+		let (rows_held, exact) = series_held(&store, &profile.aspect, tiled, s, rows).await?;
+		ok &= rows_held == rows && exact;
+	}
+	drop(store);
+	let total = held.iter().sum();
+	Ok((recovery, total, ok, format!("killed after {} acknowledged ingests across {TAGGED_SERIES} series (series {in_flight} in flight); reopened holding {held:?} of acknowledged {acked:?}", acks.len())))
 }
 
 /// One progress line to the harness, flushed at once: it reads them as they come.
@@ -354,5 +502,14 @@ mod tests {
 			assert_eq!(Failure::parse(f.as_str()), Some(f));
 		}
 		assert_eq!(Failure::parse("power-loss"), None);
+	}
+
+	#[test]
+	fn a_batch_never_crosses_the_row_count_or_the_corpus_tile() {
+		assert_eq!(batch_end(0, 16, 400, 5), 5, "the tile cuts first");
+		assert_eq!(batch_end(5, 16, 400, 5), 10);
+		assert_eq!(batch_end(0, 3, 400, 5), 3, "the batch cuts first");
+		assert_eq!(batch_end(3, 3, 400, 5), 5, "then the tile");
+		assert_eq!(batch_end(395, 16, 398, 5), 398, "the row count cuts last");
 	}
 }
