@@ -82,13 +82,13 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] (2026-09-23 list; item 3 shipped 2026-10-08.) The 2026-09-23 run
 - [ ] Run D-S21's privileged power-loss validation (sudo: dm-log-writes or a QEMU hard reset) *(owner)*
 - [x] read lane: **X-READ** Read-time newer-wins merge across overlapping segments, per series
-- [ ] maint lane: **ROB-20** Maintenance resource limits, k-way merge, re-split of oversized frames *(G1 shipped 2026-11-16 in #765 — one maintenance operation's output budget, refused before it reads anything; G2 shipped 2026-11-16 in #761 — swap outputs admitted to the disk guard; G3 in review as #772 — `merge_k_way` folds k members in one heap pass instead of k pairwise rounds; G4, re-splitting an oversized merge output, open)*
+- [x] maint lane: **ROB-20** Maintenance resource limits, k-way merge, re-split of oversized frames (byte budget #765 + disk-guard reserve #761 + per-op time budget #781; `merge_k_way` #772; output re-split #773. The time budget is honoured between swaps only, and one already-oversized segment is not auto re-split)
 - [x] open lane: **ROB-22** Suspect-frame policy and background-decode crash-loop breaker
 - [x] L-INGEST: **ROB-18** Two-phase ingest admission, total body deadline, panic mapping by phase
 - [x] **FRE-10a** Contract tests: probes, compute endpoints, metrics and roles
 - [ ] **ROB-14** Cgroup-aware memory budget with per-request reservations
 - [x] Restoring *into a chosen new root* over HTTP (7.3) (#213, 2026-11-14: `POST /api/v1/storage/restore/into?label=...&name=...` into `WEFT_RESTORE_BASE_DIR`; the offline drill at `weft-server/src/restore.rs` is unchanged)
-- [ ] Store-side row-level TTL/expiry (prerequisite for the SOA-15 TTL lane) *(cut 1 shipped 2026-11-15 in #752: the policy, the read-path filter and a report-only sweep; cut 2 shipped 2026-11-16 in #775: `purge_expired` drops whole segments whose every row is expired, and the reaper unlinks them; the rows inside a partially expired frame and the server surface — env var, settings entry, route — are cut 3 and are NOT shipped)*
+- [x] Store-side row-level TTL/expiry (prerequisite for the SOA-15 TTL lane) *(cut 1 shipped 2026-11-15 in #752: the policy, the read-path filter and a report-only sweep; cut 2 shipped 2026-11-16 in #775: `purge_expired` drops whole segments whose every row is expired, and the reaper unlinks them; cut 3, the environment switch, landed in #784 for issue #783: the `WEFT_ROW_TTL` env var, the settings entry and the config-schema docs; the daemon call site is open in #786)*
 - [x] Real-filesystem ENOSPC test for #656 on the injectable space source (#694 merged)
 - [x] **Measurement bulk ingest routed through the `.weftseg` seal** *(part 1 shipped 2026-11-16: the two legacy bulk writers that do not read the stored range first were routed through the seal store, and the aspect's own latest-timestamp read was fixed to consult it. #768 then made new legacy aspects seal-backed by default, with `WEFT_LEGACY_DEFAULT_STORAGE=rows` as the opt-out, so a fresh deployment writes sealed frames through every ingest entry point)*
 - [x] **CI**

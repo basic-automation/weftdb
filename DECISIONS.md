@@ -7864,6 +7864,7 @@ roadmap tick.
 - **Needs human.** The second missing requirement is a pinned release whose binaries can read layout 2. That requires cutting and publishing a release (a tag, `scripts/release/`, the published assets, and a committed fixture set for the new pin, without which `releases.py verify` refuses the block) — publishing is a maintainer act, so it is not a slice I can take. The repository-setting half of Needs human from earlier today still stands: required status checks on `main`.
 origin/main
 origin/main
+origin/main
 ## 2026-11-16 — Re-splitting an oversized frame: where the cut goes, and why the plan's acceptance case did not (ROB-20 G4, #758) (shipped as a cut; the slice is not complete)
 
 - **The ambiguity, and the choice.** `docs/maintenance-budgets-plan.md:225-227` states Slice 4's acceptance test as "configure a small `max_segment_bytes`, set up an aspect with a **single giant sealed segment**, run compaction, assert the aspect now has multiple segments each below the threshold". Chose instead to re-cut the output of a **fold** — the merge/squash swap that is already writing that aspect — and to leave a segment that one seal wrote alone. The reason is legality, not scope-creep: a fold of one member into two outputs must give the second output a **fresh** segment id, and `SwapPlan` refuses that case (`weftdb/src/types/segment_store/maint.rs:794-808`, rule **P2**: a fresh id wins precedence against *every* existing id, so the new frame would hide a higher-id row that overlaps its span, which is exactly what the overlap machinery exists to fold). The plan's own risk note says the same thing from the other side — "must validate that new-id allocation stays correct under concurrent splits".
@@ -7914,7 +7915,7 @@ origin/main
 - **Not compiled here, and not claimed.** As with every Rust slice this month, the gate is CI, not a
   local build; the local checks run were `cargo fmt --check -p weft-server`,
   `python3 scripts/config/check_schema.py` and `python3 scripts/ci/check-serial-order.py`.
-- **Not compiled here, and not claimed.** Nothing in this slice was built: the host's RAM belongs to the model server, and CI is this quarter's Rust gate. The API surface the new tests lean on was checked by grep instead — `IndexRow.desc: SegmentDescriptor` (`weftdb/src/types/index_txn.rs:99`), `SegmentDescriptor { row_count: usize, byte_len: u64 }` (`weft-physical-type/src/catalog.rs:66,85`), and a sibling test module already calling `store.index.rows(ASPECT)` (`tag_seal_tests.rs:51`) — and CI is what says whether they pass. The three store-level tests are written so the ceiling is the **only** difference between them and their control, and the control (`the_same_fold_writes_one_frame_when_the_ceiling_is_off`) is the one that fails on `main` if the change ever regresses into a no-op.inorigin/main
+- **Not compiled here, and not claimed.** Nothing in this slice was built: the host's RAM belongs to the model server, and CI is this quarter's Rust gate. The API surface the new tests lean on was checked by grep instead — `IndexRow.desc: SegmentDescriptor` (`weftdb/src/types/index_txn.rs:99`), `SegmentDescriptor { row_count: usize, byte_len: u64 }` (`weft-physical-type/src/catalog.rs:66,85`), and a sibling test module already calling `store.index.rows(ASPECT)` (`tag_seal_tests.rs:51`) — and CI is what says whether they pass. The three store-level tests are written so the ceiling is the **only** difference between them and their control, and the control (`the_same_fold_writes_one_frame_when_the_ceiling_is_off`) is the one that fails on `main` if the change ever regresses into a no-op.
 ## 2026-11-16 — A purge is a separate entry point, not a flag on the sweep (shipped)
 
 Issue #775, row-TTL cut 2. Cut 1 (#752) made expired rows invisible at read time and counted
@@ -7996,6 +7997,40 @@ and the docs. The bench body is 1,414,482 bytes because axum's default request-b
 the request-level bench cannot be widened to the 20.7 MB shape the parse figure used — that is a real
 ceiling on this method, not a tuning knob. Nothing was compiled locally; the local check run was
 `cargo fmt -p weft-server`.origin/main
+modules are inside the defining module.
+- **Not compiled here, and not claimed.** Nothing in this slice was built: the host's RAM belongs to the model server, and CI is this quarter's Rust gate. The API surface the new tests lean on was checked by grep instead — `IndexRow.desc: SegmentDescriptor` (`weftdb/src/types/index_txn.rs:99`), `SegmentDescriptor { row_count: usize, byte_len: u64 }` (`weft-physical-type/src/catalog.rs:66,85`), and a sibling test module already calling `store.index.rows(ASPECT)` (`tag_seal_tests.rs:51`) — and CI is what says whether they pass. The three store-level tests are written so the ceiling is the **only** difference between them and their control, and the control (`the_same_fold_writes_one_frame_when_the_ceiling_is_off`) is the one that fails on `main` if the change ever regresses into a no-op.
+
+## 2026-11-16 — Why the maintenance time budget is honoured between swaps (ROB-20 G5, shipped)
+
+- **Resource limits**: the maintenance lane reads the three ROB-20 resource limits (byte budget + disk-guard reserve + wall-clock time budget) as a complete set: the output budget refuses before a read, the disk reserve refuses before a swap commit, and the time budget marks the sweep cancelled between swaps/groups/aspects.
+- **Time budget at swap granularity**: the fold has no post-`merge_k_way` await point (the swap plan is journaled, written and fsynced in one synchronous chain), and a mid-swap abort would leave an abandoned output that `reap_held` cleans for a different failure class. Between swaps is the first deterministic boundary where cancelling is safe.
+- **Single oversized segment deliberately not re-split**: the output-re-split ceiling (G4) splits a multi-segment merge's output, but an already-oversized segment written by a single seal is left as-is. An auto-re-split pass would need to read and rewrite it, which is the same cost as a reconcile; that is a new maintenance operation, not part of the time budget.
+- **`cancelled` reused, not an error variant**: hitting the budget is not a failure — the sweep reports `cancelled: true` and what it accomplished before the deadline, exactly as `MaintenanceCancel` already does. No entry point changes signature, no HTTP code, no `StoreError` variant.
+- **Deadline computed once per sweep**: `maintenance_deadline()` in `maint.rs` computes `Instant::now() + Duration::from_secs(env_value)` once and the held paths check `Instant::now() >= deadline` between iterations, rather than recomputing seconds in a loop that might drift under scheduler delay.origin/main
+## 2026-11-16 — Naming the client abort without widening the frozen code table (shipped)
+
+- **The issue's premise was stale.** #742 described a disconnect and a deadline both ending up as
+  `408 body_timeout`. By the time the issue was filed, ROB-18 (merged) already distinguished three
+  outcomes: a deadline expiry (`ingest.rs:505-511`), a body-stream transport error (`ingest.rs:489`,
+  mapped to `400 bad_request`), and a premature EOF below the declared `Content-Length`
+  (`ingest.rs:446-457`, `check_body_truncation`). The real defect was narrower: two different
+  `bad_request` messages described the same condition (`client_disconnect`), and the stream-error arm
+  put a raw transport error string on the wire.
+- **A new `Code` variant was rejected.** The error-code table is a frozen 43-entry wire contract
+  (`TABLE` at `weft-server/src/error.rs:1138`, pinned at `assert_eq!(TABLE.len(), 43)`). A code the
+  caller cannot act on (an aborted client cannot read the answer) does not earn a slot in the
+  table. A non-standard `499` was also rejected because every `Code` carries a standard `StatusCode`
+  and the `status` method derives it from the variant (`ingest-server-failure` non-standard codes
+  break that invariant).
+- **The distinction lives in `details.reason`.** Both detection sites now produce the same labelled
+  wire answer: `400 bad_request` with message `"the client disconnected before completing the request
+  body"` and `details: {"reason": "client_disconnect"}`. The raw transport error goes to
+  `tracing::warn!` (`ingest.rs:489`, the stream-error arm) and `tracing::info!` (`ingest.rs:450`,
+  `check_body_truncation`), never onto the wire. The deadline arm (`ingest.rs:505-511`) stays
+  `408 body_timeout` untouched.
+- **Four tests added,** one of which (`a_body_that_never_finishes_is_a_deadline_not_a_disconnect`,
+  `start_paused`) proves that a stalled body is still a deadline and not a disconnect — the
+  regression guard the whole slice is about.origin/mainorigin/mainorigin/main
 
 ## 2026-11-16 — Flipping the storage-mode default, and why the roadmap's cost figure was not the gate (shipped)
 
@@ -8040,4 +8075,4 @@ project does not promise before 1.0.
 Recorded as a known limitation, not fixed: `WEFT_MAINTENANCE_MAX_SEGMENT_BYTES` (#773) re-cuts only
 folds of two or more segments, so the first frame a brand-new seal-backed aspect writes from a large bulk
 ingest can sit above that ceiling until a later fold cuts it, and #765's output budget bounds maintenance
-rather than ingest. Nothing here makes that worse; it only makes it reachable by default.origin/main
+rather than ingest. Nothing here makes that worse; it only makes it reachable by default.origin/mainorigin/main
