@@ -44,9 +44,9 @@ on:
   workflow_dispatch:
     inputs:
       values:
-        description: Number of float values in the request body (default 100000)
+        description: Number of float values in the request body (default 20000)
         required: false
-        default: "100000"
+        default: "20000"
       reps:
         description: Timed repetitions after one untimed warm-up (default 20)
         required: false
@@ -161,6 +161,26 @@ jobs:
           set -euo pipefail
           cargo bench -p weft-server --bench json_body_cost 2>&1 | tee "bench-$ARM.txt"
           echo "result=$(grep -m1 'ns/value=' "bench-$ARM.txt" || true)" >> "$GITHUB_OUTPUT"
+
+      # Run 43866691718 showed both arms panicking at the bench step with the
+      # same `400 invalid_json: Failed to buffer the request body: length limit
+      # exceeded` — the default 2 MB body limit on the interpolate route (only
+      # the ingest routes carry a custom DefaultBodyLimit). 100k values produce
+      # ~7 MB; the default is now 20k (~1.4 MB). If it fails again, re-run with
+      # backtrace and a tiny body to tell the failure mode from the body size.
+      - name: Diagnostic re-run on failure
+        if: failure() && steps.bench.outcome == 'failure'
+        shell: bash
+        env:
+          RUST_BACKTRACE: "full"
+          WEFT_JBC_VALUES: "8"
+          WEFT_JBC_REPS: "1"
+        run: |
+          set -euo pipefail
+          cargo bench -p weft-server --bench json_body_cost 2>&1 || true
+          echo "---"
+          echo "requested values: ${{ inputs.values }}; default now 20000 to stay inside axum's 2 MB body limit"
+          echo "body bytes for 1 value; ~70 bytes: $(echo -n '{"spline":"cubic","resolution":"seconds","start":"2020-01-01T00:00:00+00:00","end":"2020-01-01T00:00:00+00:00","points":[{"timestamp":"2020-01-01T00:00:00+00:00","value":0.0}]}' | wc -c)"
 
       - name: Restore Cargo.toml (undo in-job strip)
         if: always() && matrix.arm == 'off'

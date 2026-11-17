@@ -22,7 +22,11 @@ use axum::{body::Body, http::Request};
 use chrono::{TimeZone, Utc};
 use tower::ServiceExt as _;
 
-const DEFAULT_VALUES: usize = 100_000;
+// 20 000 values produce a ~1.4 MB JSON body, within axum's default 2 MB
+// body limit on the `/api/v1/interpolate` route (only the four ingest
+// routes carry a custom DefaultBodyLimit). 100 000 values would be ~7 MB
+// and be refused 400 `invalid_json` — the error run 43866691718 shows.
+const DEFAULT_VALUES: usize = 20_000;
 
 fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
 	std::env::var(name).ok().and_then(|raw| raw.trim().parse().ok()).unwrap_or(default)
