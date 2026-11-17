@@ -1,12 +1,11 @@
-//! The container memory budget (ROB-14, cut 1): read the cgroup limit, hold it in
-//! server state, account with an RAII reservation guard — but do not enforce yet.
+//! The container memory budget (ROB-14, cut 1): read the cgroup limit, hold it in server state, and account with an RAII reservation guard.
 //!
 //! ## Read order (cut 1, not yet enforced)
 //!
 //! 1. `WEFT_MEMORY_BUDGET_BYTES` — the operator's **lower** target — combined
 //!    with the cgroup value as `min(override, cgroup)`. Unset, `0`, `max` or
 //!    whitespace-only means no budget (`limit: None`).
-//! 2. cgroup v2: `<base>/memory.max` (and [`current_usage_at`] reads
+//! 2. cgroup v2: `<base>/memory.max` (and `current_usage_at` reads
 //!    `<base>/memory.current` for observability). Falling back to:
 //! 3. cgroup v1: `<base>/memory/memory.limit_in_bytes` (and
 //!    `<base>/memory/memory.usage_in_bytes` for observability).
@@ -112,9 +111,20 @@ impl MemoryBudget {
 	///
 	/// The reservation is **always** added to the counter before returning —
 	/// the caller holds the bytes from the moment this returns `Ok`.
+	///
+	/// # Errors
+	///
+	/// [`ReserveError::OverBudget`] when the budget is bounded and this
+	/// reservation would push the counter past the limit. The counter is rolled
+	/// back before the error is returned, so a refused reservation holds nothing.
 	pub fn try_reserve(&self, wanted: u64) -> Result<Reservation, ReserveError> {
-		match self.limit {
-			Some(limit) => {
+		self.limit.map_or_else(
+			|| {
+				// Unbounded: reserve succeeds but we still account for it.
+				self.reserved.fetch_add(wanted, Ordering::Relaxed);
+				Ok(Reservation { bytes: wanted, reserved: self.reserved.clone() })
+			},
+			|limit| {
 				// The decision is based on the value *after* adding wanted, so
 				// concurrent reservations cannot overshoot.
 				let reserved = self.reserved.fetch_add(wanted, Ordering::Relaxed);
@@ -125,13 +135,8 @@ impl MemoryBudget {
 					self.reserved.fetch_sub(wanted, Ordering::Relaxed);
 					Err(ReserveError::OverBudget { limit, reserved, wanted })
 				}
-			}
-			None => {
-				// Unbounded: reserve succeeds but we still account for it.
-				self.reserved.fetch_add(wanted, Ordering::Relaxed);
-				Ok(Reservation { bytes: wanted, reserved: self.reserved.clone() })
-			}
-		}
+			},
+		)
 	}
 }
 
@@ -308,12 +313,12 @@ mod tests {
 
 	#[test]
 	fn parse_override_returns_some_for_a_positive_integer() {
-		assert_eq!(parse_override(Some("1073741824")), Some(1073741824));
+		assert_eq!(parse_override(Some("1073741824")), Some(1_073_741_824));
 	}
 
 	#[test]
 	fn parse_override_accepts_surrounding_whitespace() {
-		assert_eq!(parse_override(Some("  1073741824  ")), Some(1073741824));
+		assert_eq!(parse_override(Some("  1073741824  ")), Some(1_073_741_824));
 	}
 
 	// -- cgroup_limit_from -----------------------------------------------------
@@ -328,7 +333,7 @@ mod tests {
 
 	#[test]
 	fn cgroup_limit_from_returns_some_for_a_positive_integer() {
-		assert_eq!(cgroup_limit_from(Some("1073741824")), Some(1073741824));
+		assert_eq!(cgroup_limit_from(Some("1073741824")), Some(1_073_741_824));
 	}
 
 	// -- combine ---------------------------------------------------------------
@@ -354,7 +359,7 @@ mod tests {
 		let base = Path::new(dir.path());
 		// Write v2 memory.max.
 		std::fs::write(base.join("memory.max"), "4294967296");
-		assert_eq!(read_cgroup_limit_at(base), Some(4294967296));
+		assert_eq!(read_cgroup_limit_at(base), Some(4_294_967_296));
 	}
 
 	#[test]
@@ -364,7 +369,7 @@ mod tests {
 		// Write v1 memory.limit_in_bytes.
 		std::fs::create_dir(base.join("memory"));
 		std::fs::write(base.join("memory").join("memory.limit_in_bytes"), "8589934592");
-		assert_eq!(read_cgroup_limit_at(base), Some(8589934592));
+		assert_eq!(read_cgroup_limit_at(base), Some(8_589_934_592));
 	}
 
 	#[test]
@@ -380,23 +385,24 @@ mod tests {
 		// A directory cannot hold a limit: `is_file` refuses it, and the v1
 		// fallback still answers. A limit read from a non-file would be a bug
 		// that only a container with a bind-mounted directory would show.
-		let dir = tempdir().expect("temp dir");
+		let dir = TempDir::new().unwrap();
 		std::fs::create_dir_all(dir.path().join("memory")).expect("v1 dir");
 		std::fs::create_dir(dir.path().join("memory.max")).expect("v2 non-file");
 		std::fs::write(dir.path().join("memory").join("memory.limit_in_bytes"), "536870912\n").expect("v1 limit");
-		assert_eq!(read_cgroup_limit_at(dir.path()), Some(536870912));
+		assert_eq!(read_cgroup_limit_at(dir.path()), Some(536_870_912));
 	}
 
 	#[test]
 	fn current_usage_at_reads_v2_then_v1() {
-		let dir = tempdir().expect("temp dir");
+		let dir = TempDir::new().unwrap();
 		std::fs::write(dir.path().join("memory.current"), "1048576\n").expect("v2 usage");
-		assert_eq!(current_usage_at(dir.path()), Some(1048576));
-		let other = tempdir().expect("temp dir");
+		assert_eq!(current_usage_at(dir.path()), Some(1_048_576));
+		let other = TempDir::new().unwrap();
 		std::fs::create_dir_all(other.path().join("memory")).expect("v1 dir");
 		std::fs::write(other.path().join("memory").join("memory.usage_in_bytes"), "2097152\n").expect("v1 usage");
-		assert_eq!(current_usage_at(other.path()), Some(2097152));
-		assert_eq!(current_usage_at(tempdir().expect("empty temp dir").path()), None);
+		assert_eq!(current_usage_at(other.path()), Some(2_097_152));
+		let empty = TempDir::new().unwrap();
+		assert_eq!(current_usage_at(empty.path()), None);
 	}
 
 	#[test]
