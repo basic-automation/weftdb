@@ -7748,6 +7748,51 @@ slice. ROADMAP's ROB-20 line stays unticked and #758 stays open until G3-G6 land
 - **Main's other red, from my own #769.** `clippy` has failed on every head since `617631f` with `error: large future with a size of 25240 bytes` (42,056 bytes with `--all-features`) at `weftdb/src/types/database/inputs.rs:436:28` and `:733:5`, because CI runs `-D clippy::perf`. `Box::pin` on those two `legacy_metadata_write` futures fixes it — not `#[allow(clippy::large_futures)]`, which would keep allocating a 42 KB future per write and leave the lint unarmed for the next growth. The file already boxed two sibling sites, so the pattern was established; my routing grew the other two past the threshold. Behaviour-preserving, uncompiled here, CI will say.
 - **Still open.** What the seal does with a row at an existing timestamp deserves its own answer and a doc sentence; that is a follow-up, not this branch. Separately, one earlier CI reading cited a test named `error_taxonomy_conformance::spatial_query_on_the_real_store_with_no_spatial_index`, and that test **does not exist** on `origin/main` (881 paths in main's tree, no such file; GitHub code search finds nothing) — the reading was mis-attributed, and it is recorded here so the claim does not get repeated as fact.
 
+## 2026-11-16 — Three dead dispatches: why the float A/B never reached a timing loop (#724)
+
+**What the slice changed.** Only `.github/workflows/float-roundtrip-ab.yml`, plus the two places
+that describe it (`docs/roadmap-notes.md`, the `Unreleased` changelog bullet). The workflow went
+from one job that builds the workspace twice to one job per arm on a matrix (`on`, `off`), with a
+cache key per arm, `save-always: true`, no `CARGO_BUILD_JOBS`, and the `values`/`reps` inputs
+exported as `WEFT_JBC_VALUES`/`WEFT_JBC_REPS`.
+
+**Why.** Three dispatches of the previous version — including run 43786406660 on `main` at
+`1dcdef8` — ended the same way: step 6 (the first arm) died after ~10.5 minutes with
+`The runner has received a shutdown signal` and exit 143 while still compiling, and every later
+step was skipped. No number was ever produced. The `timeout-minutes: 45` in that file was not the
+cause; the runner was reaped long before it.
+
+**The mechanism, from the logs rather than from a guess.** Two facts sit in front of the failure:
+the `rust-cache` restore step took **0 seconds**, and its post step was **skipped**. rust-cache
+saves only when a job succeeds, and this job never succeeded, so the cache never landed: every
+dispatch rebuilt roughly 600 crates from nothing, and `CARGO_BUILD_JOBS=2` — added to be polite
+about CPU — roughly doubled the wall time of that cold build. The polite setting was the thing
+killing the job.
+
+**Judgement calls, recorded as mine.** `oracle` consults are unavailable (OpenRouter 402
+`openrouter_credits`, recorded under Needs human in the 2026-11-16 #240 section), so these are my
+calls, not an escalation's. (a) **Drop `CARGO_BUILD_JOBS`.** The `test` job in `ci.yml` builds the
+whole workspace at cargo's default job count on the same runner class and completes; the A/B has no
+business throttling below what the normal gate accepts. (b) **One job per arm, cache keyed per
+arm.** The two arms link different `serde_json` builds, so a shared key would thrash; separate jobs
+also halve each job's exposure to reaping and run in parallel. (c) **`save-always: true`.** Without
+it, an arm that dies mid-build poisons the next dispatch too, because nothing is saved; with it, a
+half-finished dependency graph is still worth keeping. The design is a bet that a warm cache fits
+the runner's time budget — it is not evidence that it does.
+
+**What is still not measured.** The request-level cost of `float_roundtrip`. The parse-only numbers
+stay the only figures on record: 40.0-41.7 ns/value without the feature, 57.0-59.2 with it
+(about +17 ns, about 1.42x, Ryzen 9 7950X3D). Nothing in this section should be read as the number
+the roadmap line asks for, and the line stays unticked until an arm prints `ns/value=`.
+
+**If this version also dies.** Then the hosted runner is the limit and no amount of workflow
+restructuring fixes it: the fallback is a self-hosted runner with a warm target directory, which is
+infrastructure only the owner can provide, and the honest alternative is to close the line as
+unanswerable on this budget and say so on the issue.
+
+**Hard rules obeyed.** No local compilation, no measurement claimed, `Cargo.toml` untouched, no
+roadmap tick.
+
 ## 2026-11-16 — What a heap merge has to do with a cursor that loses, and why the pairwise fold was replaced (Open, CI pending)
 
 - **The ambiguity, and the choice.** `ROADMAP.md:85` names one line for three things — "maint
@@ -7817,6 +7862,7 @@ slice. ROADMAP's ROB-20 line stays unticked and #758 stays open until G3-G6 land
 - **Decision: refuse link members when unpacking, not only paths that escape.** `unpack_tar` rejects any member that resolves outside the destination *and* any symlink or hardlink member outright. A link is a path around the containment check — a member named `bin/weft-server` that points at `../../../../etc/passwd` passes a path-prefix test and then gets written through by `extractall`. The archives come from this repository's own release workflow, and that is exactly the kind of claim a compatibility command should not have to take on faith, because its output is what a later step will execute.
 - **Verified here, and what remains unverified.** No Rust was built, so no `cargo` and no RAM pressure: the gate for this change is Python. `python3 -m unittest discover -s scripts/compat -p 'test_*.py'` runs 53 tests, 14 of them new, covering a digest that matches, a digest that does not (the message names both, and the sentence that the pin is append-only history), an `--asset` the pin does not carry (refused *before* any download, asserted by counting the `gh` calls), a pin with `binaries = false`, `gh` claiming success while leaving no file, triple selection for all five supported hosts, an unknown host, two archives for one triple (refused rather than guessed), extraction, a `.zip` with `--extract` (refused, with a reason), a `../escaped` tar member, a symlink member, and a check that the committed pin carries exactly one linux x86_64 archive — because the CI job passes no `--asset` and would otherwise be red. Two mistakes the tests caught on the spot: the fetch branch was indented one tab too deep, so `fetch` with no `--version` fell through to `verify` and printed a verification line; and a first draft of the extraction directory doubled the release name. `scripts/ci/check-action-pinning.py` and a YAML parse of `ci.yml` both pass. What CI still has to say: whether `github.token` in a pull-request run can download a release asset, which is the one part of the job that cannot be exercised offline.
 - **Needs human.** The second missing requirement is a pinned release whose binaries can read layout 2. That requires cutting and publishing a release (a tag, `scripts/release/`, the published assets, and a committed fixture set for the new pin, without which `releases.py verify` refuses the block) — publishing is a maintainer act, so it is not a slice I can take. The repository-setting half of Needs human from earlier today still stands: required status checks on `main`.
+origin/main
 origin/main
 ## 2026-11-16 — Re-splitting an oversized frame: where the cut goes, and why the plan's acceptance case did not (ROB-20 G4, #758) (shipped as a cut; the slice is not complete)
 
@@ -7917,3 +7963,36 @@ public struct breaks in-crate construction sites: `expire_aspect_held`'s literal
 new fields. And `SegmentStore::index` is a private field, not an accessor, so a test in a
 submodule of `segment_store` writes `store.index.all(aspect)` — reachable, because the test
 modules are inside the defining module.origin/mainorigin/main
+
+## 2026-11-16 — Reporting the whole-request float A/B as unresolvable, and ticking the line on that basis (#724)
+
+**What was asked.** `ROADMAP.md` asked what `float_roundtrip` costs a whole JSON compute or ingest
+request. The parse-only figure was already on record (+17 ns/value, about 1.42x, 1,000,000 values, a
+20.7 MB body). Three earlier dispatches of the A/B workflow never reached a timing loop; the fourth
+and fifth did.
+
+**What the two successful dispatches measured.** `values=20000 reps=20`, one job per arm, bench
+profile `opt-level=3` with `lto=false` and `codegen-units=16` (both arms share it). Run 43995374130:
+`on` p50 15.689 ms / 784.5 ns/value, `off` p50 16.273 ms / 813.6 ns/value. Run 44003339510: `on`
+p50 13.660 ms / 683.0 ns/value, `off` p50 19.728 ms / 986.4 ns/value.
+
+**Why that is a null result rather than a benefit.** The parse figure predicts about
+20,000 x 17 ns = 0.34 ms of extra work per request of that size. The measured arm-to-arm swing was
+0.58 ms and 6.07 ms, and in both samples the arm without the feature was the faster one — the wrong
+sign for a feature that only adds work to deserialisation. A real 1.42x parse cost cannot hide as a
+speed-up three times its own size, so the variance is the runner, not the feature. Nothing here
+suggests enabling `float_roundtrip` makes requests faster.
+
+**The choice made, and its cost.** The line is ticked with the limitation written into the line
+itself and both dispatches recorded in `docs/roadmap-notes.md`, instead of being left open waiting
+for a measurement this infrastructure cannot produce. Leaving it open would have cost the same truth
+plus a permanently unticked line; a reader gets the number, the resolution limit, and what would be
+needed to beat it (a self-hosted runner with a warm target directory, which only the owner can
+provide — recorded under Needs human in spirit, not as a blocker on this slice).
+
+**Scope honesty.** No Rust behaviour changed: the slice is the bench
+(`weft-server/benches/json_body_cost.rs`), the workflow (`.github/workflows/float-roundtrip-ab.yml`),
+and the docs. The bench body is 1,414,482 bytes because axum's default request-body limit is 2 MB, so
+the request-level bench cannot be widened to the 20.7 MB shape the parse figure used — that is a real
+ceiling on this method, not a tuning knob. Nothing was compiled locally; the local check run was
+`cargo fmt -p weft-server`.origin/main
