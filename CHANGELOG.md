@@ -18,13 +18,27 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   is now a thin wrapper passing `SQUASH_TARGET_ROWS`. The duplicate gate calls at the two
   `capture_measurement`-side call sites in `inputs.rs` were removed — they moved into the
   bulk path.
-- **A refused maintenance plan has its own HTTP answer (#764).**- **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**
+- **A refused maintenance plan has its own HTTP answer (#764).**- **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**- **`WEFT_MEMORY_BUDGET_BYTES` and the cgroup limit are now read and held (#788).**
+Where the server could previously only bound a request's body bytes, it now knows the memory
+ceiling it runs under: `weft-server/src/memory_budget.rs` reads cgroup v2 `memory.max`, falls
+back to v1 `memory/memory.limit_in_bytes`, and treats `max`, a missing file and an unreadable
+file as *unbounded* rather than as a reason to deny everything. The operator's override is
+combined as `min(override, cgroup)`, because an override above the kernel's ceiling is not
+something the process can honour. `MemoryBudget` carries that limit plus one shared counter of
+bytes reserved in flight, and a `Reservation` guard releases its bytes on `Drop` so a panic
+cannot leak the count. Nothing is refused in this cut: reading, exposing and accounting land
+first, so the refusal (503 `over_budget` with `details.kind` of `memory`) comes in cut 2 and the
+roadmap line stays open until then.
+- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**- **A refused maintenance plan has its own HTTP answer (#764).**- **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**
+origin/main
+origin/main
   Store-wide maintenance sweeps — threshold reconcile, hot/cold reconcile, squash over threshold,
   squash to target rows, many-aspect squash — check a per-sweep deadline between components, groups,
   series and aspects. When the deadline passes, the sweep stops before the next swap, marks its
   [`cancelled`](weftdb::ReconcileSweep::cancelled) field `true`, and reports what it accomplished
   so far. An already-committed swap is never aborted. Set via the environment variable
   `WEFT_MAINTENANCE_MAX_OP_SECONDS` (Tier::Experimental); unset or `0` means unbounded.
+origin/main
 - **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**
 origin/main
 Where `expiry_sweep` only counts, the purge acts: a segment every row of which is older
