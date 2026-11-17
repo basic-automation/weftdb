@@ -16,7 +16,19 @@ on the store. When the policy is `NoExpiry` (the default) the call returns cheap
 no work; when a TTL is configured, the frames every row of which is past the cutoff are
 removed from the index and retired to the reaper. A frame that straddles the cutoff is
 left alone and counted. Failures follow the same WARN-per-aspect and breaker-skip idiom
-as the other sweeps.- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**- **A refused maintenance plan has its own HTTP answer (#764).**- **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**
+as the other sweeps.- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**- **A refused maintenance plan has its own HTTP answer (#764).**- **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**- **`WEFT_MEMORY_BUDGET_BYTES` and the cgroup limit are now read and held (#788).**
+Where the server could previously only bound a request's body bytes, it now knows the memory
+ceiling it runs under: `weft-server/src/memory_budget.rs` reads cgroup v2 `memory.max`, falls
+back to v1 `memory/memory.limit_in_bytes`, and treats `max`, a missing file and an unreadable
+file as *unbounded* rather than as a reason to deny everything. The operator's override is
+combined as `min(override, cgroup)`, because an override above the kernel's ceiling is not
+something the process can honour. `MemoryBudget` carries that limit plus one shared counter of
+bytes reserved in flight, and a `Reservation` guard releases its bytes on `Drop` so a panic
+cannot leak the count. Nothing is refused in this cut: reading, exposing and accounting land
+first, so the refusal (503 `over_budget` with `details.kind` of `memory`) comes in cut 2 and the
+roadmap line stays open until then.
+- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**- **A refused maintenance plan has its own HTTP answer (#764).**- **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**
+origin/main
 origin/main
   Store-wide maintenance sweeps — threshold reconcile, hot/cold reconcile, squash over threshold,
   squash to target rows, many-aspect squash — check a per-sweep deadline between components, groups,
