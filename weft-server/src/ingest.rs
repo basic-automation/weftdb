@@ -477,6 +477,18 @@ impl FromRequest<AppState> for IngestBody {
 		if let Some(store) = state.store() {
 			reserve_disk(store, reserved_bytes)?;
 		}
+		// Phase 1b — memory budget. The same `reserved_bytes` (the declared
+		// Content-Length, or the body cap when the body is chunked) bounds what
+		// the server must buffer while it reads. The reservation is taken before
+		// a single body byte is read, so an over-budget request refuses without
+		// first paying for the buffering it is refusing to do (ROB-14 cut 2), and
+		// it is held for the body's whole lifetime.
+		let memory_guard = match state.memory_budget().try_reserve(reserved_bytes) {
+			Ok(guard) => Some(guard),
+			Err(_err) => {
+				return Err(ApiError::new(error::Code::OverBudget, "the memory budget is exhausted; retry after in-flight requests complete").with_retry_after(1));
+			}
+		};
 		// Phase 2 — read the whole body under one total deadline. The
 		// routes' `DefaultBodyLimit` layer stays as the transport's own
 		// bound; this read enforces the same cap in the envelope, as
@@ -514,16 +526,6 @@ impl FromRequest<AppState> for IngestBody {
 		if let Some(err) = check_body_truncation(&body, declared) {
 			return Err(err);
 		}
-		// Phase 1b — memory budget. The same `reserved_bytes` (the declared
-		// Content-Length or the body cap) bounds what the server must
-		// buffer in memory while reading the body. The reservation is held
-		// for the body's lifetime (ROB-14 cut 2).
-		let memory_guard = match state.memory_budget().try_reserve(reserved_bytes) {
-			Ok(guard) => Some(guard),
-			Err(_err) => {
-				return Err(ApiError::new(error::Code::OverBudget, "the memory budget is exhausted; retry after in-flight requests complete").with_retry_after(1));
-			}
-		};
 		Ok(Self { bytes: body, reserved_bytes, _memory_guard: memory_guard })
 	}
 }

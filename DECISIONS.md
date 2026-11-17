@@ -8145,3 +8145,37 @@ historical counts written as words so the checker's digit scan cannot mistake th
 claims — and the schema version stayed at 2, since adding a variable changes what may be set, not
 the shape of the schema. **A failing gate is answered by changing what is checked, never the
 checker.**origin/mainorigin/mainorigin/main
+
+## 2026-11-17 — Where a memory reservation is taken matters more than its size (ROB-14 cut 2) (resolved)
+
+Cut 2 wires `MemoryBudget` into the request paths. Three judgement calls from the review of PR #805:
+
+- **The ingest reservation moved ahead of the body read.** `reserved_bytes` is known
+  from `content-length` (or the `WEFT_MAX_INGEST_BYTES` cap) before a single byte is
+  read, so `state.memory_budget().try_reserve(reserved_bytes)` now sits next to
+  `reserve_disk`, not after `check_body_truncation`. Reserving after the read would
+  only ever notice the pressure once the bytes were already in the process — which is
+  the failure this cut exists to prevent. The guard still lives for the body's whole
+  lifetime through `IngestBody::_memory_guard`.
+- **Downsample reserves against the grid the request declares, before the read.** When
+  both bounds are named, the bucket count is already refused against
+  `WEFT_MAX_DOWNSAMPLE_BUCKETS` at that point, so the same number reserves memory and
+  the guard covers bucket construction *and* serialization. A window naming neither
+  bound has no declared grid, so it is still accounted only on the count the reduction
+  actually produces — too late to bound the build, in time for the response body. That
+  asymmetry is deliberate: refusing an unbounded window on a number the client never
+  sent would break the documented contract, and the existing bucket cap plus
+  `WEFT_READ_TIMEOUT_SECS` are what hold that case.
+- **Budget tests must assert the counter, not only the status.** `oneshot` requests run
+  one at a time, so a read that succeeded has already released its reservation before
+  the next request arrives: a test that "fills the budget" with a sequential read and
+  then expects the next one to be refused proves nothing about contention. The helper
+  now hands the `MemoryBudget` back to the test, which holds it with
+  `try_reserve(64)` and asserts `reserved()` before and after — including that a
+  refused read leaves only the hold accounted, i.e. its own reservation rolled back.
+
+Left open on purpose: the reservation is an estimate (`ESTIMATED_BYTES_PER_ROW = 64`,
+`read_limits::ESTIMATED_BYTES_PER_ROW`), and per-format serialization cost (Arrow, CSV,
+JSON) is not accounted; the guard covers the response object, not the encoder's
+scratch. A cut that measured encoder peaks would need per-format cost tables that do
+not exist yet.

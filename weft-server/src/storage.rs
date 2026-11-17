@@ -1309,9 +1309,18 @@ pub(crate) async fn storage_downsample_inner(state: AppState, aspect: &str, para
 	// refused before any segment is opened (ROB-12). A request that names neither is
 	// not refusals on a number it never gave: its grid is checked on the count the
 	// reduction actually produces, below.
+	// A request that names both bounds states its own grid, so an impossible one is
+	// refused before any segment is opened (ROB-12), and that same number is what the
+	// container memory budget reserves against (ROB-14 cut 2): the guard is taken
+	// before the read and held until the response is handed back, so the buckets are
+	// accounted while they are built and while they are serialized. A request that
+	// names neither bound is not refused on a number it never gave: its grid is
+	// checked, and reserved, on the count the reduction actually produces, below.
+	let mut mem_guard = None;
 	if let (Some(start), Some(end)) = (params.start, params.end) {
 		let grid = read_limits::grid_buckets(i128::from(bound_nanos(start)?), i128::from(bound_nanos(end)?), width.step_nanos());
 		limits.check_downsample_buckets(grid)?;
+		mem_guard = reserve_read_memory(&budget, usize::try_from(grid).unwrap_or(usize::MAX))?;
 	}
 
 	let target = resolve_target(&store, aspect, selector).await?;
@@ -1338,7 +1347,7 @@ pub(crate) async fn storage_downsample_inner(state: AppState, aspect: &str, para
 	// The grid that was actually produced, which is what an unbounded window's cap has
 	// to go on — and the last chance to refuse before the buckets are serialized.
 	limits.check_downsample_buckets(u128::try_from(response.buckets).unwrap_or(u128::MAX))?;
-	let _mem_guard = reserve_read_memory(&budget, response.buckets)?;
+	let _mem_guard = mem_guard.map_or_else(|| reserve_read_memory(&budget, response.buckets), |guard| Ok(Some(guard)))?;
 	Ok(response)
 }
 
@@ -2615,39 +2624,46 @@ mod tests {
 
 	/// Build a router whose state carries a sealed price store **and** a tiny
 	/// memory budget. We use state construction (not env mutation) so the test
-	/// does not need .
-	async fn router_with_tight_budget() -> (TempDir, axum::Router) {
+	/// does not need the `WEFT_MEMORY_BUDGET_BYTES` override or a process env.
+	async fn router_with_tight_budget() -> (TempDir, axum::Router, MemoryBudget) {
 		let dir = TempDir::new().expect("temp dir");
 		let store = sealed_price_store(&dir).await;
 		// A 64-byte budget means a single point read (1 row x 64 bytes/row) just
-		// fits, but a second concurrent read or a multi-point read with 2+ rows is
-		// refused.
+		// fits, and nothing else does: a multi-point read with 2+ rows, or any
+		// read taken while the budget is already held, is refused.
 		let budget = MemoryBudget::new(Some(64));
-		let state = AppState::new().with_store(store).with_memory_budget(budget);
-		(dir, app_with_state(state))
+		let state = AppState::new().with_store(store).with_memory_budget(budget.clone());
+		(dir, app_with_state(state), budget)
 	}
 
 	#[tokio::test]
 	async fn read_refuses_when_budget_exhausted_and_recovers_after_drop() {
-		let (_dir, router) = router_with_tight_budget().await;
+		let (_dir, router, budget) = router_with_tight_budget().await;
 
-		// First read: a single point at t=120 fits in 64 bytes (1 x 64).
+		// First read: a single point at t=120 fits in 64 bytes (1 x 64), and its
+		// guard is released when the handler returns — the counter says so.
 		let (status, body) = get_json(router.clone(), "/api/v1/storage/price/at?t=120").await;
 		assert_eq!(status, StatusCode::OK, "first read within budget should succeed");
 		assert_eq!(body["value"], "3.5");
+		assert_eq!(budget.reserved(), 0, "a completed read releases its reservation");
 
-		// Second read: a multi-point of 3 rows (3 x 64 = 192) exceeds
-		// the 64-byte budget. The reservation is made *before* the check_rows
-		// / drop(store), so the route answers 503 over_budget.
+		// Second read: a multi-point of 3 rows (3 x 64 = 192) exceeds the
+		// 64-byte budget, and a reservation of our own holds the whole budget as
+		// well, so the refusal cannot be a fluke of the limit alone. The
+		// reservation is made *before* the check_rows / drop(store), so the route
+		// answers 503 over_budget.
+		let hold = budget.try_reserve(64).expect("the hold is the whole budget");
 		let response = router.clone().oneshot(Request::builder().uri("/api/v1/storage/price/at-multi?t=100,110,120").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "over-budget read must refuse");
+		assert_eq!(budget.reserved(), 64, "the refused read must leave only the hold accounted — its own reservation rolled back");
 		assert!(response.headers().contains_key("retry-after"), "over-budget refusal must carry Retry-After");
 		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
 		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
 		assert_eq!(json["code"], "over_budget", "refusal must use the over_budget wire code");
 
-		// Third read: the first read's guard has dropped (it was scoped to the
-		// response), so budget is available again.
+		// Third read: the hold is released, so the budget is available again.
+		drop(hold);
+		assert_eq!(budget.reserved(), 0, "releasing the hold empties the accounting");
 		let (status, body) = get_json(router.clone(), "/api/v1/storage/price/at?t=140").await;
 		assert_eq!(status, StatusCode::OK, "after the guard drops the next read must succeed");
 		assert_eq!(body["value"], "5.5");
@@ -2664,14 +2680,12 @@ mod tests {
 
 	#[tokio::test]
 	async fn budget_exhaustion_is_distinct_from_admission_shed() {
-		let (_dir, router) = router_with_tight_budget().await;
+		let (_dir, router, budget) = router_with_tight_budget().await;
 
-		// Make one read to consume the budget (1 x 64 = 64 bytes).
-		let (status, _body) = get_json(router.clone(), "/api/v1/storage/price/at?t=100").await;
-		assert_eq!(status, StatusCode::OK, "first read fills the budget");
-
-		// Now the budget is exhausted but admission shedding is not active.
-		// A second read should fail with over_budget, not overloaded.
+		// Hold the whole budget from outside the request path, so the next read
+		// must refuse on memory. The admission shedder is not involved: its own
+		// limits are nowhere near exhausted here, and it reports `overloaded`.
+		let _hold = budget.try_reserve(64).expect("the hold is the whole budget");
 		let response = router.clone().oneshot(Request::builder().uri("/api/v1/storage/price/at?t=110").body(Body::empty()).unwrap()).await.unwrap();
 		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
