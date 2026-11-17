@@ -26,13 +26,25 @@
 //! (rows at exactly `now` are preserved). The default is `NoExpiry`, which preserves all
 //! rows regardless of age.
 //!
-//! ## Sweep behaviour
+//! ## Two passes: counting, and dropping what no read can reach
 //!
-//! The sweep is **idempotent**: a second pass finds nothing to expire. It reports what it
-//! dropped via [`ExpirySweep`]. A TTL smaller than the segment close window must not
-//! delete data a recent-window query still needs — cut 1 keeps the sweep
-//! **report-only** (`dry_run` / `completed` but no physical deletion), which is
-//! acceptable and cheaper than a physical-drop sweep that could delete needed data.
+//! [`SegmentStore::expiry_sweep`](super::SegmentStore::expiry_sweep) counts expired rows and
+//! removes nothing. It is the safe default, and a store that only ever runs it keeps every
+//! byte it has ever written.
+//!
+//! [`SegmentStore::purge_expired`](super::SegmentStore::purge_expired) goes further and
+//! **removes segments from the store**. It drops a segment only when its recorded extent ends
+//! strictly before the cutoff, which is the condition under which no read that respects the
+//! TTL can return any of its rows: the index row goes, the frame is journaled `'retired'`, and
+//! the reaper unlinks it. A segment holding both expired and live rows is **left alone** and
+//! counted in [`partial_segments`](ExpirySweep::partial_segments) - rewriting a frame that
+//! also holds live rows is a separate change - so a TTL shorter than a segment's span leaves
+//! residue on disk. That residue is invisible to reads and visible to `du`. The second pass
+//! exists so the caller decides whether residue it cannot read is acceptable, rather than a
+//! policy enum implying that it is.
+//!
+//! Like every other maintenance pass, a purge needs the aspect's lock: an aspect it could not
+//! take is reported in [`busy`](ExpirySweep::busy) rather than waited for.
 
 use weft_physical_type::timestamp::TimeUnit;
 
@@ -117,8 +129,14 @@ pub fn expired_cutoff(policy: &RowExpiryPolicy, now_ns: i64, unit: &TimeUnit) ->
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AspectExpirySwept {
-	/// Number of rows the sweep found expired and would delete (cut 1: report-only).
+	/// Rows the pass found expired. A purge counts the rows of the segments it dropped *and*
+	/// the rows inside the segments it left alone, so the figure means "rows the TTL hides",
+	/// not "rows this pass deleted".
 	pub rows_expired: u64,
+	/// Segments removed from the store. Always 0 for the report-only sweep.
+	pub segments_dropped: u64,
+	/// Segments holding both expired and live rows, which a purge leaves on disk.
+	pub partial_segments: u64,
 	/// Oldest (minimum) timestamp of an expired row, if any were found.
 	pub oldest_expired_ts: Option<i64>,
 	/// Newest (maximum) timestamp of an expired row, if any were found.
@@ -131,7 +149,7 @@ pub struct AspectExpirySwept {
 impl Default for AspectExpirySwept {
 	/// A successful pass with nothing to expire.
 	fn default() -> Self {
-		Self { rows_expired: 0, oldest_expired_ts: None, newest_expired_ts: None, completed: true }
+		Self { rows_expired: 0, segments_dropped: 0, partial_segments: 0, oldest_expired_ts: None, newest_expired_ts: None, completed: true }
 	}
 }
 
@@ -149,12 +167,16 @@ pub struct ExpirySweep {
 	pub failed: Vec<(String, anyhow::Error)>,
 	/// Total rows counted as expired across all aspects.
 	pub rows_expired: u64,
+	/// Total segments removed across all aspects. 0 for the report-only sweep.
+	pub segments_dropped: u64,
+	/// Total segments holding both expired and live rows across all aspects.
+	pub partial_segments: u64,
 }
 
 impl Default for ExpirySweep {
 	/// Empty sweep (no aspects scanned, nothing expired).
 	fn default() -> Self {
-		Self { aspects_cleaned: Vec::new(), busy: Vec::new(), failed: Vec::new(), rows_expired: 0u64 }
+		Self { aspects_cleaned: Vec::new(), busy: Vec::new(), failed: Vec::new(), rows_expired: 0u64, segments_dropped: 0u64, partial_segments: 0u64 }
 	}
 }
 

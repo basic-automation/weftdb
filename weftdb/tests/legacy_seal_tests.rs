@@ -232,3 +232,39 @@ async fn seal_backed_new_measurement_entry_points_reach_the_seal() -> Result<()>
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
 	Ok(())
 }
+
+/// `capture_measurement_chunk` was the remaining entry point that did not route
+/// to the seal store on a seal-backed aspect (#779 follow-up for the #232 class).
+/// Without the fix, a chunk written through this path lands in the per-aspect
+/// rows-mode `measurements.db` where no seal-backed read can find it.
+#[serial]
+#[tokio::test]
+async fn seal_backed_capture_measurement_chunk_reaches_the_seal() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "sealed_chunk", &splimes::Resolution::Milliseconds, None).await?.id();
+	assert_eq!(db.aspect_storage_mode(&aspect_id).await?, StorageMode::Segments, "the aspect is created seal-backed");
+
+	let base = Utc.with_ymd_and_hms(2024, 4, 1, 0, 0, 0).unwrap();
+	let base_ms = base.timestamp_millis();
+	let rows: Vec<InputMeasurement> = (0..10).map(|i| InputMeasurement::new(base + Duration::seconds(i), bd(&format!("{i}.0")))).collect();
+
+	// This entry point writes a chunk through the seal store when the aspect
+	// is seal-backed (#779). Before the fix it wrote to rows-mode measurements.db
+	// and the count was 0 after this call, because reads go to the seal.
+	let tx_ids = db.capture_measurement_chunk(&aspect_id, DatasetId::new(), &rows).await?;
+	assert_eq!(tx_ids.len(), 10, "one synthetic TxId per row");
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 10, "the chunk reached the seal store that reads consult");
+
+	// The rows are in the seal frames, not in rows-mode bricks that no read will touch.
+	let store = db.seal_store().await?;
+	let sealed = weftdb::legacy_seal::read_rows(&store, &aspect_id, None, None).await?;
+	drop(store);
+	for i in 0..10 {
+		assert!(sealed.contains(&(base_ms + i64::from(i) * 1000, bd(&format!("{i}.0")))), "row {i} is in the seal frames");
+	}
+
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}

@@ -7748,6 +7748,51 @@ slice. ROADMAP's ROB-20 line stays unticked and #758 stays open until G3-G6 land
 - **Main's other red, from my own #769.** `clippy` has failed on every head since `617631f` with `error: large future with a size of 25240 bytes` (42,056 bytes with `--all-features`) at `weftdb/src/types/database/inputs.rs:436:28` and `:733:5`, because CI runs `-D clippy::perf`. `Box::pin` on those two `legacy_metadata_write` futures fixes it — not `#[allow(clippy::large_futures)]`, which would keep allocating a 42 KB future per write and leave the lint unarmed for the next growth. The file already boxed two sibling sites, so the pattern was established; my routing grew the other two past the threshold. Behaviour-preserving, uncompiled here, CI will say.
 - **Still open.** What the seal does with a row at an existing timestamp deserves its own answer and a doc sentence; that is a follow-up, not this branch. Separately, one earlier CI reading cited a test named `error_taxonomy_conformance::spatial_query_on_the_real_store_with_no_spatial_index`, and that test **does not exist** on `origin/main` (881 paths in main's tree, no such file; GitHub code search finds nothing) — the reading was mis-attributed, and it is recorded here so the claim does not get repeated as fact.
 
+## 2026-11-16 — Three dead dispatches: why the float A/B never reached a timing loop (#724)
+
+**What the slice changed.** Only `.github/workflows/float-roundtrip-ab.yml`, plus the two places
+that describe it (`docs/roadmap-notes.md`, the `Unreleased` changelog bullet). The workflow went
+from one job that builds the workspace twice to one job per arm on a matrix (`on`, `off`), with a
+cache key per arm, `save-always: true`, no `CARGO_BUILD_JOBS`, and the `values`/`reps` inputs
+exported as `WEFT_JBC_VALUES`/`WEFT_JBC_REPS`.
+
+**Why.** Three dispatches of the previous version — including run 43786406660 on `main` at
+`1dcdef8` — ended the same way: step 6 (the first arm) died after ~10.5 minutes with
+`The runner has received a shutdown signal` and exit 143 while still compiling, and every later
+step was skipped. No number was ever produced. The `timeout-minutes: 45` in that file was not the
+cause; the runner was reaped long before it.
+
+**The mechanism, from the logs rather than from a guess.** Two facts sit in front of the failure:
+the `rust-cache` restore step took **0 seconds**, and its post step was **skipped**. rust-cache
+saves only when a job succeeds, and this job never succeeded, so the cache never landed: every
+dispatch rebuilt roughly 600 crates from nothing, and `CARGO_BUILD_JOBS=2` — added to be polite
+about CPU — roughly doubled the wall time of that cold build. The polite setting was the thing
+killing the job.
+
+**Judgement calls, recorded as mine.** `oracle` consults are unavailable (OpenRouter 402
+`openrouter_credits`, recorded under Needs human in the 2026-11-16 #240 section), so these are my
+calls, not an escalation's. (a) **Drop `CARGO_BUILD_JOBS`.** The `test` job in `ci.yml` builds the
+whole workspace at cargo's default job count on the same runner class and completes; the A/B has no
+business throttling below what the normal gate accepts. (b) **One job per arm, cache keyed per
+arm.** The two arms link different `serde_json` builds, so a shared key would thrash; separate jobs
+also halve each job's exposure to reaping and run in parallel. (c) **`save-always: true`.** Without
+it, an arm that dies mid-build poisons the next dispatch too, because nothing is saved; with it, a
+half-finished dependency graph is still worth keeping. The design is a bet that a warm cache fits
+the runner's time budget — it is not evidence that it does.
+
+**What is still not measured.** The request-level cost of `float_roundtrip`. The parse-only numbers
+stay the only figures on record: 40.0-41.7 ns/value without the feature, 57.0-59.2 with it
+(about +17 ns, about 1.42x, Ryzen 9 7950X3D). Nothing in this section should be read as the number
+the roadmap line asks for, and the line stays unticked until an arm prints `ns/value=`.
+
+**If this version also dies.** Then the hosted runner is the limit and no amount of workflow
+restructuring fixes it: the fallback is a self-hosted runner with a warm target directory, which is
+infrastructure only the owner can provide, and the honest alternative is to close the line as
+unanswerable on this budget and say so on the issue.
+
+**Hard rules obeyed.** No local compilation, no measurement claimed, `Cargo.toml` untouched, no
+roadmap tick.
+
 ## 2026-11-16 — What a heap merge has to do with a cursor that loses, and why the pairwise fold was replaced (Open, CI pending)
 
 - **The ambiguity, and the choice.** `ROADMAP.md:85` names one line for three things — "maint
@@ -7808,6 +7853,17 @@ slice. ROADMAP's ROB-20 line stays unticked and #758 stays open until G3-G6 land
   ("requires up to 926081 tokens, but can only afford 721831"). G4 continues in
   `/mnt/deepmem/wt/p12-758-g4` on `p12/rob20-g4-resplit`, with the brief at
   `.briefs/rob20-g4-resplit.md` as the record of what that slice is meant to do.
+## 2026-11-16 — Downloading a published archive in CI, before any leg is able to run it (COMPAT #762, Done; the leg itself Needs human)
+
+- **What landed.** `scripts/compat/releases.py fetch` downloads one archive named in `compat/releases.toml`, for the runner's platform by target triple or by name with `--asset`, and refuses it unless the bytes hash to the sha256 the pin records. `--extract` unpacks a tar archive into `<dest>/<version>`. A new `pinned release archives` job in `.github/workflows/ci.yml` runs it with `--extract` and then asserts that the archive's own listing contains `weft-server`. Issue #762 is not closed: it names two more things, below.
+- **Why land a fetch when no leg uses it.** The three requirements for a binary leg were written down in `scripts/compat/test_leg_coverage.py` and in `UPGRADING.md`, and the first was a fetch command. Landing it does three things at once: it retires a stated absence with something checkable rather than with a promise; it makes the pin's digest column a tested claim on every pull request instead of a number copied from a release page (a different claim from `verify-assets`, which compares the pin with the release's own `SHA256SUMS` asset, not with the bytes that arrive); and it means the first time a runner downloads a published archive is not the day a compatibility leg is being debugged. The counter-argument — an unexercised code path, a job that costs a download per PR — is real but small: the command is 90 lines, and its tests are in the suite that already runs.
+- **Measured, not reasoned, about the v0.1.0 archive.** It was fetched for real on this machine and its digest matched the pin (`d7ff31ff…612`), which is why the job is believed to pass on `ubuntu-latest` before opening the pull request. Inside the archive: `weft-server`, `weft-bench` and `weft-tui` sit at the top level, next to `README.md` and the license and third-party-notice files — there is no `bin/`. Asked for `--version` or `--help`, the v0.1.0 `weft-server` prints its configuration banner (`interpolation: at most 10000000 output points per request…`) and **starts listening**: exit 1 here only because a local daemon already held the port. So a leg cannot ask a released binary which version it is; it must set the old server's environment, hit its HTTP endpoints, and identify it by which pin the archive came from. Recording that here is cheaper than rediscovering it inside a leg.
+- **Decision: the job never executes what it downloads.** Asserting `tar tzf | grep weft-server` and that the extracted path exists is enough for this slice. Running an old server in CI would need a store for it, a port, and a refusal policy for a process that writes into a layout-2 tree; all three belong to the leg, not to the fetch.
+- **Decision: refuse link members when unpacking, not only paths that escape.** `unpack_tar` rejects any member that resolves outside the destination *and* any symlink or hardlink member outright. A link is a path around the containment check — a member named `bin/weft-server` that points at `../../../../etc/passwd` passes a path-prefix test and then gets written through by `extractall`. The archives come from this repository's own release workflow, and that is exactly the kind of claim a compatibility command should not have to take on faith, because its output is what a later step will execute.
+- **Verified here, and what remains unverified.** No Rust was built, so no `cargo` and no RAM pressure: the gate for this change is Python. `python3 -m unittest discover -s scripts/compat -p 'test_*.py'` runs 53 tests, 14 of them new, covering a digest that matches, a digest that does not (the message names both, and the sentence that the pin is append-only history), an `--asset` the pin does not carry (refused *before* any download, asserted by counting the `gh` calls), a pin with `binaries = false`, `gh` claiming success while leaving no file, triple selection for all five supported hosts, an unknown host, two archives for one triple (refused rather than guessed), extraction, a `.zip` with `--extract` (refused, with a reason), a `../escaped` tar member, a symlink member, and a check that the committed pin carries exactly one linux x86_64 archive — because the CI job passes no `--asset` and would otherwise be red. Two mistakes the tests caught on the spot: the fetch branch was indented one tab too deep, so `fetch` with no `--version` fell through to `verify` and printed a verification line; and a first draft of the extraction directory doubled the release name. `scripts/ci/check-action-pinning.py` and a YAML parse of `ci.yml` both pass. What CI still has to say: whether `github.token` in a pull-request run can download a release asset, which is the one part of the job that cannot be exercised offline.
+- **Needs human.** The second missing requirement is a pinned release whose binaries can read layout 2. That requires cutting and publishing a release (a tag, `scripts/release/`, the published assets, and a committed fixture set for the new pin, without which `releases.py verify` refuses the block) — publishing is a maintainer act, so it is not a slice I can take. The repository-setting half of Needs human from earlier today still stands: required status checks on `main`.
+origin/main
+origin/main
 ## 2026-11-16 — Re-splitting an oversized frame: where the cut goes, and why the plan's acceptance case did not (ROB-20 G4, #758) (shipped as a cut; the slice is not complete)
 
 - **The ambiguity, and the choice.** `docs/maintenance-budgets-plan.md:225-227` states Slice 4's acceptance test as "configure a small `max_segment_bytes`, set up an aspect with a **single giant sealed segment**, run compaction, assert the aspect now has multiple segments each below the threshold". Chose instead to re-cut the output of a **fold** — the merge/squash swap that is already writing that aspect — and to leave a segment that one seal wrote alone. The reason is legality, not scope-creep: a fold of one member into two outputs must give the second output a **fresh** segment id, and `SwapPlan` refuses that case (`weftdb/src/types/segment_store/maint.rs:794-808`, rule **P2**: a fresh id wins precedence against *every* existing id, so the new frame would hide a higher-id row that overlaps its span, which is exactly what the overlap machinery exists to fold). The plan's own risk note says the same thing from the other side — "must validate that new-id allocation stays correct under concurrent splits".
@@ -7858,6 +7914,88 @@ slice. ROADMAP's ROB-20 line stays unticked and #758 stays open until G3-G6 land
 - **Not compiled here, and not claimed.** As with every Rust slice this month, the gate is CI, not a
   local build; the local checks run were `cargo fmt --check -p weft-server`,
   `python3 scripts/config/check_schema.py` and `python3 scripts/ci/check-serial-order.py`.
+- **Not compiled here, and not claimed.** Nothing in this slice was built: the host's RAM belongs to the model server, and CI is this quarter's Rust gate. The API surface the new tests lean on was checked by grep instead — `IndexRow.desc: SegmentDescriptor` (`weftdb/src/types/index_txn.rs:99`), `SegmentDescriptor { row_count: usize, byte_len: u64 }` (`weft-physical-type/src/catalog.rs:66,85`), and a sibling test module already calling `store.index.rows(ASPECT)` (`tag_seal_tests.rs:51`) — and CI is what says whether they pass. The three store-level tests are written so the ceiling is the **only** difference between them and their control, and the control (`the_same_fold_writes_one_frame_when_the_ceiling_is_off`) is the one that fails on `main` if the change ever regresses into a no-op.inorigin/main
+## 2026-11-16 — A purge is a separate entry point, not a flag on the sweep (shipped)
+
+Issue #775, row-TTL cut 2. Cut 1 (#752) made expired rows invisible at read time and counted
+them in `expiry_sweep`, deliberately deleting nothing. This adds `SegmentStore::purge_expired`
+and `purge_aspect_held`, which delete, and two counters on the reports: `segments_dropped` and
+`partial_segments`.
+
+**Why a separate method rather than an option on `expiry_sweep`, or a new `RowExpiryPolicy`
+variant.** `RowExpiryPolicy` is not `#[non_exhaustive]`, so adding a variant or a field to
+`Ttl { ttl }` is a breaking change for a feature that is still half-finished; and a sweep that
+deletes when you pass the wrong flag is the kind of API that loses data in a daemon restart.
+Deleting is a different act with different consequences, so it gets a different name, and the
+caller chooses it.
+
+**Why only wholly expired frames are dropped.** The test is `desc.max_ts < cutoff`, which needs
+no decode. A frame that straddles the cutoff would have to be re-read, filtered and rewritten —
+which changes its id, its byte length and its sidecars, and can collide with the overlap
+precedence rules — so it is counted in `partial_segments` and left alone (cut 3). The
+consequence is stated plainly rather than papered over: **a TTL shorter than a segment's span
+leaves expired rows on disk**, hidden from every read that respects the TTL. That is a
+correctness-neutral residue and an operator-visible cost, which is why the report counts it.
+
+**Boundary.** `max_ts < cutoff`, strict. A frame whose newest row sits exactly at the cutoff has
+a row of age exactly `ttl`, which is not expired, so it must survive; the test
+`purge_keeps_a_frame_whose_newest_row_sits_exactly_at_the_cutoff` pins that. Cut 1 chose the
+same strictness in `is_row_expired`, and a `<=` here would silently delete live data.
+
+**Breaker asymmetry, on purpose.** `purge_expired` calls `breaker_record`; `expiry_sweep` does
+not. A report-only count cannot leave the store half-changed, so tripping on it would punish an
+operator for looking. A purge can fail after some plans committed, so an aspect whose purge
+keeps failing should trip its breaker and stop being retried every tick.
+
+**Partial success is reported, then the first error is returned.** Several segments in one aspect
+can be doomed at once, and they are dropped as one plan per series. If the third plan's swap
+conflicts, the first two are already committed: the return value is the error, but the counters
+name what actually left. An aspect that dropped three segments and then failed is neither a clean
+success nor a no-op, and pretending otherwise would understate what the operator's disk holds.
+
+**No new env var, no route, no settings entry.** A TTL remains store-configured through
+`SegmentStoreOptions::with_expiry`, and `from_env` still hard-codes `NoExpiry`. Cutting a
+destructive behaviour into the server surface — where a misconfigured variable deletes
+production history — waits for cut 3, which also carries the SOA-15 TTL lane that needs it.
+
+**Two mechanical notes for whoever edits this next.** Adding a field to a `#[non_exhaustive]`
+public struct breaks in-crate construction sites: `expire_aspect_held`'s literal had to gain the
+new fields. And `SegmentStore::index` is a private field, not an accessor, so a test in a
+submodule of `segment_store` writes `store.index.all(aspect)` — reachable, because the test
+modules are inside the defining module.origin/mainorigin/main
+
+## 2026-11-16 — Reporting the whole-request float A/B as unresolvable, and ticking the line on that basis (#724)
+
+**What was asked.** `ROADMAP.md` asked what `float_roundtrip` costs a whole JSON compute or ingest
+request. The parse-only figure was already on record (+17 ns/value, about 1.42x, 1,000,000 values, a
+20.7 MB body). Three earlier dispatches of the A/B workflow never reached a timing loop; the fourth
+and fifth did.
+
+**What the two successful dispatches measured.** `values=20000 reps=20`, one job per arm, bench
+profile `opt-level=3` with `lto=false` and `codegen-units=16` (both arms share it). Run 43995374130:
+`on` p50 15.689 ms / 784.5 ns/value, `off` p50 16.273 ms / 813.6 ns/value. Run 44003339510: `on`
+p50 13.660 ms / 683.0 ns/value, `off` p50 19.728 ms / 986.4 ns/value.
+
+**Why that is a null result rather than a benefit.** The parse figure predicts about
+20,000 x 17 ns = 0.34 ms of extra work per request of that size. The measured arm-to-arm swing was
+0.58 ms and 6.07 ms, and in both samples the arm without the feature was the faster one — the wrong
+sign for a feature that only adds work to deserialisation. A real 1.42x parse cost cannot hide as a
+speed-up three times its own size, so the variance is the runner, not the feature. Nothing here
+suggests enabling `float_roundtrip` makes requests faster.
+
+**The choice made, and its cost.** The line is ticked with the limitation written into the line
+itself and both dispatches recorded in `docs/roadmap-notes.md`, instead of being left open waiting
+for a measurement this infrastructure cannot produce. Leaving it open would have cost the same truth
+plus a permanently unticked line; a reader gets the number, the resolution limit, and what would be
+needed to beat it (a self-hosted runner with a warm target directory, which only the owner can
+provide — recorded under Needs human in spirit, not as a blocker on this slice).
+
+**Scope honesty.** No Rust behaviour changed: the slice is the bench
+(`weft-server/benches/json_body_cost.rs`), the workflow (`.github/workflows/float-roundtrip-ab.yml`),
+and the docs. The bench body is 1,414,482 bytes because axum's default request-body limit is 2 MB, so
+the request-level bench cannot be widened to the 20.7 MB shape the parse figure used — that is a real
+ceiling on this method, not a tuning knob. Nothing was compiled locally; the local check run was
+`cargo fmt -p weft-server`.origin/main
 
 ## 2026-11-16 — Flipping the storage-mode default, and why the roadmap's cost figure was not the gate (shipped)
 
@@ -7902,4 +8040,4 @@ project does not promise before 1.0.
 Recorded as a known limitation, not fixed: `WEFT_MAINTENANCE_MAX_SEGMENT_BYTES` (#773) re-cuts only
 folds of two or more segments, so the first frame a brand-new seal-backed aspect writes from a large bulk
 ingest can sit above that ceiling until a later fold cuts it, and #765's output budget bounds maintenance
-rather than ingest. Nothing here makes that worse; it only makes it reachable by default.
+rather than ingest. Nothing here makes that worse; it only makes it reachable by default.origin/main

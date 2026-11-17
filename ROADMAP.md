@@ -88,7 +88,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [x] **FRE-10a** Contract tests: probes, compute endpoints, metrics and roles
 - [ ] **ROB-14** Cgroup-aware memory budget with per-request reservations
 - [x] Restoring *into a chosen new root* over HTTP (7.3) (#213, 2026-11-14: `POST /api/v1/storage/restore/into?label=...&name=...` into `WEFT_RESTORE_BASE_DIR`; the offline drill at `weft-server/src/restore.rs` is unchanged)
-- [ ] Store-side row-level TTL/expiry (prerequisite for the SOA-15 TTL lane) *(cut 1 shipped 2026-11-15 in #752: the policy, the read-path filter and a report-only sweep; deleting expired rows and GC are cut 2/3 and are NOT shipped)*
+- [ ] Store-side row-level TTL/expiry (prerequisite for the SOA-15 TTL lane) *(cut 1 shipped 2026-11-15 in #752: the policy, the read-path filter and a report-only sweep; cut 2 shipped 2026-11-16 in #775: `purge_expired` drops whole segments whose every row is expired, and the reaper unlinks them; the rows inside a partially expired frame and the server surface — env var, settings entry, route — are cut 3 and are NOT shipped)*
 - [x] Real-filesystem ENOSPC test for #656 on the injectable space source (#694 merged)
 - [x] **Measurement bulk ingest routed through the `.weftseg` seal** *(part 1 shipped 2026-11-16: the two legacy bulk writers that do not read the stored range first were routed through the seal store, and the aspect's own latest-timestamp read was fixed to consult it. #768 then made new legacy aspects seal-backed by default, with `WEFT_LEGACY_DEFAULT_STORAGE=rows` as the opt-out, so a fresh deployment writes sealed frames through every ingest entry point)*
 - [x] **CI**
@@ -96,7 +96,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
 - [ ] Write or approve the honesty-page narrative *(owner)*
 - [ ] Report the three `parquet` 60.0.0 decoder panics and the `arrow-buffer` 60.0.0 panic upstream to apache/arrow-rs *(owner: outward-facing)*
-- [ ] What `float_roundtrip` costs a whole JSON compute or ingest request
+- [x] What `float_roundtrip` costs a whole JSON compute or ingest request *(measured 2026-11-16: below what CI can resolve at whole-request granularity — the parse figure predicts 0.34 ms on a 20,000-value request against arm-to-arm swings of 0.58 ms and 6.07 ms, both in the wrong direction; the parse-only +17 ns/value (≈ 1.42×) stays the cost statement, and `docs/roadmap-notes.md` records both dispatches. A resolvable answer needs a self-hosted runner with a warm target directory.)*
 - [x] Flaky under GPU contention: `gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu`
 - [x] Guard the `#[serial]`-above-`#[test]` ordering (#726, 2026-11-13: the guard reads the keyed `#[serial(key)]` form too and requires a test attribute in the same attribute block; either position in that block serialises, so the "above" ordering is no longer enforced)
 

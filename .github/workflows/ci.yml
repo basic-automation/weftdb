@@ -533,3 +533,25 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
       - run: python3 scripts/compat/releases.py verify
+
+  # Not a compatibility leg: no old binary is pointed at anything here. What this checks is
+  # that the archives `compat/releases.toml` names still exist and still hash to the digest
+  # written when the release was pinned, and that a downloaded archive can be unpacked on a
+  # runner. Every binary leg described in `UPGRADING.md` starts by putting a released binary
+  # on disk, and until this job that step had never run in CI.
+  archives:
+    name: pinned release archives
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 scripts/compat/releases.py fetch --dest "$RUNNER_TEMP/weft-archive" --extract
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PYTHONDONTWRITEBYTECODE: "1"
+      - name: the archive carries the server binary a binary leg would run
+        run: |
+          set -euo pipefail
+          tar tzf "$RUNNER_TEMP"/weft-archive/*.tar.gz | grep -E '(^|/)weft-server$'
+          test -f "$RUNNER_TEMP"/weft-archive/0.1.0/weftdb-v0.1.0-x86_64-unknown-linux-gnu/weft-server
