@@ -234,9 +234,11 @@ pub async fn ensure_declared(store: &SegmentStore, key: &str, values: &[BigDecim
 }
 
 /// Ingest one legacy batch into `store` under its derived key, then run
-/// the store's fragmentation gate on the same aspect. This is the entry
-/// point that every call path — single-row and bulk — should use so that
-/// bulk ingest converges the seal just as the single-row capture path does.
+/// the store's fragmentation gate on the same aspect.
+///
+/// This is the entry point that every call path — single-row and bulk —
+/// should use so that bulk ingest converges the seal just as the
+/// single-row capture path does.
 ///
 /// A gate error is logged at `tracing::debug!` and **never propagated**:
 /// an ingest must not fail because the maintenance step did. The returned

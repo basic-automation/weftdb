@@ -55,12 +55,23 @@ async fn bulk_ingest_converges_at_small_target() -> Result<()> {
 	// Count the segments after all ingests.
 	let key = aspect_key(&aspect_id);
 	let segment_count = store.index().count(&key).await?;
-	// 20 batches × 3 rows = 60 rows ÷ 4 target = 15 ideal; allow a handful of slack.
-	assert!(segment_count <= 25, "the fragmentation gate should have collapsed {segment_count} segments to roughly 15 at a target of 4");
+	// 20 batches × 3 rows = 60 rows ÷ 4 target = 15 ideal, with three segments of slack for
+	// the tail of the last fold. The old bound of 25 was looser than the un-gated count
+	// (~20, one segment per batch), so the test passed with the gate call deleted.
+	assert!(segment_count <= 18, "the fragmentation gate should have collapsed {segment_count} segments to roughly 15 at a target of 4");
 
-	// Without gate, run at a large target to confirm we had data to converge.
-	let large_count = store.index().count(&key).await?;
-	assert!(large_count > 3, "there should be more than a handful of segments to converge");
+	// The comparison that makes the bound above mean something: the same volume of traffic
+	// into a second aspect, at a target so loose the gate stays idle (60 rows ÷ 2 = 30 ideal,
+	// above the ~20 segments the batches produce), must end with strictly more segments.
+	// Delete the gate call and both assertions fail together.
+	let ungated_aspect = db.track_aspect(&subject.id(), "converge_idle", &splimes::Resolution::Milliseconds, None).await?.id();
+	for i in 0..20 {
+		let offset = i as i64 * 1000;
+		let rows = vec![(base + offset, bd(&format!("{}.{}", i + 1, offset))), (base + offset + 1, bd(&format!("{}.{}", i + 2, offset))), (base + offset + 2, bd(&format!("{}.{}", i + 3, offset)))];
+		ingest_batch_with_gate(&store, &ungated_aspect, &dataset, &rows, 2).await?;
+	}
+	let idle_count = store.index().count(&aspect_key(&ungated_aspect)).await?;
+	assert!(idle_count > segment_count, "the gated aspect converged to {segment_count} segments while the same traffic with the gate idle left {idle_count}; the gate is what makes bulk ingest converge");
 
 	drop(store);
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
@@ -116,16 +127,15 @@ async fn gated_bulk_read_path_correctness() -> Result<()> {
 	Ok(())
 }
 
-/// The fragmentation gate is best-effort: the ingest succeeds even when the
-/// gate call itself cannot acquire the maintenance lock or hits a transient
-/// error. The error is logged at `tracing::debug!` and swallowed. With the
-/// `fault-injection` feature the test can force a lock timeout; without it,
-/// this test verifies the observable contract at a target of 0 (clamped to 1
-/// by the gate internals, still passes), proving the gate path does not fail
-/// the ingest.
+/// A degenerate squash target must not damage the ingest contract. `target_rows = 0`
+/// is clamped to 1 by the gate internals (`maint.rs:2060`), and at two rows the aspect
+/// is not over-fragmented, so the gate runs and returns without squashing anything.
+/// What this test therefore proves is that a nonsense target still ingests both rows
+/// and returns both `TxId`s. It does **not** prove that a gate *error* is swallowed:
+/// forcing one needs the `fault-injection` feature, and that gap is tracked separately.
 #[serial]
 #[tokio::test]
-async fn gate_failure_does_not_fail_ingest() -> Result<()> {
+async fn gate_at_degenerate_target_still_ingests() -> Result<()> {
 	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
 	let (_dir, db) = setup().await?;
 	let subject = db.observe_subject("s").await?;
