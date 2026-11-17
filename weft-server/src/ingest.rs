@@ -1393,7 +1393,7 @@ mod tests {
 	use std::sync::Arc;
 
 	use axum::{
-		body::{Body, Bytes}, http::{Request, StatusCode}
+		body::{Body, Bytes}, http::{Request, StatusCode}, response::IntoResponse
 	};
 	use tempfile::TempDir;
 	use tower::ServiceExt;
@@ -2693,7 +2693,6 @@ mod tests {
 		let request = Request::builder().method("POST").uri("/api/v1/storage/price/points").body(Body::from_stream(stream)).unwrap();
 		let err = super::IngestBody::from_request(request, &state).await.expect_err("an aborted stream must be refused");
 		drop(state);
-		use axum::response::IntoResponse;
 
 		assert_eq!(err.code(), crate::error::Code::BadRequest);
 		assert_eq!(err.code().status(), StatusCode::BAD_REQUEST);
