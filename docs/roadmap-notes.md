@@ -239,6 +239,14 @@ The licensing decisions are made. Every WeftDB crate is `MIT OR Apache-2.0`, Jus
   the rows-mode handle. The line stays unticked: new aspects are still created in rows mode
   (`StorageMode::for_new_aspect`, `weftdb/src/types/legacy_seal.rs:126-135`), and flipping that
   default is **#768**, which carries the ingest/read cost figure the flip needs.*
+
+  *Audit 2026-11-16, #768 (the flip): it shipped, and the figure named above is not a
+  gate at all. `float_roundtrip` prices the JSON body of an ingest or interpolate request, not
+  where a new aspect puts its rows, and the seal path's real costs, one-row ingest as a full
+  seal commit, the fragmentation gate, read fan-out, were already characterised in S19 and S20.
+  What the flip does need stating is the one-way door: an unset variable now leaves a new aspect
+  seal-backed, and 0.3.7 or earlier read zero measurements from such an aspect instead of
+  refusing it. The gate was the downgrade note in `docs/upgrade-notes.md`, not a benchmark.*
 - **B-tags**
 
 ### Security & packaging *(Phase 8 minimum)*
@@ -371,14 +379,16 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - → **SOA-15** soak.yml nightly workflow, TTL lane and nightly-to-nightly comparison
     *Updated 2026-11-09: parts 1 (nightly workflow with active cron `0 7 * * *`) and 3
     (nightly-to-nightly comparison with first-night-no-baseline path) shipped in #616 and
-    verified present on `origin/main`. Part 2 (TTL lane) remains blocked: the store has a row-level TTL
-    and a purge (`SegmentStore::purge_expired`, #775), but no way to configure one through the
-    server — `from_env` still hard-codes `NoExpiry` and there is no settings variable — so a
-    soak still cannot exercise the lane (`weft-bench/src/soak.rs` uses `NullServer`, and
-    `weftdb/src/types/segment_store.rs` only ever purged expired *quarantine* records; `weft-bench/src/soak.rs` uses `NullServer` so no
-    server endpoint can be exercised). Adding a TTL lane requires a store-side TTL feature
-    first. The workflow already reports the TTL lane as `"not tested"` in its honesty section
-    (`weft-bench/src/soak_report.rs` lines 610-611).*
+    verified present on `origin/main`. Part 2 (TTL lane) is active on this branch —
+    `WEFT_ROW_TTL` reaches `SegmentStoreOptions::from_env` (`#784` on main), and the soak
+    drives a store-side TTL lane (`weft-bench/src/soak_ttl.rs`) that exercises
+    `read_time_range_of_with_expiry`, `expiry_sweep` and `purge_expired`. The honesty
+    section renders the verdict. The lane opens its own temporary store (the soak uses
+    `NullServer`, so no server endpoint is exercised). It proves the expiry-aware read
+    filter, the sweep and purge plumbing, and that a `NoExpiry` store reports 0 expired
+    rows while a TTL store with aged rows reports >0. Still not covered: HTTP-level
+    expiry, cross-restart TTL persistence, and concurrent expiry with other
+    maintenance operations.*
 - **W9 · Read semantics, limits, upgrade legs**
   - read lane
   - maint lane

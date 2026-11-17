@@ -274,10 +274,39 @@ async fn seal_backed_aspect_round_trips_replays_and_widens() -> Result<()> {
 	Ok(())
 }
 
+/// #768: seal-backed is the default now, so an aspect nobody configured gets the
+/// seal store. The mode is persisted at creation and read back through the ordinary
+/// read paths, and the frames land under `segments_v2` - which is what makes the
+/// bulk writers routed in #232 part 1 the path a fresh deployment takes. This test
+/// fails on a tree without the flip.
 #[serial]
 #[tokio::test]
-async fn rows_mode_is_the_default_and_compression_forces_it() -> Result<()> {
+async fn a_new_aspect_is_seal_backed_without_being_told() -> Result<()> {
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect = db.track_aspect(&subject.id(), "unspoken", &splimes::Resolution::Milliseconds, None).await?;
+	assert_eq!(aspect.storage_mode(), StorageMode::Segments, "a new aspect is seal-backed unless someone asks for rows mode");
+	assert_eq!(db.aspect_storage_mode(&aspect.id()).await?, StorageMode::Segments, "the choice is persisted at creation, not kept in memory");
+
+	let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+	let rows: Vec<InputMeasurement> = (0..5).map(|i| InputMeasurement::new(base + Duration::seconds(i), bd(&format!("{}.5", i + 1)))).collect();
+	db.batch_capture_measurements(aspect.id(), DatasetId::new(), rows).await?;
+	assert_eq!(db.get_measurements_count(&aspect.id()).await?, 5, "the batch reached the store a seal-backed aspect reads from");
+	assert_eq!(db.get_latest_measurement(&aspect.id()).await?, Some(base + Duration::seconds(4)), "the newest row is the newest sealed row");
+
+	let db_dir = std::path::Path::new(db.metadata_path()).parent().expect("db dir").to_path_buf();
+	assert!(db_dir.join("segments_v2").join("segments").exists(), "frames live in segments_v2/segments");
+	Ok(())
+}
+
+#[serial]
+#[tokio::test]
+async fn the_rows_mode_opt_out_and_a_compression_config_both_keep_rows_mode() -> Result<()> {
+	// Rows mode is the opt-out since #768: the test names it instead of relying on an
+	// absent variable, which is exactly what a deployment that must stay rollable to an
+	// older build does.
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "rows");
 	let (_dir, db) = setup().await?;
 	let subject = db.observe_subject("s").await?;
 	let plain = db.track_aspect(&subject.id(), "plain", &splimes::Resolution::Milliseconds, None).await?;

@@ -4,6 +4,45 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-17 — SOA-15 part 2: the TTL lane opens its own store; it does not use the soak NullServer (ISSUE #727)
+
+**Context.** The 1.0 plan names SOA-15 part 2 as an exercise of the store's row-level TTL
+mechanism inside the soak harness. The soak already opens a `SegmentStore` under a
+`NullServer` (no HTTP, no daemon process), and every other lane — oracle, derived-read,
+backup, upgrade — operates through that server or through the existing library runner.
+SOA-15's TTL lane is the first lane that needs a *different* store configuration (the
+`RowExpiryPolicy::Ttl` variant and non-zero TTL), and it needs the expiry path the
+soak's main store never uses (the soak runs with `NoExpiry` and never ages out rows).
+
+**Chosen: the lane opens its own temporary `SegmentStore` with the target expiry policy,
+ingests a fixed set of rows, runs the sweep and purge, and records the verdict —
+then discards the store.** The lane runs between the last `record_step` and `harness.finish()`.
+The `run_ttl_lane()` function in `weft_bunch::soak_ttl` drives the whole sequence:
+configure a TTL, open, declare, ingest rows that straddle the cutoff, sweep, purge,
+read-back with the expiry-aware read path, close, report.
+
+**Rejected: making the soak's main store switch to a TTL policy for the lane.** The soak
+harness owns its store for many ticks and many lanes; changing its expiry mid-run would
+interfere with the oracle, derived-read and backup lanes' assumptions, and the
+`SegmentStoreOptions` are frozen at open time. A separate store is the cleanest isolation.
+
+**Rejected: running the TTL lane over HTTP.** The soak harness uses `NullServer` (no port,
+no process). Wiring a real server for the TTL lane alone would add complexity and CI
+infrastructure without exercising any HTTP expiry path (the reader already won't need one:
+`purge_expired` is a library call, not an endpoint). The lane tells the reader what it
+did in its report section.
+
+**Rejected: retaining the store after the lane finishes.** The lane is a one-shot check.
+Retaining the store would add state the soak harness does not need. The tempdir is
+dropped after the verdict is recorded.
+
+**Not vacuous.** The `NoExpiry` store reports 0 expired rows; the TTL store reports >0.
+The acceptance tests pin both.
+
+**Recorded in the soak run.** The verdict appears as `SoakRun::ttl` (v8 schema),
+serialised alongside the oracle, derived-read, backup and upgrade verdicts.
+The honesty section renders it.
+
 ## 2026-11-10 — `weft-orchestration` stays published; the residue is documentation and one stale member (REL-496)
 
 **The item offered two options — publish `weft-orchestration` or mark it `publish = false` —
@@ -8117,6 +8156,51 @@ historical counts written as words so the checker's digit scan cannot mistake th
 claims — and the schema version stayed at 2, since adding a variable changes what may be set, not
 the shape of the schema. **A failing gate is answered by changing what is checked, never the
 checker.**origin/mainorigin/mainorigin/main
+## 2026-11-16 — Flipping the storage-mode default, and why the roadmap's cost figure was not the gate (shipped)
+
+Issue #768 asked to flip new legacy aspects to seal-backed, "carrying the cost figure the flip needs"
+per the roadmap line. That figure never becomes a gate: `float_roundtrip` prices serde_json f64
+round-trip in an ingest or interpolate body (`weft-server/benches/json_body_cost.rs`), which is
+orthogonal to where a new aspect stores its rows, and the seal path's real costs, one-row ingest as a
+full seal commit, the fragmentation gate, read fan-out, shipped and were characterised in S19 and S20.
+Deciding the flip on a measurement of something else would have bought a number and learned nothing, so
+the line was re-read rather than satisfied, and the flip's actual consequence, the one-way downgrade
+door, is what the PR documents.
+
+What the flip touches is one branch. `StorageMode::for_new_aspect` answers `Segments` when
+`WEFT_LEGACY_DEFAULT_STORAGE` is unset, and otherwise routes the value through `StorageMode::parse`
+unchanged, so `rows` is the explicit opt-out and `segments` still means what it meant. That last part is
+load-bearing: `parse` is how a stored mode is read back, and `NULL`, the mode of every aspect any
+released build created, parses to rows mode. Leaving the set-value branch alone means a typo'd value
+falls back to the shape every released Weft can read instead of silently sealing an aspect, and editing
+`parse` was the one way to corrupt existing stores. The `#[default] Rows` on the enum stays too: it
+describes a struct default, not a creation policy, and changing it would silently move every
+`StorageMode::default()` call site.
+
+Blast radius was measured rather than assumed. Every suite whose premise is the legacy **queue**,
+`db_tests`, `legacy_queue_crash`, `rob5_queue_consumer_panics`, `dictionary_bounded`, orchestration's
+`test_support::data_dir` fixture and `debug_batch_test`, now names `rows` explicitly, because
+seal-backed ingest never queues and those suites would otherwise have tested an empty queue while
+believing they tested a consumer; `change_log_tests` and the renamed `legacy_seal_tests` rows-mode test
+say `rows` where they meant `unset`. `new_api_tests` and its stress sibling were deliberately left on
+the new default: 25 tests that use only the mode-agnostic new API are the soak coverage for
+seal-backed-by-default, and leaving them un-fixture-ed is what puts the flip in front of a suite instead
+of behind one. The new test `a_new_aspect_is_seal_backed_without_being_told` and the inverted unit
+assertion are the pre-flip-failing evidence.
+
+The door is documented rather than engineered. 0.3.7 and earlier know no `aspects.storage_mode` column
+and read a legacy aspect only from its `measurements.db`, so they answer **zero measurements** for a
+seal-backed aspect rather than refusing it, a silent data-loss shape on downgrade. No released build
+ever created a seal-backed legacy aspect (D-S19 is unreleased), so this is a warning for anyone running
+`main`, with `WEFT_LEGACY_DEFAULT_STORAGE=rows` as the pin that keeps a deployment rollable. A dual-read
+fallback was rejected: it keeps alive a storage shape the roadmap is retiring, for a downgrade path the
+project does not promise before 1.0.
+
+Recorded as a known limitation, not fixed: `WEFT_MAINTENANCE_MAX_SEGMENT_BYTES` (#773) re-cuts only
+folds of two or more segments, so the first frame a brand-new seal-backed aspect writes from a large bulk
+ingest can sit above that ceiling until a later fold cuts it, and #765's output budget bounds maintenance
+rather than ingest. Nothing here makes that worse; it only makes it reachable by default.origin/mainorigin/mainorigin/mainorigin/main
+
   regression guard the whole slice is about.
 
 ## 2026-11-17 — Moving the fragmentation gate into the bulk-ingest path (#232)
@@ -8139,6 +8223,14 @@ checker.**origin/mainorigin/mainorigin/main
   is a thin wrapper passing `SQUASH_TARGET_ROWS`. This lets tests drive a deliberately small target
   and lets a future caller (e.g., an archival ingest at a different threshold) choose a different
   target without another wrapper.
-- **The two duplicate gate calls in `inputs.rs` were removed.** `batch_capture_sealed` (`:2442`)
-  was left untouched: it drops the store after ingest and cannot run a gate on it. That site ran
-  no gate before and runs none now — a separate concern.origin/mainorigin/main
+- **The two duplicate gate calls in `inputs.rs` were removed, and the third caller is covered by
+  the move, not left out.** `batch_capture_sealed` (`:2442` in the file's own numbering) goes
+  through the same `ingest_batch` wrapper, so it now runs the gate it never used to run: before
+  this slice the file had gate calls at `:335` and `:446` only, and that third path had none. The
+  wrapper is what closes that gap, which is why the inline duplicates were deleted rather kept.
+- **What this does *not* close.** The gate declines on a converged large aspect
+  (`squash_aspect_to_target_rows_if_fragmented_held` returns `Ok(None)` once
+  `segment_count <= total_rows.div_ceil(target_rows)`, and `SQUASH_TARGET_ROWS` is 100 000) and its
+  failure is logged at debug level. A batch that rewrites a timestamp an existing segment already
+  holds can therefore still leave the stored row count above the number of rows a read returns,
+  which is what #800 tracks.origin/mainorigin/main
