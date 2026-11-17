@@ -653,7 +653,7 @@ impl Inputs for Database {
 
 	/// Helper: Process a chunk of measurements with bulk insert (trait method)
 	async fn capture_measurement_chunk(&self, aspect_id: &AspectId, dataset_id: DatasetId, chunk: &[InputMeasurement]) -> Result<Vec<TxId>> {
-		legacy_metadata_write(async move {
+		Box::pin(legacy_metadata_write(async move {
 			if chunk.is_empty() {
 				return Ok(Vec::new());
 			}
@@ -661,7 +661,7 @@ impl Inputs for Database {
 			// Seal-backed aspects (slice D-S19, #232 follow-up: this entry point
 			// was not yet routed): the whole chunk is one ingest transaction in the
 			// seal store, all-or-nothing, and a retry replays it. The chunk store
-			// was reading from was rows mode only, and a seal-backed aspect's reads
+			// was rows mode only, while a seal-backed aspect's reads
 			// dispatch to the seal store, so an un-routed chunk wrote where no read
 			// could find it.
 			if self.is_seal_backed(aspect_id).await? {
@@ -710,7 +710,7 @@ impl Inputs for Database {
 			self.enqueue_retrying(aspect_id, &chunk_timestamps).await?;
 
 			Ok(chunk_tx_ids)
-		})
+		}))
 		.await
 	}
 
