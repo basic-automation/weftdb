@@ -10,6 +10,18 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **`WEFT_MEMORY_BUDGET_BYTES` and the cgroup limit are now read and held (#788).**
+Where the server could previously only bound a request's body bytes, it now knows the memory
+ceiling it runs under: `weft-server/src/memory_budget.rs` reads cgroup v2 `memory.max`, falls
+back to v1 `memory/memory.limit_in_bytes`, and treats `max`, a missing file and an unreadable
+file as *unbounded* rather than as a reason to deny everything. The operator's override is
+combined as `min(override, cgroup)`, because an override above the kernel's ceiling is not
+something the process can honour. `MemoryBudget` carries that limit plus one shared counter of
+bytes reserved in flight, and a `Reservation` guard releases its bytes on `Drop` so a panic
+cannot leak the count. Nothing is refused in this cut: reading, exposing and accounting land
+first, so the refusal (503 `over_budget` with `details.kind` of `memory`) comes in cut 2 and the
+roadmap line stays open until then.
+
 - **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**
 Where `expiry_sweep` only counts, the purge acts: a segment every row of which is older
 than the store's TTL is dropped through the same swap the maintenance passes use, so its

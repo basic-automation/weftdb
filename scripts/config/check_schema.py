@@ -231,18 +231,6 @@ def extract_toml_schema_version(toml_path: Path) -> str | None:
 # ── verification ────────────────────────────────────────────────────────────
 
 
-def _extract_latest_version_row(doc_text: str) -> str:
-    """Extract the text of the latest (highest-numbered) version row from the
-    'How this version changes' table, so we check only the cumulative count
-    that reflects the current schema, not every historical row."""
-    rows = re.findall(r"^\|\s*(\d+)\s*\|(.+?)\|\s*$", doc_text, re.MULTILINE)
-    if not rows:
-        return doc_text
-    # Find the row with the highest version number
-    latest = max(rows, key=lambda r: int(r[0]))
-    return latest[1]  # Return just the Change column text
-
-
 def verify(
     doc_path: Path,
     registry_path: Path,
@@ -290,14 +278,9 @@ def verify(
             f"{effectively} says {toml_ver}"
         )
 
-    # ---- Check 3: tier counts ----
+    # ---- Check 3: tier counts (NEW) ----
     counted = _section_variable_counts(doc_text)
     total_doc = sum(counted.values())
-
-    # Only check the latest version row's cumulative counts, so historical
-    # rows that truthfully reported smaller totals do not trigger false
-    # mismatches.
-    version_row = _extract_latest_version_row(doc_text)
 
     for heading, actual in sorted(counted.items()):
         token = _TIER_TO_TOKEN.get(heading, heading)
@@ -311,11 +294,11 @@ def verify(
                 f"but table has {actual}"
             )
 
-        # 3b. Version-table per-tier totals (latest row only)
-        _check_totals_for_tier(version_row, token, actual, problems)
+        # 3b. Version-table per-tier totals
+        _check_totals_for_tier(doc_text, token, actual, problems)
 
-    # 3c. Overall version-table total (latest row only)
-    _check_total_count(version_row, total_doc, problems)
+    # 3c. Overall version-table total
+    _check_total_count(doc_text, total_doc, problems)
 
     # ---- Check 4: prose names (NEW) ----
     doc_prose = _extract_prose_names(doc_text)
