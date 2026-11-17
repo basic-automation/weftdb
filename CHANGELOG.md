@@ -10,6 +10,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **The reconcile daemon runs the expired-row purge every tick (#785).**
+After the existing sweeps, every daemon tick also calls `SegmentStore::purge_expired`
+on the store. When the policy is `NoExpiry` (the default) the call returns cheaply with
+no work; when a TTL is configured, the frames every row of which is past the cutoff are
+removed from the index and retired to the reaper. A frame that straddles the cutoff is
+left alone and counted. Failures follow the same WARN-per-aspect and breaker-skip idiom
+as the other sweeps.
 - **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**
 Where `expiry_sweep` only counts, the purge acts: a segment every row of which is older
 than the store's TTL is dropped through the same swap the maintenance passes use, so its

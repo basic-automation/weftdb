@@ -7916,4 +7916,33 @@ production history — waits for cut 3, which also carries the SOA-15 TTL lane t
 public struct breaks in-crate construction sites: `expire_aspect_held`'s literal had to gain the
 new fields. And `SegmentStore::index` is a private field, not an accessor, so a test in a
 submodule of `segment_store` writes `store.index.all(aspect)` — reachable, because the test
-modules are inside the defining module.origin/mainorigin/main
+modules are inside the defining module.
+## 2026-11-17 — The expired-row purge runs unconditionally in every daemon tick (shipping)
+
+Issue #785, TTL cut 4. The store's `purge_expired` already returns cheaply when the policy is
+`NoExpiry` (checking `self.expiry == RowExpiryPolicy::NoExpiry` at the top and returning an empty
+`ExpirySweep`), so the daemon calls it unconditionally after the other sweeps on every tick,
+with no gate or config field. This avoids a future mistake where a config field tells the daemon
+to purge when the policy is NoExpiry, fooling nobody, or tells it not to purge when a TTL is set,
+deleting nothing until an operator notices.
+
+**Why not a metric for purge work.** The brief says not to invent metric names when log instead.
+`weft_reconcile_*` counters already count work passes, so a purge that dropped segments records
+through the existing `record_reconcile_sweep` path (one aspect cleaned with N segments dropped).
+A purge that dropped nothing is a quiet tick and records only a maintenance sweep, which is the
+existing idiom. No new Prometheus counter is needed.
+
+**Clock injection.** The tick calls `std::time::SystemTime::now()` through `now_ns()`, which is
+the same pattern the rest of the crate uses (the backup daemon calls `SystemTime::now()` for its
+labels; the ingest path does the same). The store's own tests call `purge_expired` with an
+explicit `now_ns` because the policy functions respect clock injection, matching the cut-1
+contract.
+
+**The purge tick duplicates the other sweeps' failure idiom.** One WARN per failed aspect (the
+sweep kind names `"expired-purge"`), breaker-skipped aspects counted in `busy` (the existing
+`ExpirySweep::busy` field covers both contention and breaker trips, since `purge_expired` does
+not separate them — matching how the store's own `purge_expired` reports `busy`), and the tick
+carries on past a failing aspect. A whole-sweep failure (the aspect list itself unreadable) is
+logged and the tick continues.origin/main
+
+origin/main

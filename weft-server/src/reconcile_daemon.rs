@@ -61,9 +61,16 @@
 use std::{sync::Arc, time::Duration};
 
 use tracing::Instrument as _;
-use weftdb::{HotColdSweep, MaintenanceWait, OverlapSweep, ReconcileSweep, SegmentStore, SquashSweep};
+use weftdb::{ExpirySweep, HotColdSweep, MaintenanceWait, OverlapSweep, ReconcileSweep, SegmentStore, SquashSweep};
 
 use crate::metrics::SharedMetrics;
+
+/// Nanoseconds since the Unix epoch at the moment this tick runs, used as
+/// `now_ns` for the expired-row purge. Always obtained from `SystemTime`,
+/// never from the store's internal clock.
+fn now_ns() -> i64 {
+	std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+}
 
 /// Log and count the aspects a store-wide sweep could not maintain.
 ///
@@ -327,6 +334,45 @@ pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics
 	Ok(sweep)
 }
 
+/// Run one **expired-row purge** tick (TTL-CUT4 / #785).
+///
+/// Sweeps every declared aspect through
+/// [`SegmentStore::purge_expired`](weftdb::SegmentStore::purge_expired),
+/// removing the frames whose every row is past the TTL. A purge that dropped
+/// nothing records nothing. A failed aspect is skipped, logged as one `WARN`
+/// line and counted in `weft_reconcile_failed_passes_total`.
+///
+/// When the store's policy is [`RowExpiryPolicy::NoExpiry`](weftdb::RowExpiryPolicy::NoExpiry),
+/// `purge_expired` itself returns an empty sweep with no work to do, so this
+/// tick is a no-op that records only the maintenance sweep.
+pub async fn reconcile_tick_purge_expired(store: &SegmentStore, metrics: &SharedMetrics) -> ExpirySweep {
+	let now = now_ns();
+	let span = tracing::info_span!("reconcile.tick", kind = "expired-purge", aspects = tracing::field::Empty, rows_expired = tracing::field::Empty, segments_dropped = tracing::field::Empty, partial_segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty, tripped = tracing::field::Empty, cancelled = tracing::field::Empty);
+	let sweep = match store.purge_expired(now).instrument(span.clone()).await {
+		Ok(sweep) => sweep,
+		Err(err) => {
+			tracing::warn!(sweep = "expired-purge", error = %format!("{err:#}"), "reconcile daemon: expired-purge sweep failed entirely");
+			span.record("failed", 0usize);
+			return ExpirySweep::default();
+		}
+	};
+	span.record("aspects", sweep.aspects_cleaned.len());
+	span.record("rows_expired", sweep.rows_expired);
+	span.record("segments_dropped", sweep.segments_dropped);
+	span.record("partial_segments", sweep.partial_segments);
+	span.record("cancelled", false);
+	if sweep.segments_dropped > 0 || sweep.aspects_cleaned.is_empty() {
+		// A purge that dropped something is real work — record it.
+		if sweep.segments_dropped > 0 {
+			metrics.record_reconcile_sweep(u64::try_from(sweep.aspects_cleaned.len()).unwrap_or(u64::MAX), sweep.segments_dropped);
+		}
+	}
+	report_sweep_failures(&span, metrics, "expired-purge", &sweep.failed);
+	report_busy_aspects(&span, "expired-purge", &sweep.busy);
+	record_maintenance_outcome(metrics, false, 0, 0, sweep.busy.len());
+	sweep
+}
+
 /// Run one **size-targeted compaction** tick (roadmap Phase 4.6).
 ///
 /// Sweeps every aspect through the **fragmentation-gated**
@@ -437,6 +483,12 @@ pub fn spawn_reconcile_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, 
 					Err(err) => eprintln!("reconcile daemon: compaction sweep failed: {err}"),
 				}
 			}
+			// Always run the expired-row purge (TTL-CUT4 / #785) after the other sweeps.
+			// When the store's policy is NoExpiry, purge_expired returns cheaply with no work.
+			let purge = reconcile_tick_purge_expired(&store, &metrics).await;
+			if purge.segments_dropped > 0 {
+				println!("reconcile daemon (expired-purge): {} aspect(s) cleaned, {} segment(s) dropped, {} partial segment(s)", purge.aspects_cleaned.len(), purge.segments_dropped, purge.partial_segments);
+			}
 		}
 	})
 }
@@ -448,7 +500,7 @@ mod tests {
 	use bigdecimal::BigDecimal;
 	use tempfile::TempDir;
 	use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
-	use weftdb::{MaintenanceBreaker, SegmentStore};
+	use weftdb::{MaintenanceBreaker, RowExpiryPolicy, SegmentStore, SegmentStoreOptions};
 
 	use super::*;
 	use crate::metrics::Metrics;
@@ -783,5 +835,47 @@ mod tests {
 			assert_eq!(failed, 1, "{kind}: only the bad aspect fails");
 			assert_eq!(metrics.snapshot().reconcile.failed_passes, 1, "{kind}: one failed aspect pass counted");
 		}
+	}
+
+	#[tokio::test]
+	async fn purge_tick_drops_wholly_expired_frames_and_leaves_straddling_ones() {
+		// An aspect with a TTL whose wholly-expired frames are removed by one tick.
+		// A frame that straddles the cutoff is left alone.
+		let dir = TempDir::new().unwrap();
+		let store = SegmentStore::open_with_options(dir.path(), SegmentStoreOptions::default().with_expiry(RowExpiryPolicy::Ttl { ttl: 10 })).await.unwrap();
+		store.declare("a", &schema()).await.unwrap();
+		// The cutoff at now=100s is 90. Frame [60..79] is wholly expired; frame [85..120] straddles.
+		store.seal("a", &schema(), &[60_i64, 70, 79], &[bd("1"), bd("2"), bd("3")]).await.unwrap();
+		store.seal("a", &schema(), &[85_i64, 100, 120], &[bd("4"), bd("5"), bd("6")]).await.unwrap();
+		// Call purge_expired with a deterministic now_ns (= 100 seconds) so the test
+		// is reproducible; the tick function wraps this call with SystemTime::now().
+		let sweep = store.purge_expired(100_000_000_000i64).await.unwrap();
+		assert_eq!(sweep.segments_dropped, 1, "the wholly expired frame goes");
+		assert_eq!(sweep.partial_segments, 1, "the straddling frame is counted, not rewritten");
+		assert!(sweep.aspects_cleaned.contains(&"a".to_string()), "the aspect is reported as cleaned");
+		store.reap(weftdb::MaintenanceWait::Skip).await.unwrap();
+		let count = store.segment_count("a").await.unwrap();
+		assert_eq!(count, 1, "only the straddling frame keeps an index row");
+		drop(store);
+		dir.close().unwrap();
+	}
+
+	#[tokio::test]
+	async fn purge_tick_noexpiry_does_nothing() {
+		// A store with the default NoExpiry policy: the purge drops nothing
+		// and the segment set is unchanged.
+		let dir = TempDir::new().unwrap();
+		let store = SegmentStore::open_with_options(dir.path(), SegmentStoreOptions::default()).await.unwrap();
+		store.declare("a", &schema()).await.unwrap();
+		store.seal("a", &schema(), &[60_i64, 70, 79], &[bd("1"), bd("2"), bd("3")]).await.unwrap();
+		let sweep = store.purge_expired(100_000_000_000i64).await.unwrap();
+		assert_eq!(sweep.segments_dropped, 0, "NoExpiry: nothing is dropped");
+		assert_eq!(sweep.rows_expired, 0, "NoExpiry: no rows expired");
+		assert!(sweep.aspects_cleaned.is_empty(), "NoExpiry: no aspects cleaned");
+		// Segment set unchanged: purge_expired returns cheaply for NoExpiry.
+		let count = store.segment_count("a").await.unwrap();
+		assert_eq!(count, 1, "NoExpiry: the segment is still there");
+		drop(store);
+		dir.close().unwrap();
 	}
 }
