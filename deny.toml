@@ -7,7 +7,21 @@ all-features = true
 [advisories]
 # Every RustSec advisory (vulnerability, unmaintained, unsound, yanked) fails the check.
 # To accept one deliberately, add it below with a reason and a date to revisit.
-ignore = []
+ignore = [
+    # RUSTSEC-2026-0543: `chrono` is unmaintained, and RustSec states there is no safe
+    # upgrade. As of 2026-11-17 the newest release is 0.4.45, and arrow 60.1.0 still
+    # requires chrono ^0.4.40, so neither the nine manifests that depend on chrono
+    # directly nor the arrow-flight path that pulls it in transitively can move off it.
+    # The ignore carries an expiry on purpose: when the date lapses the check goes red
+    # again until the migration (#791) lands or upstream changes. Filed as #790.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, no upgrade path: chrono 0.4.45 is the newest release and arrow 60.1.0 requires chrono ^0.4.40; moving to time or jiff is #791", expiry = "2027-01-31" },
+]
+
+# An ignore that stops matching is a bug, not a free pass: the entry is stale, the
+# advisory is gone, and the exception should be deleted. Loud, so nobody carries a
+# dead exception into a release.
+unused-ignored-advisory = "deny"
+
 
 [licenses]
 # The allow-list below is also about.toml's, which generates THIRD-PARTY-LICENSES.md, the
