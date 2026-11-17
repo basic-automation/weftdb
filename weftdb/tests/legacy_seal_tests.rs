@@ -23,9 +23,7 @@ use futures::StreamExt;
 use serial_test::serial;
 use tempfile::TempDir;
 use uuid::Uuid;
-use weftdb::{
-	legacy_seal::{aspect_key, ingest_batch_with_gate, read_measurements, read_rows}, TxId
-};
+use weftdb::legacy_seal::{aspect_key, ingest_batch_with_gate, read_measurements, read_rows};
 
 /// The fragmentation gate at a small target converges repeated ingests of the same aspect.
 ///
