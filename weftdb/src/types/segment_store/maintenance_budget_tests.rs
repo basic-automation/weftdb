@@ -14,11 +14,14 @@ use bigdecimal::BigDecimal;
 use tempfile::TempDir;
 use weft_physical_type::{timestamp::TimeUnit, AspectSchema, PhysicalType};
 
-use super::{maint::size_driven_cuts, maintenance_output_budget_from, maintenance_segment_ceiling_from, SegmentStore, SegmentStoreOptions};
+use super::{maint::size_driven_cuts, maintenance_op_seconds_from, maintenance_output_budget_from, maintenance_segment_ceiling_from, MaintenanceWait, SegmentStore, SegmentStoreOptions};
 use crate::{IngestBatch, StoreError, UpsertKeys};
 
 /// The aspect every test here writes.
 const ASPECT: &str = "price";
+
+/// The second aspect for multi-aspect sweep tests.
+const OTHER: &str = "cpu";
 
 fn values(from: i64, count: i64) -> (Vec<i64>, Vec<BigDecimal>) {
 	(from..from + count).map(|t| (t, BigDecimal::from_str(&t.to_string()).expect("parses"))).unzip()
@@ -268,5 +271,32 @@ async fn a_ceiling_far_above_the_fold_writes_what_an_unbounded_fold_writes() {
 	let rows = store.index.rows(ASPECT).await.expect("read the index");
 	assert_eq!(rows.len(), 1, "a ceiling the fold fits under is indistinguishable from no ceiling");
 	assert_eq!(rows[0].desc.row_count, 1_500);
+	drop(store);
+}
+
+#[tokio::test]
+async fn a_maintenance_sweep_stops_at_its_time_budget_before_any_swap() {
+	// ROB-20 G5: the time budget check fires before any swap runs when the budget has
+	// already expired. Set with_max_maintenance_op_seconds(0) which makes
+	// maintenance_deadline() return Some(Instant::now()) — the loop guard sees
+	// Instant::now() >= deadline immediately and breaks with cancelled = true.
+	//
+	// The converse (unset ⇒ proceeds) is already covered by every existing sweep test
+	// (reconcile, squash, hot/cold) — none sets max_maintenance_op_seconds and all
+	// complete normally, proving unbounded means unbounded.
+	let dir = TempDir::new().unwrap();
+	let store = store_at(dir.path(), |options| options.with_max_maintenance_op_seconds(0)).await;
+	// Two aspects, so the sweep loop scans at least one before hitting the deadline.
+	seal_two_overlapping(&store).await;
+	let keys = crate::UpsertKeys::new(["host"]).expect("valid keys");
+	store.declare_with_upsert_keys(OTHER, &AspectSchema::new(PhysicalType::F64, BigDecimal::from(0), TimeUnit::Seconds), Some(&keys)).await.expect("declares");
+	// The store has two aspects but the deadline was already expired at the time the
+	// sweep was called: the loop checks time_deadline before the first aspect and breaks.
+	let before = segment_entries(dir.path());
+	let sweep = store.reconcile_all_over_threshold(1, MaintenanceWait::Skip).await.expect("sweep");
+	assert!(sweep.cancelled, "the sweep reports cancelled because the time budget was exhausted before any aspect");
+	assert_eq!(sweep.aspects_reconciled, 0, "no aspect was reconciled");
+	let after = segment_entries(dir.path());
+	assert_eq!(before, after, "no segments were written or deleted: the sweep stopped before any swap");
 	drop(store);
 }

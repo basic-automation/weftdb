@@ -10,6 +10,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**
+  Store-wide maintenance sweeps — threshold reconcile, hot/cold reconcile, squash over threshold,
+  squash to target rows, many-aspect squash — check a per-sweep deadline between components, groups,
+  series and aspects. When the deadline passes, the sweep stops before the next swap, marks its
+  [`cancelled`](weftdb::ReconcileSweep::cancelled) field `true`, and reports what it accomplished
+  so far. An already-committed swap is never aborted. Set via the environment variable
+  `WEFT_MAINTENANCE_MAX_OP_SECONDS` (Tier::Experimental); unset or `0` means unbounded.
+
 - **A refused maintenance plan has its own HTTP answer (#764).** `StoreError::OverBudget` — an
   overlaps merge whose segments total more than `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES`, refused before
   the group is read — now answers **`503 over_budget`** with `details.budget_bytes` and

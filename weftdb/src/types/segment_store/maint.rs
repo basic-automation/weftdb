@@ -935,10 +935,13 @@ impl SegmentStore {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let deadline = wait.deadline();
+		let time_deadline = self.maintenance_deadline();
 		let mut sweep = ReconcileSweep { aspects_scanned: aspects.len(), ..ReconcileSweep::default() };
 		for aspect in &aspects {
-			if cancel.is_requested() {
-				sweep.cancelled = true;
+			if cancel.is_requested() || time_deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+				if !sweep.cancelled && (cancel.is_requested() || time_deadline.is_some()) {
+					sweep.cancelled = true;
+				}
 				break;
 			}
 			if !self.breaker_permits(aspect) {
@@ -1081,10 +1084,13 @@ impl SegmentStore {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let deadline = wait.deadline();
+		let time_deadline = self.maintenance_deadline();
 		let mut sweep = HotColdSweep { aspects_scanned: aspects.len(), ..HotColdSweep::default() };
 		for aspect in &aspects {
-			if cancel.is_requested() {
-				sweep.cancelled = true;
+			if cancel.is_requested() || time_deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+				if !sweep.cancelled && (cancel.is_requested() || time_deadline.is_some()) {
+					sweep.cancelled = true;
+				}
 				break;
 			}
 			if !self.breaker_permits(aspect) {
@@ -1236,16 +1242,27 @@ impl SegmentStore {
 
 	/// [`reconcile_overlaps_with_policy`](Self::reconcile_overlaps_with_policy) under the
 	/// maintenance lock `held`.
+	/// The wall-clock deadline for this maintenance sweep, computed from
+	/// [`self.maintenance_op_max_secs`](SegmentStore::maintenance_op_max_secs)
+	/// (ROB-20 G5); `None` when the budget is unset.
+	fn maintenance_deadline(&self) -> Option<tokio::time::Instant> {
+		Some(tokio::time::Instant::now() + tokio::time::Duration::from_secs(self.maintenance_op_max_secs?))
+	}
+
 	pub(crate) async fn reconcile_overlaps_held(&self, held: &MaintGuard, policy: SplitPolicy) -> Result<usize> {
 		self.writable()?;
 		let aspect = held.aspect();
 		aspect_name::validate(aspect)?;
+		let deadline = self.maintenance_deadline();
 		// M1: the rows, as the swaps' preconditions will name them. Only this operation,
 		// under the maintenance lock, changes them; a seal meanwhile only adds rows.
 		let components = overlap_components(self.index.rows(aspect).await?);
 		let schema = self.require_schema(aspect).await?;
 		let mut removed = 0;
 		for mut members in components {
+			if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+				break;
+			}
 			if members.len() < 2 {
 				continue;
 			}
@@ -1527,9 +1544,13 @@ impl SegmentStore {
 	/// segments removed. Series squashed before a failure stay squashed.
 	async fn squash_series_held(&self, held: &MaintGuard, series: Vec<Vec<IndexRow>>, max_segments: usize) -> Result<usize> {
 		let aspect = held.aspect();
+		let deadline = self.maintenance_deadline();
 		let mut removed = 0;
 		let mut schema = None;
 		for members in series {
+			if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+				break;
+			}
 			if members.len() < 2 || members.len() <= max_segments {
 				continue;
 			}
@@ -1634,10 +1655,13 @@ impl SegmentStore {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let deadline = wait.deadline();
+		let time_deadline = self.maintenance_deadline();
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
-			if cancel.is_requested() {
-				sweep.cancelled = true;
+			if cancel.is_requested() || time_deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+				if !sweep.cancelled && (cancel.is_requested() || time_deadline.is_some()) {
+					sweep.cancelled = true;
+				}
 				break;
 			}
 			if !self.breaker_permits(aspect) {
@@ -1714,6 +1738,7 @@ impl SegmentStore {
 		self.writable()?;
 		let aspect = held.aspect();
 		aspect_name::validate(aspect)?;
+		let deadline = self.maintenance_deadline();
 		let target_rows = target_rows.max(1);
 		// M1: every row, ascending by id, as the swaps' preconditions will name them.
 		let rows = self.index.rows(aspect).await?;
@@ -1746,6 +1771,9 @@ impl SegmentStore {
 		let schema = self.require_schema(aspect).await?;
 		let mut removed = 0usize;
 		for members in groups {
+			if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+				break;
+			}
 			if members.len() < 2 {
 				continue;
 			}
@@ -1812,10 +1840,13 @@ impl SegmentStore {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let deadline = wait.deadline();
+		let time_deadline = self.maintenance_deadline();
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
-			if cancel.is_requested() {
-				sweep.cancelled = true;
+			if cancel.is_requested() || time_deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+				if !sweep.cancelled && (cancel.is_requested() || time_deadline.is_some()) {
+					sweep.cancelled = true;
+				}
 				break;
 			}
 			if !self.breaker_permits(aspect) {
@@ -1936,10 +1967,13 @@ impl SegmentStore {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let deadline = wait.deadline();
+		let time_deadline = self.maintenance_deadline();
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
-			if cancel.is_requested() {
-				sweep.cancelled = true;
+			if cancel.is_requested() || time_deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+				if !sweep.cancelled && (cancel.is_requested() || time_deadline.is_some()) {
+					sweep.cancelled = true;
+				}
 				break;
 			}
 			if !self.breaker_permits(aspect) {
