@@ -134,23 +134,27 @@ fn report_busy_aspects(span: &tracing::Span, kind: &'static str, busy: &[String]
 /// logs at `debug` when the budget is free enough or unbounded — the pass runs.
 /// Returns `false` to signal the caller to skip this tick, `true` to proceed.
 ///
-/// This is the ROB-14 cut 3 entry point for the maintenance/compaction/expiry-purge
-/// daemons. The check is advisory: the pass allocates later through the store and the
-/// filesystem, and the budget is a container-level estimate, not a per-operation
-/// accounting. Deferring on a tight budget is better than reaching the OOM killer.
+/// This is the ROB-14 cut 3 entry point for the reconcile daemon's tick functions: the
+/// passes that run with no request behind them. The compaction, expiry and purge daemons
+/// do not carry a budget yet, so cut 3 covers reconcile only.
+///
+/// The check is a probe, not an accounting of the pass. A pass allocates later, inside
+/// the store, and its footprint is not knowable here, so callers ask for the smallest
+/// reservation (`wanted` of 1) and the question this answers is whether any headroom
+/// exists at all. The reservation is released before returning for the same reason: the
+/// budget tracks container-level pressure, not bytes written. Deferring a pass on a
+/// tight budget is better than reaching the OOM killer.
 fn has_budget_for_pass(budget: &MemoryBudget, kind: &str, wanted: u64) -> bool {
-	let limit = budget.limit();
-	let Some(limit) = limit else {
+	let Some(limit) = budget.limit() else {
 		// Unbounded: the pass always runs.
 		return true;
 	};
 	match budget.try_reserve(wanted) {
-		Ok(_reservation) => {
-			// We hold the reservation only during this check; it is released at the end
-			// of the statement, which is correct because the budget tracks container-level
-			// pressure, not per-byte file writes. The reservation guards the decision point.
-			let _held = _reservation;
-			tracing::debug!(budget_limit = limit, reserved = %budget.reserved(), wanted, kind, "pass: budget can cover the pass");
+		Ok(reservation) => {
+			tracing::debug!(budget_limit = limit, reserved = %budget.reserved(), wanted, kind, "pass: the budget has headroom");
+			// Released on purpose: the probe covers the decision point only, and a pass
+			// that runs allocates through the store's own accounting afterwards.
+			drop(reservation);
 			true
 		}
 		Err(ReserveError::OverBudget { limit, reserved, wanted }) => {
@@ -858,9 +862,9 @@ mod tests {
 	/// ROB-14 cut 3: a tick with a tight budget (0 bytes) returns a default sweep —
 	/// the pass is deferred — and does not touch the store.
 	///
-	/// This test pins `reconcile_tick`'s budget check at line ~#has_budget_for_pass.
-	/// If the budget check is removed, the tick will run normally and its
-	/// `aspects_reconciled` will be > 0, which the assertion will catch.
+	/// This test pins the budget check `reconcile_tick` makes through
+	/// `has_budget_for_pass`: remove the check and the tick runs, so
+	/// `aspects_reconciled` and `passes` stop matching what is asserted below.
 	#[tokio::test]
 	async fn tick_is_deferred_when_budget_is_exhausted() {
 		let dir = TempDir::new().unwrap();
@@ -883,30 +887,37 @@ mod tests {
 		drop(store);
 	}
 
-	/// ROB-14 cut 3: a tick with an unbounded budget runs normally — same fixture
-	/// as the budget-exhausted test, same threshold, different budget.
-	///
-	/// This test pins `reconcile_tick`'s budget check at line ~#has_budget_for_pass.
-	/// If the budget check is removed, the tick will run the same way, but if the
-	/// check incorrectly blocks all passes this test will fail because
-	/// `aspects_reconciled` will be 0.
+	/// ROB-14 cut 3: the budget decides, not the store's readiness. Same fixture as the
+	/// deferred test, same threshold: with headroom the tick reconciles, and once a
+	/// reservation holds the whole limit the next tick defers. The second half is what
+	/// pins the check — delete it from [`reconcile_tick`] and the first half still
+	/// passes while `aspects_scanned` and `passes` stop matching.
 	#[tokio::test]
-	async fn tick_runs_when_budget_is_free() {
+	async fn a_bounded_budget_runs_a_pass_then_defers_once_full() {
 		let dir = TempDir::new().unwrap();
 		let store = SegmentStore::open(dir.path()).await.unwrap();
 		store.declare("a", &schema()).await.unwrap();
 		store.seal("a", &schema(), &[100_i64, 130, 110], &[bd("1"), bd("3"), bd("2")]).await.unwrap();
 		store.seal("a", &schema(), &[200_i64, 240, 210], &[bd("4"), bd("6"), bd("5")]).await.unwrap();
 		let metrics: SharedMetrics = Arc::new(Metrics::default());
-		// An unbounded budget: the reservation always succeeds.
-		let budget = MemoryBudget::new(None);
+		// A bounded budget with room to spare: the one-byte probe fits twice over.
+		let budget = MemoryBudget::new(Some(4096));
 
 		let sweep = reconcile_tick(&store, &metrics, &budget, 1).await.unwrap();
-		let snap = metrics.snapshot();
-		assert_eq!(sweep.aspects_reconciled, 1, "the budget is free; the tick must run");
+		assert_eq!(sweep.aspects_reconciled, 1, "a bounded budget with headroom still runs the pass");
 		assert_eq!(sweep.segments_reconciled, 2, "both segments reconciled");
-		assert_eq!(snap.reconcile.passes, 1, "the tick recorded a pass");
+		assert_eq!(metrics.snapshot().reconcile.passes, 1, "the tick recorded a pass");
 		assert_eq!(store.aspect_stats("a").await.unwrap().unsorted_segments, 0, "all out-of-order segments were reconciled");
+		assert_eq!(budget.reserved(), 0, "a completed pass leaves nothing reserved");
+
+		// Hold the whole limit. The store has no work left, so `aspects_reconciled`
+		// would read 0 either way; what the deferral is caught by is that the tick never
+		// got as far as scanning, and no pass is counted.
+		let hold = budget.try_reserve(4096).expect("the limit is free, so the hold must fit");
+		let sweep = reconcile_tick(&store, &metrics, &budget, 1).await.unwrap();
+		assert_eq!(sweep.aspects_scanned, 0, "a full budget defers the tick before it scans");
+		assert_eq!(metrics.snapshot().reconcile.passes, 1, "a deferred tick records no pass");
+		drop(hold);
 		drop(store);
 	}
 }
