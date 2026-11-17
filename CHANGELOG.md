@@ -49,7 +49,21 @@ in
   0.3.7 or earlier, which know no `aspects.storage_mode` column and answer **zero measurements**
   for such an aspect rather than refusing it. Neither the column nor the seal-backed aspect has
   ever shipped, so no released build created one; pin `WEFT_LEGACY_DEFAULT_STORAGE=rows` on a
-  deployment that must stay rollable to an older build.
+  deployment that must stay rollable to an older build.- **A maintenance merge of overlapping frames now folds them in one heap pass instead of k
+  pairwise rounds (#758, ROB-20 G3).** `merge_k_way` (`weft-physical-type/src/split.rs`) merges
+  `k` timestamp-sorted runs in a single pass over `k` cursors, and `fold_newest_wins`
+  (`weftdb/src/types/segment_store.rs`) builds those runs and calls it. The loop it replaces
+  folded the merged prefix against each member in turn, which cloned the whole prefix again on
+  every round. The rule at a shared timestamp is unchanged — the newest member's rows
+  supersede every older member's rows at that instant, while a member's own rows at other
+  instants survive and a run of equal timestamps inside one member is kept as written — so the
+  merged rows are meant to be identical either way. `split.rs`'s tests compare the two arms
+  over 600 generated overlap shapes plus the hand cases, and
+  `weft-physical-type/benches/kway_merge.rs` times both arms at k = 2, 4, 8, 16, 32 and asserts
+  they agree before timing. No number from that bench has been reported yet: nothing in this
+  slice was compiled or run on the author's machine, so CI is the gate and the speedup is a
+  claim CI has to confirm.
+origin/main
 
 ### Fixed
 
