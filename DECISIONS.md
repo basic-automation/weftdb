@@ -7915,3 +7915,36 @@ origin/main
   local build; the local checks run were `cargo fmt --check -p weft-server`,
   `python3 scripts/config/check_schema.py` and `python3 scripts/ci/check-serial-order.py`.
 - **Not compiled here, and not claimed.** Nothing in this slice was built: the host's RAM belongs to the model server, and CI is this quarter's Rust gate. The API surface the new tests lean on was checked by grep instead — `IndexRow.desc: SegmentDescriptor` (`weftdb/src/types/index_txn.rs:99`), `SegmentDescriptor { row_count: usize, byte_len: u64 }` (`weft-physical-type/src/catalog.rs:66,85`), and a sibling test module already calling `store.index.rows(ASPECT)` (`tag_seal_tests.rs:51`) — and CI is what says whether they pass. The three store-level tests are written so the ceiling is the **only** difference between them and their control, and the control (`the_same_fold_writes_one_frame_when_the_ceiling_is_off`) is the one that fails on `main` if the change ever regresses into a no-op.inorigin/main
+
+## 2026-11-16 — Reporting the whole-request float A/B as unresolvable, and ticking the line on that basis (#724)
+
+**What was asked.** `ROADMAP.md` asked what `float_roundtrip` costs a whole JSON compute or ingest
+request. The parse-only figure was already on record (+17 ns/value, about 1.42x, 1,000,000 values, a
+20.7 MB body). Three earlier dispatches of the A/B workflow never reached a timing loop; the fourth
+and fifth did.
+
+**What the two successful dispatches measured.** `values=20000 reps=20`, one job per arm, bench
+profile `opt-level=3` with `lto=false` and `codegen-units=16` (both arms share it). Run 43995374130:
+`on` p50 15.689 ms / 784.5 ns/value, `off` p50 16.273 ms / 813.6 ns/value. Run 44003339510: `on`
+p50 13.660 ms / 683.0 ns/value, `off` p50 19.728 ms / 986.4 ns/value.
+
+**Why that is a null result rather than a benefit.** The parse figure predicts about
+20,000 x 17 ns = 0.34 ms of extra work per request of that size. The measured arm-to-arm swing was
+0.58 ms and 6.07 ms, and in both samples the arm without the feature was the faster one — the wrong
+sign for a feature that only adds work to deserialisation. A real 1.42x parse cost cannot hide as a
+speed-up three times its own size, so the variance is the runner, not the feature. Nothing here
+suggests enabling `float_roundtrip` makes requests faster.
+
+**The choice made, and its cost.** The line is ticked with the limitation written into the line
+itself and both dispatches recorded in `docs/roadmap-notes.md`, instead of being left open waiting
+for a measurement this infrastructure cannot produce. Leaving it open would have cost the same truth
+plus a permanently unticked line; a reader gets the number, the resolution limit, and what would be
+needed to beat it (a self-hosted runner with a warm target directory, which only the owner can
+provide — recorded under Needs human in spirit, not as a blocker on this slice).
+
+**Scope honesty.** No Rust behaviour changed: the slice is the bench
+(`weft-server/benches/json_body_cost.rs`), the workflow (`.github/workflows/float-roundtrip-ab.yml`),
+and the docs. The bench body is 1,414,482 bytes because axum's default request-body limit is 2 MB, so
+the request-level bench cannot be widened to the 20.7 MB shape the parse figure used — that is a real
+ceiling on this method, not a tuning knob. Nothing was compiled locally; the local check run was
+`cargo fmt -p weft-server`.
