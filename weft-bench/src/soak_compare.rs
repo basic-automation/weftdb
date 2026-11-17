@@ -879,17 +879,17 @@ mod tests {
 
 	#[test]
 	fn run_soak_schema_mismatch_refuses_comparison() {
-		// Run schema 6 vs 7 should produce a run_schema_mismatch,
+		// Run schema 6 vs 8 should produce a run_schema_mismatch,
 		// suppress metric drifts, and name both versions.
 		let run = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
 		let mut prev = create_report(&run);
 		// Override the soak schema version on one side
 		prev.run.soak_schema_version = 6;
 		let curr = create_report(&run);
-		// Current uses SOAK_SCHEMA_VERSION == 7
+		// Current uses SOAK_SCHEMA_VERSION == 8
 
 		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
-		assert_eq!(comp.run_schema_mismatch, Some((6u32, 7u32)), "run schema mismatch: must report (6, 7)");
+		assert_eq!(comp.run_schema_mismatch, Some((6u32, 8u32)), "run schema mismatch: must report (6, 8)");
 		assert!(comp.metric_drifts.is_empty(), "no metric drifts when soak run schema versions differ");
 		// Rule changes should still be reported
 		assert!(!comp.rule_changes.is_empty(), "rule changes still compared across run schema versions");
@@ -903,7 +903,7 @@ mod tests {
 		// serde — so this is the defensive floor, not a live artifact path.
 		let run_modern = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
 		let modern = create_report(&run_modern);
-		// modern.run.soak_schema_version == SOAK_SCHEMA_VERSION (7 at this writing)
+		// modern.run.soak_schema_version == SOAK_SCHEMA_VERSION (8 at this writing)
 
 		let run_old = create_run(60, Some(create_oracle(60, 0)), Some(create_derived(60, 0)), Some(create_backup(1000, 1000, 2000)));
 		let mut old = create_report(&run_old);
@@ -926,13 +926,13 @@ mod tests {
 		let mut prev = create_report(&run);
 		prev.schema_version = 42;
 		prev.run.soak_schema_version = 3;
-		// Current uses default schema_version (1) and SOAK_SCHEMA_VERSION (7)
+		// Current uses default schema_version (1) and SOAK_SCHEMA_VERSION (8)
 		let curr = create_report(&run);
 
 		let comp = compare_soak_reports(&prev, &curr, DEFAULT_METRIC_TOLERANCES);
 
 		assert_eq!(comp.schema_mismatch, Some((42u32, 1u32)), "schema mismatch must be reported");
-		assert_eq!(comp.run_schema_mismatch, Some((3u32, 7u32)), "run schema mismatch must be reported");
+		assert_eq!(comp.run_schema_mismatch, Some((3u32, 8u32)), "run schema mismatch must be reported");
 		assert!(comp.metric_drifts.is_empty(), "no metric drifts when both schema versions differ");
 		assert!(comp.summary.contains("Schema version"), "summary names the report-schema mismatch");
 		assert!(comp.summary.contains("soak run schema"), "summary names the soak run schema mismatch");

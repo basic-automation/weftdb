@@ -172,7 +172,7 @@ pub async fn run_ttl_lane(ttl_secs: u64, now_ns: i64) -> anyhow::Result<TtlLaneV
 	let expired_ts: Vec<i64> = if cutoff > i64::MIN + 4 { vec![cutoff - 4, cutoff - 2] } else { Vec::new() };
 	let live_ts: Vec<i64> = vec![cutoff, cutoff + 2];
 	let ts_all: Vec<i64> = expired_ts.iter().copied().chain(live_ts.iter().copied()).collect();
-	let vs_all: Vec<BigDecimal> = ts_all.iter().map(|t| BigDecimal::from(i64::try_from(*t).unwrap_or(0))).collect();
+	let vs_all: Vec<BigDecimal> = ts_all.iter().map(|t| BigDecimal::from(*t)).collect();
 
 	store.ingest(aspect, &weftdb::IngestBatch::dense("s1", ts_all, vs_all)).await?;
 
@@ -221,6 +221,12 @@ pub async fn run_ttl_lane(ttl_secs: u64, now_ns: i64) -> anyhow::Result<TtlLaneV
 
 #[cfg(test)]
 mod tests {
+	use std::str::FromStr;
+
+	use bigdecimal::BigDecimal;
+	use weft_physical_type::{AspectSchema, PhysicalType};
+	use weftdb::{IngestBatch, RowExpiryPolicy, SeriesId};
+
 	use super::*;
 
 	#[test]
@@ -254,8 +260,6 @@ mod tests {
 
 	#[test]
 	fn ttl_policy_label_from_row_expiry_policy() {
-		use weftdb::RowExpiryPolicy;
-
 		assert_eq!(TtlPolicyLabel::from(&RowExpiryPolicy::NoExpiry), TtlPolicyLabel::NoExpiry,);
 		assert_eq!(TtlPolicyLabel::from(&RowExpiryPolicy::Ttl { ttl: 7200 }), TtlPolicyLabel::Ttl { ttl: 7200 },);
 	}
@@ -266,9 +270,9 @@ mod tests {
 		// an empty TtlExpirySweepReport.
 		let sweep = ExpirySweep::default();
 		let report: TtlExpirySweepReport = sweep.into();
-		assert!(report.aspects_cleaned.is_empty());
-		assert!(report.busy.is_empty());
-		assert!(report.failed.is_empty());
+		assert_eq!(report.aspects_cleaned, Vec::new());
+		assert_eq!(report.busy, Vec::new());
+		assert_eq!(report.failed, Vec::new());
 		assert_eq!(report.rows_expired, 0);
 		assert_eq!(report.segments_dropped, 0);
 		assert_eq!(report.partial_segments, 0);
@@ -286,14 +290,9 @@ mod tests {
 
 		// Run with NoExpiry — should report 0 expired.
 		// We bypass run_ttl_lane because it always sets TTL; open directly.
-		use weftdb::SegmentStoreOptions;
 		let dir = tempfile::tempdir().expect("tempdir");
 		let opts = SegmentStoreOptions::default().with_expiry(RowExpiryPolicy::NoExpiry);
 		let store = SegmentStore::open_with_options(dir.path(), opts).await.expect("open");
-		use std::str::FromStr;
-
-		use bigdecimal::BigDecimal;
-		use weft_physical_type::{AspectSchema, PhysicalType};
 		store.declare("noexp_test", &AspectSchema::new(PhysicalType::F64, BigDecimal::from_str("0").unwrap(), TimeUnit::Seconds)).await.expect("declare");
 		store.ingest("noexp_test", &weftdb::IngestBatch::dense("s1", vec![50, 95], vec![BigDecimal::from(1), BigDecimal::from(2)])).await.expect("ingest");
 		let sweep = store.expiry_sweep(now_ns).await.expect("sweep");
@@ -308,12 +307,6 @@ mod tests {
 	async fn ttl_lane_store_round_trip_exact_counts() {
 		let now_ns = 100_000_000_000i64; // T = 100s
 		let ttl_secs = 10u64;
-
-		use std::str::FromStr;
-
-		use bigdecimal::BigDecimal;
-		use weft_physical_type::{AspectSchema, PhysicalType};
-		use weftdb::{IngestBatch, SeriesId};
 
 		let dir = tempfile::tempdir().expect("tempdir");
 		let opts = SegmentStoreOptions::default().with_expiry(RowExpiryPolicy::Ttl { ttl: ttl_secs });
