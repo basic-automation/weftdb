@@ -16,7 +16,14 @@ on the store. When the policy is `NoExpiry` (the default) the call returns cheap
 no work; when a TTL is configured, the frames every row of which is past the cutoff are
 removed from the index and retired to the reaper. A frame that straddles the cutoff is
 left alone and counted. Failures follow the same WARN-per-aspect and breaker-skip idiom
-as the other sweeps.
+as the other sweeps.- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**
+  Store-wide maintenance sweeps — threshold reconcile, hot/cold reconcile, squash over threshold,
+  squash to target rows, many-aspect squash — check a per-sweep deadline between components, groups,
+  series and aspects. When the deadline passes, the sweep stops before the next swap, marks its
+  [`cancelled`](weftdb::ReconcileSweep::cancelled) field `true`, and reports what it accomplished
+  so far. An already-committed swap is never aborted. Set via the environment variable
+  `WEFT_MAINTENANCE_MAX_OP_SECONDS` (Tier::Experimental); unset or `0` means unbounded.
+origin/main
 - **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**
 Where `expiry_sweep` only counts, the purge acts: a segment every row of which is older
 than the store's TTL is dropped through the same swap the maintenance passes use, so its
@@ -26,6 +33,7 @@ recomputed from what is left. A report now says how many segments left
 (`partial_segments`) — those are counted and left alone, so a TTL shorter than a segment's
 span leaves rows on disk that no read returns. Unlike the sweep, the purge records
 breaker outcomes: it is a maintenance operation that can fail half-done.
+origin/main
 - **A refused maintenance plan has its own HTTP answer (#764).** `StoreError::OverBudget` — an
   overlaps merge whose segments total more than `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES`, refused before
   the group is read — now answers **`503 over_budget`** with `details.budget_bytes` and

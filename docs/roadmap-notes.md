@@ -711,3 +711,21 @@ Strategy B pins the refusal without privileges. There is no `WEFT_DISK_USAGE_COM
 command/env seam for filesystem usage anywhere in this repository — the only operator knob is
 `WEFT_DISK_RESERVE_BYTES`, and the library-side injectable figure is the `Option<DiskSpace>` argument
 of `admit`.
+
+## ROB-20 G5 — per-operation wall-clock budget for maintenance sweeps
+
+Code: `weftdb/src/types/segment_store/maint.rs` — the `maintenance_deadline()` helper computes an
+`Option<Instant>` once per sweep and each held path (`reconcile_overlaps_held`,
+`squash_series_held`, `squash_aspect_to_target_rows_held`) checks it between components/groups;
+the four store-wide sweep loops (`reconcile_all_over_threshold_with_cancel`,
+`reconcile_all_hot_cold_with_cancel`, `squash_all_over_threshold_with_cancel`,
+`squash_all_to_target_rows_with_cancel`, `squash_all_to_target_rows_if_fragmented_with_cancel`)
+check it between aspects.
+
+Test: `maintenance_budget_tests::a_maintenance_sweep_stops_at_its_time_budget_before_any_swap`
+— sets `with_max_maintenance_op_seconds(0)` so the deadline is `Some(Instant::now())` and the
+loop breaks before any swap. The converse (unset ⇒ proceeds) is covered by every existing sweep
+test that completes normally without setting the env var.
+
+Env var: `WEFT_MAINTENANCE_MAX_OP_SECONDS` (`Tier::Experimental`), parsed at
+`SegmentStoreOptions::from_env()` in `segment_store.rs:538-539`. Unset = unbounded.
