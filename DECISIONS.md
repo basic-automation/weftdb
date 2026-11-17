@@ -8007,6 +8007,30 @@ modules are inside the defining module.
 - **Single oversized segment deliberately not re-split**: the output-re-split ceiling (G4) splits a multi-segment merge's output, but an already-oversized segment written by a single seal is left as-is. An auto-re-split pass would need to read and rewrite it, which is the same cost as a reconcile; that is a new maintenance operation, not part of the time budget.
 - **`cancelled` reused, not an error variant**: hitting the budget is not a failure — the sweep reports `cancelled: true` and what it accomplished before the deadline, exactly as `MaintenanceCancel` already does. No entry point changes signature, no HTTP code, no `StoreError` variant.
 - **Deadline computed once per sweep**: `maintenance_deadline()` in `maint.rs` computes `Instant::now() + Duration::from_secs(env_value)` once and the held paths check `Instant::now() >= deadline` between iterations, rather than recomputing seconds in a loop that might drift under scheduler delay.origin/main
+## 2026-11-16 — Naming the client abort without widening the frozen code table (shipped)
+
+- **The issue's premise was stale.** #742 described a disconnect and a deadline both ending up as
+  `408 body_timeout`. By the time the issue was filed, ROB-18 (merged) already distinguished three
+  outcomes: a deadline expiry (`ingest.rs:505-511`), a body-stream transport error (`ingest.rs:489`,
+  mapped to `400 bad_request`), and a premature EOF below the declared `Content-Length`
+  (`ingest.rs:446-457`, `check_body_truncation`). The real defect was narrower: two different
+  `bad_request` messages described the same condition (`client_disconnect`), and the stream-error arm
+  put a raw transport error string on the wire.
+- **A new `Code` variant was rejected.** The error-code table is a frozen 43-entry wire contract
+  (`TABLE` at `weft-server/src/error.rs:1138`, pinned at `assert_eq!(TABLE.len(), 43)`). A code the
+  caller cannot act on (an aborted client cannot read the answer) does not earn a slot in the
+  table. A non-standard `499` was also rejected because every `Code` carries a standard `StatusCode`
+  and the `status` method derives it from the variant (`ingest-server-failure` non-standard codes
+  break that invariant).
+- **The distinction lives in `details.reason`.** Both detection sites now produce the same labelled
+  wire answer: `400 bad_request` with message `"the client disconnected before completing the request
+  body"` and `details: {"reason": "client_disconnect"}`. The raw transport error goes to
+  `tracing::warn!` (`ingest.rs:489`, the stream-error arm) and `tracing::info!` (`ingest.rs:450`,
+  `check_body_truncation`), never onto the wire. The deadline arm (`ingest.rs:505-511`) stays
+  `408 body_timeout` untouched.
+- **Four tests added,** one of which (`a_body_that_never_finishes_is_a_deadline_not_a_disconnect`,
+  `start_paused`) proves that a stalled body is still a deadline and not a disconnect — the
+  regression guard the whole slice is about.origin/mainorigin/mainorigin/main
 ## 2026-11-17 — The expired-row purge runs unconditionally in every daemon tick (shipping)
 
 Issue #785, TTL cut 4. The store's `purge_expired` already returns cheaply when the policy is
@@ -8035,4 +8059,4 @@ not separate them — matching how the store's own `purge_expired` reports `busy
 carries on past a failing aspect. A whole-sweep failure (the aspect list itself unreadable) is
 logged and the tick continues.origin/main
 
-origin/mainorigin/mainorigin/main
+origin/mainorigin/mainorigin/mainorigin/main
