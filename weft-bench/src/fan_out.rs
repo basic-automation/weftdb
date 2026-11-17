@@ -2,12 +2,12 @@
 //!
 //! On `main` `git grep -l fan-out` matches only `DECISIONS.md`, `ROADMAP.md` and
 //! `docs/roadmap-notes.md` — there is **no measurement**. This arm opens a real
-//! [`SegmentStore`](weftdb::SegmentStore), ingests a seeded multi-series corpus, then
+//! [weftdb::SegmentStore], ingests a seeded multi-series corpus, then
 //! reads every series at each rung of a series-count ladder (default 1, 10, 100, 1000)
 //! and records the wall time, rows read, and series touched.
 //!
 //! **This is a cost curve for our own engine, not a race against another vendor.**
-//! [`docs/benchmark-policy.md`] racing rules are not engaged.
+//! The racing rules of `docs/benchmark-policy.md` are not engaged.
 
 use std::time::Instant;
 

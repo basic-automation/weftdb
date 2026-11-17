@@ -10,6 +10,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **A fan-out benchmark arm — the cost of reading across many series (#809, TAG-12).**
+`weft-bench --fan-out` opens a real `SegmentStore`, ingests a seeded corpus of tagged series
+(1 000 rows each by default), and then reads every series at each rung of a series-count ladder
+(1, 10, 100, 1000), reporting wall time, rows read and series touched per rung. It is the
+multi-series read cost curve the TSBS tag-grouped queries that TAG-12 moved here need. It measures
+our own engine: the vendor racing rules in `docs/benchmark-policy.md` are not engaged by it.
 - **`WEFT_MEMORY_BUDGET_BYTES` and the cgroup limit are now read and held (#788).**
 Where the server could previously only bound a request's body bytes, it now knows the memory
 ceiling it runs under: `weft-server/src/memory_budget.rs` reads cgroup v2 `memory.max`, falls
