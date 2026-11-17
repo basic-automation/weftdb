@@ -63,10 +63,11 @@ use weft_physical_type::{crc32, widen_value_encoding, AspectSchema, PhysicalType
 
 use crate::{AspectId, DatasetId, IngestBatch, Measurement, MeasurementId, SegmentStore, TxId};
 
-/// The environment variable that names the storage mode of every newly
-/// created legacy aspect (crash-consistency design §8, S19; #768 flipped the
-/// default). `rows` asks for the per-aspect `measurements.db`, `segments` asks
-/// for the seal store, and **unset is now seal-backed**.
+/// The environment variable naming the storage mode of a newly created legacy aspect.
+///
+/// Crash-consistency design §8, S19; #768 flipped the default. `rows` asks for
+/// the per-aspect `measurements.db`, `segments` asks for the seal store, and
+/// **unset is now seal-backed**.
 ///
 /// A value that names neither word is rows mode, which is the safe side of the
 /// ambiguity: a typo leaves the aspect in the shape every released Weft can read
