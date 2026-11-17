@@ -530,7 +530,7 @@ fn maintenance_segment_ceiling_from(value: Option<&str>) -> Option<u64> {
 /// unit exactly like `RowExpiryPolicy::Ttl { ttl: u64 }` — there is no seconds-based
 /// conversion.
 fn row_expiry_policy_from(value: Option<&str>) -> row_expiry::RowExpiryPolicy {
-	value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|ttl| *ttl > 0).map(|ttl| row_expiry::RowExpiryPolicy::Ttl { ttl }).unwrap_or(row_expiry::RowExpiryPolicy::NoExpiry)
+	value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|ttl| *ttl > 0).map_or(row_expiry::RowExpiryPolicy::NoExpiry, |ttl| row_expiry::RowExpiryPolicy::Ttl { ttl })
 }
 
 /// The default per-aspect series cap, [`SegmentStoreOptions::max_series_per_aspect`]:
