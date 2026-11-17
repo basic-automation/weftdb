@@ -580,8 +580,9 @@ fn untested_surfaces(run: &SoakRun, slo: &SloReport, contamination: Option<&Cont
 	if contamination.is_none() {
 		untested.push("system contamination monitoring — SOA-12");
 	}
-	// Lanes that do not exist yet:
-	untested.push("SOA-15 TTL (coverage not yet wired)");
+	if run.ttl.is_none() {
+		untested.push("SOA-15 TTL (coverage not yet wired)");
+	}
 	if run.upgrade.is_none() {
 		untested.push("SOA-16 upgrade (coverage not yet wired)");
 	}
@@ -652,6 +653,36 @@ fn build_honesty_section(run: &SoakRun, slo: &SloReport, _coverage: &CoverageRep
 				}
 				out.push('\n');
 			}
+		}
+	}
+
+	// --- TTL lane ---
+	out.push_str("### TTL lane\n\n");
+	match &run.ttl {
+		None => out.push_str("Not exercised (store had no row TTL lane configured).\n\n"),
+		Some(v) => {
+			let policy_label = match &v.store_expiry_policy {
+				crate::soak_ttl::TtlPolicyLabel::NoExpiry => "NoExpiry".to_string(),
+				crate::soak_ttl::TtlPolicyLabel::Ttl { ttl } => format!("Ttl({{ttl={ttl}}})"),
+			};
+			let _ = writeln!(out, "Expiry policy: {policy_label}");
+			let _ = writeln!(out, "Aspects cleaned: {} — {}", v.expiry_sweep.aspects_cleaned.len(), v.expiry_sweep.aspects_cleaned.join(", "));
+			let _ = writeln!(out, "Rows expired: {}", v.expiry_sweep.rows_expired);
+			if !v.expiry_sweep.busy.is_empty() {
+				let _ = writeln!(out, "Busy aspects (not swept): {}", v.expiry_sweep.busy.join(", "));
+			}
+			if !v.expiry_sweep.failed.is_empty() {
+				let _ = writeln!(out, "Failed aspects:");
+				for (name, err) in &v.expiry_sweep.failed {
+					let _ = writeln!(out, "- {name}: {err}");
+				}
+			}
+			if v.passed() {
+				out.push_str("TTL lane: passed.\n");
+			} else {
+				out.push_str("TTL lane: FAILED — sweep reported errors.\n");
+			}
+			out.push('\n');
 		}
 	}
 

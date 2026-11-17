@@ -10,7 +10,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
-- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**
+- **A refused maintenance plan has its own HTTP answer (#764).**- **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**
   Store-wide maintenance sweeps — threshold reconcile, hot/cold reconcile, squash over threshold,
   squash to target rows, many-aspect squash — check a per-sweep deadline between components, groups,
   series and aspects. When the deadline passes, the sweep stops before the next swap, marks its
@@ -18,6 +18,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   so far. An already-committed swap is never aborted. Set via the environment variable
   `WEFT_MAINTENANCE_MAX_OP_SECONDS` (Tier::Experimental); unset or `0` means unbounded.
 - **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**
+origin/main
 Where `expiry_sweep` only counts, the purge acts: a segment every row of which is older
 than the store's TTL is dropped through the same swap the maintenance passes use, so its
 index row goes, its frame is retired for the reaper to unlink, and the aspect's rollup is
@@ -44,8 +45,11 @@ and the swap stays legal (precedence P1/P2); the rows are exactly what the fold 
 written, and the boundary rule is even division of the merged row range. Unset (the library and
 server default) re-cuts nothing. A frame a single seal wrote is not re-cut — that stays the
 operator's `split_segment`.
+origin/main
 
-in
+### Changed
+
+- **A client that aborts the request body answers `400 bad_request` with a labelled message and `details.reason: "client_disconnect"` (#742).** Both detection sites (body-stream transport error and premature EOF short of Content-Length) now produce the same wire answer instead of different text; the raw transport error is kept off the wire. The deadline timeout (`408 body_timeout`) is unchanged.
 - **Request-level benchmark for `float_roundtrip` (#724).** `weft-server/benches/json_body_cost.rs`
   drives one whole `POST /api/v1/interpolate` request with N float values in the same magnitude
   mix as the Phase 11 parse-only measurement and reports p50/p95 latency plus ns/value. A
