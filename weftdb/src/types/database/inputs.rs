@@ -658,6 +658,16 @@ impl Inputs for Database {
 				return Ok(Vec::new());
 			}
 
+			// Seal-backed aspects (slice D-S19, #232 follow-up: this entry point
+			// was not yet routed): the whole chunk is one ingest transaction in the
+			// seal store, all-or-nothing, and a retry replays it. The chunk store
+			// was reading from was rows mode only, and a seal-backed aspect's reads
+			// dispatch to the seal store, so an un-routed chunk wrote where no read
+			// could find it.
+			if self.is_seal_backed(aspect_id).await? {
+				return self.batch_capture_sealed(aspect_id, &dataset_id, chunk).await;
+			}
+
 			let db = self.get_measurement_db(aspect_id).await?;
 			let db_path = self.get_measurement_db_path(aspect_id).await?;
 			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
