@@ -8156,6 +8156,50 @@ historical counts written as words so the checker's digit scan cannot mistake th
 claims — and the schema version stayed at 2, since adding a variable changes what may be set, not
 the shape of the schema. **A failing gate is answered by changing what is checked, never the
 checker.**origin/mainorigin/mainorigin/main
+## 2026-11-16 — Flipping the storage-mode default, and why the roadmap's cost figure was not the gate (shipped)
+
+Issue #768 asked to flip new legacy aspects to seal-backed, "carrying the cost figure the flip needs"
+per the roadmap line. That figure never becomes a gate: `float_roundtrip` prices serde_json f64
+round-trip in an ingest or interpolate body (`weft-server/benches/json_body_cost.rs`), which is
+orthogonal to where a new aspect stores its rows, and the seal path's real costs, one-row ingest as a
+full seal commit, the fragmentation gate, read fan-out, shipped and were characterised in S19 and S20.
+Deciding the flip on a measurement of something else would have bought a number and learned nothing, so
+the line was re-read rather than satisfied, and the flip's actual consequence, the one-way downgrade
+door, is what the PR documents.
+
+What the flip touches is one branch. `StorageMode::for_new_aspect` answers `Segments` when
+`WEFT_LEGACY_DEFAULT_STORAGE` is unset, and otherwise routes the value through `StorageMode::parse`
+unchanged, so `rows` is the explicit opt-out and `segments` still means what it meant. That last part is
+load-bearing: `parse` is how a stored mode is read back, and `NULL`, the mode of every aspect any
+released build created, parses to rows mode. Leaving the set-value branch alone means a typo'd value
+falls back to the shape every released Weft can read instead of silently sealing an aspect, and editing
+`parse` was the one way to corrupt existing stores. The `#[default] Rows` on the enum stays too: it
+describes a struct default, not a creation policy, and changing it would silently move every
+`StorageMode::default()` call site.
+
+Blast radius was measured rather than assumed. Every suite whose premise is the legacy **queue**,
+`db_tests`, `legacy_queue_crash`, `rob5_queue_consumer_panics`, `dictionary_bounded`, orchestration's
+`test_support::data_dir` fixture and `debug_batch_test`, now names `rows` explicitly, because
+seal-backed ingest never queues and those suites would otherwise have tested an empty queue while
+believing they tested a consumer; `change_log_tests` and the renamed `legacy_seal_tests` rows-mode test
+say `rows` where they meant `unset`. `new_api_tests` and its stress sibling were deliberately left on
+the new default: 25 tests that use only the mode-agnostic new API are the soak coverage for
+seal-backed-by-default, and leaving them un-fixture-ed is what puts the flip in front of a suite instead
+of behind one. The new test `a_new_aspect_is_seal_backed_without_being_told` and the inverted unit
+assertion are the pre-flip-failing evidence.
+
+The door is documented rather than engineered. 0.3.7 and earlier know no `aspects.storage_mode` column
+and read a legacy aspect only from its `measurements.db`, so they answer **zero measurements** for a
+seal-backed aspect rather than refusing it, a silent data-loss shape on downgrade. No released build
+ever created a seal-backed legacy aspect (D-S19 is unreleased), so this is a warning for anyone running
+`main`, with `WEFT_LEGACY_DEFAULT_STORAGE=rows` as the pin that keeps a deployment rollable. A dual-read
+fallback was rejected: it keeps alive a storage shape the roadmap is retiring, for a downgrade path the
+project does not promise before 1.0.
+
+Recorded as a known limitation, not fixed: `WEFT_MAINTENANCE_MAX_SEGMENT_BYTES` (#773) re-cuts only
+folds of two or more segments, so the first frame a brand-new seal-backed aspect writes from a large bulk
+ingest can sit above that ceiling until a later fold cuts it, and #765's output budget bounds maintenance
+rather than ingest. Nothing here makes that worse; it only makes it reachable by default.origin/mainorigin/mainorigin/mainorigin/main
 
 
 ## 2026-11-17 — What the daemon budget check can honestly promise (ROB-14 cut 3, #806) (decided)
