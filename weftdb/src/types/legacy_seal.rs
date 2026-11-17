@@ -66,12 +66,13 @@ use crate::{AspectId, DatasetId, IngestBatch, Measurement, MeasurementId, Segmen
 /// The environment variable that names the storage mode of every newly
 /// created legacy aspect (crash-consistency design §8, S19; #768 flipped the
 /// default). `rows` asks for the per-aspect `measurements.db`, `segments` asks
-/// for the seal store, and **unset is now seal-backed**. A value that names
-/// neither word is rows mode, which is the safe side of the ambiguity: a typo
-/// leaves the aspect in the shape every released Weft can read instead of
-/// sealing it silently. Only the unset case changed — [`StorageMode::parse`],
-/// which reads the mode an aspect already has, still answers rows mode for
-/// `NULL` and for anything it does not recognise.
+/// for the seal store, and **unset is now seal-backed**.
+///
+/// A value that names neither word is rows mode, which is the safe side of the
+/// ambiguity: a typo leaves the aspect in the shape every released Weft can read
+/// instead of sealing it silently. Only the unset case changed —
+/// [`StorageMode::parse`], which reads the mode an aspect already has, still
+/// answers rows mode for `NULL` and for anything it does not recognise.
 pub const LEGACY_DEFAULT_STORAGE_ENV: &str = "WEFT_LEGACY_DEFAULT_STORAGE";
 
 /// The subject half of the seal store's scope: `(db, 'legacy')`.
@@ -139,10 +140,7 @@ impl StorageMode {
 		if has_compression_config {
 			return Self::Rows;
 		}
-		match env_default {
-			None => Self::Segments,
-			Some(value) => Self::parse(Some(value)),
-		}
+		env_default.map_or(Self::Segments, |value| Self::parse(Some(value)))
 	}
 }
 
