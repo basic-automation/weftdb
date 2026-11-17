@@ -113,13 +113,16 @@ origin/main
 
 ### Testing
 
-- **A multi-series cell in the crash matrix (TAG-12).** `weft-bench --failure kill-ingest-tagged`
+- **Multi-series cells in the crash matrix (TAG-12).** `weft-bench --failure kill-ingest-tagged`
   (and every `--crash-matrix` run, which takes `Failure::ALL`) kills a child process with `SIGKILL`
   while it ingests each batch into three tagged series of one aspect (`host=s0..s2`) through the
   tagged `SegmentStore::ingest` path. Each series holds values offset by its own number, so a row
   served from the wrong series reads back wrong. The reopened store must hold exactly each series'
   acknowledged rows, and only the series whose ingest was in flight may hold that one batch more;
-  then every series resumes and must finish whole. Like the other two SIGKILL cells, it runs on
+  then every series resumes and must finish whole. `--failure kill-compaction-tagged` seals the
+  same three series batch by batch, so their segments interleave, and kills a child compacting the
+  aspect. Every series must still hold all of its rows exactly, `fsck` must quarantine nothing,
+  and a rerun of the compaction must keep them exact. Like the other SIGKILL cells, both run on
   Linux only (tursodatabase/turso#7480).
 - **The compatibility-leg gate maps legs to things, and carries a category for stand-ins
   (#762).** `scripts/compat/test_leg_coverage.py` compared a pinned release's declared legs

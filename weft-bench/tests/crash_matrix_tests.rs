@@ -6,8 +6,8 @@
 //!
 //! # Platform gating for SIGKILL cells
 //!
-//! On non-Linux platforms the three SIGKILL failures (`kill-ingest`,
-//! `kill-ingest-tagged` and `kill-compaction`) are **excluded** from the matrix test, because the
+//! On non-Linux platforms the four SIGKILL failures (`kill-ingest`,
+//! `kill-ingest-tagged`, `kill-compaction` and `kill-compaction-tagged`) are **excluded** from the matrix test, because the
 //! upstream Turso MVCC engine refuses to reopen a database whose checkpoint
 //! was interrupted between `TruncateLogicalLog` and `TruncateWal` — exactly
 //! the state a SIGKILL during compaction leaves behind. The engine returns
@@ -49,7 +49,7 @@ const FIXTURE: &str = "Date;Time;Global_active_power;Global_reactive_power;Volta
 /// The failures this platform runs in the matrix test.
 ///
 /// On Linux every failure in [`Failure::ALL`] runs, the SIGKILL cells included.
-/// On every other platform the three SIGKILL cells are dropped, because the
+/// On every other platform the four SIGKILL cells are dropped, because the
 /// upstream Turso MVCC engine cannot reopen a store whose checkpoint was
 /// interrupted by SIGKILL between the logical-log truncation and the WAL
 /// truncation: the orphan `.db-wal` is indistinguishable from a genuine corrupt
@@ -69,7 +69,7 @@ fn failures_for_platform() -> Vec<Failure> {
 #[cfg(not(target_os = "linux"))]
 #[must_use]
 fn failures_for_platform() -> Vec<Failure> {
-	Failure::ALL.iter().filter(|failure| !matches!(failure, Failure::KillIngest | Failure::KillIngestTagged | Failure::KillCompaction)).copied().collect()
+	Failure::ALL.iter().filter(|failure| !matches!(failure, Failure::KillIngest | Failure::KillIngestTagged | Failure::KillCompaction | Failure::KillCompactionTagged)).copied().collect()
 }
 
 #[tokio::test]
