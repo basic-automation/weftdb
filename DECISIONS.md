@@ -8030,4 +8030,28 @@ modules are inside the defining module.
   `408 body_timeout` untouched.
 - **Four tests added,** one of which (`a_body_that_never_finishes_is_a_deadline_not_a_disconnect`,
   `start_paused`) proves that a stalled body is still a deadline and not a disconnect — the
-  regression guard the whole slice is about.origin/mainorigin/mainorigin/main
+  regression guard the whole slice is about.
+
+## 2026-11-17 — Moving the fragmentation gate into the bulk-ingest path (#232)
+
+- **The fragmentation gate was an inline duplicate, not a missing feature.** The three gate calls
+  in `inputs.rs` (`:335`, `:446`) each immediately followed an `ingest_batch` call for the same
+  aspect, replicating the gate logic inline. The third caller (`batch_capture_sealed`, `:2442`)
+  did not run the gate at all — it calls `ingest_batch` then drops the store immediately. Moving
+  the gate into `ingest_batch` itself removes the risk of a future caller forgetting it.
+- **Inline gate vs. a separate maintenance daemon.** An inline gate (called after every ingest) was
+  chosen over a background daemon because (a) the gate is O(1) on a converged aspect's rollup,
+  so its per-write cost is negligible when the aspect is stable; (b) it does not hold the
+  maintenance lock from a previous call — the lock is acquired and released within each gate call;
+  and (c) a daemon adds lifecycle complexity (start, stop, backpressure, reconcile with writes).
+  The existing `squash_all_to_target_rows_if_fragmented` sweep (`sweep_all.rs`) already
+  provides the background pass for an operator who wants a one-shot convergence across all aspects;
+  the inline gate is the per-write convergence that keeps bulk from diverging from single-row
+  behaviour.
+- **`ingest_batch_with_gate` takes a `squash_target_rows` parameter;** the existing `ingest_batch`
+  is a thin wrapper passing `SQUASH_TARGET_ROWS`. This lets tests drive a deliberately small target
+  and lets a future caller (e.g., an archival ingest at a different threshold) choose a different
+  target without another wrapper.
+- **The two duplicate gate calls in `inputs.rs` were removed.** `batch_capture_sealed` (`:2442`)
+  was left untouched: it drops the store after ingest and cannot run a gate on it. That site ran
+  no gate before and runs none now — a separate concern.
