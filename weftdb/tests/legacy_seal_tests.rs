@@ -45,7 +45,7 @@ async fn bulk_ingest_converges_at_small_target() -> Result<()> {
 	// 20 batches of 3 rows each at a target of 4: the gate should squash to ~15 segments.
 	// Without the gate we would have 20+ segments.
 	for i in 0..20 {
-		let offset = i as i64 * 1000;
+		let offset = i64::from(i) * 1000;
 		let rows = vec![(base + offset, bd(&format!("{}.{}", i + 1, offset))), (base + offset + 1, bd(&format!("{}.{}", i + 2, offset))), (base + offset + 2, bd(&format!("{}.{}", i + 3, offset)))];
 		ingest_batch_with_gate(&store, &aspect_id, &dataset, &rows, 4).await?;
 	}
@@ -64,7 +64,7 @@ async fn bulk_ingest_converges_at_small_target() -> Result<()> {
 	// Delete the gate call and both assertions fail together.
 	let ungated_aspect = db.track_aspect(&subject.id(), "converge_idle", &splimes::Resolution::Milliseconds, None).await?.id();
 	for i in 0..20 {
-		let offset = i as i64 * 1000;
+		let offset = i64::from(i) * 1000;
 		let rows = vec![(base + offset, bd(&format!("{}.{}", i + 1, offset))), (base + offset + 1, bd(&format!("{}.{}", i + 2, offset))), (base + offset + 2, bd(&format!("{}.{}", i + 3, offset)))];
 		ingest_batch_with_gate(&store, &ungated_aspect, &dataset, &rows, 2).await?;
 	}
@@ -93,8 +93,8 @@ async fn gated_bulk_read_path_correctness() -> Result<()> {
 	// Ingest 10 batches of 2 rows each through the gate path.
 	let mut all_expected: Vec<(i64, BigDecimal)> = Vec::new();
 	for i in 0..10 {
-		let offset = i as i64 * 2000;
-		let rows = vec![(base + offset, bd(&format!("{}.0", i))), (base + offset + 1000, bd(&format!("{}.5", i)))];
+		let offset = i64::from(i) * 2000;
+		let rows = vec![(base + offset, bd(&format!("{i}.0"))), (base + offset + 1000, bd(&format!("{i}.5")))];
 		ingest_batch_with_gate(&store, &aspect_id, &dataset, &rows, 4).await?;
 		all_expected.extend(rows);
 	}
@@ -161,7 +161,7 @@ async fn gate_at_degenerate_target_still_ingests() -> Result<()> {
 }
 
 /// Idempotency still holds when the fragmentation gate is enabled: replaying the same
-/// batch returns the same synthetic TxIds and does not duplicate rows.
+/// batch returns the same synthetic `TxIds` and does not duplicate rows.
 #[serial]
 #[tokio::test]
 async fn gated_ingest_idempotent_replay() -> Result<()> {
