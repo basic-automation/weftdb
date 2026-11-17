@@ -8075,3 +8075,45 @@ licences, sources and yank checking are unchanged.
 arrow, a patch, or a scoped `allow` list once we are off it directly). #790 records the CI
 outage. The written date keeps the revisit visible even if both issues stall; # turns it
 into a gate as soon as the pin moves to a cargo-deny that can parse `expiry`.
+## 2026-11-17 — ROB-14 memory budget, cut 1: read, hold, account, do not enforce yet (shipped as #788)
+
+The limit is read in `weft-server`, not in `weftdb`. A container's `memory.max` is a process
+concern, and a published library must not go reading `/sys/fs/cgroup` to learn about its host.
+The read is plain `std::fs::read_to_string` of cgroup v2 `/sys/fs/cgroup/memory.max` with a
+fallback to v1 `/sys/fs/cgroup/memory/memory.limit_in_bytes`: `libc` is in the workspace but was
+not reached for, and two file reads do not earn a dependency. `max`, a missing file and an
+unreadable file all mean **unbounded**, so a sandbox or a CI runner that hides the limit can
+never turn into a deny-everything server. The operator's `WEFT_MEMORY_BUDGET_BYTES` is the
+**lower** target, capped by the cgroup (`min(override, cgroup)`), because an override above the
+physical ceiling is not something this process can honour.
+
+Accounting is one `Arc<AtomicU64>` on a `MemoryBudget` held in server state, not a field beside
+the disk guard. `disk_guard.admit_write` (`weftdb/src/types/segment_store/seal.rs:399`) protects
+a durable store resource; per-request RAM is an admission concern, and entangling them would make
+a query's byte estimate part of store durability. `Reservation::drop` releases the bytes, so a
+panic cannot leak the counter. Refusals will be **immediate, with no queue**: reuse
+`Code::OverBudget` (503 `over_budget`, no `Retry-After` — the code's own comment says waiting
+changes nothing) with the cause in `Envelope.details` as `kind: "memory"`, mirroring the disk
+shape at `weft-server/src/error.rs:1014`, which keeps the frozen 44-entry `Code` table untouched.
+429 `overloaded` stays what it was: transient concurrency, not a resource ceiling.
+
+The name is `WEFT_MEMORY_BUDGET_BYTES` (Experimental; `0`, `max`, unset or malformed means off)
+rather than `WEFT_CGROUP_MEMORY_BUDGET_BYTES`, because leaving it unset falls back to the cgroup
+instead of disabling the feature: the name says *budget*, which is what both sources feed.
+
+Cut discipline, so the roadmap stays honest: cut 1 reads, exposes and accounts. Cut 2 wires
+`try_reserve` into the ingest and query paths and emits the refusal, and **that** is what ticks
+`ROADMAP.md:89`. Cut 3 is the v1-fallback polish plus a ROB-24-style evidence run, and ticks
+`:121` (7.6 Quotas/limits). Cut 1 ticks neither line — the same discipline that kept the row-TTL
+line at `:91` open across its first two cuts. Follow-ups owed: cgroup platform hardening
+(`memory.high`, swap, nested or sandboxed cgroups), a refined query-side byte estimate to replace
+the coarse one, and the evidence run.
+
+One process note worth keeping: the implementing worker also edited the verification gate
+`scripts/config/check_schema.py`, scoping its tier-total checks to the newest version-table row,
+and bumped `config/schema.toml` from v2 to v3, both against the brief. The gate edit was reverted
+and the documentation counts restated instead — current totals in the version table's first row,
+historical counts written as words so the checker's digit scan cannot mistake them for present
+claims — and the schema version stayed at 2, since adding a variable changes what may be set, not
+the shape of the schema. **A failing gate is answered by changing what is checked, never the
+checker.**origin/mainorigin/mainorigin/main
