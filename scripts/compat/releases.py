@@ -19,6 +19,10 @@ Subcommands:
                            it with the pin (needs gh; the release workflow's job does this)
     pin <tag> [--write]    print the block for a released tag, built from git, the tag's
                            date and the release's SHA256SUMS asset; --write appends it
+    fetch [--version V]    download one pinned archive from GitHub and refuse it unless the
+    [--asset A] --dest D   bytes match the sha256 the pin carries (needs gh; the `pinned
+    [--extract]            release archives` job in .github/workflows/ci.yml does this on
+    [--clobber]            every PR)
 
 `verify` prints one `compat: <problem>` line per problem and exits 1 if there is any. A pin
 is append-only history: changing a block after a gate has run against it means the artifact
@@ -31,10 +35,12 @@ import argparse
 import datetime
 import os
 import hashlib
+import platform
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import tomllib
 from pathlib import Path
@@ -330,6 +336,98 @@ def verify_assets(block: dict) -> list[str]:
 	return problems
 
 
+# The asset a machine would download, keyed by what `sys.platform` and `platform.machine()`
+# report. The values are Rust target triples because that is how `scripts/release/stage.sh`
+# names the archives; the keys are what a Python interpreter says about itself, and the two
+# vocabularies disagree in exactly the places worth writing down (arm64 vs aarch64,
+# win32 vs windows, arm64 vs aarch64-apple-darwin).
+TRIPLE_BY_HOST = {
+	("linux", "x86_64"): "x86_64-unknown-linux-gnu",
+	("linux", "aarch64"): "aarch64-unknown-linux-gnu",
+	("darwin", "x86_64"): "x86_64-apple-darwin",
+	("darwin", "arm64"): "aarch64-apple-darwin",
+	("win32", "amd64"): "x86_64-pc-windows-msvc",
+}
+
+ARCHIVE_SUFFIXES = (".tar.gz", ".tgz", ".tar")
+
+
+def pick_asset(assets: dict[str, str], asset: str | None = None, host: tuple[str, str] | None = None) -> str:
+	"""The archive to download: the one named, or the one this machine runs.
+
+	A named asset has to be a key of the pin, so a typo cannot download an artifact the pin
+	does not vouch for and have the digest check pass by accident — the digest that would be
+	compared would be the digest of the artifact named in the `--asset` argument's place."""
+	if asset:
+		if asset not in assets:
+			raise PinError(f"the pin carries {', '.join(sorted(assets)) if assets else 'no assets at all'}; {asset} is not one of them")
+		return asset
+	if not assets:
+		raise PinError("the pin carries no assets: a release with nothing in [release.assets] has no archive to fetch")
+	triple = TRIPLE_BY_HOST.get(host if host else (sys.platform, platform.machine()))
+	if triple is None:
+		raise PinError(f"no triple is known for this machine ({sys.platform}, {platform.machine()}); pass --asset with one of {', '.join(sorted(assets))}")
+	matches = sorted(name for name in assets if triple in name)
+	if not matches:
+		raise PinError(f"no pinned asset names the {triple} triple; the pin carries {', '.join(sorted(assets))}")
+	if len(matches) > 1:
+		raise PinError(f"more than one pinned asset names {triple} ({', '.join(matches)}); pass --asset")
+	return matches[0]
+
+
+def unpack_tar(archive: Path, into: Path) -> list[Path]:
+	"""Unpack a release tarball into `into`, refusing an archive with a member that escapes.
+
+	The archives come from this repository's own release workflow, but a compatibility
+	command is precisely the place not to take that on faith: the tar member names are input
+	like any other, and the tree it lands in is one an old binary will be pointed at."""
+	into.mkdir(parents=True, exist_ok=True)
+	root = into.resolve()
+	files: list[Path] = []
+	with tarfile.open(archive, "r:*") as tar:
+		for member in tar.getmembers():
+			if member.issym() or member.islnk():
+				raise PinError(f"{archive.name}: member {member.name} is a link to {member.linkname!r}; a release archive holds no links, and a link is a path around the check below")
+			target = (root / member.name).resolve()
+			if target != root and not str(target).startswith(str(root) + os.sep):
+				raise PinError(f"{archive.name}: member {member.name} would land outside {into}")
+			if member.isfile():
+				files.append(target)
+		tar.extractall(root, members=tar.getmembers())
+	return sorted(files)
+
+
+def fetch_asset(block: dict, dest: Path, asset: str | None = None, host: tuple[str, str] | None = None, extract: bool = False, clobber: bool = False) -> tuple[Path, str, list[Path]]:
+	"""Download one pinned archive and refuse it unless its bytes match the pinned digest.
+
+	Returns the archive, the digest computed here, and (when `extract`) the files unpacked.
+	The release's own `SHA256SUMS` asset is a second opinion about what the release *says* it
+	published; this compares the bytes that arrived with what the pin *recorded* at release
+	time, which is the claim every compatibility gate rests on. Nothing here executes what
+	it downloads."""
+	tag = str(block["tag"])
+	assets = dict(block.get("assets") or {})
+	if not block.get("binaries"):
+		raise PinError(f"{tag} pins no binaries (binaries = false); there is no archive to fetch")
+	name = pick_asset(assets, asset, host)
+	dest.mkdir(parents=True, exist_ok=True)
+	gh("release", "download", tag, "--repo", os.environ.get("GITHUB_REPOSITORY", "basic-automation/weftdb"), "--pattern", name, "--dir", str(dest), *(["--clobber"] if clobber else []))
+	archive = dest / name
+	if not archive.is_file():
+		raise PinError(f"gh reported success but left no {name} in {dest}")
+	digest = sha256_file(archive)
+	if digest != assets[name]:
+		raise PinError(f"{tag}: {name} arrived as {digest} but the pin carries {assets[name]}; the pin is append-only history, so either the release changed underneath it or these bytes are not the artifact the pin vouched for")
+	unpacked: list[Path] = []
+	if extract:
+		# The archive carries its own top-level directory (`weftdb-<tag>-<triple>/`), so the
+		# version is the only name added here: one directory per release under --dest, and the
+		# tree inside it is exactly what the release workflow packed.
+		if not name.endswith(ARCHIVE_SUFFIXES):
+			raise PinError(f"{name} is not a tar archive; this command unpacks {' and '.join(ARCHIVE_SUFFIXES)} only, so a {Path(name).suffix} archive needs its own unpacker")
+		unpacked = unpack_tar(archive, dest / str(block["version"]))
+	return archive, digest, unpacked
+
 def main(argv: list[str] | None = None) -> int:
 	parser = argparse.ArgumentParser(prog="releases.py", description=__doc__.splitlines()[0])
 	sub = parser.add_subparsers(dest="command", required=True)
@@ -342,6 +440,12 @@ def main(argv: list[str] | None = None) -> int:
 	pin = sub.add_parser("pin")
 	pin.add_argument("tag")
 	pin.add_argument("--write", action="store_true", help="append the block to compat/releases.toml")
+	fetch = sub.add_parser("fetch")
+	fetch.add_argument("--version", help="pinned version to download (default: the newest pin)")
+	fetch.add_argument("--asset", help="asset name exactly as pinned (default: this machine's target triple)")
+	fetch.add_argument("--dest", required=True, help="directory to download into")
+	fetch.add_argument("--extract", action="store_true", help="unpack a tar archive into a directory under --dest")
+	fetch.add_argument("--clobber", action="store_true", help="overwrite an archive already sitting in --dest")
 	args = parser.parse_args(argv)
 
 	try:
@@ -373,6 +477,20 @@ def main(argv: list[str] | None = None) -> int:
 				print(f"compat: {block['tag']} pins no fixture set yet", file=sys.stderr)
 				return 1
 			print(REPO / fixture)
+			return 0
+		if args.command == "fetch":
+			if args.version:
+				match = [b for b in releases if b.get("version") == args.version]
+				if not match:
+					print(f"compat: no pin for version {args.version}", file=sys.stderr)
+					return 1
+				block = match[0]
+			else:
+				block = newest(releases)
+			archive, digest, unpacked = fetch_asset(block, Path(args.dest), args.asset, extract=args.extract, clobber=args.clobber)
+			print(f"{archive} sha256={digest}")
+			for entry in unpacked:
+				print(f"unpacked {entry}")
 			return 0
 		if args.command == "verify-assets":
 			target = releases if not args.tag else [b for b in releases if b.get("tag") == args.tag]
