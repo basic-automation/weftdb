@@ -498,6 +498,13 @@ pub struct SegmentStoreOptions {
 	/// `WEFT_MAINTENANCE_MAX_SEGMENT_BYTES` (a positive whole number of bytes; unset,
 	/// malformed, or zero leaves re-splitting off).
 	pub max_maintenance_segment_bytes: Option<u64>,
+	/// The longest a store-wide maintenance sweep may run, from the open options
+	/// ([`SegmentStoreOptions::max_maintenance_op_seconds`], ROB-20 G5); `None` is
+	/// unbounded. The budget is honoured between swap plans, between candidate groups,
+	/// and between aspects — never inside `merge_k_way` and never inside a single swap's
+	/// journal/write/commit (each swap commits on its own, so refusing to start the next
+	/// swap is cancellation-safe).
+	pub max_maintenance_op_seconds: Option<u64>,
 }
 
 /// The per-aspect series cap `WEFT_MAX_SERIES_PER_ASPECT`'s value names: a positive
@@ -524,6 +531,23 @@ fn maintenance_segment_ceiling_from(value: Option<&str>) -> Option<u64> {
 	value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|ceiling| *ceiling > 0)
 }
 
+/// The row-expiry policy `WEFT_ROW_TTL` names: a whole number of the aspect's own
+/// time units (the TTL value `RowExpiryPolicy::Ttl` stores), or `NoExpiry` when it is
+/// unset, `0`, empty, or unparseable. The value is expressed in the aspect's own time
+/// unit exactly like `RowExpiryPolicy::Ttl { ttl: u64 }` — there is no seconds-based
+/// conversion.
+fn row_expiry_policy_from(value: Option<&str>) -> row_expiry::RowExpiryPolicy {
+	value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|ttl| *ttl > 0).map_or(row_expiry::RowExpiryPolicy::NoExpiry, |ttl| row_expiry::RowExpiryPolicy::Ttl { ttl })
+}
+
+/// The per-operation maintenance time budget `WEFT_MAINTENANCE_MAX_OP_SECONDS` names
+/// (ROB-20 G5): a positive whole number of seconds, or `None` (unbounded) when it is
+/// unset or anything else. Zero means "unbounded" rather than "no maintenance at all",
+/// so a mistyped zero cannot stop the sweeper.
+fn maintenance_op_seconds_from(value: Option<&str>) -> Option<u64> {
+	value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|budget| *budget > 0)
+}
+
 /// The default per-aspect series cap, [`SegmentStoreOptions::max_series_per_aspect`]:
 /// 100,000 series.
 pub const DEFAULT_MAX_SERIES_PER_ASPECT: usize = 100_000;
@@ -547,7 +571,7 @@ pub const DEFAULT_SUSPECT_FRAME_POLICY: SuspectFramePolicy = SuspectFramePolicy:
 
 impl Default for SegmentStoreOptions {
 	fn default() -> Self {
-		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), decode_breaker: MaintenanceBreaker::default(), suspect_frame_policy: DEFAULT_SUSPECT_FRAME_POLICY, max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT, max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: false, disk_reserve_bytes: 0, expiry: row_expiry::RowExpiryPolicy::NoExpiry, max_maintenance_output_bytes: None, max_maintenance_segment_bytes: None }
+		Self { checkpoints: CheckpointPolicy::DISABLED, partials: PartialSidecarPolicy::DISABLED, transposed: TransposedPolicy::DISABLED, breaker: MaintenanceBreaker::default(), decode_breaker: MaintenanceBreaker::default(), suspect_frame_policy: DEFAULT_SUSPECT_FRAME_POLICY, max_series_per_aspect: DEFAULT_MAX_SERIES_PER_ASPECT, max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: false, disk_reserve_bytes: 0, expiry: row_expiry::RowExpiryPolicy::NoExpiry, max_maintenance_output_bytes: None, max_maintenance_segment_bytes: None, max_maintenance_op_seconds: None }
 	}
 }
 
@@ -564,11 +588,14 @@ impl SegmentStoreOptions {
 	/// [`DEFAULT_DISK_RESERVE_BYTES`](crate::DEFAULT_DISK_RESERVE_BYTES)), and
 	/// `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES`
 	/// ([`max_maintenance_output_bytes`](Self::max_maintenance_output_bytes); a
-	/// positive whole number of bytes, else unbudgeted), each as lenient
+	/// positive whole number of bytes, else unbudgeted), and `WEFT_ROW_TTL`
+	/// ([`expiry`](Self::expiry); a whole positive number of the aspect's own time
+	/// unit as [`row_expiry::RowExpiryPolicy::Ttl`] stores; unset, `0`, empty or
+	/// unparseable → [`row_expiry::RowExpiryPolicy::NoExpiry`]), each as lenient
 	/// as it documents. Explicit: nothing in the library calls it.
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), decode_breaker: MaintenanceBreaker::decode_from_env(), suspect_frame_policy: std::env::var(SuspectFramePolicy::ENV_NAME).ok().as_deref().and_then(SuspectFramePolicy::parse).unwrap_or(DEFAULT_SUSPECT_FRAME_POLICY), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()), expiry: row_expiry::RowExpiryPolicy::NoExpiry, max_maintenance_output_bytes: maintenance_output_budget_from(std::env::var("WEFT_MAINTENANCE_MAX_OUTPUT_BYTES").ok().as_deref()), max_maintenance_segment_bytes: maintenance_segment_ceiling_from(std::env::var("WEFT_MAINTENANCE_MAX_SEGMENT_BYTES").ok().as_deref()) }
+		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), decode_breaker: MaintenanceBreaker::decode_from_env(), suspect_frame_policy: std::env::var(SuspectFramePolicy::ENV_NAME).ok().as_deref().and_then(SuspectFramePolicy::parse).unwrap_or(DEFAULT_SUSPECT_FRAME_POLICY), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()), expiry: row_expiry_policy_from(std::env::var("WEFT_ROW_TTL").ok().as_deref()), max_maintenance_output_bytes: maintenance_output_budget_from(std::env::var("WEFT_MAINTENANCE_MAX_OUTPUT_BYTES").ok().as_deref()), max_maintenance_segment_bytes: maintenance_segment_ceiling_from(std::env::var("WEFT_MAINTENANCE_MAX_SEGMENT_BYTES").ok().as_deref()), max_maintenance_op_seconds: maintenance_op_seconds_from(std::env::var("WEFT_MAINTENANCE_MAX_OP_SECONDS").ok().as_deref()) }
 	}
 
 	/// These options with `bytes` as the per-operation maintenance output budget
@@ -584,6 +611,15 @@ impl SegmentStoreOptions {
 	#[must_use]
 	pub const fn with_max_maintenance_segment_bytes(mut self, bytes: u64) -> Self {
 		self.max_maintenance_segment_bytes = Some(bytes);
+		self
+	}
+
+	/// These options with `secs` as the per-operation wall-clock budget for a maintenance
+	/// sweep ([`max_maintenance_op_seconds`](Self::max_maintenance_op_seconds), ROB-20 G5);
+	/// `None` by default (unbounded).
+	#[must_use]
+	pub const fn with_max_maintenance_op_seconds(mut self, secs: u64) -> Self {
+		self.max_maintenance_op_seconds = Some(secs);
 		self
 	}
 
@@ -1843,6 +1879,9 @@ pub struct SegmentStore {
 	/// ([`SegmentStoreOptions::max_maintenance_segment_bytes`], ROB-20 G4); `None`
 	/// re-splits nothing.
 	maintenance_segment_ceiling: Option<u64>,
+	/// The longest a store-wide maintenance sweep may run, from the open options
+	/// ([`SegmentStoreOptions::max_maintenance_op_seconds`], ROB-20 G5); `None` is unbounded.
+	maintenance_op_max_secs: Option<u64>,
 	/// Whether the disk guard is refusing, so the store logs the change of state once
 	/// rather than every refused write (ROB-17).
 	disk_refusals: crate::RefusalLatch,
