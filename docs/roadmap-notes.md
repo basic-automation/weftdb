@@ -371,14 +371,16 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - → **SOA-15** soak.yml nightly workflow, TTL lane and nightly-to-nightly comparison
     *Updated 2026-11-09: parts 1 (nightly workflow with active cron `0 7 * * *`) and 3
     (nightly-to-nightly comparison with first-night-no-baseline path) shipped in #616 and
-    verified present on `origin/main`. Part 2 (TTL lane) remains blocked: the store has a row-level TTL
-    and a purge (`SegmentStore::purge_expired`, #775), but no way to configure one through the
-    server — `from_env` still hard-codes `NoExpiry` and there is no settings variable — so a
-    soak still cannot exercise the lane (`weft-bench/src/soak.rs` uses `NullServer`, and
-    `weftdb/src/types/segment_store.rs` only ever purged expired *quarantine* records; `weft-bench/src/soak.rs` uses `NullServer` so no
-    server endpoint can be exercised). Adding a TTL lane requires a store-side TTL feature
-    first. The workflow already reports the TTL lane as `"not tested"` in its honesty section
-    (`weft-bench/src/soak_report.rs` lines 610-611).*
+    verified present on `origin/main`. Part 2 (TTL lane) is active on this branch —
+    `WEFT_ROW_TTL` reaches `SegmentStoreOptions::from_env` (`#784` on main), and the soak
+    drives a store-side TTL lane (`weft-bench/src/soak_ttl.rs`) that exercises
+    `read_time_range_of_with_expiry`, `expiry_sweep` and `purge_expired`. The honesty
+    section renders the verdict. The lane opens its own temporary store (the soak uses
+    `NullServer`, so no server endpoint is exercised). It proves the expiry-aware read
+    filter, the sweep and purge plumbing, and that a `NoExpiry` store reports 0 expired
+    rows while a TTL store with aged rows reports >0. Still not covered: HTTP-level
+    expiry, cross-restart TTL persistence, and concurrent expiry with other
+    maintenance operations.*
 - **W9 · Read semantics, limits, upgrade legs**
   - read lane
   - maint lane

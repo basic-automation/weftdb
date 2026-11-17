@@ -112,7 +112,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [x] **FRE-10b** Contract tests: storage and operator endpoints, plus coverage
 - [ ] **TAG-12** Multi-series crash matrix, fan-out and TSBS benchmarks, fixtures, freeze docs
 - [x] **ROB-24** Limits and overload evidence; frozen configuration documentation
-- [ ] **SOA-15** part 2: TTL lane
+- [x] **SOA-15** part 2: TTL lane
 
 ## Phase 14 — Beta tag (was W11)
 
