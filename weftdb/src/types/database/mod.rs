@@ -1133,8 +1133,8 @@ impl DatabaseStructure for Database {
 
 			// The aspect's storage mode is chosen here, at creation, and never
 			// switched afterwards (slice D-S19): a compression config forces
-			// rows mode, and WEFT_LEGACY_DEFAULT_STORAGE=segments makes new
-			// aspects seal-backed. A database created before D-S19 gains the
+			// rows mode, and since #768 made an unset WEFT_LEGACY_DEFAULT_STORAGE
+			// leave a new aspect seal-backed, `rows` is the explicit opt-out. A database created before D-S19 gains the
 			// column first, following the compression_config pattern.
 			self.ensure_storage_mode_column().await;
 			let storage_mode = crate::StorageMode::for_new_aspect(compression_config.is_some(), std::env::var(crate::legacy_seal::LEGACY_DEFAULT_STORAGE_ENV).ok().as_deref());

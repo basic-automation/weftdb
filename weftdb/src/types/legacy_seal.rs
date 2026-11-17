@@ -63,8 +63,15 @@ use weft_physical_type::{crc32, widen_value_encoding, AspectSchema, PhysicalType
 
 use crate::{AspectId, DatasetId, IngestBatch, Measurement, MeasurementId, SegmentStore, TxId};
 
-/// The environment variable that makes every newly created legacy aspect
-/// seal-backed (crash-consistency design §8, S19): exactly `segments`.
+/// The environment variable that names the storage mode of every newly
+/// created legacy aspect (crash-consistency design §8, S19; #768 flipped the
+/// default). `rows` asks for the per-aspect `measurements.db`, `segments` asks
+/// for the seal store, and **unset is now seal-backed**. A value that names
+/// neither word is rows mode, which is the safe side of the ambiguity: a typo
+/// leaves the aspect in the shape every released Weft can read instead of
+/// sealing it silently. Only the unset case changed — [`StorageMode::parse`],
+/// which reads the mode an aspect already has, still answers rows mode for
+/// `NULL` and for anything it does not recognise.
 pub const LEGACY_DEFAULT_STORAGE_ENV: &str = "WEFT_LEGACY_DEFAULT_STORAGE";
 
 /// The subject half of the seal store's scope: `(db, 'legacy')`.
@@ -84,8 +91,10 @@ pub const SQUASH_TARGET_ROWS: usize = 100_000;
 /// `aspects.storage_mode` row at creation and never changed afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum StorageMode {
-	/// Measurements in the per-aspect `measurements.db` (the historical
-	/// shape, and the default).
+	/// Measurements in the per-aspect `measurements.db`: the historical
+	/// shape, the mode of every aspect a released Weft created, and still the
+	/// mode a stored `NULL` parses to. It is no longer the mode new aspects are
+	/// created in (#768) — see [`StorageMode::for_new_aspect`].
 	#[default]
 	Rows,
 	/// Measurements sealed in the database's Storage-v2 store.
@@ -119,17 +128,20 @@ impl StorageMode {
 		matches!(self, Self::Segments)
 	}
 
-	/// The mode a new aspect is created in: `segments` when a compression
-	/// config does not force rows mode and either the caller chose segments
-	/// or [`LEGACY_DEFAULT_STORAGE_ENV`] says `segments`.
+	/// The mode a new aspect is created in (#768 flipped the unset case): it is
+	/// seal-backed unless a compression config forces rows mode — compression
+	/// deletes ranges, so it stays rows mode — or [`LEGACY_DEFAULT_STORAGE_ENV`]
+	/// names rows mode. A value that names neither word answers through
+	/// [`StorageMode::parse`], so a typo falls back to rows mode rather than
+	/// sealing an aspect that an older server cannot read back.
 	#[must_use]
 	pub fn for_new_aspect(has_compression_config: bool, env_default: Option<&str>) -> Self {
 		if has_compression_config {
 			return Self::Rows;
 		}
 		match env_default {
-			Some("segments") => Self::Segments,
-			_ => Self::Rows,
+			None => Self::Segments,
+			Some(value) => Self::parse(Some(value)),
 		}
 	}
 }
@@ -411,8 +423,14 @@ mod tests {
 		assert_eq!(StorageMode::parse(Some("bogus")), StorageMode::Rows);
 		assert_eq!(StorageMode::for_new_aspect(false, Some("segments")), StorageMode::Segments);
 		assert_eq!(StorageMode::for_new_aspect(true, Some("segments")), StorageMode::Rows, "compression stays rows mode");
-		assert_eq!(StorageMode::for_new_aspect(false, None), StorageMode::Rows);
-		assert_eq!(StorageMode::for_new_aspect(false, Some("rows")), StorageMode::Rows);
+		// #768 flipped the unset case: a new aspect is seal-backed unless told
+		// otherwise. This is the assertion that fails on a pre-flip tree, and the
+		// reason the flip needs no migration — only the mode of an aspect that does
+		// not exist yet changes.
+		assert_eq!(StorageMode::for_new_aspect(false, None), StorageMode::Segments, "a new aspect is seal-backed unless told otherwise");
+		assert_eq!(StorageMode::for_new_aspect(true, None), StorageMode::Rows, "compression still forces rows mode");
+		assert_eq!(StorageMode::for_new_aspect(false, Some("rows")), StorageMode::Rows, "rows mode is now the explicit opt-out");
+		assert_eq!(StorageMode::for_new_aspect(false, Some("segment")), StorageMode::Rows, "a typo keeps the shape every released build can read");
 	}
 
 	#[test]

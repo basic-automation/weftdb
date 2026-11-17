@@ -36,6 +36,21 @@ in
   with the shipped `float_roundtrip` feature, once with it stripped in-job — and prints both
   medians and the delta. The shipped `Cargo.toml` is never modified.
 
+### Changed
+
+- **A new legacy aspect is seal-backed by default (#768).** `WEFT_LEGACY_DEFAULT_STORAGE`
+  used to be the opt-in for the seal store: left unset, a new aspect went to the per-aspect
+  rows-mode `measurements.db`. Unset is now seal-backed and `rows` is the explicit opt-out, so
+  the bulk-ingest path routed in #769 is the path a fresh deployment takes. Only the mode of an
+  aspect that does not exist yet changes: `StorageMode::parse` still reads an existing aspect's
+  stored mode the historical way, `NULL` included, so there is no migration, no back-fill and no
+  read change. A compression config still forces rows mode, because compression deletes ranges.
+  The door is one-way in both senses: a store holding seal-backed aspects cannot be read by
+  0.3.7 or earlier, which know no `aspects.storage_mode` column and answer **zero measurements**
+  for such an aspect rather than refusing it. Neither the column nor the seal-backed aspect has
+  ever shipped, so no released build created one; pin `WEFT_LEGACY_DEFAULT_STORAGE=rows` on a
+  deployment that must stay rollable to an older build.
+
 ### Fixed
 
 - **A seal-backed legacy aspect's bulk writes now reach the store it reads from (#232).**

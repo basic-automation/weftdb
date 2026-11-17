@@ -239,6 +239,14 @@ The licensing decisions are made. Every WeftDB crate is `MIT OR Apache-2.0`, Jus
   the rows-mode handle. The line stays unticked: new aspects are still created in rows mode
   (`StorageMode::for_new_aspect`, `weftdb/src/types/legacy_seal.rs:126-135`), and flipping that
   default is **#768**, which carries the ingest/read cost figure the flip needs.*
+
+  *Audit 2026-11-16, #768 (the flip): it shipped, and the figure named above is not a
+  gate at all. `float_roundtrip` prices the JSON body of an ingest or interpolate request, not
+  where a new aspect puts its rows, and the seal path's real costs, one-row ingest as a full
+  seal commit, the fragmentation gate, read fan-out, were already characterised in S19 and S20.
+  What the flip does need stating is the one-way door: an unset variable now leaves a new aspect
+  seal-backed, and 0.3.7 or earlier read zero measurements from such an aspect instead of
+  refusing it. The gate was the downgrade note in `docs/upgrade-notes.md`, not a benchmark.*
 - **B-tags**
 
 ### Security & packaging *(Phase 8 minimum)*
