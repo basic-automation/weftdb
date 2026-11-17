@@ -52,10 +52,12 @@ pub async fn build() -> anyhow::Result<AppState> {
 	};
 	let state = state.with_audit_log(open_audit_log(store_root.as_deref()));
 	let budget = memory_budget::budget_from_env();
-	if budget.limit().is_some() {
-		println!("memory budget: {} bytes (cgroup + WEFT_MEMORY_BUDGET_BYTES)", budget.limit().unwrap());
-	} else {
-		println!("memory budget: unbounded (no cgroup limit and no WEFT_MEMORY_BUDGET_BYTES)");
+	match budget.limit() {
+		Some(limit) => println!("memory budget: {limit} bytes (cgroup limit and WEFT_MEMORY_BUDGET_BYTES, lower of the two)"),
+		None => println!("memory budget: unbounded (no cgroup limit and no WEFT_MEMORY_BUDGET_BYTES)"),
+	}
+	if let Some(usage) = memory_budget::current_usage_at(std::path::Path::new("/sys/fs/cgroup")) {
+		println!("cgroup memory usage at start: {usage} bytes");
 	}
 	let state = state.with_memory_budget(budget);
 	Ok(match std::env::var(BENCH_RUNS_DIR_ENV) {

@@ -6,10 +6,10 @@
 //! 1. `WEFT_MEMORY_BUDGET_BYTES` — the operator's **lower** target — combined
 //!    with the cgroup value as `min(override, cgroup)`. Unset, `0`, `max` or
 //!    whitespace-only means no budget (`limit: None`).
-//! 2. cgroup v2: `<base>/memory.max` (with `<base>/memory.current` for
-//!    observability). Falling back to:
-//! 3. cgroup v1: `<base>/memory/memory.limit_in_bytes` (with
-//!    `<base>/memory/memory.usage_in_bytes`).
+//! 2. cgroup v2: `<base>/memory.max` (and [`current_usage_at`] reads
+//!    `<base>/memory.current` for observability). Falling back to:
+//! 3. cgroup v1: `<base>/memory/memory.limit_in_bytes` (and
+//!    `<base>/memory/memory.usage_in_bytes` for observability).
 //!
 //! A platform that hides the cgroup limit (absent or unreadable files) disables
 //! the budget — never denies everything.
@@ -57,13 +57,14 @@ impl Reservation {
 }
 
 impl Drop for Reservation {
-	fn drop(&self) {
+	fn drop(&mut self) {
 		self.reserved.fetch_sub(self.bytes, Ordering::Relaxed);
 	}
 }
 
 /// The error returned when a reservation would exceed the budget.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ReserveError {
 	/// The budget is exceeded: `reserved + wanted > limit`.
 	OverBudget {
@@ -118,7 +119,7 @@ impl MemoryBudget {
 				// concurrent reservations cannot overshoot.
 				let reserved = self.reserved.fetch_add(wanted, Ordering::Relaxed);
 				if reserved + wanted <= limit {
-					Ok(Reservation { bytes: wanted, reserved: self.reserved })
+					Ok(Reservation { bytes: wanted, reserved: self.reserved.clone() })
 				} else {
 					// Overshoot: roll back by subtracting what we just added.
 					self.reserved.fetch_sub(wanted, Ordering::Relaxed);
@@ -128,7 +129,7 @@ impl MemoryBudget {
 			None => {
 				// Unbounded: reserve succeeds but we still account for it.
 				self.reserved.fetch_add(wanted, Ordering::Relaxed);
-				Ok(Reservation { bytes: wanted, reserved: self.reserved })
+				Ok(Reservation { bytes: wanted, reserved: self.reserved.clone() })
 			}
 		}
 	}
@@ -159,7 +160,7 @@ fn combine(op: Option<u64>, cgroup: Option<u64>) -> Option<u64> {
 /// A positive integer means `Some(n)`.
 #[must_use]
 pub fn parse_override(value: Option<&str>) -> Option<u64> {
-	let trimmed = value.map_or(None, |s| {
+	let trimmed = value.and_then(|s| {
 		let t = s.trim();
 		if t.is_empty() {
 			None
@@ -187,7 +188,7 @@ pub fn parse_override(value: Option<&str>) -> Option<u64> {
 /// `"max"` or an unparseable/unreadable line means `None`.
 #[must_use]
 fn cgroup_limit_from(value: Option<&str>) -> Option<u64> {
-	value.map_or(None, |s| {
+	value.and_then(|s| {
 		let trimmed = s.trim();
 		if trimmed.is_empty() || trimmed == "max" {
 			None
@@ -207,20 +208,50 @@ fn cgroup_limit_from(value: Option<&str>) -> Option<u64> {
 /// `/sys/fs/cgroup`.
 #[must_use]
 pub fn read_cgroup_limit_at(base: &std::path::Path) -> Option<u64> {
-	// v2: <base>/memory.max, then <base>/memory.current for observability.
+	// v2: <base>/memory.max.
 	let v2_path = base.join("memory.max");
 	if v2_path.is_file() {
-		let text = std::fs::read_to_string(&v2_path).ok()?.trim();
-		let limit = cgroup_limit_from(text.as_deref());
-		if limit.is_some() {
-			return limit;
+		// A file we cannot read, or one whose contents do not parse, does not end
+		// the search. "No limit" and "limit unreadable" must not collapse into the
+		// same answer: refusing the budget is the safe reading of an unreadable
+		// file only in the sense that nothing is enforced, so keep looking.
+		if let Ok(text) = std::fs::read_to_string(&v2_path) {
+			if let Some(limit) = cgroup_limit_from(Some(text.trim())) {
+				return Some(limit);
+			}
 		}
 	}
 	// v1 fallback: <base>/memory/memory.limit_in_bytes.
 	let v1_path = base.join("memory").join("memory.limit_in_bytes");
 	if v1_path.is_file() {
-		let text = std::fs::read_to_string(&v1_path).ok()?.trim();
-		return cgroup_limit_from(text.as_deref());
+		if let Ok(text) = std::fs::read_to_string(&v1_path) {
+			return cgroup_limit_from(Some(text.trim()));
+		}
+	}
+	None
+}
+
+/// The cgroup's current memory usage at `base`, for observability only.
+///
+/// Tries cgroup v2 (`<base>/memory.current`), then v1
+/// (`<base>/memory/memory.usage_in_bytes`). `None` when neither is readable:
+/// usage is never part of an admission decision in cut 1, so a missing value
+/// costs a diagnostic and nothing else.
+#[must_use]
+pub fn current_usage_at(base: &std::path::Path) -> Option<u64> {
+	let v2_path = base.join("memory.current");
+	if v2_path.is_file() {
+		if let Ok(text) = std::fs::read_to_string(&v2_path) {
+			if let Some(usage) = cgroup_limit_from(Some(text.trim())) {
+				return Some(usage);
+			}
+		}
+	}
+	let v1_path = base.join("memory").join("memory.usage_in_bytes");
+	if v1_path.is_file() {
+		if let Ok(text) = std::fs::read_to_string(&v1_path) {
+			return cgroup_limit_from(Some(text.trim()));
+		}
 	}
 	None
 }
@@ -342,6 +373,30 @@ mod tests {
 		let base = Path::new(dir.path());
 		std::fs::write(base.join("memory.max"), "max\n");
 		assert_eq!(read_cgroup_limit_at(base), None);
+	}
+
+	#[test]
+	fn read_cgroup_limit_at_skips_a_v2_path_that_is_not_a_regular_file() {
+		// A directory cannot hold a limit: `is_file` refuses it, and the v1
+		// fallback still answers. A limit read from a non-file would be a bug
+		// that only a container with a bind-mounted directory would show.
+		let dir = tempdir().expect("temp dir");
+		std::fs::create_dir_all(dir.path().join("memory")).expect("v1 dir");
+		std::fs::create_dir(dir.path().join("memory.max")).expect("v2 non-file");
+		std::fs::write(dir.path().join("memory").join("memory.limit_in_bytes"), "536870912\n").expect("v1 limit");
+		assert_eq!(read_cgroup_limit_at(dir.path()), Some(536870912));
+	}
+
+	#[test]
+	fn current_usage_at_reads_v2_then_v1() {
+		let dir = tempdir().expect("temp dir");
+		std::fs::write(dir.path().join("memory.current"), "1048576\n").expect("v2 usage");
+		assert_eq!(current_usage_at(dir.path()), Some(1048576));
+		let other = tempdir().expect("temp dir");
+		std::fs::create_dir_all(other.path().join("memory")).expect("v1 dir");
+		std::fs::write(other.path().join("memory").join("memory.usage_in_bytes"), "2097152\n").expect("v1 usage");
+		assert_eq!(current_usage_at(other.path()), Some(2097152));
+		assert_eq!(current_usage_at(tempdir().expect("empty temp dir").path()), None);
 	}
 
 	#[test]
