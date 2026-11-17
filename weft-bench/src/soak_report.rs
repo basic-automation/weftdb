@@ -597,6 +597,39 @@ fn untested_surfaces(run: &SoakRun, slo: &SloReport, contamination: Option<&Cont
 // Honesty section builder
 // ---------------------------------------------------------------------------
 
+/// Format the TTL lane subsection of the honesty report.
+fn format_ttl_lane_section(run: &SoakRun, mut out: String) -> String {
+	out.push_str("### TTL lane\n\n");
+	match &run.ttl {
+		None => out.push_str("Not exercised (store had no row TTL lane configured).\n\n"),
+		Some(verdict) => {
+			let label_str = match &verdict.store_expiry_policy {
+				crate::soak_ttl::TtlPolicyLabel::NoExpiry => "NoExpiry".to_string(),
+				crate::soak_ttl::TtlPolicyLabel::Ttl { ttl } => format!("Ttl({{ttl={ttl}}})"),
+			};
+			let _ = writeln!(out, "Expiry policy: {label_str}");
+			let _ = writeln!(out, "Aspects cleaned: {} — {}", verdict.expiry_sweep.aspects_cleaned.len(), verdict.expiry_sweep.aspects_cleaned.join(", "));
+			let _ = writeln!(out, "Rows expired: {}", verdict.expiry_sweep.rows_expired);
+			if !verdict.expiry_sweep.busy.is_empty() {
+				let _ = writeln!(out, "Busy aspects (not swept): {}", verdict.expiry_sweep.busy.join(", "));
+			}
+			if !verdict.expiry_sweep.failed.is_empty() {
+				let _ = writeln!(out, "Failed aspects:");
+				for (name, err) in &verdict.expiry_sweep.failed {
+					let _ = writeln!(out, "- {name}: {err}");
+				}
+			}
+			if verdict.passed() {
+				out.push_str("TTL lane: passed.\n");
+			} else {
+				out.push_str("TTL lane: FAILED — sweep reported errors.\n");
+			}
+			out.push('\n');
+		}
+	}
+	out
+}
+
 /// Build the generated honesty section as Markdown.
 #[allow(clippy::needless_vec_and)]
 #[allow(clippy::uninlined_format_args)]
@@ -656,35 +689,7 @@ fn build_honesty_section(run: &SoakRun, slo: &SloReport, _coverage: &CoverageRep
 		}
 	}
 
-	// --- TTL lane ---
-	out.push_str("### TTL lane\n\n");
-	match &run.ttl {
-		None => out.push_str("Not exercised (store had no row TTL lane configured).\n\n"),
-		Some(v) => {
-			let policy_label = match &v.store_expiry_policy {
-				crate::soak_ttl::TtlPolicyLabel::NoExpiry => "NoExpiry".to_string(),
-				crate::soak_ttl::TtlPolicyLabel::Ttl { ttl } => format!("Ttl({{ttl={ttl}}})"),
-			};
-			let _ = writeln!(out, "Expiry policy: {policy_label}");
-			let _ = writeln!(out, "Aspects cleaned: {} — {}", v.expiry_sweep.aspects_cleaned.len(), v.expiry_sweep.aspects_cleaned.join(", "));
-			let _ = writeln!(out, "Rows expired: {}", v.expiry_sweep.rows_expired);
-			if !v.expiry_sweep.busy.is_empty() {
-				let _ = writeln!(out, "Busy aspects (not swept): {}", v.expiry_sweep.busy.join(", "));
-			}
-			if !v.expiry_sweep.failed.is_empty() {
-				let _ = writeln!(out, "Failed aspects:");
-				for (name, err) in &v.expiry_sweep.failed {
-					let _ = writeln!(out, "- {name}: {err}");
-				}
-			}
-			if v.passed() {
-				out.push_str("TTL lane: passed.\n");
-			} else {
-				out.push_str("TTL lane: FAILED — sweep reported errors.\n");
-			}
-			out.push('\n');
-		}
-	}
+	out = format_ttl_lane_section(run, out);
 
 	// --- Surfaces not tested ---
 	out.push_str("### Surfaces not tested\n\n");

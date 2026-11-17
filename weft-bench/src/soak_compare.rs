@@ -604,7 +604,7 @@ mod tests {
 	fn create_run(steps: u64, oracle: Option<OracleVerdict>, derived: Option<DerivedReadVerdict>, backup: Option<BackupLaneVerdict>) -> SoakRun {
 		let config = SoakConfig::new("test".to_string(), "test profile".to_string(), 7, 60).expect("valid test config");
 		let metadata = RunMetadata::capture("2026-10-25T00:00:00+00:00".to_string());
-		SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Finished, steps, oracle, derived, backup, upgrade: None, windows: Vec::new(), phases: Vec::new(), recoveries: Vec::new(), sigterm: None }
+		SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Finished, steps, oracle, derived, backup, upgrade: None, ttl: None, windows: Vec::new(), phases: Vec::new(), recoveries: Vec::new(), sigterm: None }
 	}
 
 	/// Create a `SoakReport` from raw parameters.

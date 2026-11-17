@@ -1,7 +1,8 @@
-//! TTL lane for the soak harness (1.0 plan SOA-15, part 2): exercise
-//! the store's row-level TTL mechanism — configure a TTL on the store,
-//! let the soak's ticks age into the expiry window, then read back and
-//! report what the store's expiry sweep found.
+//! TTL lane for the soak harness (1.0 plan SOA-15, part 2).
+//!
+//! Exercise the store's row-level TTL mechanism — configure a TTL on
+//! the store, let the soak's ticks age into the expiry window, then
+//! read back and report what the store's expiry sweep found.
 //!
 //! A soak that never configures a TTL proves the store survives being
 //! read and written; it says nothing about the store surviving *row
@@ -19,8 +20,8 @@
 //! (the SLO evaluator owns thresholds).
 //!
 //! **Not vacuous when `NoExpiry`.** When the store uses
-//! [`RowExpiryPolicy::NoExpiry`], both [`expiry_sweep`] and
-//! [`purge_expired`] return [`ExpirySweep::default()`] — which
+//! [`RowExpiryPolicy::NoExpiry`], both [`SegmentStore::expiry_sweep`] and
+//! [`SegmentStore::purge_expired`] return [`ExpirySweep::default()`] — which
 //! reports `rows_expired: 0` and `aspects_cleaned: []`. The lane
 //! records that result and the policy; the SLO evaluator decides
 //! whether a run that never configured TTL can call itself tested on
@@ -59,10 +60,10 @@ use weftdb::{ExpirySweep, RowExpiryPolicy, SegmentStore, SegmentStoreOptions};
 /// [`SoakHarness::record_ttl_verdict`](crate::soak::SoakHarness::record_ttl_verdict);
 /// also serializes on its own for artifacts that want it beside the
 /// record. Carries no free text.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TtlLaneVerdict {
 	/// The expiry policy the store was opened with. Serialized as a
-	/// string ("no_expiry" or the TTL value) so the report is
+	/// string ("`no_expiry`" or the TTL value) so the report is
 	/// human-readable without the reader knowing the enum spelling.
 	pub store_expiry_policy: TtlPolicyLabel,
 	/// What the expiry sweep (or purge) reported. An empty sweep
@@ -85,19 +86,14 @@ impl TtlLaneVerdict {
 }
 
 /// A human-readable label for the store's expiry policy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TtlPolicyLabel {
 	/// The store was opened with [`RowExpiryPolicy::NoExpiry`].
+	#[default]
 	NoExpiry,
 	/// The store was opened with [`RowExpiryPolicy::Ttl { ttl }`].
 	Ttl { ttl: u64 },
-}
-
-impl Default for TtlPolicyLabel {
-	fn default() -> Self {
-		Self::NoExpiry
-	}
 }
 
 impl From<&RowExpiryPolicy> for TtlPolicyLabel {
@@ -143,6 +139,12 @@ impl From<ExpirySweep> for TtlExpirySweepReport {
 /// flags this arrangement so a reader knows the lane exercises only the library's expiry
 /// path, not the full daemon → HTTP → store chain.
 ///
+/// # Panics
+///
+/// Panics if the zero-valued `BigDecimal::from_str("0")` cannot be parsed (should
+/// never happen for any well-formed Rust toolchain shipping `str::FromStr` for
+/// `BigDecimal`).
+///
 /// # Errors
 ///
 /// Returns an error when the store cannot be opened, rows cannot be ingested, or
@@ -167,12 +169,12 @@ pub async fn run_ttl_lane(ttl_secs: u64, now_ns: i64) -> anyhow::Result<TtlLaneV
 	let cutoff = now_unit.saturating_sub(ttl_signed);
 
 	// Ingest rows: some before cutoff (will be expired), some at and after (live).
-	let expired_ts: Vec<i64> = if cutoff - 4 >= i64::MIN { vec![cutoff - 4, cutoff - 2] } else { Vec::new() };
+	let expired_ts: Vec<i64> = if cutoff > i64::MIN + 4 { vec![cutoff - 4, cutoff - 2] } else { Vec::new() };
 	let live_ts: Vec<i64> = vec![cutoff, cutoff + 2];
-	let all_ts: Vec<i64> = expired_ts.iter().copied().chain(live_ts.iter().copied()).collect();
-	let all_vs: Vec<BigDecimal> = all_ts.iter().map(|t| BigDecimal::from(*t as i32)).collect();
+	let ts_all: Vec<i64> = expired_ts.iter().copied().chain(live_ts.iter().copied()).collect();
+	let vs_all: Vec<BigDecimal> = ts_all.iter().map(|t| BigDecimal::from(i64::try_from(*t).unwrap_or(0))).collect();
 
-	store.ingest(aspect, &weftdb::IngestBatch::dense("s1", all_ts, all_vs)).await?;
+	store.ingest(aspect, &weftdb::IngestBatch::dense("s1", ts_all, vs_all)).await?;
 
 	// Read back through the expiry-aware path BEFORE anything is deleted. The expired
 	// rows are still physically on disk here, so this is the check that the read
