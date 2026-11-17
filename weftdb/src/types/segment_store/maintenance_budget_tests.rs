@@ -14,7 +14,7 @@ use bigdecimal::BigDecimal;
 use tempfile::TempDir;
 use weft_physical_type::{timestamp::TimeUnit, AspectSchema, PhysicalType};
 
-use super::{maint::size_driven_cuts, maintenance_op_seconds_from, maintenance_output_budget_from, maintenance_segment_ceiling_from, MaintenanceWait, SegmentStore, SegmentStoreOptions};
+use super::{maint::size_driven_cuts, maintenance_output_budget_from, maintenance_segment_ceiling_from, MaintenanceWait, SegmentStore, SegmentStoreOptions};
 use crate::{IngestBatch, StoreError, UpsertKeys};
 
 /// The aspect every test here writes.
