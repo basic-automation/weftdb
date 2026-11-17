@@ -359,3 +359,18 @@ async fn purge_clears_every_aspect_it_is_asked_to() {
 	drop(store);
 	dir.close().expect("close temp dir");
 }
+
+/// Cut 3's environment switch: `WEFT_ROW_TTL` becomes a policy, and anything that is not a
+/// positive count leaves expiry off. A typo in a TTL setting must never be able to empty a
+/// store, which is why `0`, a negative and a malformed value all mean `NoExpiry` — the same
+/// rule `maintenance_output_budget_from` applies to ROB-20's budgets.
+#[test]
+fn a_configured_row_ttl_becomes_a_policy_in_the_aspect_unit() {
+	assert_eq!(super::row_expiry_policy_from(Some("3600")), RowExpiryPolicy::Ttl { ttl: 3600 }, "a positive count is the ttl, counted in the aspect's own time unit");
+	assert_eq!(super::row_expiry_policy_from(Some(" 42 ")), RowExpiryPolicy::Ttl { ttl: 42 }, "the blanks around a value are the operator's, not part of the number");
+	assert_eq!(super::row_expiry_policy_from(None), RowExpiryPolicy::NoExpiry, "unset means nothing ever expires");
+	assert_eq!(super::row_expiry_policy_from(Some("0")), RowExpiryPolicy::NoExpiry, "zero means nothing ever expires: a mistyped zero must not empty the store");
+	assert_eq!(super::row_expiry_policy_from(Some("")), RowExpiryPolicy::NoExpiry, "an empty value is a mistake, not a ttl of zero");
+	assert_eq!(super::row_expiry_policy_from(Some("-1")), RowExpiryPolicy::NoExpiry, "a negative ttl is refused the same way");
+	assert_eq!(super::row_expiry_policy_from(Some("1h")), RowExpiryPolicy::NoExpiry, "a value with a unit suffix is not a count: the store cannot know the aspect's unit at parse time");
+}
