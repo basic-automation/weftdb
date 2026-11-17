@@ -7243,30 +7243,6 @@ half of the 73-route registry, partitioned between `tests/fre10a_contract.rs` (t
 compilation errors or latent test failures that only `cargo test` reveals. The PR will go
 as a draft or marked with the CI-as-first-run notice.
 
-## 2026-11-14 — EOD handoff: test file written, ROADMAP ticked, DECISIONS section written
-
-**What exists:** `weft-server/tests/fre10a_contract.rs` in the house style. ROADMAP.md:88 ticked.
-Section written above.
-
-**Not yet done:**
-- `cargo +nightly fmt` to format the new file (hard rules forbid all other cargo
-  commands, and fmt is explicitly allowed). Must run before commit.
-- Git commit with `-s`, push, and a PR opened (no merge).
-- The PR body must say "CI is the first execution; no cargo build/check/test/clippy/miri
-  was run locally."
-- `progress.md` ## Handoff section (this section is that handoff — rewrite if needed).
-
-**Risks:** The stored `Fre10b` key constants prefix `fre10b-`; the test bodies and expected
-values are derived from the handler types and the route registry rather than copied from
-`fre10b_contract.rs`; compiler errors from `cargo test` are expected on first CI run. No
-`cargo` command besides `+nightly fmt` was run.
-
-**Next step after this session:** `cargo +nightly fmt weft-server/tests/fre10a_contract.rs &&
-  git add -A &&
-  git commit -sm "fre10a: contract tests for probes, compute endpoints, metrics and roles (#325)" &&
-  git push origin p12/fre10a-contract-tests &&
-  gh pr create --base main --head p12/fre10a-contract-tests --title "FRE-10a: contract tests for probes, compute endpoints, metrics and roles" --body "Implements FRE-10a. CI is the first execution; no cargo build/check/test/clippy/miri was run locally."
-
 ## 2026-11-14 — ROB-18 closes: contract coverage pins the #681 behaviour; the client-abort code family stays out of scope (#742)
 
 **This slice delivers contract coverage, not new product code.** The two-phase ingest admission,
@@ -7832,6 +7808,16 @@ slice. ROADMAP's ROB-20 line stays unticked and #758 stays open until G3-G6 land
   ("requires up to 926081 tokens, but can only afford 721831"). G4 continues in
   `/mnt/deepmem/wt/p12-758-g4` on `p12/rob20-g4-resplit`, with the brief at
   `.briefs/rob20-g4-resplit.md` as the record of what that slice is meant to do.
+## 2026-11-16 — Downloading a published archive in CI, before any leg is able to run it (COMPAT #762, Done; the leg itself Needs human)
+
+- **What landed.** `scripts/compat/releases.py fetch` downloads one archive named in `compat/releases.toml`, for the runner's platform by target triple or by name with `--asset`, and refuses it unless the bytes hash to the sha256 the pin records. `--extract` unpacks a tar archive into `<dest>/<version>`. A new `pinned release archives` job in `.github/workflows/ci.yml` runs it with `--extract` and then asserts that the archive's own listing contains `weft-server`. Issue #762 is not closed: it names two more things, below.
+- **Why land a fetch when no leg uses it.** The three requirements for a binary leg were written down in `scripts/compat/test_leg_coverage.py` and in `UPGRADING.md`, and the first was a fetch command. Landing it does three things at once: it retires a stated absence with something checkable rather than with a promise; it makes the pin's digest column a tested claim on every pull request instead of a number copied from a release page (a different claim from `verify-assets`, which compares the pin with the release's own `SHA256SUMS` asset, not with the bytes that arrive); and it means the first time a runner downloads a published archive is not the day a compatibility leg is being debugged. The counter-argument — an unexercised code path, a job that costs a download per PR — is real but small: the command is 90 lines, and its tests are in the suite that already runs.
+- **Measured, not reasoned, about the v0.1.0 archive.** It was fetched for real on this machine and its digest matched the pin (`d7ff31ff…612`), which is why the job is believed to pass on `ubuntu-latest` before opening the pull request. Inside the archive: `weft-server`, `weft-bench` and `weft-tui` sit at the top level, next to `README.md` and the license and third-party-notice files — there is no `bin/`. Asked for `--version` or `--help`, the v0.1.0 `weft-server` prints its configuration banner (`interpolation: at most 10000000 output points per request…`) and **starts listening**: exit 1 here only because a local daemon already held the port. So a leg cannot ask a released binary which version it is; it must set the old server's environment, hit its HTTP endpoints, and identify it by which pin the archive came from. Recording that here is cheaper than rediscovering it inside a leg.
+- **Decision: the job never executes what it downloads.** Asserting `tar tzf | grep weft-server` and that the extracted path exists is enough for this slice. Running an old server in CI would need a store for it, a port, and a refusal policy for a process that writes into a layout-2 tree; all three belong to the leg, not to the fetch.
+- **Decision: refuse link members when unpacking, not only paths that escape.** `unpack_tar` rejects any member that resolves outside the destination *and* any symlink or hardlink member outright. A link is a path around the containment check — a member named `bin/weft-server` that points at `../../../../etc/passwd` passes a path-prefix test and then gets written through by `extractall`. The archives come from this repository's own release workflow, and that is exactly the kind of claim a compatibility command should not have to take on faith, because its output is what a later step will execute.
+- **Verified here, and what remains unverified.** No Rust was built, so no `cargo` and no RAM pressure: the gate for this change is Python. `python3 -m unittest discover -s scripts/compat -p 'test_*.py'` runs 53 tests, 14 of them new, covering a digest that matches, a digest that does not (the message names both, and the sentence that the pin is append-only history), an `--asset` the pin does not carry (refused *before* any download, asserted by counting the `gh` calls), a pin with `binaries = false`, `gh` claiming success while leaving no file, triple selection for all five supported hosts, an unknown host, two archives for one triple (refused rather than guessed), extraction, a `.zip` with `--extract` (refused, with a reason), a `../escaped` tar member, a symlink member, and a check that the committed pin carries exactly one linux x86_64 archive — because the CI job passes no `--asset` and would otherwise be red. Two mistakes the tests caught on the spot: the fetch branch was indented one tab too deep, so `fetch` with no `--version` fell through to `verify` and printed a verification line; and a first draft of the extraction directory doubled the release name. `scripts/ci/check-action-pinning.py` and a YAML parse of `ci.yml` both pass. What CI still has to say: whether `github.token` in a pull-request run can download a release asset, which is the one part of the job that cannot be exercised offline.
+- **Needs human.** The second missing requirement is a pinned release whose binaries can read layout 2. That requires cutting and publishing a release (a tag, `scripts/release/`, the published assets, and a committed fixture set for the new pin, without which `releases.py verify` refuses the block) — publishing is a maintainer act, so it is not a slice I can take. The repository-setting half of Needs human from earlier today still stands: required status checks on `main`.
+origin/main
 ## 2026-11-16 — Re-splitting an oversized frame: where the cut goes, and why the plan's acceptance case did not (ROB-20 G4, #758) (shipped as a cut; the slice is not complete)
 
 - **The ambiguity, and the choice.** `docs/maintenance-budgets-plan.md:225-227` states Slice 4's acceptance test as "configure a small `max_segment_bytes`, set up an aspect with a **single giant sealed segment**, run compaction, assert the aspect now has multiple segments each below the threshold". Chose instead to re-cut the output of a **fold** — the merge/squash swap that is already writing that aspect — and to leave a segment that one seal wrote alone. The reason is legality, not scope-creep: a fold of one member into two outputs must give the second output a **fresh** segment id, and `SwapPlan` refuses that case (`weftdb/src/types/segment_store/maint.rs:794-808`, rule **P2**: a fresh id wins precedence against *every* existing id, so the new frame would hide a higher-id row that overlaps its span, which is exactly what the overlap machinery exists to fold). The plan's own risk note says the same thing from the other side — "must validate that new-id allocation stays correct under concurrent splits".
@@ -7882,3 +7868,4 @@ slice. ROADMAP's ROB-20 line stays unticked and #758 stays open until G3-G6 land
 - **Not compiled here, and not claimed.** As with every Rust slice this month, the gate is CI, not a
   local build; the local checks run were `cargo fmt --check -p weft-server`,
   `python3 scripts/config/check_schema.py` and `python3 scripts/ci/check-serial-order.py`.
+- **Not compiled here, and not claimed.** Nothing in this slice was built: the host's RAM belongs to the model server, and CI is this quarter's Rust gate. The API surface the new tests lean on was checked by grep instead — `IndexRow.desc: SegmentDescriptor` (`weftdb/src/types/index_txn.rs:99`), `SegmentDescriptor { row_count: usize, byte_len: u64 }` (`weft-physical-type/src/catalog.rs:66,85`), and a sibling test module already calling `store.index.rows(ASPECT)` (`tag_seal_tests.rs:51`) — and CI is what says whether they pass. The three store-level tests are written so the ceiling is the **only** difference between them and their control, and the control (`the_same_fold_writes_one_frame_when_the_ceiling_is_off`) is the one that fails on `main` if the change ever regresses into a no-op.inorigin/main

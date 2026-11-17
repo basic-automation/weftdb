@@ -168,8 +168,14 @@ The compatibility suite lives in two places:
 
    The [`compat` job in `ci.yml`](../.github/workflows/ci.yml) runs `releases.py verify`
    on every CI run. That command re-checks every pin against git and against
-   `compat/fixtures/`, so a fixture that drifts fails CI. The leg that does run as code
-   is the upgrade path, in `tests/compat_v010.rs`.
+   `compat/fixtures/`, so a fixture that drifts fails CI. A second job, `pinned release
+   archives`, runs `releases.py fetch --extract`: it downloads the newest pinned release's
+   archive for the runner's platform and fails if the bytes hash to anything other than the
+   sha256 the pin carries, so the digest column of the pin is tested against the published
+   artifact instead of being trusted. Neither job runs the old binary. The leg that would is
+   the absence the gate reports, and it needs a store to point that binary at and a pin whose
+   binaries can read the current layout. The leg that does run as code is the upgrade path,
+   in `tests/compat_v010.rs`.
 
    Since [FRE-16](https://github.com/basic-automation/weftdb/issues/FRE-16), a
    dedicated gate (`scripts/compat/test_leg_coverage.py`) refuses to let a pin declare

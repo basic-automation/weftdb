@@ -36,7 +36,12 @@ in
   with the shipped `float_roundtrip` feature, once with it stripped in-job — and prints both
   medians and the delta. The shipped `Cargo.toml` is never modified.
 
-### Changed
+- **Fetching a pinned release archive (#762).** `python3 scripts/compat/releases.py fetch`
+  downloads one archive named in `compat/releases.toml` and refuses it unless the bytes hash
+  to the sha256 that pin records. `--asset` names the archive; `--extract` unpacks a tar
+  archive under the destination, refusing a member that would land outside it and any link
+  member. A `pinned release archives` job in `.github/workflows/ci.yml` runs it on every
+  pull request: the first time a published WeftDB archive has been downloaded in CI.### Changed
 
 - **A maintenance merge of overlapping frames now folds them in one heap pass instead of k
   pairwise rounds (#758, ROB-20 G3).** `merge_k_way` (`weft-physical-type/src/split.rs`) merges
@@ -52,6 +57,7 @@ in
   they agree before timing. No number from that bench has been reported yet: nothing in this
   slice was compiled or run on the author's machine, so CI is the gate and the speedup is a
   claim CI has to confirm.
+origin/main
 
 ### Fixed
 
