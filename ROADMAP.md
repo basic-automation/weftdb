@@ -82,7 +82,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] (2026-09-23 list; item 3 shipped 2026-10-08.) The 2026-09-23 run
 - [ ] Run D-S21's privileged power-loss validation (sudo: dm-log-writes or a QEMU hard reset) *(owner)*
 - [x] read lane: **X-READ** Read-time newer-wins merge across overlapping segments, per series
-- [ ] maint lane: **ROB-20** Maintenance resource limits, k-way merge, re-split of oversized frames *(G1 shipped 2026-11-16 in #765 — one maintenance operation's output budget, refused before it reads anything; G2 shipped 2026-11-16 in #761 — swap outputs admitted to the disk guard; G3 in review as #772 — `merge_k_way` folds k members in one heap pass instead of k pairwise rounds; G4, re-splitting an oversized merge output, open)*
+- [x] maint lane: **ROB-20** Maintenance resource limits, k-way merge, re-split of oversized frames (byte budget #765 + disk-guard reserve #761 + per-op time budget #781; `merge_k_way` #772; output re-split #773. The time budget is honoured between swaps only, and one already-oversized segment is not auto re-split)
 - [x] open lane: **ROB-22** Suspect-frame policy and background-decode crash-loop breaker
 - [x] L-INGEST: **ROB-18** Two-phase ingest admission, total body deadline, panic mapping by phase
 - [x] **FRE-10a** Contract tests: probes, compute endpoints, metrics and roles
