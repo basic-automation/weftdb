@@ -59,7 +59,7 @@ three call sites (`reconcile_overlaps_held`, `squash_series_held`,
 
 A merge of `n` members now runs `O(rows · log n)` comparisons instead of `O(n·rows)`.
 The output is provably identical to the old serial two-way fold (verified by benchmark-test
-`merge_k_way_matches_the_pairwise_fold_on_every_overlap_shape` at `kway_merge.rs:42`).
+`merge_k_way_matches_the_pairwise_fold_on_every_overlap_shape` at `weft-physical-type/src/split.rs:288`; the same equivalence is re-checked on random shapes in `weft-physical-type/benches/kway_merge.rs`).
 
 **Fan-in limit**: none. The component or group size determines how many members are folded.
 In practice capped by the number of overlapping segments an aspect accumulates before
