@@ -768,6 +768,13 @@ impl Inputs for Database {
 	/// committed before it were already committed, so the caller gets no partial
 	/// list; their timestamps are queued only after the last commit.
 	async fn capture_new_measurement_chunk(&self, aspect_id: &AspectId, db: &turso::Database, db_path: &str, dataset_id: &DatasetId, chunk: &[InputMeasurement], tx_ids: &[TxId]) -> Result<Vec<TxId>> {
+		// Refuse when the aspect is seal-backed: this entry point takes a
+		// caller-supplied rows-mode database handle and writes directly into
+		// it — no seal-backed dispatch exists.
+		if self.is_seal_backed(aspect_id).await? {
+			return Err(crate::Error::SealBackedRejected(format!("capture_new_measurement_chunk is not supported for seal-backed aspect {aspect_id}")).into());
+		}
+
 		legacy_metadata_write(async move {
 			let mut successful = Vec::new();
 			let mut successful_timestamps = Vec::new();
@@ -2126,6 +2133,12 @@ impl Inputs for Database {
 	/// Replace measurements in a time range with new compressed measurements.
 	/// This is an atomic delete + insert operation used during compression.
 	async fn replace_measurements_in_range(&self, aspect_id: &AspectId, dataset_id: &DatasetId, start: chrono::DateTime<chrono::Utc>, end: chrono::DateTime<chrono::Utc>, new_measurements: Vec<InputMeasurement>) -> Result<()> {
+		// Refuse when the aspect is seal-backed: this entry point writes to the
+		// per-aspect measurements.db that no seal-backed read ever consults.
+		if self.is_seal_backed(aspect_id).await? {
+			return Err(crate::Error::SealBackedRejected(format!("replace_measurements_in_range is not supported for seal-backed aspect {aspect_id}")).into());
+		}
+
 		legacy_metadata_write(async move {
 			if new_measurements.is_empty() {
 				// Just delete the range if no new measurements

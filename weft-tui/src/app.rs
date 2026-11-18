@@ -1316,7 +1316,7 @@ impl App {
 					aspect.set_compression_config_local(None);
 
 					// Try to persist - if it fails, warn but still report success
-					if let Err(e) = aspect.set_compression_config(None).await {
+					if let Err(e) = aspect.set_compression_config(&_db, None).await {
 						warn!("Failed to persist compression config removal: {}", e);
 					}
 
@@ -1435,7 +1435,7 @@ impl App {
 
 					// Persist compression config BEFORE starting compression
 					// This avoids database connection issues after long compression runs
-					if let Err(e) = aspect.set_compression_config(Some(config.clone())).await {
+					if let Err(e) = aspect.set_compression_config(&db, Some(config.clone())).await {
 						warn!("Failed to persist compression config: {}", e);
 						// Continue anyway - compression can still run with local config
 					}

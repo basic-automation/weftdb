@@ -8199,4 +8199,43 @@ project does not promise before 1.0.
 Recorded as a known limitation, not fixed: `WEFT_MAINTENANCE_MAX_SEGMENT_BYTES` (#773) re-cuts only
 folds of two or more segments, so the first frame a brand-new seal-backed aspect writes from a large bulk
 ingest can sit above that ceiling until a later fold cuts it, and #765's output budget bounds maintenance
-rather than ingest. Nothing here makes that worse; it only makes it reachable by default.origin/mainorigin/mainorigin/mainorigin/main
+rather than ingest. Nothing here makes that worse; it only makes it reachable by default.
+
+## 2026-11-17 — Seal-backed write guard: refuse rows-mode writes on seal-backed aspects (#801)
+
+### Refusal over implementation
+
+The three entry points (`replace_measurements_in_range`, `capture_new_measurement_chunk`,
+`compress_with_progress`, `set_compression_config`) could instead be routed to the seal store.
+Implementing seal-store range replacement or seal-store compression is a real design change
+and out of scope for this slice. Refusal is via `Error::SealBackedRejected(String)` — kept as
+a typed error so callers can handle it specifically, and rejected operations are surfaced
+up through the existing `Result` chain rather than silently succeeding with no effect.
+
+### `set_compression_config` gained a `&Database` parameter
+
+Because `Aspect` has no database handle or storage-mode field (it stores only metadata-db paths),
+the method could not consult the seal-backing of an aspect without adding a parameter. Both call
+sites in `weft-tui/src/app.rs` already had `db` in scope (`Database::existing` returns
+`Ok(_db)` / `Ok(db)`), so the signature change was minimal. `set_compression_config_local`
+(the in-memory path) was left unchanged: it has no database to consult, it is not reachable
+from a seal store, and it is used by tests that need to set a config without a live database.
+
+### Criterion 3: structural check before SELECT
+
+`ensure_storage_mode_column` already runs `ALTER TABLE aspects ADD COLUMN storage_mode TEXT`
+and ignores duplicate-column errors. Calling it before the SELECT means a pre-D-S19 database
+cannot produce a "no such column" error — the column is added if it was missing. The `Err(_)`
+catch-all is kept only for databases without an `aspects` table at all (which
+`ensure_storage_mode_column`'s no-op would also hit), and that case correctly returns `Rows`.
+No error-string matching was needed.
+
+### Entry-point enumeration
+
+Criterion 4 is satisfied by a test that asserts each legacy write entry point on a seal-backed
+aspect either routes to the seal store or returns `Error::SealBackedRejected`. The covered
+entry points are: `capture_measurement_chunk` (already routed in #779),
+`capture_new_measurement_chunk`, `replace_measurements_in_range`, `batch_capture_measurements`
+(already routed in #779), `batch_capture_new_measurements` (already routed in #779),
+`capture_measurement` (routed in #779 via `capture_new_measurement`), and the compression path
+via `set_compression_config`/`compress`/`compress_with_progress`.

@@ -1680,6 +1680,10 @@ impl Database {
 	/// If the metadata database cannot be queried for a reason other than
 	/// the aspect or the column being absent.
 	pub async fn aspect_storage_mode(&self, aspect_id: &AspectId) -> Result<crate::StorageMode> {
+		// Ensure the storage_mode column exists before selecting from it,
+		// so a pre-S19 database cannot cause a "no such column" error.
+		self.ensure_storage_mode_column().await;
+
 		let conn = Self::begin_concurrent(&self.metadata, &self.metadata_path, Some(self.cache.clone())).await?;
 		let res = conn.as_ref().query("SELECT storage_mode FROM aspects WHERE id = ?", turso::params![aspect_id.as_uuid().to_string()]).await;
 		let mode = match res {
@@ -1693,7 +1697,8 @@ impl Database {
 				};
 				value.as_deref().map_or(crate::StorageMode::Rows, |text| crate::StorageMode::parse(Some(text)))
 			}
-			// A database created before D-S19 has no column to select.
+			// A pre-S19 database has no `aspects` table at all (caught by
+			// `ensure_storage_mode_column`'s no-op).
 			Err(_) => crate::StorageMode::Rows,
 		};
 		Self::commit_concurrent(&conn).await.ok();
