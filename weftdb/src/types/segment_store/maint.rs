@@ -229,7 +229,8 @@ impl SegmentStore {
 		let mut completed = true;
 		while !series_plans.is_empty() {
 			let tail = series_plans.split_off(MAX_PLANS_PER_TXN.min(series_plans.len()));
-			let chunk: Vec<SwapPlan> = series_plans.drain(..).map(SwapPlan::purge).collect();
+			let batch = std::mem::take(&mut series_plans);
+			let chunk: Vec<SwapPlan> = batch.into_iter().map(SwapPlan::purge).collect();
 			let members: Vec<usize> = chunk.iter().map(|plan| plan.members.len()).collect();
 			match self.swap_plans(held, &schema, chunk).await {
 				Ok(outcomes) => {

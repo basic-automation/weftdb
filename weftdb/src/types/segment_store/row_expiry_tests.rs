@@ -278,7 +278,7 @@ async fn purge_drops_a_fully_expired_segment_and_keeps_a_straddling_one() {
 	let after_expiry = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads after the purge");
 	assert_eq!(before_plain, after_plain, "plain read is unchanged after dropping a frame no read could use");
 	assert_eq!(before_expiry, after_expiry, "TTL-filtered read is unchanged after dropping a frame no read could use");
-	assert_eq!(after.0.first().copied(), Some(90), "the first visible row is the first one at or past the cutoff");
+	assert_eq!(after_expiry.0.first().copied(), Some(90), "the first visible row is the first one at or past the cutoff");
 
 	let rows = store.index.all(ASPECT).await.expect("index after the purge");
 	assert_eq!(rows.len(), 1, "only the straddling frame keeps an index row");
@@ -378,7 +378,7 @@ async fn purge_does_not_drop_segment_that_shadows_a_survivor() {
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 
 	// Survivor: ts 60..=120 — max_ts=120 > cutoff=90 → straddles, kept.
-	store.ingest(ASPECT, &IngestBatch::dense("s1", (60..=120).collect(), (60..=120).map(|t| bd("1")).collect())).await.expect("ingests survivor");
+	store.ingest(ASPECT, &IngestBatch::dense("s1", (60..=120).collect(), (60..=120).map(|_| bd("1")).collect())).await.expect("ingests survivor");
 
 	// Correction: ts 70..=79 — max_ts=79 < cutoff=90 → would be doomed, but
 	// overlaps the survivor (both are series "s1").  The correction carries
