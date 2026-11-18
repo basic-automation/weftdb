@@ -177,7 +177,7 @@ impl SegmentStore {
 			}
 		}
 		if doomed.is_empty() {
-			return Ok(row_expiry::AspectExpirySwept { rows_expired, segments_dropped: 0, partial_segments, oldest_expired_ts, newest_expired_ts, completed: true });
+			return Ok(row_expiry::AspectExpirySwept { rows_expired, segments_dropped: 0, partial_segments, shadowed_and_kept: 0, oldest_expired_ts, newest_expired_ts, completed: true });
 		}
 		let plans = doomed.into_values().map(SwapPlan::purge).collect::<Vec<_>>();
 		let members = plans.iter().map(|plan| plan.members.len()).collect::<Vec<_>>();
@@ -198,7 +198,7 @@ impl SegmentStore {
 		if let Some(e) = first_error {
 			return Err(e);
 		}
-		Ok(row_expiry::AspectExpirySwept { rows_expired, segments_dropped: dropped, partial_segments, oldest_expired_ts, newest_expired_ts, completed: true })
+		Ok(row_expiry::AspectExpirySwept { rows_expired, segments_dropped: dropped, partial_segments, shadowed_and_kept: 0, oldest_expired_ts, newest_expired_ts, completed: true })
 	}
 
 	/// Count expired rows in one aspect under the maintenance lock `held`.
@@ -241,7 +241,7 @@ impl SegmentStore {
 				}
 			}
 		}
-		Ok(row_expiry::AspectExpirySwept { rows_expired, segments_dropped: 0, partial_segments: 0, oldest_expired_ts, newest_expired_ts, completed: true })
+		Ok(row_expiry::AspectExpirySwept { rows_expired, segments_dropped: 0, partial_segments: 0, shadowed_and_kept: 0, oldest_expired_ts, newest_expired_ts, completed: true })
 	}
 
 	/// Hold `aspect`'s maintenance lock until the returned guard drops, as a maintenance
