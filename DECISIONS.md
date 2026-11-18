@@ -8201,6 +8201,32 @@ folds of two or more segments, so the first frame a brand-new seal-backed aspect
 ingest can sit above that ceiling until a later fold cuts it, and #765's output budget bounds maintenance
 rather than ingest. Nothing here makes that worse; it only makes it reachable by default.origin/mainorigin/mainorigin/mainorigin/main
 
+
+## 2026-11-17 — What the daemon budget check can honestly promise (ROB-14 cut 3, #806) (decided)
+
+The brief asked the background daemons to consult `MemoryBudget` before they allocate, which
+leaves two things undefined: which daemons, and what "consult" means when a pass does not know
+its own footprint.
+
+- **Which daemons.** Only the reconcile daemon's six tick functions carry a budget in scope; the
+compaction, expiry and purge daemons have no `MemoryBudget` parameter at all, and threading one
+through them changes their signatures and their construction sites. Cut 3 covers reconcile only
+and the roadmap line stays open for the rest rather than claiming the whole item.
+- **What to reserve.** `wanted` of 1 byte. A pass allocates inside the store, and the server
+cannot know the size of a fold before asking the store to plan it, so inventing a per-pass
+estimate would be a made-up number that silently decides how much background work the limit
+admits. The honest question at that point is "is there any headroom at all", and one byte answers
+it. A pass that runs is still bounded by the store's own output ceiling
+(`WEFT_MAINTENANCE_MAX_OUTPUT_BYTES`) and the wall-clock budget (#758). This is why the check is
+named a probe in its doc comment and why the `Reservation` is dropped at the decision point:
+holding bytes the store will not use would only starve request paths.
+- **Unbounded stays unbounded.** `budget.limit()` of `None` returns `true` immediately, so the
+default server (no `WEFT_MEMORY_BUDGET_BYTES`, no cgroup limit) behaves exactly as before.
+- **How the test pins it.** The deferring test asserts `aspects_scanned == 0` and no pass
+counter, not `aspects_reconciled == 0`: after the first pass there is no work left, so a tick
+that ignored the budget would also report zero reconciled. Scanning is the first observable
+thing the check sits in front of.
+
   regression guard the whole slice is about.
 
 ## 2026-11-17 — Moving the fragmentation gate into the bulk-ingest path (#232)
