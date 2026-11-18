@@ -79,7 +79,9 @@ fn sweep_idle(cache: &mut HashMap<String, turso::Database>, after: std::time::Du
 	let mut last_used = LAST_USED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 	let idle: Vec<String> = cache.keys().filter(|path| !path.ends_with("metadata.db")).filter(|path| last_used.get(*path).is_none_or(|t| now.saturating_duration_since(*t) >= after)).cloned().collect();
 	for path in &idle {
-		cache.remove(path);
+		if let Some(db) = cache.remove(path) {
+			conn_pool::unregister(&db, conn_pool::Role::Legacy);
+		}
 		last_used.remove(path);
 	}
 	drop(last_used);
@@ -168,7 +170,9 @@ pub async fn clear_connection_cache_by_name(name: &str) {
 		let mut cache = CONNECTION_DATABASES.lock().await;
 		let keys: Vec<String> = cache.keys().filter(|path| path.contains(name)).cloned().collect();
 		for key in &keys {
-			cache.remove(key);
+			if let Some(db) = cache.remove(key) {
+				conn_pool::unregister(&db, conn_pool::Role::Legacy);
+			}
 		}
 		keys
 	};
@@ -179,6 +183,7 @@ pub async fn clear_connection_cache_by_name(name: &str) {
 }
 
 pub mod config;
+pub(crate) mod conn_pool;
 pub mod connection;
 mod creation;
 pub mod helpers;
@@ -302,6 +307,7 @@ impl DatabaseStructure for Database {
 				drop(conn);
 			}
 
+			conn_pool::register(&turso_db, conn_pool::Role::Legacy);
 			cache.insert(db_path.to_string(), turso_db.clone());
 			touch_cached(db_path);
 			drop(cache);
@@ -336,7 +342,8 @@ impl DatabaseStructure for Database {
 		// Allow connection to fully close before returning
 		tokio::task::yield_now().await;
 
-		cache.insert(db_path.to_string(), turso_db.clone());
+		conn_pool::register(&turso_db, conn_pool::Role::Legacy);
+			cache.insert(db_path.to_string(), turso_db.clone());
 		touch_cached(db_path);
 		drop(cache);
 		Ok((turso_db, true)) // Newly created
@@ -771,7 +778,9 @@ impl DatabaseStructure for Database {
 		let db_path = format!("{}/{}/metadata.db", Self::get_data_dir(), self.name);
 		{
 			let mut connection_databases = CONNECTION_DATABASES.lock().await;
-			connection_databases.remove(&db_path);
+			if let Some(db) = connection_databases.remove(&db_path) {
+				conn_pool::unregister(&db, conn_pool::Role::Legacy);
+			}
 		}
 
 		// Wait for database files to be actually released

@@ -504,10 +504,11 @@ impl IndexTxn {
 	/// failed.
 	async fn attempt(&self, db: &turso::Database) -> Result<Vec<u64>, AttemptFailure> {
 		let conn = connect(db).await.map_err(|e| AttemptFailure::before_ops(IndexTxnError::new(TxnErrorKind::Definite, None, format!("connecting: {e}"))))?;
-		conn.execute("BEGIN CONCURRENT", ()).await.map_err(|e| AttemptFailure::before_ops(IndexTxnError::new(statement_error_kind(&e), None, format!("BEGIN CONCURRENT: {e}"))))?;
+		conn.execute("BEGIN CONCURRENT", ()).await.inspect_err(|_| conn.discard()).map_err(|e| AttemptFailure::before_ops(IndexTxnError::new(statement_error_kind(&e), None, format!("BEGIN CONCURRENT: {e}"))))?;
 		let changes = match self.apply_ops(&conn).await {
 			Ok(changes) => changes,
 			Err(e) => {
+				conn.discard();
 				rollback(&conn).await;
 				return Err(AttemptFailure::after_ops(e));
 			}
@@ -515,7 +516,9 @@ impl IndexTxn {
 		if let Err(e) = conn.execute("COMMIT", ()).await {
 			// A COMMIT that failed validation rolled itself back; one that failed later
 			// may have left the connection inside the transaction. Either way the
-			// connection is dropped next, and only recovery can say what is durable.
+			// connection is closed rather than pooled (`discard`), and only recovery can
+			// say what is durable.
+			conn.discard();
 			rollback(&conn).await;
 			return Err(AttemptFailure::after_ops(IndexTxnError::new(commit_error_kind(&e), None, format!("COMMIT: {e}"))));
 		}
@@ -747,8 +750,8 @@ fn integer(n: u64) -> Value {
 }
 
 /// Roll back what is left of a failed attempt. Its error is not interesting: Turso has
-/// already rolled back a transaction that hit a conflict, and the connection is
-/// dropped right after.
+/// already rolled back a transaction that hit a conflict, and the caller has marked the
+/// connection to be closed rather than pooled.
 async fn rollback(conn: &turso::Connection) {
 	if let Err(e) = conn.execute("ROLLBACK", ()).await {
 		tracing::trace!(error = %e, "ROLLBACK after a failed segment_index transaction");

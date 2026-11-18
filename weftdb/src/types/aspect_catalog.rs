@@ -35,6 +35,12 @@ pub struct AspectCatalog {
 	db: turso::Database,
 }
 
+impl Drop for AspectCatalog {
+	fn drop(&mut self) {
+		crate::types::durable::control_plane::release(&self.db);
+	}
+}
+
 /// What a declaration says about the aspect's upsert keys.
 #[derive(Clone, Copy)]
 enum KeysOffer<'a> {
@@ -74,6 +80,7 @@ impl AspectCatalog {
 		// The control plane's MVCC write path; open fails rather than run without it.
 		crate::types::durable::control_plane::enable_mvcc_full(&db, &conn, path).await?;
 		conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await.ok();
+		crate::types::durable::control_plane::adopt(&db);
 		Ok(Self { db })
 	}
 
