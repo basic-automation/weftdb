@@ -20,7 +20,7 @@ use axum::{
 use bigdecimal::BigDecimal;
 use tower::ServiceExt;
 use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
-use weft_server::{app_with_state, reconcile_tick, AppState, Metrics, SharedMetrics};
+use weft_server::{app_with_state, reconcile_tick, AppState, MemoryBudget, Metrics, SharedMetrics};
 use weftdb::SegmentStore;
 
 /// How long the store under test waits for a busy aspect.
@@ -87,13 +87,17 @@ async fn a_daemon_tick_skips_a_busy_aspect_without_waiting() {
 	let dir = tempfile::TempDir::new().expect("tempdir");
 	let store = store_with_work(dir.path()).await;
 	let metrics: SharedMetrics = Arc::new(Metrics::default());
+	// Unbounded on purpose: this test pins the busy branch, so the budget check must
+	// not be what stops the tick. The budget argument is covered in reconcile_daemon's
+	// own tests.
+	let budget = MemoryBudget::new(None);
 	let held = store.hold_maintenance("price").await.expect("takes the aspect");
 	// The aspect stays held until the tick returns, so a tick that waited for it would
 	// never finish.
-	let sweep = tokio::time::timeout(Duration::from_secs(30), reconcile_tick(&store, &metrics, 1)).await.expect("the tick does not wait for the busy aspect").expect("the tick runs");
+	let sweep = tokio::time::timeout(Duration::from_secs(30), reconcile_tick(&store, &metrics, &budget, 1)).await.expect("the tick does not wait for the busy aspect").expect("the tick runs");
 	let price = store.aspect_stats("price").await.expect("reads the stats").unsorted_segments;
 	drop(held);
-	let next = reconcile_tick(&store, &metrics, 1).await.expect("the next tick runs");
+	let next = reconcile_tick(&store, &metrics, &budget, 1).await.expect("the next tick runs");
 	drop(store);
 
 	assert_eq!(sweep.busy, vec!["price".to_string()], "the tick skipped the busy aspect");

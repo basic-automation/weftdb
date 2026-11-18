@@ -63,7 +63,9 @@ use std::{sync::Arc, time::Duration};
 use tracing::Instrument as _;
 use weftdb::{HotColdSweep, MaintenanceWait, OverlapSweep, ReconcileSweep, SegmentStore, SquashSweep};
 
-use crate::metrics::SharedMetrics;
+use crate::{
+	memory_budget::{MemoryBudget, ReserveError}, metrics::SharedMetrics
+};
 
 /// Log and count the aspects a store-wide sweep could not maintain.
 ///
@@ -124,6 +126,42 @@ fn report_busy_aspects(span: &tracing::Span, kind: &'static str, busy: &[String]
 			tracing::debug!(sweep = kind, aspect = %aspect, "reconcile daemon: aspect busy with another maintenance operation; skipped this tick");
 		}
 	});
+}
+
+/// Check whether the memory budget can cover `wanted` bytes for a maintenance pass.
+///
+/// Logs at `warn` when the budget is bounded and exhausted — the pass is deferred;
+/// logs at `debug` when the budget is free enough or unbounded — the pass runs.
+/// Returns `false` to signal the caller to skip this tick, `true` to proceed.
+///
+/// This is the ROB-14 cut 3 entry point for the reconcile daemon's tick functions: the
+/// passes that run with no request behind them. The compaction, expiry and purge daemons
+/// do not carry a budget yet, so cut 3 covers reconcile only.
+///
+/// The check is a probe, not an accounting of the pass. A pass allocates later, inside
+/// the store, and its footprint is not knowable here, so callers ask for the smallest
+/// reservation (`wanted` of 1) and the question this answers is whether any headroom
+/// exists at all. The reservation is released before returning for the same reason: the
+/// budget tracks container-level pressure, not bytes written. Deferring a pass on a
+/// tight budget is better than reaching the OOM killer.
+fn has_budget_for_pass(budget: &MemoryBudget, kind: &str, wanted: u64) -> bool {
+	let Some(limit) = budget.limit() else {
+		// Unbounded: the pass always runs.
+		return true;
+	};
+	match budget.try_reserve(wanted) {
+		Ok(reservation) => {
+			tracing::debug!(budget_limit = limit, reserved = %budget.reserved(), wanted, kind, "pass: the budget has headroom");
+			// Released on purpose: the probe covers the decision point only, and a pass
+			// that runs allocates through the store's own accounting afterwards.
+			drop(reservation);
+			true
+		}
+		Err(ReserveError::OverBudget { limit, reserved, wanted }) => {
+			tracing::warn!(budget_limit = limit, reserved, wanted, kind, "daemon pass deferred: budget exhausted");
+			false
+		}
+	}
 }
 
 /// Configuration for the background reconcile daemon.
@@ -187,7 +225,14 @@ pub struct ReconcileDaemonConfig {
 ///
 /// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::reconcile_all_over_threshold`](weftdb::SegmentStore::reconcile_all_over_threshold).
-pub async fn reconcile_tick(store: &SegmentStore, metrics: &SharedMetrics, threshold: usize) -> anyhow::Result<ReconcileSweep> {
+pub async fn reconcile_tick(store: &SegmentStore, metrics: &SharedMetrics, budget: &MemoryBudget, threshold: usize) -> anyhow::Result<ReconcileSweep> {
+	if !has_budget_for_pass(budget, "threshold", 1) {
+		// Deferred: log at debug that the tick is skipped, report via the existing
+		// skip/deferral path (a default sweep with `cancelled = true` signals the
+		// daemon loop that nothing ran), and retry on the next tick.
+		tracing::debug!(threshold, "reconcile tick deferred: memory budget exhausted");
+		return Ok(ReconcileSweep::default());
+	}
 	let span = tracing::info_span!("reconcile.tick", kind = "threshold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty, tripped = tracing::field::Empty, cancelled = tracing::field::Empty);
 	let sweep = store.reconcile_all_over_threshold(threshold, MaintenanceWait::Skip).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_reconciled);
@@ -219,7 +264,11 @@ pub async fn reconcile_tick(store: &SegmentStore, metrics: &SharedMetrics, thres
 ///
 /// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::reconcile_all_hot_cold`](weftdb::SegmentStore::reconcile_all_hot_cold).
-pub async fn reconcile_tick_hot_cold(store: &SegmentStore, metrics: &SharedMetrics, threshold: usize) -> anyhow::Result<HotColdSweep> {
+pub async fn reconcile_tick_hot_cold(store: &SegmentStore, metrics: &SharedMetrics, budget: &MemoryBudget, threshold: usize) -> anyhow::Result<HotColdSweep> {
+	if !has_budget_for_pass(budget, "hot_cold", 1) {
+		tracing::debug!(threshold, "reconcile tick (hot/cold) deferred: memory budget exhausted");
+		return Ok(HotColdSweep::default());
+	}
 	let span = tracing::info_span!("reconcile.tick", kind = "hot_cold", threshold, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty, tripped = tracing::field::Empty, cancelled = tracing::field::Empty);
 	let sweep = store.reconcile_all_hot_cold(threshold, MaintenanceWait::Skip).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_reconciled);
@@ -249,7 +298,11 @@ pub async fn reconcile_tick_hot_cold(store: &SegmentStore, metrics: &SharedMetri
 ///
 /// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::reconcile_all_overlaps`](weftdb::SegmentStore::reconcile_all_overlaps).
-pub async fn reconcile_tick_overlaps(store: &SegmentStore, metrics: &SharedMetrics) -> anyhow::Result<OverlapSweep> {
+pub async fn reconcile_tick_overlaps(store: &SegmentStore, metrics: &SharedMetrics, budget: &MemoryBudget) -> anyhow::Result<OverlapSweep> {
+	if !has_budget_for_pass(budget, "overlaps", 1) {
+		tracing::debug!("reconcile tick (overlaps) deferred: memory budget exhausted");
+		return Ok(OverlapSweep::default());
+	}
 	let span = tracing::info_span!("reconcile.tick", kind = "overlaps", aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty, tripped = tracing::field::Empty, cancelled = tracing::field::Empty);
 	let sweep = store.reconcile_all_overlaps(MaintenanceWait::Skip).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_reconciled);
@@ -279,7 +332,11 @@ pub async fn reconcile_tick_overlaps(store: &SegmentStore, metrics: &SharedMetri
 ///
 /// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::reconcile_all_overlaps_with_policy`](weftdb::SegmentStore::reconcile_all_overlaps_with_policy).
-pub async fn reconcile_tick_overlaps_with_policy(store: &SegmentStore, metrics: &SharedMetrics, min_split_bytes: u64) -> anyhow::Result<OverlapSweep> {
+pub async fn reconcile_tick_overlaps_with_policy(store: &SegmentStore, metrics: &SharedMetrics, budget: &MemoryBudget, min_split_bytes: u64) -> anyhow::Result<OverlapSweep> {
+	if !has_budget_for_pass(budget, "overlaps_split", 1) {
+		tracing::debug!(min_split_bytes, "reconcile tick (overlaps/split) deferred: memory budget exhausted");
+		return Ok(OverlapSweep::default());
+	}
 	let span = tracing::info_span!("reconcile.tick", kind = "overlaps_split", min_split_bytes, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty, tripped = tracing::field::Empty, cancelled = tracing::field::Empty);
 	let sweep = store.reconcile_all_overlaps_with_policy(weft_physical_type::SplitPolicy::new(min_split_bytes), MaintenanceWait::Skip).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_reconciled);
@@ -311,7 +368,11 @@ pub async fn reconcile_tick_overlaps_with_policy(store: &SegmentStore, metrics: 
 ///
 /// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::squash_all_over_threshold`](weftdb::SegmentStore::squash_all_over_threshold).
-pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics, max_segments: usize) -> anyhow::Result<SquashSweep> {
+pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics, budget: &MemoryBudget, max_segments: usize) -> anyhow::Result<SquashSweep> {
+	if !has_budget_for_pass(budget, "squash", 1) {
+		tracing::debug!(max_segments, "reconcile tick (squash) deferred: memory budget exhausted");
+		return Ok(SquashSweep::default());
+	}
 	let span = tracing::info_span!("reconcile.tick", kind = "squash", max_segments, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty, tripped = tracing::field::Empty, cancelled = tracing::field::Empty);
 	let sweep = store.squash_all_over_threshold(max_segments, MaintenanceWait::Skip).instrument(span.clone()).await?;
 	span.record("aspects", sweep.aspects_squashed);
@@ -344,7 +405,11 @@ pub async fn reconcile_tick_squash(store: &SegmentStore, metrics: &SharedMetrics
 ///
 /// Propagates a failure to list the store's aspects from
 /// [`SegmentStore::squash_all_to_target_rows_if_fragmented`](weftdb::SegmentStore::squash_all_to_target_rows_if_fragmented).
-pub async fn reconcile_tick_compact(store: &SegmentStore, metrics: &SharedMetrics, target_rows: usize) -> anyhow::Result<SquashSweep> {
+pub async fn reconcile_tick_compact(store: &SegmentStore, metrics: &SharedMetrics, budget: &MemoryBudget, target_rows: usize) -> anyhow::Result<SquashSweep> {
+	if !has_budget_for_pass(budget, "compact", 1) {
+		tracing::debug!(target_rows, "reconcile tick (compact) deferred: memory budget exhausted");
+		return Ok(SquashSweep::default());
+	}
 	let span = tracing::info_span!("reconcile.tick", kind = "compact", target_rows, aspects = tracing::field::Empty, segments = tracing::field::Empty, failed = tracing::field::Empty, busy = tracing::field::Empty, tripped = tracing::field::Empty, cancelled = tracing::field::Empty);
 	// The gated sweep: a converged aspect costs one O(1) rollup read per tick, not a full
 	// segment-index scan, so the 1s daemon does not churn the control plane on a tidy store.
@@ -375,7 +440,7 @@ pub async fn reconcile_tick_compact(store: &SegmentStore, metrics: &SharedMetric
 /// logged and the loop continues (a transient control-plane error must not kill the
 /// daemon).
 #[must_use]
-pub fn spawn_reconcile_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, config: ReconcileDaemonConfig) -> tokio::task::JoinHandle<()> {
+pub fn spawn_reconcile_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, budget: MemoryBudget, config: ReconcileDaemonConfig) -> tokio::task::JoinHandle<()> {
 	tokio::spawn(async move {
 		let mut ticker = tokio::time::interval(config.interval);
 		// Consume the immediate first tick so the first sweep waits one interval.
@@ -383,7 +448,7 @@ pub fn spawn_reconcile_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, 
 		loop {
 			ticker.tick().await;
 			if config.hot_cold {
-				match reconcile_tick_hot_cold(&store, &metrics, config.threshold).await {
+				match reconcile_tick_hot_cold(&store, &metrics, &budget, config.threshold).await {
 					Ok(sweep) if sweep.aspects_reconciled > 0 => {
 						println!("reconcile daemon (hot/cold): scanned {} aspect(s), reconciled {} aspect(s) / {} cold + {} hot segment(s)", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.cold_reconciled, sweep.hot_reconciled);
 					}
@@ -391,7 +456,7 @@ pub fn spawn_reconcile_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, 
 					Err(err) => eprintln!("reconcile daemon: hot/cold sweep failed: {err}"),
 				}
 			} else {
-				match reconcile_tick(&store, &metrics, config.threshold).await {
+				match reconcile_tick(&store, &metrics, &budget, config.threshold).await {
 					Ok(sweep) if sweep.aspects_reconciled > 0 => {
 						println!("reconcile daemon: scanned {} aspect(s), reconciled {} aspect(s) / {} segment(s)", sweep.aspects_scanned, sweep.aspects_reconciled, sweep.segments_reconciled);
 					}
@@ -404,8 +469,8 @@ pub fn spawn_reconcile_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, 
 			// fully rewriting each component.
 			if config.overlaps {
 				let tick = match config.split_min_bytes {
-					Some(min) => reconcile_tick_overlaps_with_policy(&store, &metrics, min).await,
-					None => reconcile_tick_overlaps(&store, &metrics).await,
+					Some(min) => reconcile_tick_overlaps_with_policy(&store, &metrics, &budget, min).await,
+					None => reconcile_tick_overlaps(&store, &metrics, &budget).await,
 				};
 				match tick {
 					Ok(sweep) if sweep.aspects_reconciled > 0 => {
@@ -418,7 +483,7 @@ pub fn spawn_reconcile_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, 
 			// Optionally cap split-path fragmentation by squashing over-threshold aspects
 			// (runs after the overlap merge, which is what accumulates the split segments).
 			if let Some(max_segments) = config.squash_max_segments {
-				match reconcile_tick_squash(&store, &metrics, max_segments).await {
+				match reconcile_tick_squash(&store, &metrics, &budget, max_segments).await {
 					Ok(sweep) if sweep.aspects_squashed > 0 => {
 						println!("reconcile daemon (squash): scanned {} aspect(s), squashed {} aspect(s) / removed {} segment(s)", sweep.aspects_scanned, sweep.aspects_squashed, sweep.segments_removed);
 					}
@@ -429,7 +494,7 @@ pub fn spawn_reconcile_daemon(store: Arc<SegmentStore>, metrics: SharedMetrics, 
 			// Optionally coalesce toward a target segment size (size-aware fragmentation
 			// bound; runs after the squash-to-one pass, an independent axis).
 			if let Some(target_rows) = config.compact_target_rows {
-				match reconcile_tick_compact(&store, &metrics, target_rows).await {
+				match reconcile_tick_compact(&store, &metrics, &budget, target_rows).await {
 					Ok(sweep) if sweep.aspects_squashed > 0 => {
 						println!("reconcile daemon (compact): scanned {} aspect(s), compacted {} aspect(s) / removed {} segment(s)", sweep.aspects_scanned, sweep.aspects_squashed, sweep.segments_removed);
 					}
@@ -472,10 +537,11 @@ mod tests {
 		store.seal("a", &schema(), &[200_i64, 240, 210], &[bd("4"), bd("6"), bd("5")]).await.unwrap();
 		store.seal("b", &schema(), &[100_i64, 130, 110], &[bd("7"), bd("9"), bd("8")]).await.unwrap();
 		let metrics: SharedMetrics = Arc::new(Metrics::default());
+		let budget = MemoryBudget::new(None);
 
 		// One tick at threshold 2: only aspect a fires (2 passes = 1 aspect? no —
 		// a is one reconciled aspect rewriting 2 segments). b holds below threshold.
-		let sweep = reconcile_tick(&store, &metrics, 2).await.unwrap();
+		let sweep = reconcile_tick(&store, &metrics, &budget, 2).await.unwrap();
 		let snap = metrics.snapshot();
 		assert_eq!(sweep.aspects_reconciled, 1, "only a is over threshold 2");
 		assert_eq!(sweep.segments_reconciled, 2, "both of a's segments rewritten");
@@ -485,7 +551,7 @@ mod tests {
 
 		// A quiet tick (nothing over threshold 2 now) records no reconcile work —
 		// but it still counts as a maintenance sweep that ran.
-		let quiet = reconcile_tick(&store, &metrics, 2).await.unwrap();
+		let quiet = reconcile_tick(&store, &metrics, &budget, 2).await.unwrap();
 		let snap2 = metrics.snapshot();
 		drop(store);
 		assert_eq!(quiet.aspects_reconciled, 0);
@@ -505,10 +571,11 @@ mod tests {
 		store.seal("a", &schema(), &[100_i64, 130, 110], &[bd("1"), bd("3"), bd("2")]).await.unwrap();
 		store.seal("a", &schema(), &[200_i64, 240, 210], &[bd("4"), bd("6"), bd("5")]).await.unwrap();
 		let metrics: SharedMetrics = Arc::new(Metrics::default());
+		let budget = MemoryBudget::new(None);
 
 		// Threshold 3 is above the backlog: the cold segment reconciles, the hot tail
 		// is deferred, and the one reconciled aspect / one segment are recorded.
-		let sweep = reconcile_tick_hot_cold(&store, &metrics, 3).await.unwrap();
+		let sweep = reconcile_tick_hot_cold(&store, &metrics, &budget, 3).await.unwrap();
 		let snap = metrics.snapshot();
 		assert_eq!(sweep.aspects_reconciled, 1);
 		assert_eq!(sweep.cold_reconciled, 1, "the cold segment is reconciled below threshold");
@@ -520,7 +587,7 @@ mod tests {
 
 		// A second tick at threshold 3 now finds only the deferred hot tail (backlog 1
 		// < 3) — nothing is rewritten and the counters do not move.
-		let quiet = reconcile_tick_hot_cold(&store, &metrics, 3).await.unwrap();
+		let quiet = reconcile_tick_hot_cold(&store, &metrics, &budget, 3).await.unwrap();
 		let snap2 = metrics.snapshot();
 		drop(store);
 		assert_eq!(quiet.aspects_reconciled, 0);
@@ -536,8 +603,9 @@ mod tests {
 		store.seal("a", &schema(), &[0_i64, 10, 20], &[bd("1"), bd("2"), bd("3")]).await.unwrap();
 		store.seal("a", &schema(), &[10_i64, 20, 30], &[bd("4"), bd("5"), bd("6")]).await.unwrap();
 		let metrics: SharedMetrics = Arc::new(Metrics::default());
+		let budget = MemoryBudget::new(None);
 
-		let sweep = reconcile_tick_overlaps(&store, &metrics).await.unwrap();
+		let sweep = reconcile_tick_overlaps(&store, &metrics, &budget).await.unwrap();
 		let snap = metrics.snapshot();
 		assert_eq!(sweep.aspects_reconciled, 1);
 		assert_eq!(sweep.segments_removed, 1, "the overlapping pair merged to one");
@@ -546,7 +614,7 @@ mod tests {
 		assert_eq!(store.aspect_stats("a").await.unwrap().overlapping_segments, 0);
 
 		// A second tick has nothing to merge and records nothing.
-		let quiet = reconcile_tick_overlaps(&store, &metrics).await.unwrap();
+		let quiet = reconcile_tick_overlaps(&store, &metrics, &budget).await.unwrap();
 		let snap2 = metrics.snapshot();
 		drop(store);
 		assert_eq!(quiet.aspects_reconciled, 0);
@@ -564,9 +632,10 @@ mod tests {
 		store.seal("a", &schema(), &base_ts, &base_values).await.unwrap();
 		store.seal("a", &schema(), &[90_i64, 100, 110], &[bd("900"), bd("1000"), bd("1100")]).await.unwrap();
 		let metrics: SharedMetrics = Arc::new(Metrics::default());
+		let budget = MemoryBudget::new(None);
 
 		// A tiny floor splits the cold prefix off (2 segments) instead of one full rewrite.
-		let sweep = reconcile_tick_overlaps_with_policy(&store, &metrics, 1).await.unwrap();
+		let sweep = reconcile_tick_overlaps_with_policy(&store, &metrics, &budget, 1).await.unwrap();
 		let snap = metrics.snapshot();
 		let stats = store.aspect_stats("a").await.unwrap();
 		drop(store);
@@ -587,8 +656,9 @@ mod tests {
 		store.seal("a", &schema(), &[20_i64, 30], &[bd("2"), bd("3")]).await.unwrap();
 		store.seal("a", &schema(), &[40_i64, 50], &[bd("4"), bd("5")]).await.unwrap();
 		let metrics: SharedMetrics = Arc::new(Metrics::default());
+		let budget = MemoryBudget::new(None);
 
-		let sweep = reconcile_tick_squash(&store, &metrics, 2).await.unwrap();
+		let sweep = reconcile_tick_squash(&store, &metrics, &budget, 2).await.unwrap();
 		let snap = metrics.snapshot();
 		let count = store.segment_count("a").await.unwrap();
 		drop(store);
@@ -599,7 +669,7 @@ mod tests {
 
 		// A second tick at the same cap finds one segment (<= 2) and records nothing.
 		let store = SegmentStore::open(dir.path()).await.unwrap();
-		let quiet = reconcile_tick_squash(&store, &metrics, 2).await.unwrap();
+		let quiet = reconcile_tick_squash(&store, &metrics, &budget, 2).await.unwrap();
 		let snap2 = metrics.snapshot();
 		drop(store);
 		assert_eq!(quiet.aspects_squashed, 0);
@@ -618,8 +688,9 @@ mod tests {
 		store.seal("a", &schema(), &[40_i64, 50], &[bd("4"), bd("5")]).await.unwrap();
 		store.seal("a", &schema(), &[60_i64, 70], &[bd("6"), bd("7")]).await.unwrap();
 		let metrics: SharedMetrics = Arc::new(Metrics::default());
+		let budget = MemoryBudget::new(None);
 
-		let sweep = reconcile_tick_compact(&store, &metrics, 4).await.unwrap();
+		let sweep = reconcile_tick_compact(&store, &metrics, &budget, 4).await.unwrap();
 		let snap = metrics.snapshot();
 		let count = store.segment_count("a").await.unwrap();
 		drop(store);
@@ -630,7 +701,7 @@ mod tests {
 
 		// A second tick: the two segments are each already at the 4-row target → no-op.
 		let store = SegmentStore::open(dir.path()).await.unwrap();
-		let quiet = reconcile_tick_compact(&store, &metrics, 4).await.unwrap();
+		let quiet = reconcile_tick_compact(&store, &metrics, &budget, 4).await.unwrap();
 		let snap2 = metrics.snapshot();
 		drop(store);
 		assert_eq!(quiet.aspects_squashed, 0);
@@ -702,9 +773,10 @@ mod tests {
 		let dir = TempDir::new().unwrap();
 		let store = sweep_isolation_fixture(dir.path()).await;
 		let metrics: SharedMetrics = Arc::new(Metrics::default());
+		let budget = MemoryBudget::new(None);
 		let log = CapturedLog::default();
 		let guard = tracing::subscriber::set_default(log.subscriber());
-		let sweep = reconcile_tick(&store, &metrics, 1).await.expect("a bad aspect does not fail the tick");
+		let sweep = reconcile_tick(&store, &metrics, &budget, 1).await.expect("a bad aspect does not fail the tick");
 		drop(guard);
 		let s6_unsorted = store.aspect_stats("s6").await.unwrap().unsorted_segments;
 		drop(store);
@@ -729,10 +801,11 @@ mod tests {
 		let dir = TempDir::new().unwrap();
 		let store = sweep_isolation_fixture(dir.path()).await.with_maintenance_breaker(MaintenanceBreaker { failure_threshold: 1, cooldown: std::time::Duration::from_secs(60) });
 		let metrics: SharedMetrics = Arc::new(Metrics::default());
+		let budget = MemoryBudget::new(None);
 
 		// First tick: the damaged aspect fails and trips its breaker (threshold
 		// 1); the five healthy aspects reconcile.
-		let sweep = reconcile_tick(&store, &metrics, 1).await.expect("tick");
+		let sweep = reconcile_tick(&store, &metrics, &budget, 1).await.expect("tick");
 		assert_eq!(sweep.failed.len(), 1, "the damaged aspect fails once");
 		assert_eq!(sweep.aspects_reconciled, 5, "the healthy aspects are maintained");
 		assert_eq!(sweep.breaker_trips, 1, "the failure is the trip event");
@@ -744,7 +817,7 @@ mod tests {
 
 		// Second tick: the tripped aspect is skipped outright — no attempt, no
 		// new failure — and the tick is otherwise clean.
-		let sweep = reconcile_tick(&store, &metrics, 1).await.expect("tick");
+		let sweep = reconcile_tick(&store, &metrics, &budget, 1).await.expect("tick");
 		drop(store);
 		assert_eq!(sweep.tripped, vec!["s2".to_string()], "the tripped aspect is named");
 		assert!(sweep.failed.is_empty(), "a tripped aspect records no new failure");
@@ -762,15 +835,16 @@ mod tests {
 			let dir = TempDir::new().unwrap();
 			let store = sweep_isolation_fixture(dir.path()).await;
 			let metrics: SharedMetrics = Arc::new(Metrics::default());
+			let budget = MemoryBudget::new(None);
 			let log = CapturedLog::default();
 			let guard = tracing::subscriber::set_default(log.subscriber());
 			let (maintained, failed) = match kind {
-				"threshold" => reconcile_tick(&store, &metrics, 1).await.map(|s| (s.aspects_reconciled, s.failed.len())),
-				"hot_cold" => reconcile_tick_hot_cold(&store, &metrics, 1).await.map(|s| (s.aspects_reconciled, s.failed.len())),
-				"overlaps" => reconcile_tick_overlaps(&store, &metrics).await.map(|s| (s.aspects_reconciled, s.failed.len())),
-				"overlaps_split" => reconcile_tick_overlaps_with_policy(&store, &metrics, 1).await.map(|s| (s.aspects_reconciled, s.failed.len())),
-				"squash" => reconcile_tick_squash(&store, &metrics, 2).await.map(|s| (s.aspects_squashed, s.failed.len())),
-				"compact" => reconcile_tick_compact(&store, &metrics, 6).await.map(|s| (s.aspects_squashed, s.failed.len())),
+				"threshold" => reconcile_tick(&store, &metrics, &budget, 1).await.map(|s| (s.aspects_reconciled, s.failed.len())),
+				"hot_cold" => reconcile_tick_hot_cold(&store, &metrics, &budget, 1).await.map(|s| (s.aspects_reconciled, s.failed.len())),
+				"overlaps" => reconcile_tick_overlaps(&store, &metrics, &budget).await.map(|s| (s.aspects_reconciled, s.failed.len())),
+				"overlaps_split" => reconcile_tick_overlaps_with_policy(&store, &metrics, &budget, 1).await.map(|s| (s.aspects_reconciled, s.failed.len())),
+				"squash" => reconcile_tick_squash(&store, &metrics, &budget, 2).await.map(|s| (s.aspects_squashed, s.failed.len())),
+				"compact" => reconcile_tick_compact(&store, &metrics, &budget, 6).await.map(|s| (s.aspects_squashed, s.failed.len())),
 				_ => unreachable!("unknown tick kind {kind}"),
 			}
 			.unwrap_or_else(|err| panic!("{kind}: a bad aspect failed the whole tick: {err:#}"));
@@ -783,5 +857,67 @@ mod tests {
 			assert_eq!(failed, 1, "{kind}: only the bad aspect fails");
 			assert_eq!(metrics.snapshot().reconcile.failed_passes, 1, "{kind}: one failed aspect pass counted");
 		}
+	}
+
+	/// ROB-14 cut 3: a tick with a tight budget (0 bytes) returns a default sweep —
+	/// the pass is deferred — and does not touch the store.
+	///
+	/// This test pins the budget check `reconcile_tick` makes through
+	/// `has_budget_for_pass`: remove the check and the tick runs, so
+	/// `aspects_reconciled` and `passes` stop matching what is asserted below.
+	#[tokio::test]
+	async fn tick_is_deferred_when_budget_is_exhausted() {
+		let dir = TempDir::new().unwrap();
+		let store = SegmentStore::open(dir.path()).await.unwrap();
+		store.declare("a", &schema()).await.unwrap();
+		store.seal("a", &schema(), &[100_i64, 130, 110], &[bd("1"), bd("3"), bd("2")]).await.unwrap();
+		store.seal("a", &schema(), &[200_i64, 240, 210], &[bd("4"), bd("6"), bd("5")]).await.unwrap();
+		let metrics: SharedMetrics = Arc::new(Metrics::default());
+		// A tight budget of 0 bytes: every reservation fails → the tick is deferred.
+		let budget = MemoryBudget::new(Some(0));
+
+		let sweep = reconcile_tick(&store, &metrics, &budget, 1).await.unwrap();
+		let snap = metrics.snapshot();
+		assert_eq!(sweep.aspects_reconciled, 0, "the budget is exhausted; the tick must be deferred");
+		assert_eq!(sweep.segments_reconciled, 0, "nothing was reconciled when deferred");
+		assert_eq!(sweep.aspects_scanned, 0, "no aspects scanned when deferred");
+		assert_eq!(snap.reconcile.passes, 0, "a deferred tick records no passes");
+		// The aspect still has its unsorted segments (the next tick will retry).
+		assert_eq!(store.aspect_stats("a").await.unwrap().unsorted_segments, 2, "pending work is not dropped by deferral");
+		drop(store);
+	}
+
+	/// ROB-14 cut 3: the budget decides, not the store's readiness. Same fixture as the
+	/// deferred test, same threshold: with headroom the tick reconciles, and once a
+	/// reservation holds the whole limit the next tick defers. The second half is what
+	/// pins the check — delete it from [`reconcile_tick`] and the first half still
+	/// passes while `aspects_scanned` and `passes` stop matching.
+	#[tokio::test]
+	async fn a_bounded_budget_runs_a_pass_then_defers_once_full() {
+		let dir = TempDir::new().unwrap();
+		let store = SegmentStore::open(dir.path()).await.unwrap();
+		store.declare("a", &schema()).await.unwrap();
+		store.seal("a", &schema(), &[100_i64, 130, 110], &[bd("1"), bd("3"), bd("2")]).await.unwrap();
+		store.seal("a", &schema(), &[200_i64, 240, 210], &[bd("4"), bd("6"), bd("5")]).await.unwrap();
+		let metrics: SharedMetrics = Arc::new(Metrics::default());
+		// A bounded budget with room to spare: the one-byte probe fits twice over.
+		let budget = MemoryBudget::new(Some(4096));
+
+		let sweep = reconcile_tick(&store, &metrics, &budget, 1).await.unwrap();
+		assert_eq!(sweep.aspects_reconciled, 1, "a bounded budget with headroom still runs the pass");
+		assert_eq!(sweep.segments_reconciled, 2, "both segments reconciled");
+		assert_eq!(metrics.snapshot().reconcile.passes, 1, "the tick recorded a pass");
+		assert_eq!(store.aspect_stats("a").await.unwrap().unsorted_segments, 0, "all out-of-order segments were reconciled");
+		assert_eq!(budget.reserved(), 0, "a completed pass leaves nothing reserved");
+
+		// Hold the whole limit. The store has no work left, so `aspects_reconciled`
+		// would read 0 either way; what the deferral is caught by is that the tick never
+		// got as far as scanning, and no pass is counted.
+		let hold = budget.try_reserve(4096).expect("the limit is free, so the hold must fit");
+		let sweep = reconcile_tick(&store, &metrics, &budget, 1).await.unwrap();
+		assert_eq!(sweep.aspects_scanned, 0, "a full budget defers the tick before it scans");
+		assert_eq!(metrics.snapshot().reconcile.passes, 1, "a deferred tick records no pass");
+		drop(hold);
+		drop(store);
 	}
 }
