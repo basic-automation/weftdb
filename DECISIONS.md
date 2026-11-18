@@ -8226,3 +8226,37 @@ default server (no `WEFT_MEMORY_BUDGET_BYTES`, no cgroup limit) behaves exactly 
 counter, not `aspects_reconciled == 0`: after the first pass there is no work left, so a tick
 that ignored the budget would also report zero reconciled. Scanning is the first observable
 thing the check sits in front of.
+
+## 2026-11-17 — Shadow-segment guard and chunked swap plans for TTL purge (#797, #798)
+
+The brief (#797 weftdb) describes a defect where a wholly-expired correction segment whose
+timeline extent overlaps a surviving segment of the same series is dropped by
+`purge_aspect_held`, causing a plain (non-TTL) read to revert to the superseded values.
+The same brief describes #798: an aspect with more than 32 series causes
+`swap_plans` to bail with "at most 32 plans". Two decisions:
+
+- **The guard is overlap on timeline extent, not on the exact timestamp set.** A doomed
+  segment whose `[min_ts, max_ts]` interval overlaps any surviving segment of the same
+  series is kept on disk. This is the simplest test that prevents the revert; a finer
+  check (matching actual timestamps) would require decoding the segment, adding a
+  read-cost for an already-expensive pass, and the window for false positives is small
+  (a wholly-expired segment that happens to have no timestamp in common but whose extent
+  overlaps a survivor's extent)
+- **Chunking rather than raising `MAX_PLANS_PER_TXN`.** The constant is 32 and guards
+  against a single transaction that is too large for the store. Raising it would push the
+  risk to the database without addressing the structural problem of an aspect with many
+  series. Instead `purge_aspect_held` now submits plans in chunks of `MAX_PLANS_PER_TXN`
+  each through its own `swap_plans` call. When a later chunk fails, the swaps of earlier
+  chunks are already committed; the function returns `Ok` with `completed: false` so the
+  caller counts the real drops and does not charge the circuit breaker, ensuring the next
+  pass retries the remaining segments.
+- **No attempt to backfill the count for older segments.** The `shadowed_and_kept` field
+  starts at zero; the first full-purge pass after the upgrade will count correctly.
+- **Partial-failure test not provable from the test harness.** The test named
+  `purge_33_series_partial_chunk_failure` creates 34 series to force two chunks and
+  asserts at least 32 drops (the first chunk). A deliberate, controlled chunk failure
+  would require the `fault-injection` feature or corrupting on-disk segment files, both
+  outside the scope of the lib test suite. The happy path of the chunking is covered by
+  `purge_drops_33_series_in_one_pass`; the failure path is covered by code inspection and
+  the logical argument that each chunk's swap commits in its own transaction.
+

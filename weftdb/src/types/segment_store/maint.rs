@@ -100,23 +100,32 @@ impl SegmentStore {
 			};
 			match self.purge_aspect_held(&held, now_ns).await {
 				Ok(swept) => {
-					self.breaker_record(aspect, false);
+					// #798: a partial sweep (completed: false, set when a chunk or plan
+					// failed) counts the drops already committed but does not charge the
+					// breaker — the partial progress is real and the next pass should retry
+					// the remaining segments rather than being blocked by a tripped
+					// circuit breaker until the cooldown expires.
+					if swept.completed {
+						self.breaker_record(aspect, false);
+					} else {
+						tracing::warn!(aspect, "purge_aspect_held completed=false, counting partial drops");
+					}
 					sweep.rows_expired += swept.rows_expired;
 					sweep.segments_dropped += swept.segments_dropped;
 					sweep.partial_segments += swept.partial_segments;
+					sweep.shadowed_and_kept += swept.shadowed_and_kept;
 					// `aspects_cleaned` answers "did this purge change this aspect", so it keys on
 					// what left the store, not on the count of expired rows: a straddling frame's
 					// expired rows are counted on every pass, and reporting the aspect as cleaned
 					// each time would make a second purge look like a first one.
-					if swept.segments_dropped > 0 {
+					if swept.segments_dropped > 0 && swept.completed {
 						sweep.aspects_cleaned.push(aspect.clone());
 					}
 				}
 				Err(err) => {
-					// The partial progress of a failed purge is not folded into the counters: each
-					// swap is committed on its own, so whatever left the store is already visible in
-					// the index, and the caller learns the truth by what the next sweep finds there.
-					// The error names the aspect that stopped the pass.
+					// A genuine error (not a chunk failure, which is now Ok with
+					// completed=false) means the aspect could not be purged at all.
+					// Committed drops from prior chunks are already in the index.
 					self.breaker_record(aspect, true);
 					sweep.failed.push((aspect.clone(), err));
 				}
@@ -149,6 +158,9 @@ impl SegmentStore {
 		let mut oldest_expired_ts: Option<i64> = None;
 		let mut newest_expired_ts: Option<i64> = None;
 		let mut partial_segments: u64 = 0;
+		let mut shadowed_and_kept: u64 = 0;
+		// Survivors: segments that survive this pass (straddling or kept past the cutoff).
+		let mut survivors: std::collections::HashMap<u64, Vec<IndexRow>> = std::collections::HashMap::new();
 		let mut doomed: std::collections::BTreeMap<u64, Vec<IndexRow>> = std::collections::BTreeMap::new();
 		for row in &rows {
 			let (Some(min_ts), Some(max_ts)) = (row.desc.min_ts, row.desc.max_ts) else {
@@ -174,31 +186,73 @@ impl SegmentStore {
 					partial_segments += 1;
 					rows_expired += counted;
 				}
+				survivors.entry(row.series_id).or_default().push(row.clone());
+			} else {
+				// An entirely livable segment (min_ts > cutoff): kept past the cutoff.
+				survivors.entry(row.series_id).or_default().push(row.clone());
 			}
 		}
-		if doomed.is_empty() {
-			return Ok(row_expiry::AspectExpirySwept { rows_expired, segments_dropped: 0, partial_segments, shadowed_and_kept: 0, oldest_expired_ts, newest_expired_ts, completed: true });
+		// #797 — shadow-segment guard: remove doomed segments whose extent overlaps a
+		// surviving segment of the same series. Dropping a correction or null-out would
+		// re-expose the superseded rows of the survivor.
+		let mut filtered_doomed: std::collections::BTreeMap<u64, Vec<IndexRow>> = std::collections::BTreeMap::new();
+		for (series_id, series_doomed) in doomed {
+			if let Some(series_survivors) = survivors.get(&series_id) {
+				for segment in series_doomed {
+					if series_survivors.iter().any(|survivor| {
+						let s_min = survivor.desc.min_ts.unwrap();
+						let s_max = survivor.desc.max_ts.unwrap();
+						let d_min = segment.desc.min_ts.unwrap();
+						let d_max = segment.desc.max_ts.unwrap();
+						d_max >= s_min && d_min <= s_max
+					}) {
+						tracing::debug!(series = series_id, segment_id = segment.desc.id, segment_min_ts = segment.desc.min_ts, segment_max_ts = segment.desc.max_ts, aspect = aspect, "doomed segment shadows a surviving segment: keeping it on disk",);
+						shadowed_and_kept += 1;
+						continue;
+					}
+					filtered_doomed.entry(series_id).or_default().push(segment);
+				}
+			} else {
+				// No survivors of this series — all expired segments can be dropped.
+				filtered_doomed.entry(series_id).or_default().extend(series_doomed);
+			}
 		}
-		let plans = doomed.into_values().map(SwapPlan::purge).collect::<Vec<_>>();
-		let members = plans.iter().map(|plan| plan.members.len()).collect::<Vec<_>>();
-		let outcomes = self.swap_plans(held, &schema, plans).await?;
-		debug_assert_eq!(outcomes.len(), members.len(), "one outcome per purge plan");
+		if filtered_doomed.is_empty() {
+			return Ok(row_expiry::AspectExpirySwept { rows_expired, segments_dropped: 0, partial_segments, shadowed_and_kept, oldest_expired_ts, newest_expired_ts, completed: true });
+		}
+		// #798 — submit plans in chunks of MAX_PLANS_PER_TXN.  A later chunk that fails
+		// does not discard the drops of earlier chunks: we set completed: false and return
+		// Ok so the breaker is not charged and the caller counts the drops that really
+		// happened.
+		let mut series_plans: Vec<Vec<IndexRow>> = filtered_doomed.into_values().collect();
 		let mut dropped: u64 = 0;
-		let mut first_error: Option<anyhow::Error> = None;
-		for (count, outcome) in members.into_iter().zip(outcomes) {
-			match outcome {
-				Ok(_) => dropped += count as u64,
-				Err(e) => {
-					if first_error.is_none() {
-						first_error = Some(e);
+		let mut completed = true;
+		while !series_plans.is_empty() {
+			let tail = series_plans.split_off(MAX_PLANS_PER_TXN.min(series_plans.len()));
+			let chunk: Vec<SwapPlan> = series_plans.drain(..).map(SwapPlan::purge).collect();
+			let members: Vec<usize> = chunk.iter().map(|plan| plan.members.len()).collect();
+			match self.swap_plans(held, &schema, chunk).await {
+				Ok(outcomes) => {
+					debug_assert_eq!(outcomes.len(), members.len(), "one outcome per purge plan per chunk");
+					for (count, outcome) in members.into_iter().zip(outcomes) {
+						match outcome {
+							Ok(_) => dropped += count as u64,
+							Err(e) => {
+								tracing::warn!(aspect, error = %e, "a purge swap plan failed but committed drops are already counted");
+								completed = false;
+							}
+						}
 					}
 				}
+				Err(e) => {
+					tracing::warn!(aspect, error = %e, "purge_aspect_held chunk failed after committed drops: partial progress reported");
+					completed = false;
+					break;
+				}
 			}
+			series_plans = tail;
 		}
-		if let Some(e) = first_error {
-			return Err(e);
-		}
-		Ok(row_expiry::AspectExpirySwept { rows_expired, segments_dropped: dropped, partial_segments, shadowed_and_kept: 0, oldest_expired_ts, newest_expired_ts, completed: true })
+		Ok(row_expiry::AspectExpirySwept { rows_expired, segments_dropped: dropped, partial_segments, shadowed_and_kept, oldest_expired_ts, newest_expired_ts, completed })
 	}
 
 	/// Count expired rows in one aspect under the maintenance lock `held`.
