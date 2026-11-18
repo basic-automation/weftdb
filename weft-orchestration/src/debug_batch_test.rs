@@ -15,6 +15,9 @@ async fn debug_batch_processing() -> Result<()> {
 	// Create a test database with a smaller dataset first
 	remove_database("debug_batch_test");
 
+	// The queue this test builds is fed only by rows-mode ingest, so the premise is
+	// stated: #768 made an unset WEFT_LEGACY_DEFAULT_STORAGE leave new aspects sealed.
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "rows");
 	let db = Database::new("debug_batch_test").await.unwrap();
 	let test_subject = db.observe_subject("TestSubject").await.unwrap();
 	let test_aspect = db.track_aspect(&test_subject.id(), "TestAspect", &Resolution::Minutes, None).await.unwrap();

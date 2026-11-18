@@ -16,6 +16,18 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 (1, 10, 100, 1000), reporting wall time, rows read and series touched per rung. It is the
 multi-series read cost curve the TSBS tag-grouped queries that TAG-12 moved here need. It measures
 our own engine: the vendor racing rules in `docs/benchmark-policy.md` are not engaged by it.
+- **The reconcile daemon defers its passes when the memory budget has no headroom (#806,
+ROB-14 cut 3).** Each of the six tick functions in `weft-server/src/reconcile_daemon.rs`
+now asks `has_budget_for_pass` before it touches the store: with a limit set (the
+`min(WEFT_MEMORY_BUDGET_BYTES, cgroup memory.max)` cut 1 established), an exhausted budget
+ends the tick early with an empty [`ReconcileSweep`](weftdb::ReconcileSweep) and a
+`warn!` naming which pass was deferred, instead of letting a background pass allocate its
+way into the OOM killer. The check is a probe, not per-pass accounting — the store decides
+how much a fold allocates and the server cannot know that ahead of the call — so a pass
+whose footprint the probe cannot see is still bounded by the store's own
+`WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` and the wall-clock budget from #758, both unchanged.
+The deferral costs nothing: the backlog is not dropped and the next tick retries. The
+compaction, expiry and purge daemons do not carry a budget yet, so ROB-14 stays open.
 - **`WEFT_MEMORY_BUDGET_BYTES` and the cgroup limit are now read and held (#788).**
 Where the server could previously only bound a request's body bytes, it now knows the memory
 ceiling it runs under: `weft-server/src/memory_budget.rs` reads cgroup v2 `memory.max`, falls
@@ -88,7 +100,18 @@ origin/main
   member. A `pinned release archives` job in `.github/workflows/ci.yml` runs it on every
   pull request: the first time a published WeftDB archive has been downloaded in CI.### Changed
 
-- **A maintenance merge of overlapping frames now folds them in one heap pass instead of k
+- **A new legacy aspect is seal-backed by default (#768).** `WEFT_LEGACY_DEFAULT_STORAGE`
+  used to be the opt-in for the seal store: left unset, a new aspect went to the per-aspect
+  rows-mode `measurements.db`. Unset is now seal-backed and `rows` is the explicit opt-out, so
+  the bulk-ingest path routed in #769 is the path a fresh deployment takes. Only the mode of an
+  aspect that does not exist yet changes: `StorageMode::parse` still reads an existing aspect's
+  stored mode the historical way, `NULL` included, so there is no migration, no back-fill and no
+  read change. A compression config still forces rows mode, because compression deletes ranges.
+  The door is one-way in both senses: a store holding seal-backed aspects cannot be read by
+  0.3.7 or earlier, which know no `aspects.storage_mode` column and answer **zero measurements**
+  for such an aspect rather than refusing it. Neither the column nor the seal-backed aspect has
+  ever shipped, so no released build created one; pin `WEFT_LEGACY_DEFAULT_STORAGE=rows` on a
+  deployment that must stay rollable to an older build.- **A maintenance merge of overlapping frames now folds them in one heap pass instead of k
   pairwise rounds (#758, ROB-20 G3).** `merge_k_way` (`weft-physical-type/src/split.rs`) merges
   `k` timestamp-sorted runs in a single pass over `k` cursors, and `fold_newest_wins`
   (`weftdb/src/types/segment_store.rs`) builds those runs and calls it. The loop it replaces
