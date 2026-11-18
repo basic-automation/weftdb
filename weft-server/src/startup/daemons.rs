@@ -170,8 +170,9 @@ pub fn spawn_reconcile_if_configured(state: &AppState, daemons: &Daemons) -> any
 	// Registered with the Daemons registry (ROB-3): the factory re-spawns
 	// the daemon after a panic, under the registry's supervision.
 	let metrics = state.metrics().clone();
+	let budget = state.memory_budget().clone();
 	drop(daemons.spawn("reconcile", move || {
-		let handle = spawn_reconcile_daemon(Arc::clone(&store), metrics.clone(), config);
+		let handle = spawn_reconcile_daemon(Arc::clone(&store), metrics.clone(), budget.clone(), config);
 		await_supervised(handle)
 	}));
 	let mode = if hot_cold { "hot/cold" } else { "threshold" };

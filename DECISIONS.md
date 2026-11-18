@@ -8046,34 +8046,6 @@ modules are inside the defining module.
 - **Single oversized segment deliberately not re-split**: the output-re-split ceiling (G4) splits a multi-segment merge's output, but an already-oversized segment written by a single seal is left as-is. An auto-re-split pass would need to read and rewrite it, which is the same cost as a reconcile; that is a new maintenance operation, not part of the time budget.
 - **`cancelled` reused, not an error variant**: hitting the budget is not a failure — the sweep reports `cancelled: true` and what it accomplished before the deadline, exactly as `MaintenanceCancel` already does. No entry point changes signature, no HTTP code, no `StoreError` variant.
 - **Deadline computed once per sweep**: `maintenance_deadline()` in `maint.rs` computes `Instant::now() + Duration::from_secs(env_value)` once and the held paths check `Instant::now() >= deadline` between iterations, rather than recomputing seconds in a loop that might drift under scheduler delay.origin/main
-## 2026-11-17 — ROB-14 cut 2: enforce the container memory budget on request paths (shipped)
-
-- **MemoryBudget is now consulted on the server's request paths.** Cut 1 (#787) added the
-  machinery but no call sites; cut 2 adds the `try_reserve` calls.
-- **Ingest path.** `IngestBody::from_request` (`weft-server/src/ingest.rs`) reserves against the
-  memory budget using the same `reserved_bytes` (the declared `Content-Length` or the body cap) that
-  sizes the disk guard. A refusal is `503 over_budget` with `Retry-After: 1`. The guard is held for
-  the body's lifetime via the `_memory_guard: Option<Reservation>` field.
-- **Query/read path.** Every stored-data route in `weft-server/src/storage.rs` (13 handlers)
-  reserves a conservative per-row estimate (`ESTIMATED_BYTES_PER_ROW = 64` in `read_limits.rs`, a
-  doc comment explains the sizing rule and that it is an estimate, not exact accounting). The
-  `reserve_read_memory` helper clones the budget before `drop(state)`, reads the result rows, and
-  holds the guard through serialization.
-- **Refusal mapping.** `Code::OverBudget` → `503` with wire code `over_budget`. `with_retry_after(1)`
-  tells the caller to retry after 1 second. No new `Code`, status, or wire string was added; the
-  frozen code table at `error.rs:1138` is unchanged.
-- **Unbounded escape hatch.** When neither `WEFT_MEMORY_BUDGET_BYTES` nor a readable container limit
-  bounds the process, the budget is `MemoryBudget::new(None)` and every reservation succeeds —
-  behaviour is byte-for-byte what it was before this cut. Every test under default configuration
-  passes unchanged.
-- **Fixes.** Fixed a bug in the ingest code path (inherited from the initial cut-1 cherry-pick) where
-  the memory budget refusal used `.ok()`, silently swallowing a refused reservation. The corrected
-  code returns `Err` when the budget is exhausted.
-- **Gate.** This change was not compiled locally (the host has ~4 GB free and a build OOM-kills
-  the model server). Only the following were run: `rustfmt --edition 2021 --check` on touched
-  `.rs` files, `python3 scripts/ci/check-serial-order.py`, `python3 scripts/config/check_schema.py`
-  (both pre-existing warnings, unchanged by this cut), `git diff --check`.
-
 ## 2026-11-16 — Naming the client abort without widening the frozen code table (shipped)
 
 - **The issue's premise was stale.** #742 described a disconnect and a deadline both ending up as
@@ -8229,10 +8201,60 @@ folds of two or more segments, so the first frame a brand-new seal-backed aspect
 ingest can sit above that ceiling until a later fold cuts it, and #765's output budget bounds maintenance
 rather than ingest. Nothing here makes that worse; it only makes it reachable by default.origin/mainorigin/mainorigin/mainorigin/main
 
+
+## 2026-11-17 — What the daemon budget check can honestly promise (ROB-14 cut 3, #806) (decided)
+
+The brief asked the background daemons to consult `MemoryBudget` before they allocate, which
+leaves two things undefined: which daemons, and what "consult" means when a pass does not know
+its own footprint.
+
+- **Which daemons.** Only the reconcile daemon's six tick functions carry a budget in scope; the
+compaction, expiry and purge daemons have no `MemoryBudget` parameter at all, and threading one
+through them changes their signatures and their construction sites. Cut 3 covers reconcile only
+and the roadmap line stays open for the rest rather than claiming the whole item.
+- **What to reserve.** `wanted` of 1 byte. A pass allocates inside the store, and the server
+cannot know the size of a fold before asking the store to plan it, so inventing a per-pass
+estimate would be a made-up number that silently decides how much background work the limit
+admits. The honest question at that point is "is there any headroom at all", and one byte answers
+it. A pass that runs is still bounded by the store's own output ceiling
+(`WEFT_MAINTENANCE_MAX_OUTPUT_BYTES`) and the wall-clock budget (#758). This is why the check is
+named a probe in its doc comment and why the `Reservation` is dropped at the decision point:
+holding bytes the store will not use would only starve request paths.
+- **Unbounded stays unbounded.** `budget.limit()` of `None` returns `true` immediately, so the
+default server (no `WEFT_MEMORY_BUDGET_BYTES`, no cgroup limit) behaves exactly as before.
+- **How the test pins it.** The deferring test asserts `aspects_scanned == 0` and no pass
+counter, not `aspects_reconciled == 0`: after the first pass there is no work left, so a tick
+that ignored the budget would also report zero reconciled. Scanning is the first observable
+thing the check sits in front of.
+
+## 2026-11-17 — ROB-14 cut 2: enforce the container memory budget on request paths (shipped)
+- **MemoryBudget is now consulted on the server's request paths.** Cut 1 (#787) added the
+  machinery but no call sites; cut 2 adds the `try_reserve` calls.
+- **Ingest path.** `IngestBody::from_request` (`weft-server/src/ingest.rs`) reserves against the
+  memory budget using the same `reserved_bytes` (the declared `Content-Length` or the body cap) that
+  sizes the disk guard. A refusal is `503 over_budget` with `Retry-After: 1`. The guard is held for
+  the body's lifetime via the `_memory_guard: Option<Reservation>` field.
+- **Query/read path.** Every stored-data route in `weft-server/src/storage.rs` (13 handlers)
+  reserves a conservative per-row estimate (`ESTIMATED_BYTES_PER_ROW = 64` in `read_limits.rs`, a
+  doc comment explains the sizing rule and that it is an estimate, not exact accounting). The
+  `reserve_read_memory` helper clones the budget before `drop(state)`, reads the result rows, and
+  holds the guard through serialization.
+- **Refusal mapping.** `Code::OverBudget` → `503` with wire code `over_budget`. `with_retry_after(1)`
+  tells the caller to retry after 1 second. No new `Code`, status, or wire string was added; the
+  frozen code table at `error.rs:1138` is unchanged.
+- **Unbounded escape hatch.** When neither `WEFT_MEMORY_BUDGET_BYTES` nor a readable container limit
+  bounds the process, the budget is `MemoryBudget::new(None)` and every reservation succeeds —
+  behaviour is byte-for-byte what it was before this cut. Every test under default configuration
+  passes unchanged.
+- **Fixes.** Fixed a bug in the ingest code path (inherited from the initial cut-1 cherry-pick) where
+  the memory budget refusal used `.ok()`, silently swallowing a refused reservation. The corrected
+  code returns `Err` when the budget is exhausted.
+- **Gate.** This change was not compiled locally (the host has ~4 GB free and a build OOM-kills
+  the model server). Only the following were run: `rustfmt --edition 2021 --check` on touched
+  `.rs` files, `python3 scripts/ci/check-serial-order.py`, `python3 scripts/config/check_schema.py`
+  (both pre-existing warnings, unchanged by this cut), `git diff --check`.
 ## 2026-11-17 — Where a memory reservation is taken matters more than its size (ROB-14 cut 2) (resolved)
-
 Cut 2 wires `MemoryBudget` into the request paths. Three judgement calls from the review of PR #805:
-
 - **The ingest reservation moved ahead of the body read.** `reserved_bytes` is known
   from `content-length` (or the `WEFT_MAX_INGEST_BYTES` cap) before a single byte is
   read, so `state.memory_budget().try_reserve(reserved_bytes)` now sits next to
@@ -8256,9 +8278,8 @@ Cut 2 wires `MemoryBudget` into the request paths. Three judgement calls from th
   now hands the `MemoryBudget` back to the test, which holds it with
   `try_reserve(64)` and asserts `reserved()` before and after — including that a
   refused read leaves only the hold accounted, i.e. its own reservation rolled back.
-
 Left open on purpose: the reservation is an estimate (`ESTIMATED_BYTES_PER_ROW = 64`,
 `read_limits::ESTIMATED_BYTES_PER_ROW`), and per-format serialization cost (Arrow, CSV,
 JSON) is not accounted; the guard covers the response object, not the encoder's
 scratch. A cut that measured encoder peaks would need per-format cost tables that do
-not exist yet.origin/main
+not exist yet.

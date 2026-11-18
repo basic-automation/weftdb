@@ -10,6 +10,18 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **The reconcile daemon defers its passes when the memory budget has no headroom (#806,
+ROB-14 cut 3).** Each of the six tick functions in `weft-server/src/reconcile_daemon.rs`
+now asks `has_budget_for_pass` before it touches the store: with a limit set (the
+`min(WEFT_MEMORY_BUDGET_BYTES, cgroup memory.max)` cut 1 established), an exhausted budget
+ends the tick early with an empty [`ReconcileSweep`](weftdb::ReconcileSweep) and a
+`warn!` naming which pass was deferred, instead of letting a background pass allocate its
+way into the OOM killer. The check is a probe, not per-pass accounting — the store decides
+how much a fold allocates and the server cannot know that ahead of the call — so a pass
+whose footprint the probe cannot see is still bounded by the store's own
+`WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` and the wall-clock budget from #758, both unchanged.
+The deferral costs nothing: the backlog is not dropped and the next tick retries. The
+compaction, expiry and purge daemons do not carry a budget yet, so ROB-14 stays open.
 - **`WEFT_MEMORY_BUDGET_BYTES` and the cgroup limit are now read and held (#788).**
 Where the server could previously only bound a request's body bytes, it now knows the memory
 ceiling it runs under: `weft-server/src/memory_budget.rs` reads cgroup v2 `memory.max`, falls
