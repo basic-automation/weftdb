@@ -24,7 +24,7 @@ use serial_test::serial;
 use tempfile::TempDir;
 use uuid::Uuid;
 use weftdb::{
-	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, Database, DatasetId, InputMeasurement, StorageMode
+	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, Database, DatasetId, InputMeasurement, StorageMode, TxId
 };
 
 fn bd(s: &str) -> BigDecimal {
@@ -264,6 +264,119 @@ async fn seal_backed_capture_measurement_chunk_reaches_the_seal() -> Result<()> 
 	for i in 0..10 {
 		assert!(sealed.contains(&(base_ms + i64::from(i) * 1000, bd(&format!("{i}.0")))), "row {i} is in the seal frames");
 	}
+
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
+
+/// #801 reproduction: `replace_measurements_in_range` on a seal-backed aspect
+/// writes to the per-aspect rows-mode `measurements.db` that no seal-backed read
+/// consults, so the compressed data is stored and reported as success while the
+/// stored (sealed) data is unchanged. After the fix it must return
+/// `Error::SealBackedRejected`.
+#[serial]
+#[tokio::test]
+async fn seal_backed_replace_measurements_in_range_refuses() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "sealed_replace", &splimes::Resolution::Milliseconds, None).await?.id();
+	assert_eq!(db.aspect_storage_mode(&aspect_id).await?, StorageMode::Segments, "the aspect is created seal-backed");
+
+	let base = Utc.with_ymd_and_hms(2024, 5, 1, 0, 0, 0).unwrap();
+	let dataset = DatasetId::new();
+	let rows: Vec<InputMeasurement> = (0..3).map(|i| InputMeasurement::new(base + Duration::seconds(i), bd(&format!("{}.0", i + 1)))).collect();
+
+	// Ingest some rows first
+	db.batch_capture_measurements(aspect_id, dataset, rows.clone()).await?;
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 3);
+
+	// Try to replace the range. Before the fix this succeeds (writing to
+	// measurements.db). After the fix it returns SealBackedRejected.
+	let err = db.replace_measurements_in_range(&aspect_id, &dataset, base, base + Duration::seconds(2), rows).await.unwrap_err();
+	assert!(
+		err.downcast_ref::<weftdb::Error>().is_some_and(|e| matches!(e, weftdb::Error::SealBackedRejected(_))),
+		"replace_measurements_in_range must return a typed error for a seal-backed aspect: {err}"
+	);
+
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
+
+/// #801 reproduction: `capture_new_measurement_chunk` on a seal-backed aspect
+/// writes rows into the caller-supplied rows-mode database handle, which seals
+/// never read from. After the fix it must return `Error::SealBackedRejected`,
+/// since the call site is a rows-mode-only helper that is not reachable from
+/// the seal-dispatched bulk entry points.
+#[serial]
+#[tokio::test]
+async fn seal_backed_capture_new_measurement_chunk_refuses() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "sealed_chunk_refuse", &splimes::Resolution::Milliseconds, None).await?.id();
+	assert_eq!(db.aspect_storage_mode(&aspect_id).await?, StorageMode::Segments, "the aspect is created seal-backed");
+
+	let base = Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap();
+	let dataset = DatasetId::new();
+	let chunk: Vec<InputMeasurement> = (0..2).map(|i| InputMeasurement::new(base + Duration::seconds(i), bd(&format!("{}.0", i + 1)))).collect();
+
+	// Get the rows-mode database handles as the caller of this entry point would.
+	let db_path = db.get_measurement_db_path(&aspect_id).await?;
+	let db_handle = db.get_measurement_db(&aspect_id).await?;
+	let tx_ids: Vec<TxId> = chunk.iter().map(|_| TxId::new()).collect();
+
+	// This entry point takes a caller-supplied rows-mode handle and writes
+	// directly into it — no seal-backed dispatch exists. Before the fix this
+	// succeeds. After the fix it returns SealBackedRejected.
+	let err = Inputs::capture_new_measurement_chunk(
+		&db, &aspect_id, &db_handle, &db_path, &dataset, &chunk, &tx_ids
+	).await.unwrap_err();
+	assert!(
+		err.downcast_ref::<weftdb::Error>().is_some_and(|e| matches!(e, weftdb::Error::SealBackedRejected(_))),
+		"capture_new_measurement_chunk must return a typed error for a seal-backed aspect: {err}"
+	);
+
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
+
+/// #801 reproduction: `compress_with_progress` (and by delegation `compress`)
+/// on a seal-backed aspect reads from the seal store, then deletes and inserts
+/// rows in the per-aspect `measurements.db` that nothing reads, and reports
+/// success — so the sealed data is unchanged while the metadata says compression
+/// ran. After the fix it must return `Error::SealBackedRejected`.
+#[serial]
+#[tokio::test]
+async fn seal_backed_compress_with_progress_refuses() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "sealed_compress", &splimes::Resolution::Milliseconds, None).await?.id();
+	assert_eq!(db.aspect_storage_mode(&aspect_id).await?, StorageMode::Segments, "the aspect is created seal-backed");
+
+	// Ingest a few rows so compress has data to process.
+	let base = Utc.with_ymd_and_hms(2024, 7, 1, 0, 0, 0).unwrap();
+	let rows: Vec<InputMeasurement> = (0..10).map(|i| InputMeasurement::new(base + Duration::hours(i), bd(&format!("{}.0", i + 1)))).collect();
+	db.batch_capture_measurements(aspect_id, DatasetId::new(), rows).await?;
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 10);
+
+	// Set a compression config locally (the aspect was created without one).
+	// Must enable compression so the test hits the seal guard rather than
+	// returning early from the `!config.enabled` shortcut.
+	let mut aspect = db.get_aspect(&aspect_id).await?;
+	aspect.set_compression_config_local(Some(weftdb::CompressionConfig {
+		enabled: true,
+		time_based: None,
+		size_based: None,
+		..Default::default()
+	}));
+
+	let err = aspect.compress_with_progress(&db, None).await.unwrap_err();
+	assert!(
+		err.downcast_ref::<weftdb::Error>().is_some_and(|e| matches!(e, weftdb::Error::SealBackedRejected(_))),
+		"compress_with_progress must return a typed error for a seal-backed aspect: {err}"
+	);
 
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
 	Ok(())
