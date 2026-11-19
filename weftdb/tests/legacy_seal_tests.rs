@@ -564,6 +564,9 @@ async fn seal_backed_write_entry_points_never_reach_measurements_db() -> Result<
 	aspect.set_compression_config_local(Some(weftdb::CompressionConfig { enabled: true, time_based: None, size_based: None, ..Default::default() }));
 	let err4 = aspect.compress(&db).await.unwrap_err();
 	assert!(err4.downcast_ref::<weftdb::Error>().is_some_and(|e| matches!(e, weftdb::Error::SealBackedRejected(_))), "compress must refuse seal-backed: {err4}");
+	// `Aspect` owns database handles, so `clippy::significant_drop_tightening` wants it
+	// released before the filesystem assertions below rather than at end of scope.
+	drop(aspect);
 
 	// Assert the rows-mode measurements.db file was never created for this aspect.
 	let measurements_db = db_dir.join("aspects").join(aspect_id.as_uuid().to_string()).join("measurements.db");
@@ -600,6 +603,7 @@ async fn seal_backed_compress_with_progress_refuses() -> Result<()> {
 
 	let err = aspect.compress_with_progress(&db, None).await.unwrap_err();
 	assert!(err.downcast_ref::<weftdb::Error>().is_some_and(|e| matches!(e, weftdb::Error::SealBackedRejected(_))), "compress_with_progress must return a typed error for a seal-backed aspect: {err}");
+	drop(aspect);
 
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
 	Ok(())
