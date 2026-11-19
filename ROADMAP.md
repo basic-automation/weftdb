@@ -100,7 +100,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] **Legacy seal routing defects** *(found 2026-11-17 by a read-only audit of #769, #770 and #780; these gate the seal-backed default in #768)*
   - [ ] **SEAL-COUNT** The count of a seal-backed aspect agrees with what a range read returns after a batch rewrites a timestamp (#800)
   - [ ] **SEAL-REPLACE** `replace_measurements_in_range` and `compress()` never write to the unread rows file of a seal-backed aspect (#801)
-  - [ ] **SEAL-DUP** The replace-not-append rule for duplicate timestamps is documented and pinned by a test (#802)
+  - [x] **SEAL-DUP** The replace-not-append rule for duplicate timestamps is documented and pinned by a test (#802)
   - [ ] **SEAL-IDEM** A reused `DatasetId` cannot lose a write or fail on a CRC-32 collision (#803)
 - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
 - [ ] Write or approve the honesty-page narrative *(owner)*
