@@ -374,3 +374,114 @@ fn a_configured_row_ttl_becomes_a_policy_in_the_aspect_unit() {
 	assert_eq!(super::row_expiry_policy_from(Some("-1")), RowExpiryPolicy::NoExpiry, "a negative ttl is refused the same way");
 	assert_eq!(super::row_expiry_policy_from(Some("1h")), RowExpiryPolicy::NoExpiry, "a value with a unit suffix is not a count: the store cannot know the aspect's unit at parse time");
 }
+
+// ── Red-evidence tests (fail on main, pass after TTL-UNIT fix) ──────────
+
+#[tokio::test]
+async fn two_aspects_one_policy_same_wall_clock_age() {
+	// One store, one Seconds aspect and one Nanos aspect, one policy Ttl that
+	// the operator intends as 1 second of wall-clock time.
+	//
+	// On main the TTL is a bare number: `Ttl { ttl: 1 }` means 1 **second** for
+	// the Seconds aspect and 1 **nanosecond** for the Nanos aspect. So a row aged
+	// 0.5 wall-clock seconds in the Nanos aspect (age 500_000_000 ns > 1 ns) is
+	// incorrectly expired — the test assertion for that row **fails on main**.
+	//
+	// After the fix the TTL carries its own unit and is converted to the aspect's
+	// unit, so both aspects use the same wall-clock age.
+
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: 1 }).await;
+	store.declare("seconds_aspect", &schema(TimeUnit::Seconds)).await.expect("declares seconds aspect");
+	store.declare("nanos_aspect", &schema(TimeUnit::Nanos)).await.expect("declares nanos aspect");
+
+	// Row aged 2 wall-clock seconds in each aspect.
+	// Seconds: ts=98 (age 2s at now=100s), Nanos: ts=98_000_000_000 (age 2s at now=100s).
+	store.ingest("seconds_aspect", &IngestBatch::dense("s1", vec![98], vec![bd("1")])).await.expect("ingests seconds row");
+	store.ingest("nanos_aspect", &IngestBatch::dense("s1", vec![98_000_000_000i64], vec![bd("2")])).await.expect("ingests nanos row aged 2s");
+
+	// Row aged 0.5 wall-clock seconds in the Nanos aspect.
+	// Nanos: ts=99_500_000_000 (age 0.5s at now=100s → NOT expired).
+	store.ingest("nanos_aspect", &IngestBatch::dense("s1", vec![99_500_000_000i64], vec![bd("3")])).await.expect("ingests nanos row aged 0.5s");
+
+	// Both rows aged 2s should be expired (age > 1 second wall-clock).
+	let (sec_ts, _) = store.read_time_range_of_with_expiry("seconds_aspect", crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads seconds with expiry");
+	assert!(!sec_ts.contains(&98), "Seconds aspect: row aged 2s must be expired");
+
+	let (nanos_ts, _) = store.read_time_range_of_with_expiry("nanos_aspect", crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads nanos with expiry");
+	assert!(!nanos_ts.contains(&98_000_000_000i64), "Nanos aspect: row aged 2s must be expired");
+
+	// On main, this assertion FAILS: the Nanos aspect uses TTL=1 ns, so
+	// 0.5s = 500_000_000 ns > 1 ns → the row is incorrectly expired.
+	assert!(nanos_ts.contains(&99_500_000_000i64), "Nanos aspect: row aged 0.5s must NOT be expired (age 0.5s < 1s TTL)");
+
+	// Sweep agrees with the read path.
+	let sweep = store.expiry_sweep(NOW_NS).await.expect("sweep");
+	assert_eq!(sweep.rows_expired, 2, "exactly two rows expired across both aspects");
+
+	drop(store);
+	dir.close().expect("close temp dir");
+}
+
+#[tokio::test]
+async fn read_filter_and_purge_agree_for_pre_epoch_rows() {
+	// For a negative now_ns (pre-epoch clock), the read path and the purge
+	// path must agree on which rows are expired. On main they disagree:
+	// is_row_expired computes the age as (now_unit - row_ts) and compares
+	// against ttl, so a pre-epoch row can be expired; expired_cutoff saturates
+	// to i64::MIN when now_unit < ttl, so the purge thinks nothing is expired.
+	//
+	// Fix: express is_row_expired in terms of the same cutoff used by the purgelike.
+
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: 10 }).await;
+	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
+
+	// Pre-epoch row at t=-100 (seconds); pre-epoch now at -1 (one nanosecond before epoch).
+	// now_unit = -1, age = (-1) - (-100) = 99 > 10 → expired by is_row_expired on main.
+	// But expired_cutoff: -1 < 10 → i64::MIN → purge drops nothing.
+	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![-100i64], vec![bd("1")])).await.expect("ingests pre-epoch row");
+
+	// Read path: row should be expired at negative now_ns.
+	let now_ns_pre_epoch = -1; // 1 ns before epoch
+	let (ts, _) = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, now_ns_pre_epoch).await.expect("reads with pre-epoch now");
+	assert!(!ts.contains(&-100i64), "Pre-epoch row aged 99>10 must be expired in read path");
+
+	// Purge path: the cutoff must be 109 (now_unit=-1 - ttl=10 = -11 but by strict boundary:
+	// the cutfrom is now_unit - ttl = -1 - 10 = -11, so row_ts=-100 < -11 is expired —
+	// on main the cutoff returns i64::MIN so the purge skips this row.
+	// We assert that the purge path considers the same row expired.
+	//
+	// We cannot easily observe the cutoff directly here, but we can observe the
+	// purge's segments_dropped result — which should be >0 if the row is fully expired.
+	let cutoff = expired_cutoff(&RowExpiryPolicy::Ttl { ttl: 10 }, now_ns_pre_epoch, &TimeUnit::Seconds);
+	assert!(cutoff > i64::MIN, "Cutoff must not be i64::MIN — pre-epoch now_unit still produces a valid cutoff");
+	assert_eq!(cutoff, -11, "cutoff = now_unit - ttl = -1 - 10 = -11");
+
+	drop(store);
+	dir.close().expect("close temp dir");
+}
+
+#[tokio::test]
+async fn boundary_age_equals_ttl_not_expired_in_millis_aspect() {
+	// The strict boundary (age == TTL is NOT expired) must hold in a non-Seconds
+	// aspect too, not just in Seconds. On main this works because TTL is in the
+	// aspect's own unit; after the fix the TTL is converted to the aspect's unit
+	// so the boundary must still be checked correctly.
+
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: 1000 }).await;
+	store.declare(ASPECT, &schema(TimeUnit::Millis)).await.expect("declares millis aspect");
+
+	// NOW_NS = 100s = 100_000 ms. TTL = 1000 ms.
+	// Row at t = 99_000 ms: age = 100_000 - 99_000 = 1000 ms = TTL → NOT expired.
+	// Row at t = 98_999 ms: age = 100_001 ms > TTL → expired.
+	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![98_999i64, 99_000i64], vec![bd("2"), bd("1")])).await.expect("ingests");
+
+	let (ts, _) = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads with expiry");
+	assert!(ts.contains(&99_000i64), "Row at t=99000 (age == TTL) must be visible in millis aspect");
+	assert!(!ts.contains(&98_999i64), "Row at t=98999 (age > TTL) must be hidden");
+
+	let sweep = store.expiry_sweep(NOW_NS).await.expect("sweep");
+	assert_eq!(sweep.rows_expired, 1, "only one row expired");
+
+	drop(store);
+	dir.close().expect("close temp dir");
+}
