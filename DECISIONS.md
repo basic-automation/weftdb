@@ -8413,3 +8413,33 @@ The same brief describes #798: an aspect with more than 32 series causes
 `purge_drops_a_fully_expired_segment_and_keeps_a_straddling_one` compared `read_time_range_of_with_expiry` before and after the purge and required it to be unchanged: a purge may delete frames, and the filter already hid their rows, so no filtered answer moves. When this slice added a plain-read comparison to the same fixture it inherited that reasoning and asserted `before_plain == after_plain`, which is false: `read_time_range` applies no TTL at all, so the wholly expired frame at instants 60..=79 is part of the plain answer, and dropping it legitimately takes those twenty rows with it. CI said so (`left` held 60..=79 plus 85..=120, `right` held only 85..=120). The assertion now pins the real contract instead — the dropped frame's instants are absent afterwards, the plain read loses exactly twenty rows, and the straddling frame still spans 85..=120. A purge's promise is that the *filtered* answer and the surviving frames' data are untouched; it has never promised that an unfiltered scan keeps returning rows it no longer has on disk.
 
 The companion lesson is about fixtures, not production code. The #797 reproduction ingested both frames under the same idempotency key (`IngestBatch::dense("s1", …)` twice), and the second ingest was refused with "aspect "temp" already holds idempotency key "s1" for a different batch … nothing was written" — so the overlap the test meant to create never existed, and the test would have been vacuous even with the assertions rewritten. An idempotency key names one batch; series identity comes from the measurement tags. Two frames of one series therefore need two batch keys and the same (untagged) value shape.
+
+## 2026-11-17 — The expired-row purge runs unconditionally in every daemon tick (shipping)
+
+Issue #785, TTL cut 4. The store's `purge_expired` already returns cheaply when the policy is
+`NoExpiry` (checking `self.expiry == RowExpiryPolicy::NoExpiry` at the top and returning an empty
+`ExpirySweep`), so the daemon calls it unconditionally after the other sweeps on every tick,
+with no gate or config field. This avoids a future mistake where a config field tells the daemon
+to purge when the policy is NoExpiry, fooling nobody, or tells it not to purge when a TTL is set,
+deleting nothing until an operator notices.
+
+**Why not a metric for purge work.** The brief says not to invent metric names when log instead.
+`weft_reconcile_*` counters already count work passes, so a purge that dropped segments records
+through the existing `record_reconcile_sweep` path (one aspect cleaned with N segments dropped).
+A purge that dropped nothing is a quiet tick and records only a maintenance sweep, which is the
+existing idiom. No new Prometheus counter is needed.
+
+**Clock injection.** The tick calls `std::time::SystemTime::now()` through `now_ns()`, which is
+the same pattern the rest of the crate uses (the backup daemon calls `SystemTime::now()` for its
+labels; the ingest path does the same). The store's own tests call `purge_expired` with an
+explicit `now_ns` because the policy functions respect clock injection, matching the cut-1
+contract.
+
+**The purge tick duplicates the other sweeps' failure idiom.** One WARN per failed aspect (the
+sweep kind names `"expired-purge"`), breaker-skipped aspects counted in `busy` (the existing
+`ExpirySweep::busy` field covers both contention and breaker trips, since `purge_expired` does
+not separate them — matching how the store's own `purge_expired` reports `busy`), and the tick
+carries on past a failing aspect. A whole-sweep failure (the aspect list itself unreadable) is
+logged and the tick continues.origin/main
+
+origin/mainorigin/mainorigin/mainorigin/mainorigin/mainorigin/main
