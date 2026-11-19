@@ -63,8 +63,17 @@ use weft_physical_type::{crc32, widen_value_encoding, AspectSchema, PhysicalType
 
 use crate::{AspectId, DatasetId, IngestBatch, Measurement, MeasurementId, SegmentStore, TxId};
 
-/// The environment variable that makes every newly created legacy aspect
-/// seal-backed (crash-consistency design §8, S19): exactly `segments`.
+/// The environment variable naming the storage mode of a newly created legacy aspect.
+///
+/// Crash-consistency design §8, S19; #768 flipped the default. `rows` asks for
+/// the per-aspect `measurements.db`, `segments` asks for the seal store, and
+/// **unset is now seal-backed**.
+///
+/// A value that names neither word is rows mode, which is the safe side of the
+/// ambiguity: a typo leaves the aspect in the shape every released Weft can read
+/// instead of sealing it silently. Only the unset case changed —
+/// [`StorageMode::parse`], which reads the mode an aspect already has, still
+/// answers rows mode for `NULL` and for anything it does not recognise.
 pub const LEGACY_DEFAULT_STORAGE_ENV: &str = "WEFT_LEGACY_DEFAULT_STORAGE";
 
 /// The subject half of the seal store's scope: `(db, 'legacy')`.
@@ -84,8 +93,10 @@ pub const SQUASH_TARGET_ROWS: usize = 100_000;
 /// `aspects.storage_mode` row at creation and never changed afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum StorageMode {
-	/// Measurements in the per-aspect `measurements.db` (the historical
-	/// shape, and the default).
+	/// Measurements in the per-aspect `measurements.db`: the historical
+	/// shape, the mode of every aspect a released Weft created, and still the
+	/// mode a stored `NULL` parses to. It is no longer the mode new aspects are
+	/// created in (#768) — see [`StorageMode::for_new_aspect`].
 	#[default]
 	Rows,
 	/// Measurements sealed in the database's Storage-v2 store.
@@ -119,18 +130,18 @@ impl StorageMode {
 		matches!(self, Self::Segments)
 	}
 
-	/// The mode a new aspect is created in: `segments` when a compression
-	/// config does not force rows mode and either the caller chose segments
-	/// or [`LEGACY_DEFAULT_STORAGE_ENV`] says `segments`.
+	/// The mode a new aspect is created in (#768 flipped the unset case): it is
+	/// seal-backed unless a compression config forces rows mode — compression
+	/// deletes ranges, so it stays rows mode — or [`LEGACY_DEFAULT_STORAGE_ENV`]
+	/// names rows mode. A value that names neither word answers through
+	/// [`StorageMode::parse`], so a typo falls back to rows mode rather than
+	/// sealing an aspect that an older server cannot read back.
 	#[must_use]
 	pub fn for_new_aspect(has_compression_config: bool, env_default: Option<&str>) -> Self {
 		if has_compression_config {
 			return Self::Rows;
 		}
-		match env_default {
-			Some("segments") => Self::Segments,
-			_ => Self::Rows,
-		}
+		env_default.map_or(Self::Segments, |value| Self::parse(Some(value)))
 	}
 }
 
@@ -233,16 +244,23 @@ pub async fn ensure_declared(store: &SegmentStore, key: &str, values: &[BigDecim
 	Ok(widened)
 }
 
-/// Ingest one legacy batch into `store` under its derived key: the whole
-/// call is the store's one ingest transaction, and a retry replays it.
-/// Returns the synthetic `TxIds`, one per row, in row order.
+/// Ingest one legacy batch into `store` under its derived key, then run
+/// the store's fragmentation gate on the same aspect.
+///
+/// This is the entry point that every call path — single-row and bulk —
+/// should use so that bulk ingest converges the seal just as the
+/// single-row capture path does.
+///
+/// A gate error is logged at `tracing::debug!` and **never propagated**:
+/// an ingest must not fail because the maintenance step did. The returned
+/// `TxIds` are the same whether the gate ran or not.
 ///
 /// # Errors
 ///
 /// As [`SegmentStore::ingest`], including its typed idempotency conflict
 /// when the derived key was already committed with a different payload of
 /// the same length and CRC (a CRC collision, not a retry).
-pub async fn ingest_batch(store: &SegmentStore, aspect_id: &AspectId, dataset_id: &DatasetId, rows: &[(i64, BigDecimal)]) -> Result<Vec<TxId>> {
+pub async fn ingest_batch_with_gate(store: &SegmentStore, aspect_id: &AspectId, dataset_id: &DatasetId, rows: &[(i64, BigDecimal)], squash_target_rows: usize) -> Result<Vec<TxId>> {
 	let key = aspect_key(aspect_id);
 	let values: Vec<BigDecimal> = rows.iter().map(|(_, value)| value.clone()).collect();
 	ensure_declared(store, &key, &values).await?;
@@ -250,7 +268,23 @@ pub async fn ingest_batch(store: &SegmentStore, aspect_id: &AspectId, dataset_id
 	let timestamps: Vec<i64> = rows.iter().map(|(timestamp, _)| *timestamp).collect();
 	let receipt = store.ingest(&key, &IngestBatch::dense(idem.clone(), timestamps, values)).await?;
 	debug_assert_eq!(receipt.row_count, rows.len());
+	if let Err(e) = store.squash_aspect_to_target_rows_if_fragmented(&key, squash_target_rows).await {
+		tracing::debug!("Failed to run the fragmentation gate after ingesting a batch for aspect {aspect_id}; it is sealed: {e}");
+	}
 	Ok((0..rows.len()).map(|index| synthetic_tx_id(&idem, index)).collect())
+}
+
+/// Ingest one legacy batch, then run the fragmentation gate with
+/// [`SQUASH_TARGET_ROWS`].
+///
+/// This is the thin wrapper that existing callers continue to use with
+/// unchanged behaviour.
+///
+/// # Errors
+///
+/// As [`ingest_batch_with_gate`].
+pub async fn ingest_batch(store: &SegmentStore, aspect_id: &AspectId, dataset_id: &DatasetId, rows: &[(i64, BigDecimal)]) -> Result<Vec<TxId>> {
+	ingest_batch_with_gate(store, aspect_id, dataset_id, rows, SQUASH_TARGET_ROWS).await
 }
 
 /// Every row of a seal-backed aspect in `[start, end]`, sorted by timestamp.
@@ -411,8 +445,14 @@ mod tests {
 		assert_eq!(StorageMode::parse(Some("bogus")), StorageMode::Rows);
 		assert_eq!(StorageMode::for_new_aspect(false, Some("segments")), StorageMode::Segments);
 		assert_eq!(StorageMode::for_new_aspect(true, Some("segments")), StorageMode::Rows, "compression stays rows mode");
-		assert_eq!(StorageMode::for_new_aspect(false, None), StorageMode::Rows);
-		assert_eq!(StorageMode::for_new_aspect(false, Some("rows")), StorageMode::Rows);
+		// #768 flipped the unset case: a new aspect is seal-backed unless told
+		// otherwise. This is the assertion that fails on a pre-flip tree, and the
+		// reason the flip needs no migration — only the mode of an aspect that does
+		// not exist yet changes.
+		assert_eq!(StorageMode::for_new_aspect(false, None), StorageMode::Segments, "a new aspect is seal-backed unless told otherwise");
+		assert_eq!(StorageMode::for_new_aspect(true, None), StorageMode::Rows, "compression still forces rows mode");
+		assert_eq!(StorageMode::for_new_aspect(false, Some("rows")), StorageMode::Rows, "rows mode is now the explicit opt-out");
+		assert_eq!(StorageMode::for_new_aspect(false, Some("segment")), StorageMode::Rows, "a typo keeps the shape every released build can read");
 	}
 
 	#[test]

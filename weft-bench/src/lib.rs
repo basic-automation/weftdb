@@ -141,6 +141,7 @@ pub mod soak_read;
 pub mod soak_report;
 pub mod soak_sched;
 pub mod soak_system;
+pub mod soak_ttl;
 pub mod soak_upgrade;
 pub mod soak_workload;
 pub mod sparse;

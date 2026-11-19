@@ -90,9 +90,18 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [x] Restoring *into a chosen new root* over HTTP (7.3) (#213, 2026-11-14: `POST /api/v1/storage/restore/into?label=...&name=...` into `WEFT_RESTORE_BASE_DIR`; the offline drill at `weft-server/src/restore.rs` is unchanged)
 - [x] Store-side row-level TTL/expiry (prerequisite for the SOA-15 TTL lane) *(cut 1 shipped 2026-11-15 in #752: the policy, the read-path filter and a report-only sweep; cut 2 shipped 2026-11-16 in #775: `purge_expired` drops whole segments whose every row is expired, and the reaper unlinks them; cut 3, the environment switch, landed in #784 for issue #783: the `WEFT_ROW_TTL` env var, the settings entry and the config-schema docs; cut 4, the daemon call site, shipped 2026-11-17 in #786 for issue #785: `reconcile_tick_purge_expired` in `weft-server/src/reconcile_daemon.rs` calls `SegmentStore::purge_expired` on the daemon's own tick and records the sweep, so expiry no longer waits for an operator call; with `NoExpiry` the tick is a recorded no-op)*
 - [x] Real-filesystem ENOSPC test for #656 on the injectable space source (#694 merged)
-- [ ] **Measurement bulk ingest routed through the `.weftseg` seal** *(part 1 shipped 2026-11-16: the two legacy bulk writers that do not read the stored range first now route to the seal store for a seal-backed aspect. Still unticked because new aspects are still created in rows mode, and flipping that default is #768, which carries the cost figure the flip needs)*
+- [x] **Measurement bulk ingest routed through the `.weftseg` seal** *(part 1 shipped 2026-11-16: the two legacy bulk writers that do not read the stored range first were routed through the seal store, and the aspect's own latest-timestamp read was fixed to consult it. #768 then made new legacy aspects seal-backed by default, with `WEFT_LEGACY_DEFAULT_STORAGE=rows` as the opt-out, so a fresh deployment writes sealed frames through every ingest entry point)*
 - [x] **CI**
 - [x] Packaging (1.0 minimum)
+- [ ] **Row-TTL purge defects** *(found 2026-11-17 by a read-only audit of #776; nothing on `main` calls `purge_expired` yet, so these gate the daemon call site in #785)*
+  - [ ] **TTL-PURGE** Dropping an expired segment must not bring back the values it superseded in a surviving overlapping segment (#797)
+  - [ ] **TTL-PURGE** An aspect with more than 32 series with expired segments can be purged, and partial drops are counted (#798)
+  - [ ] **TTL-UNIT** The row TTL carries a unit instead of being a bare number read in each aspect's own time unit (#799)
+- [ ] **Legacy seal routing defects** *(found 2026-11-17 by a read-only audit of #769, #770 and #780; these gate the seal-backed default in #768)*
+  - [ ] **SEAL-COUNT** The count of a seal-backed aspect agrees with what a range read returns after a batch rewrites a timestamp (#800)
+  - [ ] **SEAL-REPLACE** `replace_measurements_in_range` and `compress()` never write to the unread rows file of a seal-backed aspect (#801)
+  - [ ] **SEAL-DUP** The replace-not-append rule for duplicate timestamps is documented and pinned by a test (#802)
+  - [ ] **SEAL-IDEM** A reused `DatasetId` cannot lose a write or fail on a CRC-32 collision (#803)
 - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
 - [ ] Write or approve the honesty-page narrative *(owner)*
 - [ ] Report the three `parquet` 60.0.0 decoder panics and the `arrow-buffer` 60.0.0 panic upstream to apache/arrow-rs *(owner: outward-facing)*
@@ -112,7 +121,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [x] **FRE-10b** Contract tests: storage and operator endpoints, plus coverage
 - [ ] **TAG-12** Multi-series crash matrix, fan-out and TSBS benchmarks, fixtures, freeze docs
 - [x] **ROB-24** Limits and overload evidence; frozen configuration documentation
-- [ ] **SOA-15** part 2: TTL lane
+- [x] **SOA-15** part 2: TTL lane
 
 ## Phase 14 — Beta tag (was W11)
 

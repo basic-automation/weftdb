@@ -995,6 +995,34 @@ fn run_soak(name: &str, seed: u64, duration_secs: u64, ticks: u64, _window_ticks
 			return ExitCode::FAILURE;
 		}
 	}
+
+	// Drive the TTL lane (SOA-15, part 2): open a temp store with a configured TTL,
+	// ingest rows that straddle the expiry cutoff, run sweep + purge, and record
+	// the outcome on the verdict.
+	let ttl_secs = 3600u64;
+	let now_ns = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+		Ok(d) => d.as_nanos().try_into().unwrap_or(i64::MAX),
+		Err(e) => {
+			eprintln!("{PROG}: soak-run: clock error before TTL lane: {e:#}");
+			return ExitCode::FAILURE;
+		}
+	};
+	// `run_soak` is synchronous and runs before `main`'s own runtime exists, so the
+	// lane gets a current-thread runtime here: the same sync-to-async bridge `main`
+	// uses for the failure-matrix child. Calling an `async fn` without `block_on`
+	// would build a future and drop it, and the lane would never run.
+	let ttl_verdict = match tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(anyhow::Error::from).and_then(|rt| rt.block_on(weft_bench::soak_ttl::run_ttl_lane(ttl_secs, now_ns))) {
+		Ok(v) => v,
+		Err(e) => {
+			eprintln!("{PROG}: soak-run: TTL lane failed: {e:#}");
+			return ExitCode::FAILURE;
+		}
+	};
+	if let Err(e) = harness.record_ttl_verdict(ttl_verdict) {
+		eprintln!("{PROG}: soak-run: failed to record TTL verdict: {e:#}");
+		return ExitCode::FAILURE;
+	}
+
 	if let Err(e) = harness.finish() {
 		eprintln!("{PROG}: soak-run: failed to finish harness: {e:#}");
 		return ExitCode::FAILURE;

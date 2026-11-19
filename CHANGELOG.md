@@ -10,6 +10,28 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **The bulk-ingest path (`ingest_batch`) now runs the fragmentation gate (#232).**
+  A new `ingest_batch_with_gate(store, aspect_id, dataset_id, rows, squash_target_rows)`
+  does the existing ingest then calls
+  `store.squash_aspect_to_target_rows_if_fragmented` with the supplied target, logging a
+  gate failure at `tracing::debug!` and never propagating it. The existing `ingest_batch`
+  is now a thin wrapper passing `SQUASH_TARGET_ROWS`. The duplicate gate calls at the two
+  `capture_measurement`-side call sites in `inputs.rs` were removed — they moved into the
+  bulk path.
+- **A refused maintenance plan has its own HTTP answer (#764).**- **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**- **`WEFT_MEMORY_BUDGET_BYTES` and the cgroup limit are now read and held (#788).**
+- **The reconcile daemon defers its passes when the memory budget has no headroom (#806,
+ROB-14 cut 3).** Each of the six tick functions in `weft-server/src/reconcile_daemon.rs`
+now asks `has_budget_for_pass` before it touches the store: with a limit set (the
+`min(WEFT_MEMORY_BUDGET_BYTES, cgroup memory.max)` cut 1 established), an exhausted budget
+ends the tick early with an empty [`ReconcileSweep`](weftdb::ReconcileSweep) and a
+`warn!` naming which pass was deferred, instead of letting a background pass allocate its
+way into the OOM killer. The check is a probe, not per-pass accounting — the store decides
+how much a fold allocates and the server cannot know that ahead of the call — so a pass
+whose footprint the probe cannot see is still bounded by the store's own
+`WEFT_MAINTENANCE_MAX_OUTPUT_BYTES` and the wall-clock budget from #758, both unchanged.
+The deferral costs nothing: the backlog is not dropped and the next tick retries. The
+compaction, expiry and purge daemons do not carry a budget yet, so ROB-14 stays open.
+- **`WEFT_MEMORY_BUDGET_BYTES` and the cgroup limit are now read and held (#788).**
 - **The reconcile daemon runs the expired-row purge every tick (#785).**
 After the existing sweeps, every daemon tick also calls `SegmentStore::purge_expired`
 on the store. When the policy is `NoExpiry` (the default) the call returns cheaply with
@@ -89,7 +111,18 @@ origin/main
   member. A `pinned release archives` job in `.github/workflows/ci.yml` runs it on every
   pull request: the first time a published WeftDB archive has been downloaded in CI.### Changed
 
-- **A maintenance merge of overlapping frames now folds them in one heap pass instead of k
+- **A new legacy aspect is seal-backed by default (#768).** `WEFT_LEGACY_DEFAULT_STORAGE`
+  used to be the opt-in for the seal store: left unset, a new aspect went to the per-aspect
+  rows-mode `measurements.db`. Unset is now seal-backed and `rows` is the explicit opt-out, so
+  the bulk-ingest path routed in #769 is the path a fresh deployment takes. Only the mode of an
+  aspect that does not exist yet changes: `StorageMode::parse` still reads an existing aspect's
+  stored mode the historical way, `NULL` included, so there is no migration, no back-fill and no
+  read change. A compression config still forces rows mode, because compression deletes ranges.
+  The door is one-way in both senses: a store holding seal-backed aspects cannot be read by
+  0.3.7 or earlier, which know no `aspects.storage_mode` column and answer **zero measurements**
+  for such an aspect rather than refusing it. Neither the column nor the seal-backed aspect has
+  ever shipped, so no released build created one; pin `WEFT_LEGACY_DEFAULT_STORAGE=rows` on a
+  deployment that must stay rollable to an older build.- **A maintenance merge of overlapping frames now folds them in one heap pass instead of k
   pairwise rounds (#758, ROB-20 G3).** `merge_k_way` (`weft-physical-type/src/split.rs`) merges
   `k` timestamp-sorted runs in a single pass over `k` cursors, and `fold_newest_wins`
   (`weftdb/src/types/segment_store.rs`) builds those runs and calls it. The loop it replaces
@@ -203,6 +236,7 @@ origin/main
 
 - **Document TimescaleDB percentile internals and the like-for-like plan.** `percentile_agg()` wraps a UDDSketch at 200 buckets / 0.001 max error; the research note with source URLs and the measurement plan is at `docs/research/timescale-percentile.md` (#732).
 - **Restore a whole store into a chosen new root over HTTP** (`POST /api/v1/storage/restore/into?label=&name=`), guarded by `WEFT_RESTORE_BASE_DIR` and a containment check that refuses destinations inside the backup base.
+- **SOA-15 part 2: TTL lane (#727).** The nightly soak now drives a store-side TTL lane: it opens a temporary `SegmentStore` with a configured TTL, ingests rows that straddle the expiry cutoff, runs `expiry_sweep` + `purge_expired`, and records the outcome on the soak record as `TtlLaneVerdict`. The lane is not vacuous: a `NoExpiry` store reports 0 expired rows while a TTL store with aged rows reports >0. Acceptance tests cover both cases, store round-trip exact counts, and the verdict's JSON round-trip. The honesty section renders the verdict, and the soak.yml comment reflects that the lane is active.
 
 ### Documentation
 

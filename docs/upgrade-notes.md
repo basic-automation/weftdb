@@ -13,6 +13,16 @@
    - v0.1.0 windows with duplicate rows now answer with fewer rows; compatibility
      tests updated for the corrected shape.
 
+2. **A new legacy aspect is seal-backed unless you ask otherwise (#768).** Leaving
+   `WEFT_LEGACY_DEFAULT_STORAGE` unset used to mean the aspect's measurements live in its
+   `measurements.db`; now it means they live in the `.weftseg` seal store, and `rows` is how
+   you ask for the old shape. Nothing already stored moves, and an aspect's mode is still read
+   back exactly as it was written. **Downgrade is the one-way part:** 0.3.7 and earlier do not
+   know the `aspects.storage_mode` column, so they do not refuse a seal-backed aspect, they read
+   zero measurements from it. Neither the column nor seal-backed aspects have appeared in any
+   release, so a store built from a release is unaffected; anyone running `main` who needs to
+   stay rollable should pin `WEFT_LEGACY_DEFAULT_STORAGE=rows` before creating aspects.
+
 ## v0.2.1 → v0.3.0
 
 Released 2026-11-05. See the [CHANGELOG](../CHANGELOG.md) for the full list of changes.

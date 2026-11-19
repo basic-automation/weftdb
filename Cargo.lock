@@ -5630,6 +5630,7 @@ dependencies = [
  "sha2",
  "splimes",
  "sysinfo",
+ "tempfile",
  "tokio",
  "uuid",
  "weft-arrow",
