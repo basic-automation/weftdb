@@ -8227,6 +8227,40 @@ counter, not `aspects_reconciled == 0`: after the first pass there is no work le
 that ignored the budget would also report zero reconciled. Scanning is the first observable
 thing the check sits in front of.
 
+  regression guard the whole slice is about.
+
+## 2026-11-17 — Moving the fragmentation gate into the bulk-ingest path (#232)
+
+- **The fragmentation gate was an inline duplicate, not a missing feature.** The three gate calls
+  in `inputs.rs` (`:335`, `:446`) each immediately followed an `ingest_batch` call for the same
+  aspect, replicating the gate logic inline. The third caller (`batch_capture_sealed`, `:2442`)
+  did not run the gate at all — it calls `ingest_batch` then drops the store immediately. Moving
+  the gate into `ingest_batch` itself removes the risk of a future caller forgetting it.
+- **Inline gate vs. a separate maintenance daemon.** An inline gate (called after every ingest) was
+  chosen over a background daemon because (a) the gate is O(1) on a converged aspect's rollup,
+  so its per-write cost is negligible when the aspect is stable; (b) it does not hold the
+  maintenance lock from a previous call — the lock is acquired and released within each gate call;
+  and (c) a daemon adds lifecycle complexity (start, stop, backpressure, reconcile with writes).
+  The existing `squash_all_to_target_rows_if_fragmented` sweep (`sweep_all.rs`) already
+  provides the background pass for an operator who wants a one-shot convergence across all aspects;
+  the inline gate is the per-write convergence that keeps bulk from diverging from single-row
+  behaviour.
+- **`ingest_batch_with_gate` takes a `squash_target_rows` parameter;** the existing `ingest_batch`
+  is a thin wrapper passing `SQUASH_TARGET_ROWS`. This lets tests drive a deliberately small target
+  and lets a future caller (e.g., an archival ingest at a different threshold) choose a different
+  target without another wrapper.
+- **The two duplicate gate calls in `inputs.rs` were removed, and the third caller is covered by
+  the move, not left out.** `batch_capture_sealed` (`:2442` in the file's own numbering) goes
+  through the same `ingest_batch` wrapper, so it now runs the gate it never used to run: before
+  this slice the file had gate calls at `:335` and `:446` only, and that third path had none. The
+  wrapper is what closes that gap, which is why the inline duplicates were deleted rather kept.
+- **What this does *not* close.** The gate declines on a converged large aspect
+  (`squash_aspect_to_target_rows_if_fragmented_held` returns `Ok(None)` once
+  `segment_count <= total_rows.div_ceil(target_rows)`, and `SQUASH_TARGET_ROWS` is 100 000) and its
+  failure is logged at debug level. A batch that rewrites a timestamp an existing segment already
+  holds can therefore still leave the stored row count above the number of rows a read returns,
+  which is what #800 tracks.origin/mainorigin/main
+
 ## 2026-11-17 — ROB-14 cut 2: enforce the container memory budget on request paths (shipped)
 - **MemoryBudget is now consulted on the server's request paths.** Cut 1 (#787) added the
   machinery but no call sites; cut 2 adds the `try_reserve` calls.
@@ -8253,6 +8287,7 @@ thing the check sits in front of.
   the model server). Only the following were run: `rustfmt --edition 2021 --check` on touched
   `.rs` files, `python3 scripts/ci/check-serial-order.py`, `python3 scripts/config/check_schema.py`
   (both pre-existing warnings, unchanged by this cut), `git diff --check`.
+
 ## 2026-11-17 — Where a memory reservation is taken matters more than its size (ROB-14 cut 2) (resolved)
 Cut 2 wires `MemoryBudget` into the request paths. Three judgement calls from the review of PR #805:
 - **The ingest reservation moved ahead of the body read.** `reserved_bytes` is known
