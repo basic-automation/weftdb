@@ -183,6 +183,12 @@ pub struct AspectExpirySwept {
 	pub oldest_expired_ts: Option<i64>,
 	/// Newest (maximum) timestamp of an expired row, if any were found.
 	pub newest_expired_ts: Option<i64>,
+	/// Segments that are wholly expired but overlap a surviving segment of the same
+	/// series and were therefore kept on disk to avoid shadow-reverting plain reads
+	/// (#797). A shadowed-and-kept segment is neither dropped (it would silently
+	/// reveal the superseded rows of the survivor) nor straddling (every row is
+	/// expired).
+	pub shadowed_and_kept: u64,
 	/// Whether the sweep ran to completion on this aspect (cut 1: always true on
 	/// success — no physical deletion yet).
 	pub completed: bool,
@@ -191,7 +197,7 @@ pub struct AspectExpirySwept {
 impl Default for AspectExpirySwept {
 	/// A successful pass with nothing to expire.
 	fn default() -> Self {
-		Self { rows_expired: 0, segments_dropped: 0, partial_segments: 0, oldest_expired_ts: None, newest_expired_ts: None, completed: true }
+		Self { rows_expired: 0, segments_dropped: 0, partial_segments: 0, shadowed_and_kept: 0, oldest_expired_ts: None, newest_expired_ts: None, completed: true }
 	}
 }
 
@@ -213,12 +219,15 @@ pub struct ExpirySweep {
 	pub segments_dropped: u64,
 	/// Total segments holding both expired and live rows across all aspects.
 	pub partial_segments: u64,
+	/// Segments that were wholly expired but kept on disk because they overlapped a
+	/// surviving segment of the same series (#797).
+	pub shadowed_and_kept: u64,
 }
 
 impl Default for ExpirySweep {
 	/// Empty sweep (no aspects scanned, nothing expired).
 	fn default() -> Self {
-		Self { aspects_cleaned: Vec::new(), busy: Vec::new(), failed: Vec::new(), rows_expired: 0u64, segments_dropped: 0u64, partial_segments: 0u64 }
+		Self { aspects_cleaned: Vec::new(), busy: Vec::new(), failed: Vec::new(), rows_expired: 0u64, segments_dropped: 0u64, partial_segments: 0u64, shadowed_and_kept: 0u64 }
 	}
 }
 

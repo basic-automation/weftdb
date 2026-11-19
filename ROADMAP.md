@@ -94,8 +94,8 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [x] **CI**
 - [x] Packaging (1.0 minimum)
 - [ ] **Row-TTL purge defects** *(found 2026-11-17 by a read-only audit of #776; nothing on `main` calls `purge_expired` yet, so these gate the daemon call site in #785)*
-  - [ ] **TTL-PURGE** Dropping an expired segment must not bring back the values it superseded in a surviving overlapping segment (#797)
-  - [ ] **TTL-PURGE** An aspect with more than 32 series with expired segments can be purged, and partial drops are counted (#798)
+  - [x] **TTL-PURGE** Dropping an expired segment must not bring back the values it superseded in a surviving overlapping segment (#797, 2026-11-19: `purge_aspect_held` keeps a wholly-expired segment on disk when its `[min_ts, max_ts]` extent overlaps a surviving segment of the same series, so a plain read cannot revert to superseded values)
+  - [x] **TTL-PURGE** An aspect with more than 32 series with expired segments can be purged, and partial drops are counted (#798, 2026-11-19: the swap plans are applied in chunks that stay inside the store's per-transaction plan ceiling, and the sweep report counts the aspects and segments it actually dropped)
   - [x] **TTL-UNIT** The row TTL carries a unit instead of being a bare number read in each aspect's own time unit (#799, 2026-11-19: `RowExpiryPolicy::Ttl` carries a `TimeUnit`, `WEFT_ROW_TTL` takes an `ns`/`us`/`ms`/`s` suffix with bare = seconds, and the read filter and the purge sweep share one cutoff rule)
 - [ ] **Legacy seal routing defects** *(found 2026-11-17 by a read-only audit of #769, #770 and #780; these gate the seal-backed default in #768)*
   - [x] **SEAL-COUNT** The count of a seal-backed aspect agrees with what a range read returns after a batch rewrites a timestamp (#800, 2026-11-19: `ingest_batch_with_gate` now folds overlapping clusters with `SegmentStore::reconcile_overlaps` after every ingest, so the segment index stays overlap-free and the rollup count equals the read)

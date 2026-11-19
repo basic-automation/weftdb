@@ -13,7 +13,7 @@ use weft_physical_type::{timestamp::TimeUnit, AspectSchema, PhysicalType};
 
 use super::{SegmentStore, SegmentStoreOptions};
 use crate::{
-	segment_store::row_expiry::{expired_cutoff, is_row_expired, RowExpiryPolicy}, IngestBatch
+	segment_store::row_expiry::{expired_cutoff, is_row_expired, RowExpiryPolicy}, IngestBatch, TagSet
 };
 
 fn bd(s: &str) -> BigDecimal {
@@ -265,7 +265,8 @@ async fn purge_drops_a_fully_expired_segment_and_keeps_a_straddling_one() {
 	assert_eq!(store.index.all(ASPECT).await.expect("index").len(), 2, "each ingest seals its own frame");
 	assert_eq!(frames(dir.path()).len(), 2, "two frames on disk");
 
-	let before = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads before the purge");
+	let before_plain = store.read_time_range(ASPECT, 0, 200).await.expect("plain read before the purge");
+	let before_expiry = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads before the purge");
 	let sweep = store.purge_expired(NOW_NS).await.expect("purges");
 	assert!(sweep.busy.is_empty() && sweep.failed.is_empty(), "the aspect was neither busy nor failing: {:?}", sweep.failed.iter().map(|(aspect, err)| (aspect.clone(), err.to_string())).collect::<Vec<_>>());
 	assert_eq!(sweep.segments_dropped, 1, "the wholly expired frame goes");
@@ -273,9 +274,17 @@ async fn purge_drops_a_fully_expired_segment_and_keeps_a_straddling_one() {
 	assert_eq!(sweep.rows_expired, 20 + 5, "the dropped frame's twenty rows plus the five expired rows inside the frame left behind");
 	assert!(sweep.aspects_cleaned.contains(&ASPECT.to_string()), "the aspect is reported as cleaned");
 
-	let after = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads after the purge");
-	assert_eq!(before, after, "dropping a frame no read could use changes no answer");
-	assert_eq!(after.0.first().copied(), Some(90), "the first visible row is the first one at or past the cutoff");
+	let after_plain = store.read_time_range(ASPECT, 0, 200).await.expect("plain read after the purge");
+	let after_expiry = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads after the purge");
+	// A plain read does not apply the TTL, so it could use those rows: dropping the wholly
+	// expired frame must remove exactly its instants from a plain read and touch nothing else.
+	assert!(before_plain.0.contains(&60) && before_plain.0.contains(&79), "a plain read sees the wholly expired frame before the purge");
+	assert!(!after_plain.0.iter().any(|&ts| ts <= 79), "the dropped frame's instants leave the plain read: {:?}", after_plain.0.iter().filter(|&&ts| ts <= 79).copied().collect::<Vec<_>>());
+	assert_eq!(after_plain.0.len(), before_plain.0.len() - 20, "exactly the dropped frame's twenty rows go, no more");
+	assert_eq!(after_plain.0.first().copied(), Some(85), "the straddling frame still starts the plain read");
+	assert_eq!(after_plain.0.last().copied(), Some(120), "and still ends it");
+	assert_eq!(before_expiry, after_expiry, "TTL-filtered read is unchanged after dropping a frame no read could use");
+	assert_eq!(after_expiry.0.first().copied(), Some(90), "the first visible row is the first one at or past the cutoff");
 
 	let rows = store.index.all(ASPECT).await.expect("index after the purge");
 	assert_eq!(rows.len(), 1, "only the straddling frame keeps an index row");
@@ -359,6 +368,140 @@ async fn purge_clears_every_aspect_it_is_asked_to() {
 	drop(store);
 	dir.close().expect("close temp dir");
 }
+
+// ── Criterion #797: shadow-segment guard ──────────────────────────────────
+// A doomed segment whose extent overlaps a surviving segment of the same series
+// must be kept on disk; dropping it would silently revert a plain read to the
+// superseded values.
+
+#[tokio::test]
+async fn purge_does_not_drop_segment_that_shadows_a_survivor() {
+	// #797 core: two overlapping segments of one series exactly as the issue describes.
+	// Segment 1 (survivor) straddles the cutoff; segment 2 (correction) is wholly
+	// expired but overlaps segment 1's extent. After the purge the correction must
+	// still be visible to plain reads.
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
+	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
+
+	// Survivor: ts 60..=120 — max_ts=120 > cutoff=90 → straddles, kept.
+	// The batch keys differ because one idempotency key may name one batch only; both
+	// batches still write the same untagged series, which is what makes the second a shadow.
+	store.ingest(ASPECT, &IngestBatch::dense("k60", (60..=120).collect(), (60..=120).map(|_| bd("1")).collect())).await.expect("ingests survivor");
+
+	// Correction: ts 70..=79 — max_ts=79 < cutoff=90 → would be doomed, but
+	// overlaps the survivor (both are series "s1").  The correction carries
+	// a different value so we can distinguish which wins.
+	store.ingest(ASPECT, &IngestBatch::dense("k70", (70..=79).collect(), (70..=79).map(|_| bd("42")).collect())).await.expect("ingests correction");
+
+	let before = store.read_time_range(ASPECT, 0, 200).await.expect("reads before purge");
+	let sweep = store.purge_expired(NOW_NS).await.expect("purges");
+
+	// The correction segment was kept because it overlaps the survivor.
+	assert_eq!(sweep.shadowed_and_kept, 1, "the correction segment shadows the survivor and is kept");
+	assert_eq!(sweep.segments_dropped, 0, "no segment was dropped");
+	assert!(sweep.failed.is_empty(), "no failure");
+
+	let after = store.read_time_range(ASPECT, 0, 200).await.expect("reads after purge");
+	assert_eq!(before, after, "plain read is unchanged — the correction values survive");
+
+	// The correction values are visible, not the superseded survivor values.
+	let (ts, vs) = &after;
+	let idx_75 = ts.iter().position(|t| *t == 75).expect("ts 75 present");
+	assert_eq!(vs[idx_75], Some(bd("42")), "the correction (newer segment) wins at overlapped timestamps");
+
+	drop(store);
+	dir.close().expect("close temp dir");
+}
+
+#[tokio::test]
+async fn purge_still_drops_doomed_segment_that_overlaps_nothing() {
+	// #797 no-over-refusal: a doomed segment that overlaps no survivor of its
+	// series is still dropped — the guard does not disable the purge.
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
+	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
+
+	// Two series, each with one wholly expired segment in a range with no survivor.
+	store.ingest(ASPECT, &IngestBatch::dense("s1", vec![60, 65, 69], vec![bd("1"), bd("2"), bd("3")])).await.expect("ingests s1 expired");
+	store.ingest(ASPECT, &IngestBatch::dense("s2", vec![50, 55, 59], vec![bd("4"), bd("5"), bd("6")])).await.expect("ingests s2 expired");
+
+	let sweep = store.purge_expired(NOW_NS).await.expect("purges");
+	assert_eq!(sweep.shadowed_and_kept, 0, "no segment kept due to shadowing");
+	assert_eq!(sweep.segments_dropped, 2, "both fully expired segments are dropped");
+	assert!(sweep.failed.is_empty(), "no failure");
+
+	drop(store);
+	dir.close().expect("close temp dir");
+}
+
+// ── Criterion #798: chunking by MAX_PLANS_PER_TXN ────────────────────────
+// An aspect with more plans than `MAX_PLANS_PER_TXN` (32) used to be refused by
+// `swap_plans` outright: "a swap of aspect "temp" carries at most 32 plans, not 33".
+// The sweep now chunks the plans, so such an aspect is purged in several
+// transactions instead of never at all.
+//
+// The series, not the idempotency key, decides how many plans a sweep carries:
+// plans are bucketed by `series_id`, and an untagged ingest lands on
+// `SeriesId::UNTAGGED` no matter how many distinct keys it used.  Every test here
+// therefore gives each series its own tag group — without that, 33 ingests collapse
+// into one plan and the ceiling is never reached, which is the mistake the first
+// version of these tests made.
+
+#[tokio::test]
+async fn purge_drops_33_series_in_one_pass() {
+	// 33 series, each with one wholly expired segment: 33 plans, one more than
+	// the per-transaction ceiling.  On main this aspect fails with the
+	// `swap_plans` guard instead of purging (see the red run recorded on #798);
+	// after the fix all 33 segments drop across two chunks (32 + 1).
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
+	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
+
+	for i in 1..=33u64 {
+		let groups = TagSet::from_pairs([("host", format!("h{i}"))]).expect("valid tags");
+		let key = format!("k{i}");
+		store.ingest(ASPECT, &IngestBatch::dense(&key, vec![80], vec![bd(&i.to_string())]).with_groups(groups)).await.expect("ingests an expired row");
+	}
+
+	let sweep = store.purge_expired(NOW_NS).await.expect("purges");
+	assert!(sweep.failed.is_empty(), "#798: no aspect should fail: {:?}", sweep.failed.iter().map(|(a, e)| (a.clone(), e.to_string())).collect::<Vec<_>>());
+	assert_eq!(sweep.segments_dropped, 33, "#798: all 33 wholly expired segments are dropped, across two swap transactions");
+	assert_eq!(sweep.shadowed_and_kept, 0, "nothing here overlaps a survivor, so the #797 guard keeps nothing");
+	assert_eq!(store.index.all(ASPECT).await.expect("index").len(), 0, "no frames remain");
+
+	drop(store);
+	dir.close().expect("close temp dir");
+}
+
+#[tokio::test]
+async fn purge_drops_65_series_across_three_chunks() {
+	// Two full chunks and a remainder (32 + 32 + 1): the chunk loop has to
+	// advance twice, and the last, short chunk still has to commit.  A loop that
+	// stranded the tail would drop 64 and leave one frame behind, which the index
+	// assertion below catches.
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
+	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
+
+	for i in 1..=65u64 {
+		let groups = TagSet::from_pairs([("host", format!("h{i}"))]).expect("valid tags");
+		let key = format!("k{i}");
+		store.ingest(ASPECT, &IngestBatch::dense(&key, vec![80], vec![bd(&i.to_string())]).with_groups(groups)).await.expect("ingests an expired row");
+	}
+
+	let sweep = store.purge_expired(NOW_NS).await.expect("purges");
+	assert!(sweep.failed.is_empty(), "#798: a 65-plan aspect should not fail: {:?}", sweep.failed.iter().map(|(a, e)| (a.clone(), e.to_string())).collect::<Vec<_>>());
+	assert_eq!(sweep.segments_dropped, 65, "32 + 32 + 1 segments drop");
+	assert_eq!(store.index.all(ASPECT).await.expect("index").len(), 0, "the short final chunk committed too");
+
+	drop(store);
+	dir.close().expect("close temp dir");
+}
+
+// #798's partial-failure branch (one chunk commits, a later chunk fails, the
+// sweep reports `completed == false` while keeping the committed counts) has no
+// automated coverage.  There is no seam to make the second chunk's `swap_plans`
+// fail while the first one succeeds without the `fault-injection` feature, which
+// runs in a CI job that does not run these library tests, and a test written to
+// accept either outcome proves nothing.  Recorded on #798 as the known gap rather
+// than papered over.
 
 /// Cut 3's environment switch: `WEFT_ROW_TTL` becomes a policy, and anything that is not a
 /// positive count leaves expiry off. A typo in a TTL setting must never be able to empty a
