@@ -1680,11 +1680,31 @@ impl Database {
 	/// If the metadata database cannot be queried for a reason other than
 	/// the aspect or the column being absent.
 	pub async fn aspect_storage_mode(&self, aspect_id: &AspectId) -> Result<crate::StorageMode> {
-		// Ensure the storage_mode column exists before selecting from it,
-		// so a pre-S19 database cannot cause a "no such column" error.
-		self.ensure_storage_mode_column().await;
-
+		// The storage mode decides which write guards apply, so a lookup that
+		// merely failed must not answer "rows mode": every guard would then be
+		// skippable on a seal-backed aspect (#801). Only two shapes honestly mean
+		// rows mode: the column is absent (a database created before D-S19), and
+		// the row or its value is missing. Anything else propagates.
 		let conn = Self::begin_concurrent(&self.metadata, &self.metadata_path, Some(self.cache.clone())).await?;
+		let probe = conn.as_ref().query("SELECT COUNT(*) FROM pragma_table_info('aspects') WHERE name = 'storage_mode'", turso::params![]).await;
+		let has_column = match probe {
+			Ok(mut rows) => match rows.next().await {
+				Ok(Some(row)) => matches!(row.get_value(0)?, turso::Value::Integer(count) if count > 0),
+				Ok(None) => false,
+				Err(error) => {
+					Self::commit_concurrent(&conn).await.ok();
+					return Err(anyhow::anyhow!("the storage-mode column probe failed: {error}"));
+				}
+			},
+			Err(error) => {
+				Self::commit_concurrent(&conn).await.ok();
+				return Err(anyhow::anyhow!("the storage-mode column probe failed: {error}"));
+			}
+		};
+		if !has_column {
+			Self::commit_concurrent(&conn).await.ok();
+			return Ok(crate::StorageMode::Rows);
+		}
 		let res = conn.as_ref().query("SELECT storage_mode FROM aspects WHERE id = ?", turso::params![aspect_id.as_uuid().to_string()]).await;
 		let mode = match res {
 			Ok(mut rows) => {
@@ -1697,9 +1717,10 @@ impl Database {
 				};
 				value.as_deref().map_or(crate::StorageMode::Rows, |text| crate::StorageMode::parse(Some(text)))
 			}
-			// A pre-S19 database has no `aspects` table at all (caught by
-			// `ensure_storage_mode_column`'s no-op).
-			Err(_) => crate::StorageMode::Rows,
+			Err(error) => {
+				Self::commit_concurrent(&conn).await.ok();
+				return Err(anyhow::anyhow!("the storage-mode lookup for aspect {aspect_id} failed: {error}"));
+			}
 		};
 		Self::commit_concurrent(&conn).await.ok();
 		Ok(mode)

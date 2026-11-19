@@ -371,9 +371,13 @@ async fn seal_backed_write_entry_points_never_reach_measurements_db() -> Result<
 	assert_eq!(tx_ids3.len(), 2);
 	assert_eq!(db.get_measurements_count(&aspect_id).await?, 8);
 
-	// 5. capture_new_measurement_chunk must refuse
-	let db_path = db.get_measurement_db_path(&aspect_id).await?;
-	let db_handle = db.get_measurement_db(&aspect_id).await?;
+	// 5. capture_new_measurement_chunk must refuse. The path and the turso handle are
+	// derived without calling get_measurement_db, which creates the very
+	// measurements.db file this test asserts is never created (the assertion below
+	// would then be false whatever the guards do).
+	let db_dir = std::path::Path::new(db.metadata_path()).parent().expect("db dir").to_path_buf();
+	let db_path = db_dir.join("aspects").join(aspect_id.as_uuid().to_string()).join("measurements.db").to_string_lossy().into_owned();
+	let db_handle = turso::Builder::new_local(":memory:").build().await.expect("throwaway handle for the refusal probe");
 	let refuse_tx_ids: Vec<TxId> = (0..2).map(|_| TxId::new()).collect();
 	let err = Inputs::capture_new_measurement_chunk(&db, &aspect_id, &db_handle, &db_path, &dataset, &chunk_rows, &refuse_tx_ids).await.unwrap_err();
 	assert!(err.downcast_ref::<weftdb::Error>().is_some_and(|e| matches!(e, weftdb::Error::SealBackedRejected(_))), "capture_new_measurement_chunk must refuse seal-backed: {err}");
@@ -393,9 +397,9 @@ async fn seal_backed_write_entry_points_never_reach_measurements_db() -> Result<
 	assert!(err4.downcast_ref::<weftdb::Error>().is_some_and(|e| matches!(e, weftdb::Error::SealBackedRejected(_))), "compress must refuse seal-backed: {err4}");
 
 	// Assert the rows-mode measurements.db file was never created for this aspect.
-	let db_dir = std::path::Path::new(db.metadata_path()).parent().expect("db dir");
 	let measurements_db = db_dir.join("aspects").join(aspect_id.as_uuid().to_string()).join("measurements.db");
 	assert!(!measurements_db.exists(), "the rows-mode measurements.db must not exist for a seal-backed aspect");
+	assert_eq!(db.aspect_storage_mode(&aspect_id).await?, StorageMode::Segments, "the refusals must not flip a seal-backed aspect back to rows mode");
 
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
 	Ok(())
