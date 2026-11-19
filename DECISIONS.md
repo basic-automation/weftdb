@@ -8414,6 +8414,58 @@ The same brief describes #798: an aspect with more than 32 series causes
 
 The companion lesson is about fixtures, not production code. The #797 reproduction ingested both frames under the same idempotency key (`IngestBatch::dense("s1", …)` twice), and the second ingest was refused with "aspect "temp" already holds idempotency key "s1" for a different batch … nothing was written" — so the overlap the test meant to create never existed, and the test would have been vacuous even with the assertions rewritten. An idempotency key names one batch; series identity comes from the measurement tags. Two frames of one series therefore need two batch keys and the same (untagged) value shape.
 
+## 2026-11-17 — The expired-row purge runs unconditionally in every daemon tick (shipping)
+
+Issue #785, TTL cut 4. The store's `purge_expired` already returns cheaply when the policy is
+`NoExpiry` (checking `self.expiry == RowExpiryPolicy::NoExpiry` at the top and returning an empty
+`ExpirySweep`), so the daemon calls it unconditionally after the other sweeps on every tick,
+with no gate or config field. This avoids a future mistake where a config field tells the daemon
+to purge when the policy is NoExpiry, fooling nobody, or tells it not to purge when a TTL is set,
+deleting nothing until an operator notices.
+
+**Why not a metric for purge work.** The brief says not to invent metric names when log instead.
+`weft_reconcile_*` counters already count work passes, so a purge that dropped segments records
+through the existing `record_reconcile_sweep` path (one aspect cleaned with N segments dropped).
+A purge that dropped nothing is a quiet tick and records only a maintenance sweep, which is the
+existing idiom. No new Prometheus counter is needed.
+
+**Clock injection.** The tick calls `std::time::SystemTime::now()` through `now_ns()`, which is
+the same pattern the rest of the crate uses (the backup daemon calls `SystemTime::now()` for its
+labels; the ingest path does the same). The store's own tests call `purge_expired` with an
+explicit `now_ns` because the policy functions respect clock injection, matching the cut-1
+contract.
+
+**The purge tick duplicates the other sweeps' failure idiom.** One WARN per failed aspect (the
+sweep kind names `"expired-purge"`), breaker-skipped aspects counted in `busy` (the existing
+`ExpirySweep::busy` field covers both contention and breaker trips, since `purge_expired` does
+not separate them — matching how the store's own `purge_expired` reports `busy`), and the tick
+carries on past a failing aspect. A whole-sweep failure (the aspect list itself unreadable) is
+logged and the tick continues.origin/main
+
+origin/mainorigin/mainorigin/mainorigin/mainorigin/mainorigin/main
+## 2026-11-17 — What the fan-out arm measures, and what it refuses to be (TAG-12, #807) (decided)
+
+- **A cost curve, not a race.** `docs/benchmark-policy.md` governs measuring against another vendor,
+  and this arm races nothing: it publishes our own wall-time curve across a series-count ladder. The
+  module doc says so in its own words, because the file sits next to the arms that do engage those
+  rules and a reader should not have to open the policy to know which category a number came from.
+  The other half of TAG-12, the multi-series crash matrix, is claimed elsewhere, so this slice is the
+  measurement half only.
+- **A ladder, not a point.** `FanOutParams::default()` is 1, 10, 100, 1000 series at 1 000 rows each
+  under a 1 000-second read window, seeded by `DEFAULT_FAN_OUT_SEED`. A single series count cannot
+  show the shape of the curve, and publishing the seed means a run regenerates the corpus exactly.
+- **Ingest is setup and is excluded from the timed span.** The corpus is built once; each rung
+  re-reads the first N series from the same store. Timing the ingest as well would make this arm
+  measure writes, which the ingest-growth and online arms already do.
+- **Correctness is asserted inside the timed loop.** `run_fan_out` fails the run when a series does
+  not return exactly `rows_per_series` rows, because a fan-out curve from a store that quietly
+  returned fewer rows is not a measurement, and a number that is fast because it read less is the
+  worst kind of benchmark result.
+- **The tests take `serial_test`.** They open real stores under a temp root, so they run one at a
+  time rather than contending with each other; `weft-bench` had never needed the dependency before
+  because its other arms build segments in memory.
+- **CI is the first execution.** Nothing here was compiled or run locally: this host cannot build the
+  workspace without OOM-killing the model server.
 ## 2026-11-17 — Seal-backed write guard: refuse rows-mode writes on seal-backed aspects (#801)
 
 ### Refusal over implementation
