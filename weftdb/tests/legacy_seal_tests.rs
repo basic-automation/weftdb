@@ -402,6 +402,58 @@ async fn seal_backed_new_measurement_entry_points_reach_the_seal() -> Result<()>
 	Ok(())
 }
 
+/// A reused `DatasetId` across multiple writes silently drops the third write from an A-B-A
+/// sequence: the idempotency key `legacy:{dataset}:{crc}:{n}` matches the first call's, so the
+/// ledger re-plays the old receipt and never lands the last write. Read back returns the middle
+/// value (7) instead of the last one (5).
+///
+/// A **red** test on `main` — the two terminal assertions fail because the bug replays A's
+/// old receipt instead of writing the new row. After the fix this test passes.
+#[serial]
+#[tokio::test]
+async fn reused_dataset_id_swallows_last_write_in_aba() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "reused_id", &splimes::Resolution::Milliseconds, None).await?.id();
+
+	// One DatasetId reused across all three writes.
+	let dataset = DatasetId::new();
+	let store = db.seal_store().await?;
+	let base = Utc::now().timestamp_millis();
+
+	// A: write (t, 5)
+	let tx_a = ingest_batch_with_gate(&store, &aspect_id, &dataset, &[(base, bd("5"))], 4).await?;
+	assert_eq!(tx_a.len(), 1, "A returns one TxId");
+	let after_a = read_rows(&store, &aspect_id, None, None).await?;
+	assert_eq!(after_a.len(), 1, "one row after A");
+	assert!(after_a.contains(&(base, bd("5"))), "after A: (t, 5)");
+
+	// B: write (t, 7) — different payload => different CRC => different key.
+	let tx_b = ingest_batch_with_gate(&store, &aspect_id, &dataset, &[(base, bd("7"))], 4).await?;
+	assert_ne!(tx_b, tx_a, "B's key differs from A's");
+	let after_b = read_rows(&store, &aspect_id, None, None).await?;
+	assert_eq!(after_b.len(), 1, "one row after B");
+	assert!(after_b.contains(&(base, bd("7"))), "after B: (t, 7)");
+
+	// A again: write (t, 5) — same payload as A => same CRC => same key.
+	// On main the ledger replays the old receipt from A; after the fix it
+	// should produce new TxIds because the row payload actually changed.
+	let tx_a2 = ingest_batch_with_gate(&store, &aspect_id, &dataset, &[(base, bd("5"))], 4).await?;
+
+	// *** Red assertion 1: the third call must not replay A's stale receipt. ***
+	assert_ne!(tx_a2, tx_a, "the third call produces fresh TxIds, not a replay of A (bug: replayed on main)");
+
+	// *** Red assertion 2: the last-written value (t,5) must be the one we read. ***
+	let final_read = read_rows(&store, &aspect_id, None, None).await?;
+	assert_eq!(final_read.len(), 1, "exactly one row in the final read");
+	assert!(final_read.contains(&(base, bd("5"))), "the read sees the last-written value (t, 5), not the stale middle (t, 7)");
+
+	drop(store);
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
+
 /// `capture_measurement_chunk` was the remaining entry point that did not route
 /// to the seal store on a seal-backed aspect (#779 follow-up for the #232 class).
 /// Without the fix, a chunk written through this path lands in the per-aspect
