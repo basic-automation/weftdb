@@ -1,28 +1,23 @@
-# progress — p12/ingest-disconnect-4xx
+# Progress: p800/count-read-parity - Count/Read parity for overlapping segments (#800)
 
 ## Done
 
-- **`check_body_truncation` helper** — `pub(crate) fn` at `weft-server/src/ingest.rs:438` that compares received body length against declared `Content-Length`. Returns `Some(ApiError::new(Code::BadRequest, …))` when truncated, `None` otherwise. Logs a distinct `tracing::info!` line with declared/received counts.
-- **`from_request` phase 3** — after the body read succeeds (not a timeout), the truncation check runs. A mismatch produces `400 bad_request` before the `IngestPhase` scope wraps anything, so the §4 5xx redaction cannot overwrite it.
-- **Unit tests for the helper** — 4 tests in `weft-server/src/ingest.rs mod tests`: matching length → None, no Content-Length → None, body longer than declared → None, body shorter than declared → 400 bad_request with correct message.
-- **Integration tests** — `ingest_body_that_ends_early_is_400_bad_request` (truncated body → 400), `ingest_body_timeout_still_returns_408` (timeout → 408, regression guard), `ingest_body_full_body_passes_the_truncation_check` (matching body → success).
-- **CHANGELOG.md** — `### Fixed` entry under `[Unreleased]`.
-- **DECISIONS.md** — appended section explaining the no-new-code choice, where causes are separated, and why 400.
-- **Code table unchanged** — 43 codes, `TABLE.len()` still 43, no variant added/removed/reordered.
-- **No schema/OpenAPI changes** — `compat/openapi/weftdb.json`, `docs/config-schema.md`, `docs/openapi-description.md`, `weft-server/src/openapi.rs`, `routes.rs` untouched.
-- **No compiled artifacts** — per HARD RULE.
-
-## Not done
-
-- CI has not run — this host cannot `cargo build`.
-- PR not opened.
-- The commit-phase disconnect safety (SEAL-1) is covered by existing tests and by the design (phase 3 runs before the handler reads the body, far before `IngestPhase::Committing`). No new test was added for it because the existing `ingest_body_that_ends_early_is_400_bad_request` and the code structure prove the 4xx is returned from `from_request`, before any phase-scoped code runs. If a stronger test is desired — one that pipelines a disconnect while the handler is mid-commit — it must wait for CI, since building the race-condition harness locally is not possible.
-
-## ## Handoff
+- Read brief, issue #800, key files (legacy_seal.rs, outputs.rs, traits/outputs.rs, maint.rs, legacy_seal_tests.rs)
+- Created branch p800/count-read-parity from origin/main
+- Commit 9eff2c5: Added test `count_agrees_with_range_read_after_overlapping_ingests` (red on origin/main — count=6 vs read=4)
+- Commit 69a1895: Fix — `ingest_batch_with_gate` now calls `store.reconcile_overlaps(&key)` after every ingest
+- Added rustdoc invariant on `get_measurements_count` in trait and impl
+- Added DECISIONS.md section
+- rustfmt and check-serial-order pass
+- Pushed to origin, PR #813 opened
+- CI run #44467522997 (queued)
 
 ## Handoff
 
-- **All code changes are in `weft-server/src/ingest.rs`**, `CHANGELOG.md`, `DECISIONS.md`.
-- **To open a PR:** `gh pr create --repo basic-automation/weftdb --base main --head p12/ingest-disconnect-4xx` with a body that says "CI is the first execution; this code was never compiled locally."
-- **To run CI:** push the branch; CI will compile and run the tests. Key test to watch: `ingest_body_read_past_the_total_deadline_is_408` (must stay green — it was not modified, only duplicated).
-- **Next command after this handoff:** `cargo fmt` to format the code, then commit and push.
+Branch: p800/count-read-parity (2 commits ahead of origin/main)
+PR: https://github.com/basic-automation/weftdb/pull/813
+CI: https://github.com/basic-automation/weftdb/actions/runs/44467522997
+
+If CI fails, check the run output for compile errors and fix on the same branch.
+If CI passes, the fix is complete — do not merge (task specifies DO NOT merge).
+
