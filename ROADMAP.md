@@ -74,12 +74,6 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 
 ## Phase 12 — Close the pre-beta lanes (was W6, W8 and W9 open items)
 
-- [ ] START HERE (filed 2026-11-11 for the next run)
-- [ ] START HERE (rewritten 2026-11-11 for the next run)
-- [ ] START HERE (filed 2026-10-11 for the next run)
-- [ ] START HERE (filed 2026-10-09 for the next run)
-- [ ] (2026-10-08 list.) The 2026-10-08 run (PR `routine/dsp-2026-10-08`)
-- [ ] (2026-09-23 list; item 3 shipped 2026-10-08.) The 2026-09-23 run
 - [ ] Run D-S21's privileged power-loss validation (sudo: dm-log-writes or a QEMU hard reset) *(owner)*
 - [x] read lane: **X-READ** Read-time newer-wins merge across overlapping segments, per series
 - [x] maint lane: **ROB-20** Maintenance resource limits, k-way merge, re-split of oversized frames (byte budget #765 + disk-guard reserve #761 + per-op time budget #781; `merge_k_way` #772; output re-split #773. The time budget is honoured between swaps only, and one already-oversized segment is not auto re-split)
