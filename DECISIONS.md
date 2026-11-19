@@ -8261,6 +8261,120 @@ thing the check sits in front of.
   holds can therefore still leave the stored row count above the number of rows a read returns,
   which is what #800 tracks.origin/mainorigin/main
 
+## 2026-11-17 — ROB-14 cut 2: enforce the container memory budget on request paths (shipped)
+- **MemoryBudget is now consulted on the server's request paths.** Cut 1 (#787) added the
+  machinery but no call sites; cut 2 adds the `try_reserve` calls.
+- **Ingest path.** `IngestBody::from_request` (`weft-server/src/ingest.rs`) reserves against the
+  memory budget using the same `reserved_bytes` (the declared `Content-Length` or the body cap) that
+  sizes the disk guard. A refusal is `503 over_budget` with `Retry-After: 1`. The guard is held for
+  the body's lifetime via the `_memory_guard: Option<Reservation>` field.
+- **Query/read path.** Every stored-data route in `weft-server/src/storage.rs` (13 handlers)
+  reserves a conservative per-row estimate (`ESTIMATED_BYTES_PER_ROW = 64` in `read_limits.rs`, a
+  doc comment explains the sizing rule and that it is an estimate, not exact accounting). The
+  `reserve_read_memory` helper clones the budget before `drop(state)`, reads the result rows, and
+  holds the guard through serialization.
+- **Refusal mapping.** `Code::OverBudget` → `503` with wire code `over_budget`. `with_retry_after(1)`
+  tells the caller to retry after 1 second. No new `Code`, status, or wire string was added; the
+  frozen code table at `error.rs:1138` is unchanged.
+- **Unbounded escape hatch.** When neither `WEFT_MEMORY_BUDGET_BYTES` nor a readable container limit
+  bounds the process, the budget is `MemoryBudget::new(None)` and every reservation succeeds —
+  behaviour is byte-for-byte what it was before this cut. Every test under default configuration
+  passes unchanged.
+- **Fixes.** Fixed a bug in the ingest code path (inherited from the initial cut-1 cherry-pick) where
+  the memory budget refusal used `.ok()`, silently swallowing a refused reservation. The corrected
+  code returns `Err` when the budget is exhausted.
+- **Gate.** This change was not compiled locally (the host has ~4 GB free and a build OOM-kills
+  the model server). Only the following were run: `rustfmt --edition 2021 --check` on touched
+  `.rs` files, `python3 scripts/ci/check-serial-order.py`, `python3 scripts/config/check_schema.py`
+  (both pre-existing warnings, unchanged by this cut), `git diff --check`.
+
+## 2026-11-17 — Where a memory reservation is taken matters more than its size (ROB-14 cut 2) (resolved)
+Cut 2 wires `MemoryBudget` into the request paths. Three judgement calls from the review of PR #805:
+- **The ingest reservation moved ahead of the body read.** `reserved_bytes` is known
+  from `content-length` (or the `WEFT_MAX_INGEST_BYTES` cap) before a single byte is
+  read, so `state.memory_budget().try_reserve(reserved_bytes)` now sits next to
+  `reserve_disk`, not after `check_body_truncation`. Reserving after the read would
+  only ever notice the pressure once the bytes were already in the process — which is
+  the failure this cut exists to prevent. The guard still lives for the body's whole
+  lifetime through `IngestBody::_memory_guard`.
+- **Downsample reserves against the grid the request declares, before the read.** When
+  both bounds are named, the bucket count is already refused against
+  `WEFT_MAX_DOWNSAMPLE_BUCKETS` at that point, so the same number reserves memory and
+  the guard covers bucket construction *and* serialization. A window naming neither
+  bound has no declared grid, so it is still accounted only on the count the reduction
+  actually produces — too late to bound the build, in time for the response body. That
+  asymmetry is deliberate: refusing an unbounded window on a number the client never
+  sent would break the documented contract, and the existing bucket cap plus
+  `WEFT_READ_TIMEOUT_SECS` are what hold that case.
+- **Budget tests must assert the counter, not only the status.** `oneshot` requests run
+  one at a time, so a read that succeeded has already released its reservation before
+  the next request arrives: a test that "fills the budget" with a sequential read and
+  then expects the next one to be refused proves nothing about contention. The helper
+  now hands the `MemoryBudget` back to the test, which holds it with
+  `try_reserve(64)` and asserts `reserved()` before and after — including that a
+  refused read leaves only the hold accounted, i.e. its own reservation rolled back.
+Left open on purpose: the reservation is an estimate (`ESTIMATED_BYTES_PER_ROW = 64`,
+`read_limits::ESTIMATED_BYTES_PER_ROW`), and per-format serialization cost (Arrow, CSV,
+JSON) is not accounted; the guard covers the response object, not the encoder's
+scratch. A cut that measured encoder peaks would need per-format cost tables that do
+not exist yet.
+
+## 2026-11-18 — Row-count / read parity for overlapping segments (#800)
+
+- **The defect.** `get_measurements_count` returned the sum of segment row counts from the
+  segment index, while range reads folded cross-segment overlaps newest-wins by segment id.
+  After two batches whose timestamps overlapped for the same series, the count was 6 while a
+  range read (newer-wins merge) returned 4.
+- **What was not chosen: making the count newest-wins/deduplicated.** It would cost more than
+  the read it summarises — every segment would need to be scanned per-timestamp — and would
+  make a cheap metadata operation expensive.
+- **What was not chosen: an unconditional fragmentation gate.** The gate declines on a
+  converged large aspect (`squash_aspect_to_target_rows_if_fragmented_held` returns `Ok(None)`
+  once `segment_count <= total_rows.div_ceil(target_rows)`), so the count could still diverge
+  from the read.
+- **What was chosen: guarantee at write time** that a batch's timestamps never overlap an
+  existing segment's `[min_ts,max_ts]` for the same series without folding that cluster first.
+  `ingest_batch_with_gate` now calls `store.reconcile_overlaps(&key)` after every ingest, in
+  addition to the existing fragmentation gate. `reconcile_overlaps` folds oldest → newest with
+  newer-wins semantics, is a no-op when nothing overlaps, and uses the maintenance lock so it
+  is safe against concurrent writes.
+- **Trade-off.** The fold at write time costs I/O on every overlap (a read-merge-write cycle of
+  the overlapping segment frames). For the common case — append-only writes at disjoint
+  timestamps — it is a no-op (the maintenance lock is acquired, the index is scanned, no
+  overlap is found, and no frames are touched). An inconsistent count silently misreported
+  capacity to operators and the quota/overload logic, so the small I/O cost on the rare
+  overlap path is acceptable.
+- **How the first commit's test, then on main, is red.** `count_agrees_with_range_read_after_overlapping_ingests`
+  in `weftdb/tests/legacy_seal_tests.rs` writes two overlapping batches and asserts
+  `get_measurements_count == read_rows().len()`. Before this fix the count was 6 and the read
+  returned 4; after the fix both are 4.
+- **Issue #802 overlap.** This change settles how superseded rows are accounted: they are
+  removed from the index when the overlap fold replaces the overlapping segments with a single
+  deduplicated segment. The count then reflects only the surviving rows.
+
+## 2026-11-19 — Seal-backed aspects replace, not append, at a shared timestamp (#802, SEAL-DUP)
+
+- **Newest call wins at a shared timestamp.** When two ingest calls share a timestamp on a
+  seal-backed aspect, the rows from the newer call are kept and the older call's rows at that
+  timestamp are discarded. Duplicates **inside one call** are all kept.
+- **Rows mode appends.** In rows mode, both rows survive because there is no unique constraint on
+  `timestamp` (the table has a non-unique index). A range read returns both.
+- **Why seal mode differs.** The seal store merges overlapping frame ranges with a correct
+  newer-wins fold (`weft-physical-type/src/split.rs`, `fold_newest_wins` and the underlying
+  `merge_k_way`). At a shared instant, only the newest member's rows survive — this is not a
+  special case for duplicate timestamps but a consequence of the merge rule for all overlapping
+  ranges. Rows inside one seal call land in one frame, so equal timestamps within a call are
+  not folded by the merge rule and are all kept.
+- **What a migrating user should expect.** An aspect created seal-backed (the default since #768)
+  can no longer store two different values at the same timestamp from two separate writes. The
+  newer write replaces the older. To preserve the rows-mode append behaviour, set
+  `WEFT_LEGACY_DEFAULT_STORAGE=rows` before creating the aspect.
+- **The in-frame duplicate is a separate question.** Rows inside one call with identical
+  timestamps and different values are all kept by both modes. No decision was taken on whether
+  that should change.
+
+## 2026-11-19 — (empty, placeholder for the next decision)
+
 ## 2026-11-17 — The expired-row purge runs unconditionally in every daemon tick (shipping)
 
 Issue #785, TTL cut 4. The store's `purge_expired` already returns cheaply when the policy is

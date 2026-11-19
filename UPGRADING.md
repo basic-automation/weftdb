@@ -12,6 +12,17 @@ release pins that every compatibility gate checks are in
 
 ---
 
+## Duplicate timestamps on seal-backed aspects (#802, SEAL-DUP)
+
+Aspect storage mode differences: **rows mode** stores every row at every timestamp; a
+range read returns all of them. **Seal-backed aspects** at a shared timestamp keep only
+the newest call's rows (duplicates inside one call are all kept). This is a behaviour
+change for any aspect that becomes seal-backed, because the rows mode they replaced
+appended. A migrating deployment whose workload depends on reading back multiple rows at
+the same timestamp must pin `WEFT_LEGACY_DEFAULT_STORAGE=rows` to stay in rows mode.
+
+---
+
 ## Layout 1 → layout 2 (v0.1.0 → v0.2.0)
 
 Every WeftDB release since v0.2.0 writes store **layout 2**. A layout 1 store (written
