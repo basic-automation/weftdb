@@ -2,7 +2,7 @@
 //!
 //! On `main` `git grep -l fan-out` matches only `DECISIONS.md`, `ROADMAP.md` and
 //! `docs/roadmap-notes.md` — there is **no measurement**. This arm opens a real
-//! [weftdb::SegmentStore], ingests a seeded multi-series corpus, then
+//! [`weftdb::SegmentStore`], ingests a seeded multi-series corpus, then
 //! reads every series at each rung of a series-count ladder (default 1, 10, 100, 1000)
 //! and records the wall time, rows read, and series touched.
 //!
@@ -48,10 +48,10 @@ impl Default for FanOutParams {
 }
 
 /// Default seed for fan-out profiles.
-pub const DEFAULT_FAN_OUT_SEED: u64 = 0xF0_1D_A7_0FF;
+pub const DEFAULT_FAN_OUT_SEED: u64 = 0x000F_01DA_70FF;
 
 /// A single ladder-rung measurement: the wall time to read `series_count` series.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FanOutRung {
 	/// How many series this rung read.
 	pub series_count: usize,
@@ -71,9 +71,11 @@ fn usize_to_u64(value: usize) -> u64 {
 	u64::try_from(value).unwrap_or(u64::MAX)
 }
 
-/// Run the fan-out benchmark: open a temporary store, ingest `max_series` tagged series
-/// (each with [`FanOutParams::rows_per_series`] rows), then for each rung in the ladder
-/// read every series in the rung and record the total wall time.
+/// Run the fan-out benchmark: a cost curve for reading across many tagged series.
+///
+/// Opens a temporary store and ingests `max_series` tagged series (each with
+/// [`FanOutParams::rows_per_series`] rows), then for each rung in the ladder reads every
+/// series in the rung and records the total wall time.
 ///
 /// The corpus is generated and ingested **once** (setup, excluded from per-rung timing);
 /// each rung re-reads the first `N` series against the same store and the timed span covers
@@ -81,6 +83,11 @@ fn usize_to_u64(value: usize) -> u64 {
 ///
 /// Correctness is gated: each series' read must return exactly [`FanOutParams::rows_per_series`]
 /// rows (the store's `read_time_range_of` returns the rows we wrote).
+///
+/// # Panics
+///
+/// Panics if a generated tag set is rejected, which cannot happen for the `s<i>` series
+/// tags this arm builds.
 ///
 /// # Errors
 ///
