@@ -8373,26 +8373,114 @@ not exist yet.
   timestamps and different values are all kept by both modes. No decision was taken on whether
   that should change.
 
-## 2026-11-19 — Multi-series crash cell (#341, TAG-12) (decided)
+## 2026-11-19 — (empty, placeholder for the next decision)
 
-- **What the multi-series cell proves.** When a process writing to 8 seal-backed aspects
-  in a single store is killed at `SFrameWritten` (the frame has reached disk but not yet
-  committed), every aspect independently recovers: the committed frames of each aspect
-  are exactly what a single-threaded replay of its committed batches would produce. No
-  aspect shows a value from a frame that never committed, and no aspect loses a value
-  whose frame did commit. The invariant holds because the seal store's frame write
-  (`write_seal_frame`) is write-once: a frame is fsynced before the fault point fires,
-  and the per-aspect generation counter ensures no frame name is reused, so crash litter
-  never becomes live data.
-- **What it does not prove.** This is a process-kill test, not a power-loss test. A
-  missing fsync (the kernel's write-back cache) is not detected — see the header of
-  `scripts/crash-matrix.sh` which already says a kill soak cannot see a missing fsync.
-  The test does not exercise the `SBetweenFrames` fault point (multi-frame chunks), the
-  `SDirSynced` point (directory sync after frame write), or the maintenance-path fault
-  points (`MPlanned`, `MPendingCommitted`, `MOutputWritten`, `MOutputSynced`, `MDirSynced`,
-  `MSwapped`). Those remain for future cells in the crash matrix.
-- **Why `SFrameWritten` was chosen.** It is the canonical mid-write point: the frame is
-  durably on disk but the index has not recorded it, so on recovery the orphan frame is
-  classified as crash litter. Every other point before commit (`SFrameSynced`, `SDirSynced`,
-  `SRowsInserted`) would leave a similarly orphaned frame; `SFrameWritten` is the earliest
-  fault point after the first durable write and thus the broadest mid-write signal.
+## 2026-11-17 — Shadow-segment guard and chunked swap plans for TTL purge (#797, #798)
+
+The brief (#797 weftdb) describes a defect where a wholly-expired correction segment whose
+timeline extent overlaps a surviving segment of the same series is dropped by
+`purge_aspect_held`, causing a plain (non-TTL) read to revert to the superseded values.
+The same brief describes #798: an aspect with more than 32 series causes
+`swap_plans` to bail with "at most 32 plans". Two decisions:
+
+- **The guard is overlap on timeline extent, not on the exact timestamp set.** A doomed
+  segment whose `[min_ts, max_ts]` interval overlaps any surviving segment of the same
+  series is kept on disk. This is the simplest test that prevents the revert; a finer
+  check (matching actual timestamps) would require decoding the segment, adding a
+  read-cost for an already-expensive pass, and the window for false positives is small
+  (a wholly-expired segment that happens to have no timestamp in common but whose extent
+  overlaps a survivor's extent)
+- **Chunking rather than raising `MAX_PLANS_PER_TXN`.** The constant is 32 and guards
+  against a single transaction that is too large for the store. Raising it would push the
+  risk to the database without addressing the structural problem of an aspect with many
+  series. Instead `purge_aspect_held` now submits plans in chunks of `MAX_PLANS_PER_TXN`
+  each through its own `swap_plans` call. When a later chunk fails, the swaps of earlier
+  chunks are already committed; the function returns `Ok` with `completed: false` so the
+  caller counts the real drops and does not charge the circuit breaker, ensuring the next
+  pass retries the remaining segments.
+- **No attempt to backfill the count for older segments.** The `shadowed_and_kept` field
+  starts at zero; the first full-purge pass after the upgrade will count correctly.
+- **Partial-failure test not provable from the test harness.** The test named
+  `purge_33_series_partial_chunk_failure` creates 34 series to force two chunks and
+  asserts at least 32 drops (the first chunk). A deliberate, controlled chunk failure
+  would require the `fault-injection` feature or corrupting on-disk segment files, both
+  outside the scope of the lib test suite. The happy path of the chunking is covered by
+  `purge_drops_33_series_in_one_pass`; the failure path is covered by code inspection and
+  the logical argument that each chunk's swap commits in its own transaction.
+
+## 2026-11-18 — A plain read is not TTL-filtered, so a purge legitimately changes it (#797, #798)
+
+`purge_drops_a_fully_expired_segment_and_keeps_a_straddling_one` compared `read_time_range_of_with_expiry` before and after the purge and required it to be unchanged: a purge may delete frames, and the filter already hid their rows, so no filtered answer moves. When this slice added a plain-read comparison to the same fixture it inherited that reasoning and asserted `before_plain == after_plain`, which is false: `read_time_range` applies no TTL at all, so the wholly expired frame at instants 60..=79 is part of the plain answer, and dropping it legitimately takes those twenty rows with it. CI said so (`left` held 60..=79 plus 85..=120, `right` held only 85..=120). The assertion now pins the real contract instead — the dropped frame's instants are absent afterwards, the plain read loses exactly twenty rows, and the straddling frame still spans 85..=120. A purge's promise is that the *filtered* answer and the surviving frames' data are untouched; it has never promised that an unfiltered scan keeps returning rows it no longer has on disk.
+
+The companion lesson is about fixtures, not production code. The #797 reproduction ingested both frames under the same idempotency key (`IngestBatch::dense("s1", …)` twice), and the second ingest was refused with "aspect "temp" already holds idempotency key "s1" for a different batch … nothing was written" — so the overlap the test meant to create never existed, and the test would have been vacuous even with the assertions rewritten. An idempotency key names one batch; series identity comes from the measurement tags. Two frames of one series therefore need two batch keys and the same (untagged) value shape.
+
+## 2026-11-19 — The idempotency unit is the call, not the payload (#803)
+
+- **Rejected: single-use `DatasetId` as the key.** Oracle option B would repurpose `DatasetId` as
+  a per-call token, keying the ledger as `legacy:{dataset_uuid}` and routing a reused id with a
+  different payload to `IdempotencyConflict` (HTTP 409).  The premise — "no caller reuses one
+  `DatasetId` for many payloads" — is falsified by `bulk_ingest_converges_at_small_target`,
+  `gated_bulk_read_path_correctness` and
+  `seal_backed_aspect_round_trips_replays_and_widens`, which all reuse one `DatasetId` across
+  distinct payloads and expect every write to land.  `DatasetId` is a **logical, multi-write
+  identity** (`weftdb/src/types/dataset.rs:9-10`, `rows_mode.rs:25-27`).
+- **The A-B-A argument.**  No pure `(DatasetId, payload) -> key` function can distinguish "retry
+  of A" from "new submission of identical content A′", so the only sound fix is a caller-minted
+  per-call token.  The adopted design splits the two identities the adapter previously conflated:
+  `DatasetId` stays a stable logical identity, while the seal idempotency unit becomes an explicit
+  per-call token (UUIDv4 when the caller supplies `None`).  The store already has the right
+  primitive (`SegmentStore::ingest` keyed by `(aspect, batch.key)`); the adapter now stops
+  bypassing it with a derived key.
+- **Deliberate scope choice.**  Crash-safe typed-API replay is left to the HTTP layer's existing
+  `Idempotency-Key` (`weft-server/src/ingest.rs:701-709`).  The typed seal path with `None` is
+  append-only, matching rows-mode's documented "no idempotency key" contract.  No `Inputs` trait
+  method signatures were changed in this slice.
+- **Reviewer invariant.**  A seal ingest key is minted once per logical write call and is **never**
+  a function of the payload.  No call site may feed a content hash into `IngestBatch::key`.
+  Presenting the same explicit token with the same batch replays; presenting a different token (or
+  a fresh nonce) always yields a distinct key and therefore a distinct write — never a silent
+  replay of a stale receipt.
+- **Separate, still-open availability point.**  The surviving 64-bit FNV-1a fingerprint
+  (`weftdb/src/types/ingest.rs:162-180`) can produce a false `IdempotencyConflict`.
+  Not addressed here.
+
+## 2026-11-19 — (empty, placeholder for the next decision)
+
+## 2026-11-17 — Shadow-segment guard and chunked swap plans for TTL purge (#797, #798)
+
+The brief (#797 weftdb) describes a defect where a wholly-expired correction segment whose
+timeline extent overlaps a surviving segment of the same series is dropped by
+`purge_aspect_held`, causing a plain (non-TTL) read to revert to the superseded values.
+The same brief describes #798: an aspect with more than 32 series causes
+`swap_plans` to bail with "at most 32 plans". Two decisions:
+
+- **The guard is overlap on timeline extent, not on the exact timestamp set.** A doomed
+  segment whose `[min_ts, max_ts]` interval overlaps any surviving segment of the same
+  series is kept on disk. This is the simplest test that prevents the revert; a finer
+  check (matching actual timestamps) would require decoding the segment, adding a
+  read-cost for an already-expensive pass, and the window for false positives is small
+  (a wholly-expired segment that happens to have no timestamp in common but whose extent
+  overlaps a survivor's extent)
+- **Chunking rather than raising `MAX_PLANS_PER_TXN`.** The constant is 32 and guards
+  against a single transaction that is too large for the store. Raising it would push the
+  risk to the database without addressing the structural problem of an aspect with many
+  series. Instead `purge_aspect_held` now submits plans in chunks of `MAX_PLANS_PER_TXN`
+  each through its own `swap_plans` call. When a later chunk fails, the swaps of earlier
+  chunks are already committed; the function returns `Ok` with `completed: false` so the
+  caller counts the real drops and does not charge the circuit breaker, ensuring the next
+  pass retries the remaining segments.
+- **No attempt to backfill the count for older segments.** The `shadowed_and_kept` field
+  starts at zero; the first full-purge pass after the upgrade will count correctly.
+- **Partial-failure test not provable from the test harness.** The test named
+  `purge_33_series_partial_chunk_failure` creates 34 series to force two chunks and
+  asserts at least 32 drops (the first chunk). A deliberate, controlled chunk failure
+  would require the `fault-injection` feature or corrupting on-disk segment files, both
+  outside the scope of the lib test suite. The happy path of the chunking is covered by
+  `purge_drops_33_series_in_one_pass`; the failure path is covered by code inspection and
+  the logical argument that each chunk's swap commits in its own transaction.
+
+## 2026-11-18 — A plain read is not TTL-filtered, so a purge legitimately changes it (#797, #798)
+
+`purge_drops_a_fully_expired_segment_and_keeps_a_straddling_one` compared `read_time_range_of_with_expiry` before and after the purge and required it to be unchanged: a purge may delete frames, and the filter already hid their rows, so no filtered answer moves. When this slice added a plain-read comparison to the same fixture it inherited that reasoning and asserted `before_plain == after_plain`, which is false: `read_time_range` applies no TTL at all, so the wholly expired frame at instants 60..=79 is part of the plain answer, and dropping it legitimately takes those twenty rows with it. CI said so (`left` held 60..=79 plus 85..=120, `right` held only 85..=120). The assertion now pins the real contract instead — the dropped frame's instants are absent afterwards, the plain read loses exactly twenty rows, and the straddling frame still spans 85..=120. A purge's promise is that the *filtered* answer and the surviving frames' data are untouched; it has never promised that an unfiltered scan keeps returning rows it no longer has on disk.
+
+The companion lesson is about fixtures, not production code. The #797 reproduction ingested both frames under the same idempotency key (`IngestBatch::dense("s1", …)` twice), and the second ingest was refused with "aspect "temp" already holds idempotency key "s1" for a different batch … nothing was written" — so the overlap the test meant to create never existed, and the test would have been vacuous even with the assertions rewritten. An idempotency key names one batch; series identity comes from the measurement tags. Two frames of one series therefore need two batch keys and the same (untagged) value shape.

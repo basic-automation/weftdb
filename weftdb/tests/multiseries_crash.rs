@@ -23,9 +23,7 @@ use chrono::{TimeZone, Utc};
 use serial_test::serial;
 use uuid::Uuid;
 use weftdb::{
-	database::traits::DatabaseStructure,
-	durable::fault::{self, FaultAction, FaultPoint, FAULT_ENV},
-	clear_connection_cache_by_name, Database, DatasetId, InputMeasurement, Outputs,
+	clear_connection_cache_by_name, database::traits::DatabaseStructure, durable::fault::{self, FaultAction, FaultPoint, FAULT_ENV}, Database, DatasetId, InputMeasurement, Outputs
 };
 
 /// The env var naming the test database. The child reads this to know which database to
@@ -48,13 +46,7 @@ fn batch_timestamps(aspect_index: usize, batch: usize) -> [i64; BATCH_ROWS] {
 /// The value for a given aspect's row in a given batch — each is unique and
 /// deterministically derivable.
 fn batch_value(aspect_index: usize, batch: usize, row: usize) -> BigDecimal {
-	BigDecimal::from_str(&format!(
-		"{}.{:02}{:02}",
-		aspect_index * 100 + batch * 10 + row,
-		aspect_index,
-		batch * 3 + row,
-	))
-	.expect("valid BigDecimal")
+	BigDecimal::from_str(&format!("{}.{:02}{:02}", aspect_index * 100 + batch * 10 + row, aspect_index, batch * 3 + row,)).expect("valid BigDecimal")
 }
 
 /// The planned measurements for one batch of one aspect.
@@ -62,10 +54,7 @@ fn planned_batch(aspect_index: usize, batch: usize) -> Vec<InputMeasurement> {
 	let ts = batch_timestamps(aspect_index, batch);
 	let mut measurements = Vec::with_capacity(BATCH_ROWS);
 	for (i, t) in ts.iter().enumerate() {
-		let dt = Utc
-			.timestamp_millis_opt(*t)
-			.single()
-			.expect("valid timestamp");
+		let dt = Utc.timestamp_millis_opt(*t).single().expect("valid timestamp");
 		let value = batch_value(aspect_index, batch, i);
 		measurements.push(InputMeasurement::new(dt, value));
 	}
@@ -79,10 +68,7 @@ fn planned_batch(aspect_index: usize, batch: usize) -> Vec<InputMeasurement> {
 fn suppress_core_dump() {
 	#[cfg(unix)]
 	{
-		let none = libc::rlimit {
-			rlim_cur: 0,
-			rlim_max: 0,
-		};
+		let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
 		// SAFETY: setrlimit only reads the struct, for the duration of the call.
 		unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const none) };
 	}
@@ -115,9 +101,7 @@ async fn child() -> Result<()> {
 	};
 	suppress_core_dump();
 
-	let name = name
-		.into_string()
-		.map_err(|raw| anyhow::anyhow!("{raw:?} is not UTF-8"))?;
+	let name = name.into_string().map_err(|raw| anyhow::anyhow!("{raw:?} is not UTF-8"))?;
 	let db = Database::existing(&name).await?;
 
 	// Write round 1 to every aspect (3 rows each). No fault is armed, so all
@@ -126,8 +110,7 @@ async fn child() -> Result<()> {
 		let aspect_name = format!("series_{i}");
 		let aspect = db.get_aspect_by_name(&aspect_name).await?;
 		let measurements = planned_batch(i, 0);
-		db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements)
-			.await?;
+		db.batch_capture_measurements(aspect.id(), DatasetId::new(), measurements).await?;
 	}
 
 	// Arm the fault: the next frame write aborts.
@@ -137,8 +120,7 @@ async fn child() -> Result<()> {
 	// but never commits.
 	let aspect0 = db.get_aspect_by_name("series_0").await?;
 	let measurements = planned_batch(0, 1);
-	db.batch_capture_measurements(aspect0.id(), DatasetId::new(), measurements)
-		.await?;
+	db.batch_capture_measurements(aspect0.id(), DatasetId::new(), measurements).await?;
 
 	panic!("{FAULT_ENV} did not abort batch_capture_measurements");
 }
@@ -158,10 +140,7 @@ async fn child() -> Result<()> {
 #[tokio::test]
 async fn a_multiseries_crash_at_sframe_written_is_recoverable() -> Result<()> {
 	let temp_dir = tempfile::tempdir()?;
-	let data_dir = temp_dir
-		.path()
-		.to_str()
-		.context("temp data dir is not valid UTF-8")?;
+	let data_dir = temp_dir.path().to_str().context("temp data dir is not valid UTF-8")?;
 	std::env::set_var("WEFT_DATA_DIR", data_dir);
 	// Default storage is already seal-backed since #768; set explicitly to
 	// avoid depending on a future default change.
@@ -175,14 +154,7 @@ async fn a_multiseries_crash_at_sframe_written_is_recoverable() -> Result<()> {
 	let mut aspect_ids = Vec::with_capacity(N_SERIES);
 	for i in 0..N_SERIES {
 		let aspect_name = format!("series_{i}");
-		let aspect = db
-			.track_aspect(
-				&subject.id(),
-				&aspect_name,
-				&splimes::Resolution::Milliseconds,
-				None,
-			)
-			.await?;
+		let aspect = db.track_aspect(&subject.id(), &aspect_name, &splimes::Resolution::Milliseconds, None).await?;
 		aspect_ids.push(aspect.id());
 	}
 
@@ -192,12 +164,7 @@ async fn a_multiseries_crash_at_sframe_written_is_recoverable() -> Result<()> {
 
 	// ── Spawn child ───────────────────────────────────────────────────────
 	let output = std::process::Command::new(std::env::current_exe()?)
-		.args([
-			"multiseries_crash::child",
-			"--exact",
-			"--nocapture",
-			"--test-threads=1",
-		])
+		.args(["multiseries_crash::child", "--exact", "--nocapture", "--test-threads=1"])
 		.env(CHILD_ENV, &name)
 		.env("WEFT_DATA_DIR", data_dir)
 		.env("WEFT_LEGACY_DEFAULT_STORAGE", "segments")
@@ -208,17 +175,10 @@ async fn a_multiseries_crash_at_sframe_written_is_recoverable() -> Result<()> {
 	#[cfg(unix)]
 	{
 		use std::os::unix::process::ExitStatusExt;
-		assert_eq!(
-			output.status.signal(),
-			Some(6),
-			"killed by SIGABRT: {output:?}"
-		);
+		assert_eq!(output.status.signal(), Some(6), "killed by SIGABRT: {output:?}");
 	}
 	let stderr = String::from_utf8_lossy(&output.stderr);
-	assert!(
-		stderr.contains("aborting at fault point S-frame-written"),
-		"the child reached SFrameWritten: {output:?}"
-	);
+	assert!(stderr.contains("aborting at fault point S-frame-written"), "the child reached SFrameWritten: {output:?}");
 
 	// ── Reopen and verify ─────────────────────────────────────────────────
 	let db = Database::existing(&name).await?;
@@ -229,43 +189,24 @@ async fn a_multiseries_crash_at_sframe_written_is_recoverable() -> Result<()> {
 		let aspect_id = aspect_ids[i];
 
 		// Read all measurements for this aspect.
-		let measurements: Vec<_> = db
-			.get_raw_measurements(&aspect_id, None, None, 1000, 0)
-			.await?
-			.collect::<Vec<_>>()
-			.await;
+		let measurements: Vec<_> = db.get_raw_measurements(&aspect_id, None, None, 1000, 0).await?.collect::<Vec<_>>().await;
 
 		// Every aspect must have exactly the first batch: 3 rows, no
 		// cross-contamination, no phantom data from the aborting second batch.
-		assert_eq!(
-			measurements.len(),
-			BATCH_ROWS,
-			"aspect {i} ({aspect_name}): got {} rows, expected {BATCH_ROWS} (the abort fired before the second batch committed)",
-			measurements.len(),
-		);
+		assert_eq!(measurements.len(), BATCH_ROWS, "aspect {i} ({aspect_name}): got {} rows, expected {BATCH_ROWS} (the abort fired before the second batch committed)", measurements.len(),);
 
 		// Verify each row matches the planned first-batch data.
 		let planned = planned_batch(i, 0);
 		// Sort the measurements by timestamp for deterministic comparison.
-		let mut sorted = measurements
-			.into_iter()
-			.collect::<std::result::Result<Vec<_>, _>>()?;
+		let mut sorted = measurements.into_iter().collect::<std::result::Result<Vec<_>, _>>()?;
 		sorted.sort_by_key(|m| m.timestamp());
 
 		for (row_index, measurement) in sorted.iter().enumerate() {
 			let expected_ts = batch_timestamps(i, 0)[row_index];
 			let expected_value = batch_value(i, 0, row_index);
 
-			assert_eq!(
-				measurement.timestamp().timestamp_millis(),
-				expected_ts,
-				"aspect {i} ({aspect_name}), row {row_index}: timestamp mismatch"
-			);
-			assert_eq!(
-				measurement.value(),
-				&expected_value,
-				"aspect {i} ({aspect_name}), row {row_index}: value mismatch"
-			);
+			assert_eq!(measurement.timestamp().timestamp_millis(), expected_ts, "aspect {i} ({aspect_name}), row {row_index}: timestamp mismatch");
+			assert_eq!(measurement.value(), &expected_value, "aspect {i} ({aspect_name}), row {row_index}: value mismatch");
 		}
 	}
 
