@@ -8259,4 +8259,27 @@ thing the check sits in front of.
   `segment_count <= total_rows.div_ceil(target_rows)`, and `SQUASH_TARGET_ROWS` is 100 000) and its
   failure is logged at debug level. A batch that rewrites a timestamp an existing segment already
   holds can therefore still leave the stored row count above the number of rows a read returns,
-  which is what #800 tracks.origin/mainorigin/main
+  which is what #800 tracks.
+
+## 2026-11-19 — Seal-backed aspects replace, not append, at a shared timestamp (#802, SEAL-DUP)
+
+- **Newest call wins at a shared timestamp.** When two ingest calls share a timestamp on a
+  seal-backed aspect, the rows from the newer call are kept and the older call's rows at that
+  timestamp are discarded. Duplicates **inside one call** are all kept.
+- **Rows mode appends.** In rows mode, both rows survive because there is no unique constraint on
+  `timestamp` (the table has a non-unique index). A range read returns both.
+- **Why seal mode differs.** The seal store merges overlapping frame ranges with a correct
+  newer-wins fold (`weft-physical-type/src/split.rs`, `fold_newest_wins` and the underlying
+  `merge_k_way`). At a shared instant, only the newest member's rows survive — this is not a
+  special case for duplicate timestamps but a consequence of the merge rule for all overlapping
+  ranges. Rows inside one seal call land in one frame, so equal timestamps within a call are
+  not folded by the merge rule and are all kept.
+- **What a migrating user should expect.** An aspect created seal-backed (the default since #768)
+  can no longer store two different values at the same timestamp from two separate writes. The
+  newer write replaces the older. To preserve the rows-mode append behaviour, set
+  `WEFT_LEGACY_DEFAULT_STORAGE=rows` before creating the aspect.
+- **The in-frame duplicate is a separate question.** Rows inside one call with identical
+  timestamps and different values are all kept by both modes. No decision was taken on whether
+  that should change.
+
+## 2026-11-19 — (empty, placeholder for the next decision)

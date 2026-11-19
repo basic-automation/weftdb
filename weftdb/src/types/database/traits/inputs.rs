@@ -58,9 +58,12 @@ pub trait Inputs {
 	//
 
 	/// Capture a new measurement for a given aspect
-	/// No duplicate handling: a timestamp already stored is stored again, so a range
-	/// read returns both rows. Nothing is averaged and no error is raised — see the
+	/// For **rows mode**: a timestamp already stored is stored again, so a range read
+	/// returns both rows. Nothing is averaged and no error is raised — see the
 	/// note on [`batch_capture_measurements`](Self::batch_capture_measurements).
+	/// For **seal-backed aspects** (#802): at a shared timestamp only the newest call's
+	/// rows survive (rows inside one call are all kept). This replaces behaviour from
+	/// rows mode, where both rows were kept.
 	///
 	/// # Crash consistency (rows mode)
 	///
@@ -90,13 +93,14 @@ pub trait Inputs {
 
 	/// Capture one measurement with a plain insert.
 	///
-	/// No duplicate handling of any kind: rows mode has no unique constraint to
-	/// violate (`weftdb/src/types/aspect.rs:511-523` creates `measurements` with a
+	/// No duplicate handling: rows mode has no unique constraint to violate
+	/// (`weftdb/src/types/aspect.rs:511-523` creates `measurements` with a
 	/// non-unique index on `timestamp`), so a timestamp already stored is stored
 	/// again and a range read returns both rows; nothing is averaged and no error
-	/// is raised, whatever the older version of this comment said. A seal-backed
-	/// aspect appends through the seal store the same way (#232), and equal
-	/// timestamps there resolve at read time with the newer row winning.
+	/// is raised, whatever the older version of this comment said. Seal-backed
+	/// aspects differ (#802): at a shared timestamp only the newest call's rows
+	/// survive (rows inside one call are all kept). Equal timestamps across calls
+	/// resolve newest-first when the frames are read.
 	///
 	/// # Errors
 	///
@@ -112,9 +116,10 @@ pub trait Inputs {
 
 	/// Capture multiple measurements for a given aspect
 	/// No duplicate handling: rows mode inserts every row, a timestamp already stored
-	/// twice is stored twice, and a seal-backed aspect ingests the batch as an append
-	/// whose equal timestamps resolve newest-first when the frames are read. Nothing
-	/// is averaged, whatever the older version of this comment said (#232).
+	/// twice is stored twice. A seal-backed aspect at a shared timestamp keeps only the
+	/// newest call's rows (rows inside one call are all kept). This is a behaviour
+	/// change from rows mode (#802, SEAL-DUP). Nothing is averaged, whatever the older
+	/// version of this comment said (#232).
 	///
 	/// # Crash consistency (rows mode)
 	///
