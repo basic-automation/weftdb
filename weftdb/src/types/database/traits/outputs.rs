@@ -42,6 +42,16 @@ pub trait Outputs {
 
 	async fn get_raw_measurements(&self, aspect_id: &AspectId, start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>, max_per_page: usize, page: usize) -> Result<Pin<Box<dyn Stream<Item = Result<Measurement>> + Send + 'static>>>;
 
+	/// Return the total number of measurements for `aspect_id`.
+	///
+	/// # Invariant (seal-backed)
+	///
+	/// On a seal-backed aspect this equals the number of rows a full-range
+	/// [`get_raw_measurements`](Self::get_raw_measurements) would return: the
+	/// segment index is kept overlap-free at write time by
+	/// [`ingest_batch_with_gate`](crate::legacy_seal::ingest_batch_with_gate),
+	/// which calls [`reconcile_overlaps`] after every ingest so overlapping
+	/// timestamp ranges are folded before the count is published.
 	async fn get_measurements_count(&self, aspect_id: &AspectId) -> Result<usize>;
 
 	async fn parse_measurement_row(&self, row: turso::Row) -> Result<Measurement>;

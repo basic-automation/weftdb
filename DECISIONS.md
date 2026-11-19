@@ -8260,3 +8260,36 @@ thing the check sits in front of.
   failure is logged at debug level. A batch that rewrites a timestamp an existing segment already
   holds can therefore still leave the stored row count above the number of rows a read returns,
   which is what #800 tracks.origin/mainorigin/main
+
+## 2026-11-18 — Row-count / read parity for overlapping segments (#800)
+
+- **The defect.** `get_measurements_count` returned the sum of segment row counts from the
+  segment index, while range reads folded cross-segment overlaps newest-wins by segment id.
+  After two batches whose timestamps overlapped for the same series, the count was 6 while a
+  range read (newer-wins merge) returned 4.
+- **What was not chosen: making the count newest-wins/deduplicated.** It would cost more than
+  the read it summarises — every segment would need to be scanned per-timestamp — and would
+  make a cheap metadata operation expensive.
+- **What was not chosen: an unconditional fragmentation gate.** The gate declines on a
+  converged large aspect (`squash_aspect_to_target_rows_if_fragmented_held` returns `Ok(None)`
+  once `segment_count <= total_rows.div_ceil(target_rows)`), so the count could still diverge
+  from the read.
+- **What was chosen: guarantee at write time** that a batch's timestamps never overlap an
+  existing segment's `[min_ts,max_ts]` for the same series without folding that cluster first.
+  `ingest_batch_with_gate` now calls `store.reconcile_overlaps(&key)` after every ingest, in
+  addition to the existing fragmentation gate. `reconcile_overlaps` folds oldest → newest with
+  newer-wins semantics, is a no-op when nothing overlaps, and uses the maintenance lock so it
+  is safe against concurrent writes.
+- **Trade-off.** The fold at write time costs I/O on every overlap (a read-merge-write cycle of
+  the overlapping segment frames). For the common case — append-only writes at disjoint
+  timestamps — it is a no-op (the maintenance lock is acquired, the index is scanned, no
+  overlap is found, and no frames are touched). An inconsistent count silently misreported
+  capacity to operators and the quota/overload logic, so the small I/O cost on the rare
+  overlap path is acceptable.
+- **How the first commit's test, then on main, is red.** `count_agrees_with_range_read_after_overlapping_ingests`
+  in `weftdb/tests/legacy_seal_tests.rs` writes two overlapping batches and asserts
+  `get_measurements_count == read_rows().len()`. Before this fix the count was 6 and the read
+  returned 4; after the fix both are 4.
+- **Issue #802 overlap.** This change settles how superseded rows are accounted: they are
+  removed from the index when the overlap fold replaces the overlapping segments with a single
+  deduplicated segment. The count then reflects only the surviving rows.
