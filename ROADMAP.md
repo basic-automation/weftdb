@@ -100,13 +100,8 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] **Legacy seal routing defects** *(found 2026-11-17 by a read-only audit of #769, #770 and #780; these gate the seal-backed default in #768)*
   - [x] **SEAL-COUNT** The count of a seal-backed aspect agrees with what a range read returns after a batch rewrites a timestamp (#800, 2026-11-19: `ingest_batch_with_gate` now folds overlapping clusters with `SegmentStore::reconcile_overlaps` after every ingest, so the segment index stays overlap-free and the rollup count equals the read)
   - [ ] **SEAL-REPLACE** `replace_measurements_in_range` and `compress()` never write to the unread rows file of a seal-backed aspect (#801)
-<<<<<<< HEAD
-  - [ ] **SEAL-DUP** The replace-not-append rule for duplicate timestamps is documented and pinned by a test (#802)
-  - [x] **SEAL-IDEM** A reused `DatasetId` cannot lose a write or fail on a CRC-32 collision (#803)
-=======
   - [x] **SEAL-DUP** The replace-not-append rule for duplicate timestamps is documented and pinned by a test (#802)
-  - [ ] **SEAL-IDEM** A reused `DatasetId` cannot lose a write or fail on a CRC-32 collision (#803)
->>>>>>> origin/main
+  - [x] **SEAL-IDEM** A reused `DatasetId` cannot lose a write or fail on a CRC-32 collision (#803, 2026-11-19: the key is derived from a per-call token, so a reused `DatasetId` cannot absorb a write, and a key collision stays a loud `StoreIdempotencyConflict`)
 - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
 - [ ] Write or approve the honesty-page narrative *(owner)*
 - [ ] Report the three `parquet` 60.0.0 decoder panics and the `arrow-buffer` 60.0.0 panic upstream to apache/arrow-rs *(owner: outward-facing)*
