@@ -19,6 +19,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `capture_measurement`-side call sites in `inputs.rs` were removed — they moved into the
   bulk path.
 - **A refused maintenance plan has its own HTTP answer (#764).**- **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**- **`WEFT_MEMORY_BUDGET_BYTES` and the cgroup limit are now read and held (#788).**
+- **A fan-out benchmark arm — the cost of reading across many series (#809, TAG-12).**
+`weft-bench --fan-out` opens a real `SegmentStore`, ingests a seeded corpus of tagged series
+(1 000 rows each by default), and then reads every series at each rung of a series-count ladder
+(1, 10, 100, 1000), reporting wall time, rows read and series touched per rung. It is the
+multi-series read cost curve the TSBS tag-grouped queries that TAG-12 moved here need. It measures
+our own engine: the vendor racing rules in `docs/benchmark-policy.md` are not engaged by it.
 - **The reconcile daemon defers its passes when the memory budget has no headroom (#806,
 ROB-14 cut 3).** Each of the six tick functions in `weft-server/src/reconcile_daemon.rs`
 now asks `has_budget_for_pass` before it touches the store: with a limit set (the

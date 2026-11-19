@@ -8443,3 +8443,26 @@ carries on past a failing aspect. A whole-sweep failure (the aspect list itself 
 logged and the tick continues.origin/main
 
 origin/mainorigin/mainorigin/mainorigin/mainorigin/mainorigin/main
+## 2026-11-17 — What the fan-out arm measures, and what it refuses to be (TAG-12, #807) (decided)
+
+- **A cost curve, not a race.** `docs/benchmark-policy.md` governs measuring against another vendor,
+  and this arm races nothing: it publishes our own wall-time curve across a series-count ladder. The
+  module doc says so in its own words, because the file sits next to the arms that do engage those
+  rules and a reader should not have to open the policy to know which category a number came from.
+  The other half of TAG-12, the multi-series crash matrix, is claimed elsewhere, so this slice is the
+  measurement half only.
+- **A ladder, not a point.** `FanOutParams::default()` is 1, 10, 100, 1000 series at 1 000 rows each
+  under a 1 000-second read window, seeded by `DEFAULT_FAN_OUT_SEED`. A single series count cannot
+  show the shape of the curve, and publishing the seed means a run regenerates the corpus exactly.
+- **Ingest is setup and is excluded from the timed span.** The corpus is built once; each rung
+  re-reads the first N series from the same store. Timing the ingest as well would make this arm
+  measure writes, which the ingest-growth and online arms already do.
+- **Correctness is asserted inside the timed loop.** `run_fan_out` fails the run when a series does
+  not return exactly `rows_per_series` rows, because a fan-out curve from a store that quietly
+  returned fewer rows is not a measurement, and a number that is fast because it read less is the
+  worst kind of benchmark result.
+- **The tests take `serial_test`.** They open real stores under a temp root, so they run one at a
+  time rather than contending with each other; `weft-bench` had never needed the dependency before
+  because its other arms build segments in memory.
+- **CI is the first execution.** Nothing here was compiled or run locally: this host cannot build the
+  workspace without OOM-killing the model server.
