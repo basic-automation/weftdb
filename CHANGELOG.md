@@ -145,6 +145,13 @@ origin/main
   separate swap transactions; a later chunk that fails does not undo the drops of earlier
   chunks, and `completed` is set to `false` in the returned `AspectExpirySwept` so the caller
   does not charge the breaker and the next sweep retries the remaining segments.
+- **Seal-backed aspects replace at shared timestamps, rows mode appends (#802).**
+  At a timestamp that two ingest calls share, a seal-backed aspect keeps only the newest
+  call's rows (duplicates inside one call are all kept). This is a behaviour change from
+  rows mode, where both rows are stored. The test
+  `seal_backed_new_measurement_entry_points_reach_the_seal` now asserts that the new value
+  is present and the old value is absent after a duplicate-timestamp write, for a single-row
+  write and for a batch write.
 - **A seal-backed aspect's row count now agrees with what a range read returns (#800).**
   The count is answered from the segment rollup (`aspect_stats().total_rows`), which sums every
   segment's rows, while a range read folds overlapping timestamp ranges newest-wins. After a
@@ -158,6 +165,8 @@ origin/main
   overlaps). The gate on its own could not have done it: whether it folds at all is a function
   of `total_rows / target_rows`, so a small aspect can be left fragmented.
 origin/main
+  of `total_rows / target_rows`, so a small aspect can be left fragmented.origin/main
+
 - **A seal-backed legacy aspect's bulk writes now reach the store it reads from (#232).**
   `capture_new_measurement` and `batch_capture_new_measurements`
   (`weftdb/src/types/database/inputs.rs`) wrote into the per-aspect rows-mode

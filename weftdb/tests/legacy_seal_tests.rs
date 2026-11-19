@@ -390,13 +390,37 @@ async fn seal_backed_new_measurement_entry_points_reach_the_seal() -> Result<()>
 	assert!(sealed.contains(&(base_ms, bd("1.25"))), "the batch's first row is in the seal frames");
 	assert!(sealed.contains(&(base_ms + 9_000, bd("9.5"))), "the single-row write is in the seal frames, stored as written");
 
-	// A second write at a timestamp the aspect already holds reports success and adds
-	// no row. Three doc passages claimed these entry points error on a duplicate
-	// timestamp; they do not. What the store does with the row -- replaces the value
-	// there, as the seal's newer-wins merge would, or drops it -- is not settled by
-	// anything I have run, so neither is asserted. Only the count is.
+	// A second write at a timestamp the aspect already holds replaces the old value:
+	// the newest call's rows win at a shared timestamp on seal-backed aspects
+	// (SEAL-DUP #802). Duplicates inside the same call are all kept; duplicates
+	// across calls replace.
 	db.capture_new_measurement(&aspect_id, &dataset, &InputMeasurement::new(base, bd("100.5"))).await?;
 	assert_eq!(db.get_measurements_count(&aspect_id).await?, 5, "a second row at a timestamp the aspect already has leaves the count where it was");
+
+	// The new value is present and the old value is absent at the rewritten timestamp.
+	let store2 = db.seal_store().await?;
+	let sealed2 = weftdb::legacy_seal::read_rows(&store2, &aspect_id, None, None).await?;
+	drop(store2);
+	assert!(sealed2.contains(&(base_ms, bd("100.5"))), "the single-row duplicate write replaced the value at base with 100.5");
+	assert!(!sealed2.contains(&(base_ms, bd("1.25"))), "the old value at base was replaced and is gone");
+
+	// Batch write with overlapping timestamps also replaces: the new batch's rows
+	// at a shared timestamp supersede the older rows.
+	db.batch_capture_new_measurements(&aspect_id, &dataset, vec![InputMeasurement::new(base + Duration::seconds(1), bd("200.5")), InputMeasurement::new(base + Duration::seconds(2), bd("300.5"))]).await?;
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 5, "the batch duplicate write replaced two rows; count stays at 5");
+
+	let store3 = db.seal_store().await?;
+	let sealed3 = weftdb::legacy_seal::read_rows(&store3, &aspect_id, None, None).await?;
+	drop(store3);
+	// New values present.
+	assert!(sealed3.contains(&(base_ms + 1000, bd("200.5"))), "the batch write replaced the value at base+1s with 200.5");
+	assert!(sealed3.contains(&(base_ms + 2000, bd("300.5"))), "the batch write replaced the value at base+2s with 300.5");
+	// Old values absent at the overwritten timestamps.
+	assert!(!sealed3.contains(&(base_ms + 1000, bd("2.25"))), "the old value at base+1s is gone after the batch duplicate write");
+	assert!(!sealed3.contains(&(base_ms + 2000, bd("3.25"))), "the old value at base+2s is gone after the batch duplicate write");
+	// Un-overwritten rows are still there: base+3s (4.25) and base+9s (9.5).
+	assert!(sealed3.contains(&(base_ms + 3000, bd("4.25"))), "the un-touched row at base+3s is still present after the batch duplicate write");
+	assert!(sealed3.contains(&(base_ms + 9_000, bd("9.5"))), "the un-touched row at base+9s is still present");
 
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
 	Ok(())
