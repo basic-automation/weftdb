@@ -194,6 +194,18 @@ a 1.0 compatibility promise.
 
 ---
 
+## Experimental variables can change meaning: `WEFT_ROW_TTL` (#799)
+
+`WEFT_ROW_TTL` is `Tier::Experimental`, and it changed meaning rather than being renamed.
+It used to be a bare count read **in each aspect's own time unit**, so one setting meant
+different real durations per aspect. It is now a duration with a unit: `90s`, `250ms`,
+`500us`, `2ns`, or a bare number meaning **seconds**. If you had it set, re-read the value:
+what you wrote as `3600` now expires rows older than 3600 **seconds** in every aspect, not
+3600 ticks of each aspect's unit. Nothing on disk records the old interpretation — expiry is
+a read-time and sweep-time rule — so there is no data to migrate.
+
+---
+
 ## What is NOT guaranteed
 
 - **A real rollback-after-writes CI test.** No CI job today writes data with the current

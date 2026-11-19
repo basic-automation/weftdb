@@ -8318,3 +8318,31 @@ Left open on purpose: the reservation is an estimate (`ESTIMATED_BYTES_PER_ROW =
 JSON) is not accounted; the guard covers the response object, not the encoder's
 scratch. A cut that measured encoder peaks would need per-format cost tables that do
 not exist yet.
+
+## 2026-11-19 — The row TTL carries a unit; bare numbers mean seconds (#799, TTL-UNIT)
+
+**Question.** `WEFT_ROW_TTL` was a bare number that every aspect read in its own time unit,
+so one operator setting meant wildly different real durations. Making the number mean one
+span is a semantic change to a live (Experimental) variable, and the repo has no precedent
+for changing a variable's meaning rather than adding a new one.
+
+**Decision.** Keep the name, change the meaning, and say so loudly: `RowExpiryPolicy::Ttl`
+now carries a `TimeUnit`; the value accepts an `ns`/`us`/`ms`/`s` suffix and a bare number is
+**seconds**; the conversion happens once per aspect and is saturating. Expiry is stated as one
+rule — `row_ts < cutoff(now, ttl)` — shared by the range-read filter and the purge sweep,
+because two implementations of "expired" is how the pre-1970 unsigned-age wrap survived.
+
+**Rejected.** Adding `WEFT_ROW_TTL_UNIT` alongside the number: two variables that must agree
+is the failure mode we are removing, not a way to preserve it. Also rejected: converting the
+count at the settings layer only, which leaves the store's own `from_env` path still
+unit-blind. Silently keeping "bare = aspect units" was rejected because that is the bug.
+
+**Boundary and residue.** A row whose age equals the TTL is **not** expired (strict `>`). A
+TTL finer than the aspect's resolution saturates to 0 — every row aged at least one tick
+expires — rather than turning into "never expires"; that saturation is documented on the
+policy. Because the variable is `Experimental`, the settings-tier test list is unchanged and
+no deprecation window applies; `UPGRADING.md` carries a short "variables can change meaning"
+section instead. The store-side parser is the single parse point (`row_expiry_policy_from`,
+`weftdb/src/types/segment_store.rs`); `docs/config-schema.md` and the `settings.rs` `VarSpec`
+summary were rewritten to match, since both previously promised "there is no seconds-based
+conversion".

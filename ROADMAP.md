@@ -96,7 +96,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] **Row-TTL purge defects** *(found 2026-11-17 by a read-only audit of #776; nothing on `main` calls `purge_expired` yet, so these gate the daemon call site in #785)*
   - [ ] **TTL-PURGE** Dropping an expired segment must not bring back the values it superseded in a surviving overlapping segment (#797)
   - [ ] **TTL-PURGE** An aspect with more than 32 series with expired segments can be purged, and partial drops are counted (#798)
-  - [ ] **TTL-UNIT** The row TTL carries a unit instead of being a bare number read in each aspect's own time unit (#799)
+  - [x] **TTL-UNIT** The row TTL carries a unit instead of being a bare number read in each aspect's own time unit (#799, 2026-11-19: `RowExpiryPolicy::Ttl` carries a `TimeUnit`, `WEFT_ROW_TTL` takes an `ns`/`us`/`ms`/`s` suffix with bare = seconds, and the read filter and the purge sweep share one cutoff rule)
 - [ ] **Legacy seal routing defects** *(found 2026-11-17 by a read-only audit of #769, #770 and #780; these gate the seal-backed default in #768)*
   - [ ] **SEAL-COUNT** The count of a seal-backed aspect agrees with what a range read returns after a batch rewrites a timestamp (#800)
   - [ ] **SEAL-REPLACE** `replace_measurements_in_range` and `compress()` never write to the unread rows file of a seal-backed aspect (#801)
