@@ -1783,7 +1783,7 @@ impl Aspect {
 	/// mode, so it is safe to call on a seal-backed aspect in contexts where no
 	/// write will follow: setting up a local config before a test, or clearing
 	/// the in-memory copy after a refusal. The seal-backed guard lives in
-	/// [`set_compression_config`] and [`compress_with_progress`](Self::compress_with_progress).
+	/// [`set_compression_config`](Self::set_compression_config) and [`compress_with_progress`](Self::compress_with_progress).
 	pub fn set_compression_config_local(&mut self, config: Option<CompressionConfig>) {
 		self.compression_config = config;
 	}

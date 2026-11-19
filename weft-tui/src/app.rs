@@ -1310,13 +1310,13 @@ impl App {
 
 		tokio::spawn(async move {
 			match Database::existing(&db_name).await {
-				Ok(_db) => {
+				Ok(db) => {
 					let mut aspect = aspect;
 					// Set locally first (instant)
 					aspect.set_compression_config_local(None);
 
 					// Try to persist - if it fails, warn but still report success
-					if let Err(e) = aspect.set_compression_config(&_db, None).await {
+					if let Err(e) = aspect.set_compression_config(&db, None).await {
 						warn!("Failed to persist compression config removal: {}", e);
 					}
 
