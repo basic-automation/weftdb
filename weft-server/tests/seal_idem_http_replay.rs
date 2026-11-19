@@ -72,13 +72,7 @@ fn ingest_body() -> serde_json::Value {
 /// Build a POST request to `/api/v1/storage/price/points` with the given
 /// body bytes and the fixed `Idempotency-Key`.
 fn idem_post(key: &str, body_bytes: Vec<u8>) -> Request<Body> {
-	Request::builder()
-		.method("POST")
-		.uri("/api/v1/storage/price/points")
-		.header(header::CONTENT_TYPE, "application/json")
-		.header("Idempotency-Key", key)
-		.body(Body::from(body_bytes))
-		.unwrap()
+	Request::builder().method("POST").uri("/api/v1/storage/price/points").header(header::CONTENT_TYPE, "application/json").header("Idempotency-Key", key).body(Body::from(body_bytes)).unwrap()
 }
 
 // ── Test ───────────────────────────────────────────────────────────────────
@@ -101,11 +95,14 @@ async fn http_idem_key_prevents_second_store_on_seal_backed_aspect() {
 			.method("POST")
 			.uri("/api/v1/storage/aspects")
 			.header(header::CONTENT_TYPE, "application/json")
-			.body(Body::from(serde_json::to_vec(&serde_json::json!({
-				"name": "price",
-				"physical_type": "f64",
-				"timestamp_unit": "seconds",
-			})).unwrap()))
+			.body(Body::from(
+				serde_json::to_vec(&serde_json::json!({
+					"name": "price",
+					"physical_type": "f64",
+					"timestamp_unit": "seconds",
+				}))
+				.unwrap(),
+			))
 			.unwrap(),
 	)
 	.await;
@@ -119,7 +116,7 @@ async fn http_idem_key_prevents_second_store_on_seal_backed_aspect() {
 	assert_eq!(status1, StatusCode::CREATED, "first POST: {body1}");
 	assert_eq!(body1["replayed"], false, "a fresh seal is not a replay: {body1}");
 	assert_eq!(body1["row_count"], 3, "{body1}");
-	let first_segment_id = body1["segment_id"];
+	let first_segment_id = body1["segment_id"].clone();
 
 	// 3. Retry with the same Idempotency-Key and the same body → 200 OK,
 	//    replayed=true, same segment_id.
@@ -131,21 +128,9 @@ async fn http_idem_key_prevents_second_store_on_seal_backed_aspect() {
 	assert_eq!(body2["row_count"], 3, "{body2}");
 
 	// 4. Read back the range: the batch must appear once, not twice.
-	let (status3, _headers3, body3) = send_json(
-		router,
-		Request::builder()
-			.method("GET")
-			.uri("/api/v1/storage/price/points?start=0&end=100")
-			.body(Body::empty())
-			.unwrap(),
-	)
-	.await;
+	let (status3, _headers3, body3) = send_json(router, Request::builder().method("GET").uri("/api/v1/storage/price/points?start=0&end=100").body(Body::empty()).unwrap()).await;
 	assert_eq!(status3, StatusCode::OK, "range read: {body3}");
-	assert_eq!(
-		body3["total"],
-		3,
-		"a retried POST with one Idempotency-Key stored the batch twice on a seal-backed aspect (#823)"
-	);
+	assert_eq!(body3["total"], 3, "a retried POST with one Idempotency-Key stored the batch twice on a seal-backed aspect (#823)");
 	assert_eq!(body3["count"], 3, "the points array length matches: {body3}");
 
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
