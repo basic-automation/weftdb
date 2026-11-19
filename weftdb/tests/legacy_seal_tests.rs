@@ -437,3 +437,37 @@ async fn seal_backed_capture_measurement_chunk_reaches_the_seal() -> Result<()> 
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
 	Ok(())
 }
+
+/// A **red** test on `main` — two separate calls with one `DatasetId` and the **identical**
+/// single row write an identical key (the content-derived key), and the second call on `main`
+/// replays the first's receipt, silently losing the write.  After the fix (#803) each call with
+/// `None` (the default) mints a fresh token, so the second write lands and the read returns
+/// **two** rows at that timestamp.
+#[serial]
+#[tokio::test]
+async fn identical_resubmission_under_one_dataset_id_is_not_silently_dropped() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "identical_resubmission", &splimes::Resolution::Milliseconds, None).await?.id();
+
+	let dataset = DatasetId::new();
+	let store = db.seal_store().await?;
+	let base = Utc::now().timestamp_millis();
+
+	// Two separate write calls, same DatasetId, same single row.
+	// On main the content-derived key is identical → the second call replays the first.
+	let tx1 = ingest_batch_with_gate(&store, &aspect_id, &dataset, &[(base, bd("5"))], 4).await?;
+	assert_eq!(tx1.len(), 1, "first call returns one TxId");
+	let tx2 = ingest_batch_with_gate(&store, &aspect_id, &dataset, &[(base, bd("5"))], 4).await?;
+	assert_eq!(tx2.len(), 1, "second call returns one TxId");
+
+	// *** Red assertion: the read must return two rows, but on main the second call
+	//     replays the first's receipt → left: 1 / right: 2. ***
+	let read_back = read_rows(&store, &aspect_id, None, None).await?;
+	assert_eq!(read_back.len(), 2, "two rows at the same timestamp: the second call was not silently dropped (bug: 1 on main)");
+
+	drop(store);
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
