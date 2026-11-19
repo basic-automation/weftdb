@@ -211,6 +211,17 @@ origin/main
   already had. Two new unit tests in `disk_guard_tests.rs` pin the
   refusal and the success case.
 
+- **`replace_measurements_in_range` and `capture_new_measurement_chunk` are now refused on seal-backed
+  aspects with a typed `Error::SealBackedRejected` (#801).** Both entry points wrote into the
+  per-aspect rows-mode `measurements.db` that no seal-backed read ever consults — the call returned
+  `Ok` while the data was silently unreachable. `replace_measurements_in_range`
+  (`weftdb/src/types/database/inputs.rs:2128`) checked its guard before the `legacy_metadata_write`
+  wrapper; `capture_new_measurement_chunk` (`:770`) checks at its entry. The same guard is added to
+  `Aspect::compress_with_progress` (`aspect.rs:1871`) and `Aspect::set_compression_config` (`aspect.rs:1805`).
+- **`aspect_storage_mode` now calls `ensure_storage_mode_column` before the SELECT, so a
+  pre-D-S19 database produces `Rows` without string-matching an SQLite error (#801, criterion 3).**
+  The former `Err(_) => Rows` catch-all is narrowed to genuinely absent rows or `NULL` values.
+
 ### Testing
 
 - **The compatibility-leg gate maps legs to things, and carries a category for stand-ins

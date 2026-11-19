@@ -99,7 +99,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
   - [ ] **TTL-UNIT** The row TTL carries a unit instead of being a bare number read in each aspect's own time unit (#799)
 - [ ] **Legacy seal routing defects** *(found 2026-11-17 by a read-only audit of #769, #770 and #780; these gate the seal-backed default in #768)*
   - [x] **SEAL-COUNT** The count of a seal-backed aspect agrees with what a range read returns after a batch rewrites a timestamp (#800, 2026-11-19: `ingest_batch_with_gate` now folds overlapping clusters with `SegmentStore::reconcile_overlaps` after every ingest, so the segment index stays overlap-free and the rollup count equals the read)
-  - [ ] **SEAL-REPLACE** `replace_measurements_in_range` and `compress()` never write to the unread rows file of a seal-backed aspect (#801)
+  - [x] **SEAL-REPLACE** `replace_measurements_in_range` and `compress()` never write to the unread rows file of a seal-backed aspect (#801, 2026-11-19: the rows-mode-only entry points refuse up front with `Error::SealBackedRejected` when the aspect is seal-backed; `set_compression_config` and `capture_new_measurement_chunk` are covered by the same guard)
   - [x] **SEAL-DUP** The replace-not-append rule for duplicate timestamps is documented and pinned by a test (#802)
   - [ ] **SEAL-IDEM** A reused `DatasetId` cannot lose a write or fail on a CRC-32 collision (#803)
 - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
