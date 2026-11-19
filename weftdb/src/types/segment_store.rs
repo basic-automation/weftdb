@@ -552,17 +552,14 @@ fn row_expiry_policy_from(value: Option<&str>) -> row_expiry::RowExpiryPolicy {
 	use row_expiry::RowExpiryPolicy;
 
 	fn parse_unit(s: &str) -> Option<(u64, TimeUnit)> {
-		if let Some(rest) = s.strip_suffix("ns") {
-			rest.trim().parse::<u64>().ok().map(|v| (v, TimeUnit::Nanos))
-		} else if let Some(rest) = s.strip_suffix("us") {
-			rest.trim().parse::<u64>().ok().map(|v| (v, TimeUnit::Micros))
-		} else if let Some(rest) = s.strip_suffix("ms") {
-			rest.trim().parse::<u64>().ok().map(|v| (v, TimeUnit::Millis))
-		} else if let Some(rest) = s.strip_suffix('s') {
-			rest.trim().parse::<u64>().ok().map(|v| (v, TimeUnit::Seconds))
-		} else {
-			s.trim().parse::<u64>().ok().map(|v| (v, TimeUnit::Seconds))
+		// Longest suffix first: `ms` must win over `s`, and `ns`/`us` before either.
+		const SUFFIXES: &[(&str, TimeUnit)] = &[("ns", TimeUnit::Nanos), ("us", TimeUnit::Micros), ("ms", TimeUnit::Millis), ("s", TimeUnit::Seconds)];
+		for (suffix, unit) in SUFFIXES {
+			if let Some(rest) = s.strip_suffix(*suffix) {
+				return rest.trim().parse::<u64>().ok().map(|v| (v, *unit));
+			}
 		}
+		s.trim().parse::<u64>().ok().map(|v| (v, TimeUnit::Seconds))
 	}
 
 	value.and_then(|v| {

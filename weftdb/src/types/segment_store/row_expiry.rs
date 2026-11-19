@@ -95,11 +95,11 @@ impl RowExpiryPolicy {
 	#[must_use]
 	pub fn ttl_in_aspect_unit(&self, aspect_unit: &TimeUnit) -> Option<i64> {
 		match self {
-			RowExpiryPolicy::NoExpiry => None,
-			RowExpiryPolicy::Ttl { ttl, unit: ttl_unit } => {
+			Self::NoExpiry => None,
+			Self::Ttl { ttl, unit: ttl_unit } => {
 				let ttl = *ttl;
-				let ttl_ns = (ttl as i128).checked_mul(ttl_unit.nanos_per_unit() as i128).unwrap_or(i128::MAX);
-				let result = ttl_ns / aspect_unit.nanos_per_unit() as i128;
+				let ttl_ns = i128::from(ttl).checked_mul(i128::from(ttl_unit.nanos_per_unit())).unwrap_or(i128::MAX);
+				let result = ttl_ns / i128::from(aspect_unit.nanos_per_unit());
 				Some(i64::try_from(result).unwrap_or(i64::MAX))
 			}
 		}
@@ -108,11 +108,11 @@ impl RowExpiryPolicy {
 	/// The cutoff timestamp (in `aspect_unit`) — handled the same way by both
 	/// `is_row_expired` and `expired_cutoff`.
 	#[must_use]
-	fn cutoff(&self, now_ns: i64, aspect_unit: &TimeUnit) -> i64 {
+	fn cutoff(&self, now_ns: i64, aspect_unit: TimeUnit) -> i64 {
 		match self {
-			RowExpiryPolicy::NoExpiry => i64::MIN,
-			RowExpiryPolicy::Ttl { .. } => {
-				let Some(ttl_in_unit) = self.ttl_in_aspect_unit(aspect_unit) else {
+			Self::NoExpiry => i64::MIN,
+			Self::Ttl { .. } => {
+				let Some(ttl_in_unit) = self.ttl_in_aspect_unit(&aspect_unit) else {
 					return i64::MIN;
 				};
 				let now_unit = aspect_unit.from_nanos(now_ns);
@@ -146,7 +146,7 @@ impl RowExpiryPolicy {
 ///   a TTL finer than the aspect's resolution saturates toward zero.
 #[must_use]
 pub fn is_row_expired(policy: &RowExpiryPolicy, now_ns: i64, row_ts: i64, aspect_unit: &TimeUnit) -> bool {
-	let cutoff = policy.cutoff(now_ns, aspect_unit);
+	let cutoff = policy.cutoff(now_ns, *aspect_unit);
 	row_ts < cutoff
 }
 
@@ -160,7 +160,7 @@ pub fn is_row_expired(policy: &RowExpiryPolicy, now_ns: i64, row_ts: i64, aspect
 /// subtraction; a TTL finer than the aspect's resolution saturates toward zero.
 #[must_use]
 pub fn expired_cutoff(policy: &RowExpiryPolicy, now_ns: i64, unit: &TimeUnit) -> i64 {
-	policy.cutoff(now_ns, unit)
+	policy.cutoff(now_ns, *unit)
 }
 
 // ---------------------------------------------------------------------------
