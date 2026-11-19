@@ -390,13 +390,37 @@ async fn seal_backed_new_measurement_entry_points_reach_the_seal() -> Result<()>
 	assert!(sealed.contains(&(base_ms, bd("1.25"))), "the batch's first row is in the seal frames");
 	assert!(sealed.contains(&(base_ms + 9_000, bd("9.5"))), "the single-row write is in the seal frames, stored as written");
 
-	// A second write at a timestamp the aspect already holds reports success and adds
-	// no row. Three doc passages claimed these entry points error on a duplicate
-	// timestamp; they do not. What the store does with the row -- replaces the value
-	// there, as the seal's newer-wins merge would, or drops it -- is not settled by
-	// anything I have run, so neither is asserted. Only the count is.
+	// A second write at a timestamp the aspect already holds replaces the old value:
+	// the newest call's rows win at a shared timestamp on seal-backed aspects
+	// (SEAL-DUP #802). Duplicates inside the same call are all kept; duplicates
+	// across calls replace.
 	db.capture_new_measurement(&aspect_id, &dataset, &InputMeasurement::new(base, bd("100.5"))).await?;
 	assert_eq!(db.get_measurements_count(&aspect_id).await?, 5, "a second row at a timestamp the aspect already has leaves the count where it was");
+
+	// The new value is present and the old value is absent at the rewritten timestamp.
+	let store2 = db.seal_store().await?;
+	let sealed2 = weftdb::legacy_seal::read_rows(&store2, &aspect_id, None, None).await?;
+	drop(store2);
+	assert!(sealed2.contains(&(base_ms, bd("100.5"))), "the single-row duplicate write replaced the value at base with 100.5");
+	assert!(!sealed2.contains(&(base_ms, bd("1.25"))), "the old value at base was replaced and is gone");
+
+	// Batch write with overlapping timestamps also replaces: the new batch's rows
+	// at a shared timestamp supersede the older rows.
+	db.batch_capture_new_measurements(&aspect_id, &dataset, vec![InputMeasurement::new(base + Duration::seconds(1), bd("200.5")), InputMeasurement::new(base + Duration::seconds(2), bd("300.5"))]).await?;
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 5, "the batch duplicate write replaced two rows; count stays at 5");
+
+	let store3 = db.seal_store().await?;
+	let sealed3 = weftdb::legacy_seal::read_rows(&store3, &aspect_id, None, None).await?;
+	drop(store3);
+	// New values present.
+	assert!(sealed3.contains(&(base_ms + 1000, bd("200.5"))), "the batch write replaced the value at base+1s with 200.5");
+	assert!(sealed3.contains(&(base_ms + 2000, bd("300.5"))), "the batch write replaced the value at base+2s with 300.5");
+	// Old values absent at the overwritten timestamps.
+	assert!(!sealed3.contains(&(base_ms + 1000, bd("2.25"))), "the old value at base+1s is gone after the batch duplicate write");
+	assert!(!sealed3.contains(&(base_ms + 2000, bd("3.25"))), "the old value at base+2s is gone after the batch duplicate write");
+	// Un-overwritten rows are still there: base+3s (4.25) and base+9s (9.5).
+	assert!(sealed3.contains(&(base_ms + 3000, bd("4.25"))), "the un-touched row at base+3s is still present after the batch duplicate write");
+	assert!(sealed3.contains(&(base_ms + 9_000, bd("9.5"))), "the un-touched row at base+9s is still present");
 
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
 	Ok(())
@@ -605,6 +629,41 @@ async fn seal_backed_compress_with_progress_refuses() -> Result<()> {
 	assert!(err.downcast_ref::<weftdb::Error>().is_some_and(|e| matches!(e, weftdb::Error::SealBackedRejected(_))), "compress_with_progress must return a typed error for a seal-backed aspect: {err}");
 	drop(aspect);
 
+/// The count and the range-read length must agree after two batches whose timestamps
+/// overlap for the same series, even when the fragmentation gate is idle.
+///
+/// On `origin/main` without the `reconcile_overlaps` fix, the count is the sum of both
+/// segments' `row_count` (6) while the read merges newest-wins and returns 4 rows.
+/// The assertion then fails. After the fix, `reconcile_overlaps` folds the overlap at
+/// write time, so the count and the read agree.
+#[serial]
+#[tokio::test]
+async fn count_agrees_with_range_read_after_overlapping_ingests() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "count_parity", &splimes::Resolution::Milliseconds, None).await?.id();
+
+	let dataset = DatasetId::new();
+	let store = db.seal_store().await?;
+	let base = Utc::now().timestamp_millis();
+
+	// Two batches whose time ranges overlap.  target_rows=4 is small enough that
+	// the gate stays idle (segment_count(2) <= ideal(total_rows=6).div_ceil(4)=2).
+	// Without the reconcile_overlaps fix the count is the sum of both row_counts (6)
+	// while a range read returns 4 rows (newer-wins at the overlapping timestamps).
+	let rows1 = vec![(base, bd("10.0")), (base + 1000, bd("20.0")), (base + 2000, bd("30.0"))];
+	let rows2 = vec![(base + 1000, bd("21.0")), (base + 2000, bd("31.0")), (base + 3000, bd("40.0"))];
+
+	ingest_batch_with_gate(&store, &aspect_id, &dataset, &rows1, 4).await?;
+	ingest_batch_with_gate(&store, &aspect_id, &dataset, &rows2, 4).await?;
+
+	let count = db.get_measurements_count(&aspect_id).await?;
+	let read = read_rows(&store, &aspect_id, None, None).await?;
+
+	assert_eq!(count, read.len(), "the seal-backed count ({count}) equals the number of rows a range read returns ({}) after overlapping segments", read.len());
+
+	drop(store);
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
 	Ok(())
 }

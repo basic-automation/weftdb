@@ -93,6 +93,15 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [x] **Measurement bulk ingest routed through the `.weftseg` seal** *(part 1 shipped 2026-11-16: the two legacy bulk writers that do not read the stored range first were routed through the seal store, and the aspect's own latest-timestamp read was fixed to consult it. #768 then made new legacy aspects seal-backed by default, with `WEFT_LEGACY_DEFAULT_STORAGE=rows` as the opt-out, so a fresh deployment writes sealed frames through every ingest entry point)*
 - [x] **CI**
 - [x] Packaging (1.0 minimum)
+- [ ] **Row-TTL purge defects** *(found 2026-11-17 by a read-only audit of #776; nothing on `main` calls `purge_expired` yet, so these gate the daemon call site in #785)*
+  - [ ] **TTL-PURGE** Dropping an expired segment must not bring back the values it superseded in a surviving overlapping segment (#797)
+  - [ ] **TTL-PURGE** An aspect with more than 32 series with expired segments can be purged, and partial drops are counted (#798)
+  - [ ] **TTL-UNIT** The row TTL carries a unit instead of being a bare number read in each aspect's own time unit (#799)
+- [ ] **Legacy seal routing defects** *(found 2026-11-17 by a read-only audit of #769, #770 and #780; these gate the seal-backed default in #768)*
+  - [x] **SEAL-COUNT** The count of a seal-backed aspect agrees with what a range read returns after a batch rewrites a timestamp (#800, 2026-11-19: `ingest_batch_with_gate` now folds overlapping clusters with `SegmentStore::reconcile_overlaps` after every ingest, so the segment index stays overlap-free and the rollup count equals the read)
+  - [x] **SEAL-REPLACE** `replace_measurements_in_range` and `compress()` never write to the unread rows file of a seal-backed aspect (#801, 2026-11-19: the rows-mode-only entry points refuse up front with `Error::SealBackedRejected` when the aspect is seal-backed; `set_compression_config` and `capture_new_measurement_chunk` are covered by the same guard)
+  - [x] **SEAL-DUP** The replace-not-append rule for duplicate timestamps is documented and pinned by a test (#802)
+  - [ ] **SEAL-IDEM** A reused `DatasetId` cannot lose a write or fail on a CRC-32 collision (#803)
 - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
 - [ ] Write or approve the honesty-page narrative *(owner)*
 - [ ] Report the three `parquet` 60.0.0 decoder panics and the `arrow-buffer` 60.0.0 panic upstream to apache/arrow-rs *(owner: outward-facing)*

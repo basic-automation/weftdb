@@ -310,8 +310,11 @@ impl Inputs for Database {
 	}
 
 	/// Capture a new measurement for a given aspect
-	/// No duplicate handling: a timestamp already stored is stored again, so a range read
+	/// For **rows mode**: a timestamp already stored is stored again, so a range read
 	/// returns both rows. Nothing is averaged and no error is raised (#232's audit).
+	/// For **seal-backed aspects**: at a shared timestamp only the newest call's rows
+	/// survive (rows inside one call are all kept). This is a behaviour change from rows
+	/// mode (#802, SEAL-DUP).
 	/// Uses Turso's concurrent writes feature for better performance and conflict resolution.
 	/// Also enqueues the measurement timestamp for incremental batch processing, in rows mode only.
 	///
