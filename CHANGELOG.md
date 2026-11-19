@@ -138,6 +138,19 @@ origin/main
 
 ### Fixed
 
+- **TTL purge no longer drops a doomed segment that shadows a surviving segment of the same series (#797).**
+  `purge_aspect_held` now builds a `survivors` map (straddling and wholly live segments)
+  before it considers doomed segments; any doomed segment whose timeline extent overlaps a
+  survivor of the same series is kept on disk with a `tracing::debug!` line and a count in
+  `shadowed_and_kept`. Previously a wholly expired segment whose rows superseded an older
+  segment whose extent it overlaps was dropped, re-exposing the superseded values to a plain
+  (non-expiry) read.
+- **TTL purge now chunks swap plans by `MAX_PLANS_PER_TXN` and reports partial progress instead of returning an error (#798).**
+  An aspect with more than 32 series was previously refused by `swap_plans`'s "at most 32
+  plans" guard. Now the plans are split into chunks of `MAX_PLANS_PER_TXN` and submitted in
+  separate swap transactions; a later chunk that fails does not undo the drops of earlier
+  chunks, and `completed` is set to `false` in the returned `AspectExpirySwept` so the caller
+  does not charge the breaker and the next sweep retries the remaining segments.
 - **Seal-backed aspects replace at shared timestamps, rows mode appends (#802).**
   At a timestamp that two ingest calls share, a seal-backed aspect keeps only the newest
   call's rows (duplicates inside one call are all kept). This is a behaviour change from
@@ -156,6 +169,8 @@ origin/main
   `SegmentStore::reconcile_overlaps` after the fragmentation gate, so an overlapping cluster is
   folded at write time and the index stays overlap-free (it returns `Ok(0)` when nothing
   overlaps). The gate on its own could not have done it: whether it folds at all is a function
+  of `total_rows / target_rows`, so a small aspect can be left fragmented.
+origin/main
   of `total_rows / target_rows`, so a small aspect can be left fragmented.origin/main
 
 - **A seal-backed legacy aspect's bulk writes now reach the store it reads from (#232).**
