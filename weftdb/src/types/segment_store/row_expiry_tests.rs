@@ -380,7 +380,7 @@ async fn purge_does_not_drop_segment_that_shadows_a_survivor() {
 	// Segment 1 (survivor) straddles the cutoff; segment 2 (correction) is wholly
 	// expired but overlaps segment 1's extent. After the purge the correction must
 	// still be visible to plain reads.
-	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS, unit: TimeUnit::Seconds }).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 
 	// Survivor: ts 60..=120 — max_ts=120 > cutoff=90 → straddles, kept.
@@ -417,7 +417,7 @@ async fn purge_does_not_drop_segment_that_shadows_a_survivor() {
 async fn purge_still_drops_doomed_segment_that_overlaps_nothing() {
 	// #797 no-over-refusal: a doomed segment that overlaps no survivor of its
 	// series is still dropped — the guard does not disable the purge.
-	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS, unit: TimeUnit::Seconds }).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 
 	// Two series, each with one wholly expired segment in a range with no survivor.
@@ -452,7 +452,7 @@ async fn purge_drops_33_series_in_one_pass() {
 	// the per-transaction ceiling.  On main this aspect fails with the
 	// `swap_plans` guard instead of purging (see the red run recorded on #798);
 	// after the fix all 33 segments drop across two chunks (32 + 1).
-	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS, unit: TimeUnit::Seconds }).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 
 	for i in 1..=33u64 {
@@ -477,7 +477,7 @@ async fn purge_drops_65_series_across_three_chunks() {
 	// advance twice, and the last, short chunk still has to commit.  A loop that
 	// stranded the tail would drop 64 and leave one frame behind, which the index
 	// assertion below catches.
-	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
+	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS, unit: TimeUnit::Seconds }).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 
 	for i in 1..=65u64 {
