@@ -265,6 +265,14 @@ pub async fn ingest_batch_with_gate(store: &SegmentStore, aspect_id: &AspectId, 
 	if let Err(e) = store.squash_aspect_to_target_rows_if_fragmented(&key, squash_target_rows).await {
 		tracing::debug!("Failed to run the fragmentation gate after ingesting a batch for aspect {aspect_id}; it is sealed: {e}");
 	}
+	// Guarantee at write time that the batch's timestamps do not overlap an existing
+	// segment's extent for the same series without folding that cluster first.
+	// `reconcile_overlaps` folds oldest → newest with newer-wins semantics, so after
+	// this call the segment index's row count matches what a range read returns.
+	// A no-op when nothing overlaps.
+	if let Err(e) = store.reconcile_overlaps(&key).await {
+		tracing::debug!("Failed to reconcile overlaps after ingesting a batch for aspect {aspect_id}; the count and the read may disagree: {e}");
+	}
 	Ok((0..rows.len()).map(|index| synthetic_tx_id(&idem, index)).collect())
 }
 
