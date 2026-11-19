@@ -8414,7 +8414,7 @@ The same brief describes #798: an aspect with more than 32 series causes
 
 The companion lesson is about fixtures, not production code. The #797 reproduction ingested both frames under the same idempotency key (`IngestBatch::dense("s1", …)` twice), and the second ingest was refused with "aspect "temp" already holds idempotency key "s1" for a different batch … nothing was written" — so the overlap the test meant to create never existed, and the test would have been vacuous even with the assertions rewritten. An idempotency key names one batch; series identity comes from the measurement tags. Two frames of one series therefore need two batch keys and the same (untagged) value shape.
 
-   ## 2026-11-17 — The expired-row purge runs unconditionally in every daemon tick (shipping)
+## 2026-11-17 — The expired-row purge runs unconditionally in every daemon tick (shipping)
 
 Issue #785, TTL cut 4. The store's `purge_expired` already returns cheaply when the policy is
 `NoExpiry` (checking `self.expiry == RowExpiryPolicy::NoExpiry` at the top and returning an empty
@@ -8465,4 +8465,4 @@ origin/mainorigin/mainorigin/mainorigin/mainorigin/mainorigin/main
   time rather than contending with each other; `weft-bench` had never needed the dependency before
   because its other arms build segments in memory.
 - **CI is the first execution.** Nothing here was compiled or run locally: this host cannot build the
-workspace without OOM-killing the model server.
+  workspace without OOM-killing the model server.
