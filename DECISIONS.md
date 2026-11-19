@@ -8199,8 +8199,67 @@ project does not promise before 1.0.
 Recorded as a known limitation, not fixed: `WEFT_MAINTENANCE_MAX_SEGMENT_BYTES` (#773) re-cuts only
 folds of two or more segments, so the first frame a brand-new seal-backed aspect writes from a large bulk
 ingest can sit above that ceiling until a later fold cuts it, and #765's output budget bounds maintenance
-rather than ingest. Nothing here makes that worse; it only makes it reachable by default.
+rather than ingest. Nothing here makes that worse; it only makes it reachable by default.origin/mainorigin/mainorigin/mainorigin/main
 
+
+## 2026-11-17 — What the daemon budget check can honestly promise (ROB-14 cut 3, #806) (decided)
+
+The brief asked the background daemons to consult `MemoryBudget` before they allocate, which
+leaves two things undefined: which daemons, and what "consult" means when a pass does not know
+its own footprint.
+
+- **Which daemons.** Only the reconcile daemon's six tick functions carry a budget in scope; the
+compaction, expiry and purge daemons have no `MemoryBudget` parameter at all, and threading one
+through them changes their signatures and their construction sites. Cut 3 covers reconcile only
+and the roadmap line stays open for the rest rather than claiming the whole item.
+- **What to reserve.** `wanted` of 1 byte. A pass allocates inside the store, and the server
+cannot know the size of a fold before asking the store to plan it, so inventing a per-pass
+estimate would be a made-up number that silently decides how much background work the limit
+admits. The honest question at that point is "is there any headroom at all", and one byte answers
+it. A pass that runs is still bounded by the store's own output ceiling
+(`WEFT_MAINTENANCE_MAX_OUTPUT_BYTES`) and the wall-clock budget (#758). This is why the check is
+named a probe in its doc comment and why the `Reservation` is dropped at the decision point:
+holding bytes the store will not use would only starve request paths.
+- **Unbounded stays unbounded.** `budget.limit()` of `None` returns `true` immediately, so the
+default server (no `WEFT_MEMORY_BUDGET_BYTES`, no cgroup limit) behaves exactly as before.
+- **How the test pins it.** The deferring test asserts `aspects_scanned == 0` and no pass
+counter, not `aspects_reconciled == 0`: after the first pass there is no work left, so a tick
+that ignored the budget would also report zero reconciled. Scanning is the first observable
+thing the check sits in front of.
+
+  regression guard the whole slice is about.
+
+## 2026-11-17 — Moving the fragmentation gate into the bulk-ingest path (#232)
+
+- **The fragmentation gate was an inline duplicate, not a missing feature.** The three gate calls
+  in `inputs.rs` (`:335`, `:446`) each immediately followed an `ingest_batch` call for the same
+  aspect, replicating the gate logic inline. The third caller (`batch_capture_sealed`, `:2442`)
+  did not run the gate at all — it calls `ingest_batch` then drops the store immediately. Moving
+  the gate into `ingest_batch` itself removes the risk of a future caller forgetting it.
+- **Inline gate vs. a separate maintenance daemon.** An inline gate (called after every ingest) was
+  chosen over a background daemon because (a) the gate is O(1) on a converged aspect's rollup,
+  so its per-write cost is negligible when the aspect is stable; (b) it does not hold the
+  maintenance lock from a previous call — the lock is acquired and released within each gate call;
+  and (c) a daemon adds lifecycle complexity (start, stop, backpressure, reconcile with writes).
+  The existing `squash_all_to_target_rows_if_fragmented` sweep (`sweep_all.rs`) already
+  provides the background pass for an operator who wants a one-shot convergence across all aspects;
+  the inline gate is the per-write convergence that keeps bulk from diverging from single-row
+  behaviour.
+- **`ingest_batch_with_gate` takes a `squash_target_rows` parameter;** the existing `ingest_batch`
+  is a thin wrapper passing `SQUASH_TARGET_ROWS`. This lets tests drive a deliberately small target
+  and lets a future caller (e.g., an archival ingest at a different threshold) choose a different
+  target without another wrapper.
+- **The two duplicate gate calls in `inputs.rs` were removed, and the third caller is covered by
+  the move, not left out.** `batch_capture_sealed` (`:2442` in the file's own numbering) goes
+  through the same `ingest_batch` wrapper, so it now runs the gate it never used to run: before
+  this slice the file had gate calls at `:335` and `:446` only, and that third path had none. The
+  wrapper is what closes that gap, which is why the inline duplicates were deleted rather kept.
+- **What this does *not* close.** The gate declines on a converged large aspect
+  (`squash_aspect_to_target_rows_if_fragmented_held` returns `Ok(None)` once
+  `segment_count <= total_rows.div_ceil(target_rows)`, and `SQUASH_TARGET_ROWS` is 100 000) and its
+  failure is logged at debug level. A batch that rewrites a timestamp an existing segment already
+  holds can therefore still leave the stored row count above the number of rows a read returns,
+  which is what #800 tracks.origin/mainorigin/main
 ## 2026-11-17 — Seal-backed write guard: refuse rows-mode writes on seal-backed aspects (#801)
 
 ### Refusal over implementation

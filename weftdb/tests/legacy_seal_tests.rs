@@ -23,6 +23,175 @@ use futures::StreamExt;
 use serial_test::serial;
 use tempfile::TempDir;
 use uuid::Uuid;
+use weftdb::legacy_seal::{aspect_key, ingest_batch_with_gate, read_measurements, read_rows};
+
+/// The fragmentation gate at a small target converges repeated ingests of the same aspect.
+///
+/// This test must fail if the gate call inside `ingest_batch_with_gate` is removed:
+/// without it, many small ingests leave many small sealed segments whose count is not
+/// collapsed by the size-targeted compaction.
+#[serial]
+#[tokio::test]
+async fn bulk_ingest_converges_at_small_target() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "converge_test", &splimes::Resolution::Milliseconds, None).await?.id();
+
+	let dataset = DatasetId::new();
+	let store = db.seal_store().await?;
+	let base = Utc::now().timestamp_millis();
+
+	// 20 batches of 3 rows each at a target of 4: the gate should squash to ~15 segments.
+	// Without the gate we would have 20+ segments.
+	for i in 0..20 {
+		let offset = i64::from(i) * 1000;
+		let rows = vec![(base + offset, bd(&format!("{}.{}", i + 1, offset))), (base + offset + 1, bd(&format!("{}.{}", i + 2, offset))), (base + offset + 2, bd(&format!("{}.{}", i + 3, offset)))];
+		ingest_batch_with_gate(&store, &aspect_id, &dataset, &rows, 4).await?;
+	}
+
+	// Count the segments after all ingests.
+	let key = aspect_key(&aspect_id);
+	let segment_count = store.index().count(&key).await?;
+	// 20 batches × 3 rows = 60 rows ÷ 4 target = 15 ideal, with three segments of slack for
+	// the tail of the last fold. The old bound of 25 was looser than the un-gated count
+	// (~20, one segment per batch), so the test passed with the gate call deleted.
+	assert!(segment_count <= 18, "the fragmentation gate should have collapsed {segment_count} segments to roughly 15 at a target of 4");
+
+	// The comparison that makes the bound above mean something: the same volume of traffic
+	// into a second aspect, at a target so loose the gate stays idle (60 rows ÷ 2 = 30 ideal,
+	// above the ~20 segments the batches produce), must end with strictly more segments.
+	// Delete the gate call and both assertions fail together.
+	let ungated_aspect = db.track_aspect(&subject.id(), "converge_idle", &splimes::Resolution::Milliseconds, None).await?.id();
+	for i in 0..20 {
+		let offset = i64::from(i) * 1000;
+		let rows = vec![(base + offset, bd(&format!("{}.{}", i + 1, offset))), (base + offset + 1, bd(&format!("{}.{}", i + 2, offset))), (base + offset + 2, bd(&format!("{}.{}", i + 3, offset)))];
+		ingest_batch_with_gate(&store, &ungated_aspect, &dataset, &rows, 2).await?;
+	}
+	let idle_count = store.index().count(&aspect_key(&ungated_aspect)).await?;
+	assert!(idle_count > segment_count, "the gated aspect converged to {segment_count} segments while the same traffic with the gate idle left {idle_count}; the gate is what makes bulk ingest converge");
+
+	drop(store);
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
+
+/// After a gated ingest, every row is readable exactly once, in order,
+/// with the same `MeasurementId` derivation as a second read.
+#[serial]
+#[tokio::test]
+async fn gated_bulk_read_path_correctness() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "read_correct", &splimes::Resolution::Milliseconds, None).await?.id();
+
+	let dataset = DatasetId::new();
+	let store = db.seal_store().await?;
+	let base = Utc::now().timestamp_millis();
+
+	// Ingest 10 batches of 2 rows each through the gate path.
+	let mut all_expected: Vec<(i64, BigDecimal)> = Vec::new();
+	for i in 0..10 {
+		let offset = i64::from(i) * 2000;
+		let rows = vec![(base + offset, bd(&format!("{i}.0"))), (base + offset + 1000, bd(&format!("{i}.5")))];
+		ingest_batch_with_gate(&store, &aspect_id, &dataset, &rows, 4).await?;
+		all_expected.extend(rows);
+	}
+	all_expected.sort_by_key(|(ts, _)| *ts);
+
+	// Read rows back.
+	let read_back = read_rows(&store, &aspect_id, None, None).await?;
+	assert_eq!(read_back.len(), all_expected.len(), "every row is returned exactly once");
+	for (got, expected) in read_back.iter().zip(all_expected.iter()) {
+		assert_eq!(got, expected, "row values match in order");
+	}
+
+	// Read measurements back: ids are deterministic.
+	let ms1 = read_measurements(&store, &aspect_id, None, None).await?;
+	let ms2 = read_measurements(&store, &aspect_id, None, None).await?;
+	assert_eq!(ms1.len(), all_expected.len(), "every row returned as a Measurement");
+	for (m, e) in ms1.iter().zip(all_expected.iter()) {
+		assert_eq!(m.timestamp().timestamp_millis(), e.0, "timestamp from Measurement matches");
+		assert_eq!(*m.value(), e.1, "value from Measurement matches");
+	}
+	// A second read produces the same ids.
+	for (m1, m2) in ms1.iter().zip(ms2.iter()) {
+		assert_eq!(m1.id(), m2.id(), "second read produces the same MeasurementId");
+	}
+
+	drop(store);
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
+
+/// A degenerate squash target must not damage the ingest contract. `target_rows = 0`
+/// is clamped to 1 by the gate internals (`maint.rs:2060`), and at two rows the aspect
+/// is not over-fragmented, so the gate runs and returns without squashing anything.
+/// What this test therefore proves is that a nonsense target still ingests both rows
+/// and returns both `TxId`s. It does **not** prove that a gate *error* is swallowed:
+/// forcing one needs the `fault-injection` feature, and that gap is tracked separately.
+#[serial]
+#[tokio::test]
+async fn gate_at_degenerate_target_still_ingests() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "gate_fail", &splimes::Resolution::Milliseconds, None).await?.id();
+
+	let dataset = DatasetId::new();
+	let store = db.seal_store().await?;
+	let base = Utc::now().timestamp_millis();
+
+	let rows = vec![(base, bd("42.5")), (base + 1000, bd("43.5"))];
+	// target=0 is clamped to 1 by the gate internals; the gate runs and
+	// the ingest succeeds regardless.
+	let tx_ids = ingest_batch_with_gate(&store, &aspect_id, &dataset, &rows, 0).await?;
+	assert_eq!(tx_ids.len(), 2, "two TxIds returned despite gate target=0");
+
+	// Rows are readable.
+	let read_back = read_rows(&store, &aspect_id, None, None).await?;
+	assert_eq!(read_back.len(), 2, "rows readable after gated ingest");
+	assert!(read_back.contains(&(base, bd("42.5"))));
+	assert!(read_back.contains(&(base + 1000, bd("43.5"))));
+
+	drop(store);
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
+
+/// Idempotency still holds when the fragmentation gate is enabled: replaying the same
+/// batch returns the same synthetic `TxIds` and does not duplicate rows.
+#[serial]
+#[tokio::test]
+async fn gated_ingest_idempotent_replay() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "idempotent", &splimes::Resolution::Milliseconds, None).await?.id();
+
+	let dataset = DatasetId::new();
+	let store = db.seal_store().await?;
+	let base = Utc::now().timestamp_millis();
+
+	let rows = vec![(base, bd("10.0")), (base + 1000, bd("20.0")), (base + 2000, bd("30.0"))];
+
+	// First call.
+	let tx1 = ingest_batch_with_gate(&store, &aspect_id, &dataset, &rows, 4).await?;
+	assert_eq!(tx1.len(), 3, "first call returns 3 TxIds");
+
+	// Replay the same batch.
+	let tx2 = ingest_batch_with_gate(&store, &aspect_id, &dataset, &rows, 4).await?;
+	assert_eq!(tx2, tx1, "replay returns the same TxIds");
+
+	// No duplicate rows.
+	let read_back = read_rows(&store, &aspect_id, None, None).await?;
+	assert_eq!(read_back.len(), 3, "no duplicate rows after replay with gate");
+
+	drop(store);
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
 use weftdb::{
 	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, Database, DatasetId, InputMeasurement, StorageMode, TxId
 };

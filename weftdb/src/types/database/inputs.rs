@@ -332,9 +332,7 @@ impl Inputs for Database {
 				let store = self.seal_store().await?;
 				let tx_ids = crate::legacy_seal::ingest_batch(&store, aspect_id, dataset_id, &rows).await?;
 				self.forget_cached_earliest_measurement(aspect_id).await;
-				if let Err(e) = store.squash_aspect_to_target_rows_if_fragmented(&crate::legacy_seal::aspect_key(aspect_id), crate::legacy_seal::SQUASH_TARGET_ROWS).await {
-					tracing::debug!("Failed to run the fragmentation gate after capturing a measurement of aspect {aspect_id}; it is sealed: {e}");
-				}
+				// The fragmentation gate moved into the bulk path (ingest_batch now calls it internally).
 				drop(store);
 				return Ok(tx_ids.into_iter().next().unwrap_or_default());
 			}
@@ -443,9 +441,7 @@ impl Inputs for Database {
 				let store = self.seal_store().await?;
 				let tx_ids = crate::legacy_seal::ingest_batch(&store, aspect_id, dataset_id, &rows).await?;
 				self.forget_cached_earliest_measurement(aspect_id).await;
-				if let Err(e) = store.squash_aspect_to_target_rows_if_fragmented(&crate::legacy_seal::aspect_key(aspect_id), crate::legacy_seal::SQUASH_TARGET_ROWS).await {
-					tracing::debug!("Failed to run the fragmentation gate after capturing a new measurement of aspect {aspect_id}; it is sealed: {e}");
-				}
+				// The fragmentation gate moved into the bulk path (ingest_batch now calls it internally).
 				drop(store);
 				return Ok(tx_ids.into_iter().next().unwrap_or_default());
 			}
