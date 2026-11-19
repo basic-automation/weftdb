@@ -13,7 +13,7 @@ use weft_physical_type::{timestamp::TimeUnit, AspectSchema, PhysicalType};
 
 use super::{SegmentStore, SegmentStoreOptions};
 use crate::{
-	segment_store::row_expiry::{expired_cutoff, RowExpiryPolicy}, IngestBatch
+	segment_store::row_expiry::{expired_cutoff, RowExpiryPolicy}, IngestBatch, TagSet
 };
 
 fn bd(s: &str) -> BigDecimal {
@@ -434,26 +434,37 @@ async fn purge_still_drops_doomed_segment_that_overlaps_nothing() {
 }
 
 // ── Criterion #798: chunking by MAX_PLANS_PER_TXN ────────────────────────
-// An aspect with more than 32 series was previously refused by swap_plans.
-// Now the plans are chunked, so a large-number-of-series aspect can be
-// purged in multiple transactions.
+// An aspect with more plans than `MAX_PLANS_PER_TXN` (32) used to be refused by
+// `swap_plans` outright: "a swap of aspect "temp" carries at most 32 plans, not 33".
+// The sweep now chunks the plans, so such an aspect is purged in several
+// transactions instead of never at all.
+//
+// The series, not the idempotency key, decides how many plans a sweep carries:
+// plans are bucketed by `series_id`, and an untagged ingest lands on
+// `SeriesId::UNTAGGED` no matter how many distinct keys it used.  Every test here
+// therefore gives each series its own tag group — without that, 33 ingests collapse
+// into one plan and the ceiling is never reached, which is the mistake the first
+// version of these tests made.
 
 #[tokio::test]
 async fn purge_drops_33_series_in_one_pass() {
-	// #798 core: 33 series, each with one wholly expired segment.  Before the fix
-	// this would fail with "at most 32 plans".  After the fix all 33 should be
-	// dropped across two chunks.
+	// 33 series, each with one wholly expired segment: 33 plans, one more than
+	// the per-transaction ceiling.  On main this aspect fails with the
+	// `swap_plans` guard instead of purging (see the red run recorded on #798);
+	// after the fix all 33 segments drop across two chunks (32 + 1).
 	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 
 	for i in 1..=33u64 {
-		let series = format!("s{i}");
-		store.ingest(ASPECT, &IngestBatch::dense(&series, vec![80], vec![bd(&i.to_string())])).await.expect("ingests an expired row");
+		let groups = TagSet::from_pairs([("host", format!("h{i}"))]).expect("valid tags");
+		let key = format!("k{i}");
+		store.ingest(ASPECT, &IngestBatch::dense(&key, vec![80], vec![bd(&i.to_string())]).with_groups(groups)).await.expect("ingests an expired row");
 	}
 
 	let sweep = store.purge_expired(NOW_NS).await.expect("purges");
-	assert!(sweep.failed.is_empty(), "no aspect failed: {:?}", sweep.failed.iter().map(|(a, e)| (a.clone(), e.to_string())).collect::<Vec<_>>());
-	assert_eq!(sweep.segments_dropped, 33, "all 33 wholly expired segments are dropped");
+	assert!(sweep.failed.is_empty(), "#798: no aspect should fail: {:?}", sweep.failed.iter().map(|(a, e)| (a.clone(), e.to_string())).collect::<Vec<_>>());
+	assert_eq!(sweep.segments_dropped, 33, "#798: all 33 wholly expired segments are dropped, across two swap transactions");
+	assert_eq!(sweep.shadowed_and_kept, 0, "nothing here overlaps a survivor, so the #797 guard keeps nothing");
 	assert_eq!(store.index.all(ASPECT).await.expect("index").len(), 0, "no frames remain");
 
 	drop(store);
@@ -461,46 +472,36 @@ async fn purge_drops_33_series_in_one_pass() {
 }
 
 #[tokio::test]
-async fn purge_33_series_partial_chunk_failure() {
-	// #798 partial failure: when one chunk commits and a later one fails, the
-	// committed drops are still counted and completed == false.
-	//
-	// **We cannot provoke a controlled chunk failure from within this test
-	// suite** without either the `fault-injection` feature (which runs in a
-	// separate CI job that does not run the lib tests) or by corrupting a
-	// segment file on disk in a way that makes `swap_plans` fail only on the
-	// second chunk while the first chunk's swap has already committed.  The
-	// scenario is covered by doctoring the code: removing `ok_or` or
-	// replacing the second chunk's `swap_plans` return with an `Err(()))` in
-	// a single-chunk variant verifies the partial-counting path compiles and
-	// behaves as designed.
-	//
-	// What follows is a best-effort test that creates enough series to force
-	// chunking and verifies the happy path; the partial-failure branch
-	// remains covered only by code inspection and the logical argument that
-	// a swap that commits on its own transaction cannot be rolled back by a
-	// later swap's failure.
+async fn purge_drops_65_series_across_three_chunks() {
+	// Two full chunks and a remainder (32 + 32 + 1): the chunk loop has to
+	// advance twice, and the last, short chunk still has to commit.  A loop that
+	// stranded the tail would drop 64 and leave one frame behind, which the index
+	// assertion below catches.
 	let (dir, store) = make_store(RowExpiryPolicy::Ttl { ttl: TTL_SECS }).await;
 	store.declare(ASPECT, &schema(TimeUnit::Seconds)).await.expect("declares");
 
-	// 34 series = two chunks of 32 and 2.
-	for i in 1..=34u64 {
-		let series = format!("s{i}");
-		store.ingest(ASPECT, &IngestBatch::dense(&series, vec![80], vec![bd(&i.to_string())])).await.expect("ingests an expired row");
+	for i in 1..=65u64 {
+		let groups = TagSet::from_pairs([("host", format!("h{i}"))]).expect("valid tags");
+		let key = format!("k{i}");
+		store.ingest(ASPECT, &IngestBatch::dense(&key, vec![80], vec![bd(&i.to_string())]).with_groups(groups)).await.expect("ingests an expired row");
 	}
 
 	let sweep = store.purge_expired(NOW_NS).await.expect("purges");
-	// If the happy path succeeds, all 34 are dropped and completed is true.
-	// If a failure occurs (for example because of libSQL contention or the
-	// index state being stale), the committed drops are still counted and
-	// completed=false.  Either outcome is acceptable for this test.
-	assert!(sweep.failed.is_empty(), "the sweep reports no fully-failed aspects (chunk failures use completed=false instead)");
-	// At minimum, the first chunk of 32 must have committed:
-	assert!(sweep.segments_dropped >= 32, "at least 32 segments were dropped (the first chunk)");
+	assert!(sweep.failed.is_empty(), "#798: a 65-plan aspect should not fail: {:?}", sweep.failed.iter().map(|(a, e)| (a.clone(), e.to_string())).collect::<Vec<_>>());
+	assert_eq!(sweep.segments_dropped, 65, "32 + 32 + 1 segments drop");
+	assert_eq!(store.index.all(ASPECT).await.expect("index").len(), 0, "the short final chunk committed too");
 
 	drop(store);
 	dir.close().expect("close temp dir");
 }
+
+// #798's partial-failure branch (one chunk commits, a later chunk fails, the
+// sweep reports `completed == false` while keeping the committed counts) has no
+// automated coverage.  There is no seam to make the second chunk's `swap_plans`
+// fail while the first one succeeds without the `fault-injection` feature, which
+// runs in a CI job that does not run these library tests, and a test written to
+// accept either outcome proves nothing.  Recorded on #798 as the known gap rather
+// than papered over.
 
 /// Cut 3's environment switch: `WEFT_ROW_TTL` becomes a policy, and anything that is not a
 /// positive count leaves expiry off. A typo in a TTL setting must never be able to empty a
