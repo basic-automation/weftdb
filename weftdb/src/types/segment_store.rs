@@ -531,13 +531,43 @@ fn maintenance_segment_ceiling_from(value: Option<&str>) -> Option<u64> {
 	value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|ceiling| *ceiling > 0)
 }
 
-/// The row-expiry policy `WEFT_ROW_TTL` names: a whole number of the aspect's own
-/// time units (the TTL value `RowExpiryPolicy::Ttl` stores), or `NoExpiry` when it is
-/// unset, `0`, empty, or unparseable. The value is expressed in the aspect's own time
-/// unit exactly like `RowExpiryPolicy::Ttl { ttl: u64 }` — there is no seconds-based
-/// conversion.
+/// The row-expiry policy `WEFT_ROW_TTL` names: either a bare number (interpreted as
+/// seconds) or a number with a unit suffix (`s`, `ms`, `us`, `ns`). The value and unit
+/// are stored directly in [`RowExpiryPolicy::Ttl`]. Returns `NoExpiry` when the value is
+/// unset, `0`, empty, or unparseable.
+///
+/// # Suffix grammar
+///
+/// | Suffix | Unit |
+/// |--------|------|
+/// | (none) | Seconds |
+/// | `s`    | Seconds |
+/// | `ms`   | Millis |
+/// | `us`   | Micros |
+/// | `ns`   | Nanos |
 fn row_expiry_policy_from(value: Option<&str>) -> row_expiry::RowExpiryPolicy {
-	value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|ttl| *ttl > 0).map_or(row_expiry::RowExpiryPolicy::NoExpiry, |ttl| row_expiry::RowExpiryPolicy::Ttl { ttl })
+	use row_expiry::{RowExpiryPolicy, TimeUnit};
+
+	fn parse_unit(s: &str) -> Option<(u64, TimeUnit)> {
+		if let Some(rest) = s.strip_suffix("ns") {
+			rest.trim().parse::<u64>().ok().map(|v| (v, TimeUnit::Nanos))
+		} else if let Some(rest) = s.strip_suffix("us") {
+			rest.trim().parse::<u64>().ok().map(|v| (v, TimeUnit::Micros))
+		} else if let Some(rest) = s.strip_suffix("ms") {
+			rest.trim().parse::<u64>().ok().map(|v| (v, TimeUnit::Millis))
+		} else if let Some(rest) = s.strip_suffix('s') {
+			rest.trim().parse::<u64>().ok().map(|v| (v, TimeUnit::Seconds))
+		} else {
+			s.trim().parse::<u64>().ok().map(|v| (v, TimeUnit::Seconds))
+		}
+	}
+
+	value.and_then(|v| {
+		let v = v.trim();
+		parse_unit(v)
+	})
+	.filter(|(ttl, _)| *ttl > 0)
+	.map_or(RowExpiryPolicy::NoExpiry, |(ttl, unit)| RowExpiryPolicy::Ttl { ttl, unit })
 }
 
 /// The per-operation maintenance time budget `WEFT_MAINTENANCE_MAX_OP_SECONDS` names
