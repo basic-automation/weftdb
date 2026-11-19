@@ -99,22 +99,30 @@ async fn seal_backed_ingest_feeds_the_change_log_not_the_queue() -> Result<()> {
 	assert_eq!(changes[0].min_ts, Some(base.timestamp_millis()));
 	assert_eq!(changes[0].max_ts, Some((base + Duration::seconds(4)).timestamp_millis()));
 
-	// A retried call replays the commit: no new change row.
+	// A retried call is a new call, not a replay of the old one.  Since #803 the
+	// idempotency unit is the call and not the payload: `batch_capture_measurements`
+	// carries no idempotency token, so an identical resubmission under the same
+	// `DatasetId` commits again instead of being absorbed as a duplicate -- absorbing
+	// it was the defect.  A replay of the *same* call, carrying the same explicit
+	// token, still records exactly one row: `gated_ingest_idempotent_replay` in
+	// `legacy_seal_tests.rs` pins that.
 	db.batch_capture_measurements(aspect_id, dataset, rows).await?;
-	assert_eq!(db.seal_changes(&aspect_id).await?.len(), 1, "a replay records no change");
+	let changes = db.seal_changes(&aspect_id).await?;
+	assert_eq!(changes.len(), 2, "a retried call is its own commit, not a silent replay");
+	assert_eq!(changes[1].row_count, 5, "the retry writes the batch again");
 
 	// A single capture is another commit and another row.
 	db.capture_measurement(&aspect_id, &dataset, &InputMeasurement::new(base + Duration::seconds(10), bd("99.25"))).await?;
 	let changes = db.seal_changes(&aspect_id).await?;
-	assert_eq!(changes.len(), 2);
-	assert_eq!(changes[1].row_count, 1);
+	assert_eq!(changes.len(), 3);
+	assert_eq!(changes[2].row_count, 1);
 	assert_eq!(db.count_unbatched_measurements(&aspect_id).await?, 0);
 
 	// Acknowledgement drains the log through the epoch.
 	db.ack_seal_changes(&aspect_id, changes[0].epoch).await?;
 	let remaining = db.seal_changes(&aspect_id).await?;
-	assert_eq!(remaining.len(), 1);
-	assert_eq!(remaining[0].epoch, changes[1].epoch);
+	assert_eq!(remaining.len(), 2);
+	assert_eq!(remaining[0].epoch, changes[1].epoch, "the ack drained the first call's commit, leaving the retry and the capture");
 
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
 	Ok(())
