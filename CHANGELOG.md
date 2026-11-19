@@ -8,6 +8,20 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- **The legacy seal adapter no longer derives the idempotency key from a CRC-32 of the payload (#803).**
+  `DatasetId` is a logical multi-write identity and is not the idempotency unit; a seal write is
+  idempotent only under a caller-supplied per-call token (UUIDv4 when `None`), otherwise each call
+  appends (matching rows-mode's documented "no idempotency key" contract).  The prior key shape
+  `legacy:{uuid}:{crc}:{n}` is never written and existing rows under that scheme stay inert.
+  `ingest_batch_with_gate` gained an `idempotency_token: Option<&str>` parameter.
+
+### Removed
+
+- **`payload_crc`** — the CRC-32 content hash that was part of the derived idempotency key.  It is
+  removed entirely; no call site feeds a content hash into `IngestBatch::key` (#803).
+
 ### Added
 
 - **The bulk-ingest path (`ingest_batch`) now runs the fragmentation gate (#232).**

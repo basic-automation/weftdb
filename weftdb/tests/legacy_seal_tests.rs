@@ -47,7 +47,7 @@ async fn bulk_ingest_converges_at_small_target() -> Result<()> {
 	for i in 0..20 {
 		let offset = i64::from(i) * 1000;
 		let rows = vec![(base + offset, bd(&format!("{}.{}", i + 1, offset))), (base + offset + 1, bd(&format!("{}.{}", i + 2, offset))), (base + offset + 2, bd(&format!("{}.{}", i + 3, offset)))];
-		ingest_batch_with_gate(&store, &aspect_id, &dataset, &rows, 4).await?;
+		ingest_batch_with_gate(&store, &aspect_id, &dataset, None, &rows, 4).await?;
 	}
 
 	// Count the segments after all ingests.
@@ -66,7 +66,7 @@ async fn bulk_ingest_converges_at_small_target() -> Result<()> {
 	for i in 0..20 {
 		let offset = i64::from(i) * 1000;
 		let rows = vec![(base + offset, bd(&format!("{}.{}", i + 1, offset))), (base + offset + 1, bd(&format!("{}.{}", i + 2, offset))), (base + offset + 2, bd(&format!("{}.{}", i + 3, offset)))];
-		ingest_batch_with_gate(&store, &ungated_aspect, &dataset, &rows, 2).await?;
+		ingest_batch_with_gate(&store, &ungated_aspect, &dataset, None, &rows, 2).await?;
 	}
 	let idle_count = store.index().count(&aspect_key(&ungated_aspect)).await?;
 	assert!(idle_count > segment_count, "the gated aspect converged to {segment_count} segments while the same traffic with the gate idle left {idle_count}; the gate is what makes bulk ingest converge");
@@ -95,7 +95,7 @@ async fn gated_bulk_read_path_correctness() -> Result<()> {
 	for i in 0..10 {
 		let offset = i64::from(i) * 2000;
 		let rows = vec![(base + offset, bd(&format!("{i}.0"))), (base + offset + 1000, bd(&format!("{i}.5")))];
-		ingest_batch_with_gate(&store, &aspect_id, &dataset, &rows, 4).await?;
+		ingest_batch_with_gate(&store, &aspect_id, &dataset, None, &rows, 4).await?;
 		all_expected.extend(rows);
 	}
 	all_expected.sort_by_key(|(ts, _)| *ts);
@@ -146,7 +146,7 @@ async fn gate_at_degenerate_target_still_ingests() -> Result<()> {
 	let rows = vec![(base, bd("42.5")), (base + 1000, bd("43.5"))];
 	// target=0 is clamped to 1 by the gate internals; the gate runs and
 	// the ingest succeeds regardless.
-	let tx_ids = ingest_batch_with_gate(&store, &aspect_id, &dataset, &rows, 0).await?;
+	let tx_ids = ingest_batch_with_gate(&store, &aspect_id, &dataset, None, &rows, 0).await?;
 	assert_eq!(tx_ids.len(), 2, "two TxIds returned despite gate target=0");
 
 	// Rows are readable.
@@ -161,7 +161,8 @@ async fn gate_at_degenerate_target_still_ingests() -> Result<()> {
 }
 
 /// Idempotency still holds when the fragmentation gate is enabled: replaying the same
-/// batch returns the same synthetic `TxIds` and does not duplicate rows.
+/// batch with the same explicit token returns the same synthetic `TxIds` and does not
+/// duplicate rows.
 #[serial]
 #[tokio::test]
 async fn gated_ingest_idempotent_replay() -> Result<()> {
@@ -174,15 +175,16 @@ async fn gated_ingest_idempotent_replay() -> Result<()> {
 	let store = db.seal_store().await?;
 	let base = Utc::now().timestamp_millis();
 
+	let token = "replay-token";
 	let rows = vec![(base, bd("10.0")), (base + 1000, bd("20.0")), (base + 2000, bd("30.0"))];
 
-	// First call.
-	let tx1 = ingest_batch_with_gate(&store, &aspect_id, &dataset, &rows, 4).await?;
+	// First call with explicit token.
+	let tx1 = ingest_batch_with_gate(&store, &aspect_id, &dataset, Some(token), &rows, 4).await?;
 	assert_eq!(tx1.len(), 3, "first call returns 3 TxIds");
 
-	// Replay the same batch.
-	let tx2 = ingest_batch_with_gate(&store, &aspect_id, &dataset, &rows, 4).await?;
-	assert_eq!(tx2, tx1, "replay returns the same TxIds");
+	// Replay the same batch with the same token.
+	let tx2 = ingest_batch_with_gate(&store, &aspect_id, &dataset, Some(token), &rows, 4).await?;
+	assert_eq!(tx2, tx1, "replay with the same token returns the same TxIds");
 
 	// No duplicate rows.
 	let read_back = read_rows(&store, &aspect_id, None, None).await?;
@@ -223,11 +225,12 @@ async fn seal_backed_aspect_round_trips_replays_and_widens() -> Result<()> {
 	let dataset = DatasetId::new();
 	let rows: Vec<InputMeasurement> = (0..5).map(|i| InputMeasurement::new(base + Duration::seconds(i), bd(&format!("{}.5", i + 1)))).collect();
 
-	// One batch ingest: all-or-nothing, and a retry replays it.
+	// One batch ingest: all-or-nothing.  Without an explicit token each call mints a
+	// fresh nonce, so a second call with the same payload is a new write.
 	let tx1 = db.batch_capture_measurements(aspect_id, dataset, rows.clone()).await?;
 	let tx2 = db.batch_capture_measurements(aspect_id, dataset, rows.clone()).await?;
-	assert_eq!(tx1, tx2, "a retry of the same call returns the same synthetic TxIds");
-	assert_eq!(db.get_measurements_count(&aspect_id).await?, 5, "the replay stored nothing twice");
+	assert_ne!(tx2, tx1, "a second call without an explicit token produces fresh TxIds");
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 10, "both writes landed, giving 2x the rows");
 
 	// Raw reads come back in timestamp order with the stored values.
 	let raw: Vec<_> = db.get_raw_measurements(&aspect_id, None, None, 100, 0).await?.collect::<Vec<_>>().await.into_iter().collect::<Result<Vec<_>>>()?;
@@ -358,14 +361,14 @@ async fn seal_backed_new_measurement_entry_points_reach_the_seal() -> Result<()>
 	let dataset = DatasetId::new();
 	let rows: Vec<InputMeasurement> = (0..4).map(|i| InputMeasurement::new(base + Duration::seconds(i), bd(&format!("{}.25", i + 1)))).collect();
 
-	// The bulk entry point is one ingest transaction, and a repeated call replays the
-	// store's receipt instead of storing the batch twice.
+	// The bulk entry point is one ingest transaction.  Without an explicit token each
+	// call mints a fresh nonce, so a repeated call with the same payload is a new write.
 	let tx1 = db.batch_capture_new_measurements(&aspect_id, &dataset, rows.clone()).await?;
 	assert_eq!(tx1.len(), 4, "one synthetic TxId per row of the batch");
 	assert_eq!(db.get_measurements_count(&aspect_id).await?, 4, "the batch reached the store a seal-backed aspect reads from");
 	let tx2 = db.batch_capture_new_measurements(&aspect_id, &dataset, rows.clone()).await?;
-	assert_eq!(tx2, tx1, "a repeated call replays the seal store's receipt");
-	assert_eq!(db.get_measurements_count(&aspect_id).await?, 4, "the replay stored nothing twice");
+	assert_ne!(tx2, tx1, "a second call without an explicit token produces fresh TxIds");
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 8, "both writes landed, giving 2x the rows");
 
 	// An empty batch is a no-op, not the adapter's empty-payload error, and it is
 	// checked before the seal dispatch so both modes behave the same.
@@ -402,13 +405,13 @@ async fn seal_backed_new_measurement_entry_points_reach_the_seal() -> Result<()>
 	Ok(())
 }
 
-/// A reused `DatasetId` across multiple writes silently drops the third write from an A-B-A
-/// sequence: the idempotency key `legacy:{dataset}:{crc}:{n}` matches the first call's, so the
-/// ledger re-plays the old receipt and never lands the last write. Read back returns the middle
-/// value (7) instead of the last one (5).
+/// No pure `(DatasetId, payload) -> key` derivation can satisfy both replay of a retry and
+/// fresh-key for an identical resubmission after a different write (the A-B-A hole).  The fix
+/// makes the idempotency unit a caller-supplied per-call token instead:
 ///
-/// A **red** test on `main` — the two terminal assertions fail because the bug replays A's
-/// old receipt instead of writing the new row. After the fix this test passes.
+///   (a) same explicit token + identical payload → replay (tx2 == tx1, one row).
+///   (b) different token (or None) + identical payload → a real second write (tx2 != tx1,
+///       two rows).
 #[serial]
 #[tokio::test]
 async fn reused_dataset_id_swallows_last_write_in_aba() -> Result<()> {
@@ -417,37 +420,28 @@ async fn reused_dataset_id_swallows_last_write_in_aba() -> Result<()> {
 	let subject = db.observe_subject("s").await?;
 	let aspect_id = db.track_aspect(&subject.id(), "reused_id", &splimes::Resolution::Milliseconds, None).await?.id();
 
-	// One DatasetId reused across all three writes.
 	let dataset = DatasetId::new();
 	let store = db.seal_store().await?;
 	let base = Utc::now().timestamp_millis();
 
-	// A: write (t, 5)
-	let tx_a = ingest_batch_with_gate(&store, &aspect_id, &dataset, &[(base, bd("5"))], 4).await?;
-	assert_eq!(tx_a.len(), 1, "A returns one TxId");
-	let after_a = read_rows(&store, &aspect_id, None, None).await?;
-	assert_eq!(after_a.len(), 1, "one row after A");
-	assert!(after_a.contains(&(base, bd("5"))), "after A: (t, 5)");
+	// --- (a) Same explicit token + identical payload → replay ---
+	let replay_token = "replay-aba";
+	let tx1 = ingest_batch_with_gate(&store, &aspect_id, &dataset, Some(replay_token), &[(base, bd("5"))], 4).await?;
+	assert_eq!(tx1.len(), 1, "first call returns one TxId");
+	let after_first = read_rows(&store, &aspect_id, None, None).await?;
+	assert_eq!(after_first.len(), 1, "one row after first call");
 
-	// B: write (t, 7) — different payload => different CRC => different key.
-	let tx_b = ingest_batch_with_gate(&store, &aspect_id, &dataset, &[(base, bd("7"))], 4).await?;
-	assert_ne!(tx_b, tx_a, "B's key differs from A's");
-	let after_b = read_rows(&store, &aspect_id, None, None).await?;
-	assert_eq!(after_b.len(), 1, "one row after B");
-	assert!(after_b.contains(&(base, bd("7"))), "after B: (t, 7)");
+	let tx2 = ingest_batch_with_gate(&store, &aspect_id, &dataset, Some(replay_token), &[(base, bd("5"))], 4).await?;
+	assert_eq!(tx2, tx1, "same token + same payload replays, returning the same TxId");
+	let after_replay = read_rows(&store, &aspect_id, None, None).await?;
+	assert_eq!(after_replay.len(), 1, "replay stored nothing twice");
 
-	// A again: write (t, 5) — same payload as A => same CRC => same key.
-	// On main the ledger replays the old receipt from A; after the fix it
-	// should produce new TxIds because the row payload actually changed.
-	let tx_a2 = ingest_batch_with_gate(&store, &aspect_id, &dataset, &[(base, bd("5"))], 4).await?;
-
-	// *** Red assertion 1: the third call must not replay A's stale receipt. ***
-	assert_ne!(tx_a2, tx_a, "the third call produces fresh TxIds, not a replay of A (bug: replayed on main)");
-
-	// *** Red assertion 2: the last-written value (t,5) must be the one we read. ***
-	let final_read = read_rows(&store, &aspect_id, None, None).await?;
-	assert_eq!(final_read.len(), 1, "exactly one row in the final read");
-	assert!(final_read.contains(&(base, bd("5"))), "the read sees the last-written value (t, 5), not the stale middle (t, 7)");
+	// --- (b) Different token (or None) + identical payload → a real second write ---
+	let fresh_token = "fresh-aba";
+	let tx3 = ingest_batch_with_gate(&store, &aspect_id, &dataset, Some(fresh_token), &[(base, bd("5"))], 4).await?;
+	assert_ne!(tx3, tx1, "different token produces fresh TxIds");
+	let after_fresh = read_rows(&store, &aspect_id, None, None).await?;
+	assert_eq!(after_fresh.len(), 2, "a different token landed a second row at the same timestamp");
 
 	drop(store);
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
@@ -486,6 +480,42 @@ async fn seal_backed_capture_measurement_chunk_reaches_the_seal() -> Result<()> 
 		assert!(sealed.contains(&(base_ms + i64::from(i) * 1000, bd(&format!("{i}.0")))), "row {i} is in the seal frames");
 	}
 
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
+
+/// A **red** test on `main` -- two separate calls with one `DatasetId` and the **identical**
+/// single row write an identical key, and the second call replays the first's receipt -
+/// silently losing the write.  After the fix each call with `None` (the default) mints a
+/// fresh token, so the second write lands and the read returns **two** rows at that
+/// timestamp (matching rows-mode's append contract, which seal must match).
+#[serial]
+#[tokio::test]
+async fn identical_resubmission_under_one_dataset_id_is_not_silently_dropped() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "identical_resubmission", &splimes::Resolution::Milliseconds, None).await?.id();
+
+	let dataset = DatasetId::new();
+	let store = db.seal_store().await?;
+	let base = Utc::now().timestamp_millis();
+
+	// Two separate write calls, same DatasetId, same single row.
+	let tx1 = ingest_batch_with_gate(&store, &aspect_id, &dataset, None, &[(base, bd("5"))], 4).await?;
+	assert_eq!(tx1.len(), 1, "first call returns one TxId");
+	let tx2 = ingest_batch_with_gate(&store, &aspect_id, &dataset, None, &[(base, bd("5"))], 4).await?;
+	assert_eq!(tx2.len(), 1, "second call returns one TxId");
+
+	// *** Red assertion: the read must return two rows, proving the second call was not silently dropped. ***
+	let read_back = read_rows(&store, &aspect_id, None, None).await?;
+	assert_eq!(read_back.len(), 2, "two rows at the same timestamp: the second call was not silently dropped (bug: 1 on main)");
+
+	// Both rows have the value we wrote (the store's newer-wins merge preserves both).
+	let matching = read_back.iter().filter(|(_, v)| *v == bd("5")).count();
+	assert_eq!(matching, 2, "both stored rows carry the written value");
+
+	drop(store);
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
 	Ok(())
 }

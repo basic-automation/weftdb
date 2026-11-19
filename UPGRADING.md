@@ -194,6 +194,15 @@ a 1.0 compatibility promise.
 
 ---
 
+## Unreleased — seal idempotency key change (#803)
+
+The legacy seal adapter no longer derives the idempotency key from a CRC-32 of the payload.
+Seal-backed typed-API writes without an explicit token now append (duplicate-timestamp writes
+resolve newer-wins at read, matching rows-mode's no-unique-constraint behaviour).  Callers who
+require byte-identical-retry replay must supply an explicit idempotency token (the HTTP
+`Idempotency-Key` path is unchanged).  The prior `legacy:{uuid}:{crc}:{n}` ledger rows are
+inert historical entries; the adapter never looks them up.
+
 ## What is NOT guaranteed
 
 - **A real rollback-after-writes CI test.** No CI job today writes data with the current

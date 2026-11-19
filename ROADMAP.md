@@ -101,7 +101,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
   - [ ] **SEAL-COUNT** The count of a seal-backed aspect agrees with what a range read returns after a batch rewrites a timestamp (#800)
   - [ ] **SEAL-REPLACE** `replace_measurements_in_range` and `compress()` never write to the unread rows file of a seal-backed aspect (#801)
   - [ ] **SEAL-DUP** The replace-not-append rule for duplicate timestamps is documented and pinned by a test (#802)
-  - [ ] **SEAL-IDEM** A reused `DatasetId` cannot lose a write or fail on a CRC-32 collision (#803)
+  - [x] **SEAL-IDEM** A reused `DatasetId` cannot lose a write or fail on a CRC-32 collision (#803)
 - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
 - [ ] Write or approve the honesty-page narrative *(owner)*
 - [ ] Report the three `parquet` 60.0.0 decoder panics and the `arrow-buffer` 60.0.0 panic upstream to apache/arrow-rs *(owner: outward-facing)*

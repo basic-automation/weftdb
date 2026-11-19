@@ -8260,3 +8260,33 @@ thing the check sits in front of.
   failure is logged at debug level. A batch that rewrites a timestamp an existing segment already
   holds can therefore still leave the stored row count above the number of rows a read returns,
   which is what #800 tracks.origin/mainorigin/main
+
+## 2026-11-19 — The idempotency unit is the call, not the payload (#803)
+
+- **Rejected: single-use `DatasetId` as the key.** Oracle option B would repurpose `DatasetId` as
+  a per-call token, keying the ledger as `legacy:{dataset_uuid}` and routing a reused id with a
+  different payload to `IdempotencyConflict` (HTTP 409).  The premise — "no caller reuses one
+  `DatasetId` for many payloads" — is falsified by `bulk_ingest_converges_at_small_target`,
+  `gated_bulk_read_path_correctness` and
+  `seal_backed_aspect_round_trips_replays_and_widens`, which all reuse one `DatasetId` across
+  distinct payloads and expect every write to land.  `DatasetId` is a **logical, multi-write
+  identity** (`weftdb/src/types/dataset.rs:9-10`, `rows_mode.rs:25-27`).
+- **The A-B-A argument.**  No pure `(DatasetId, payload) -> key` function can distinguish "retry
+  of A" from "new submission of identical content A′", so the only sound fix is a caller-minted
+  per-call token.  The adopted design splits the two identities the adapter previously conflated:
+  `DatasetId` stays a stable logical identity, while the seal idempotency unit becomes an explicit
+  per-call token (UUIDv4 when the caller supplies `None`).  The store already has the right
+  primitive (`SegmentStore::ingest` keyed by `(aspect, batch.key)`); the adapter now stops
+  bypassing it with a derived key.
+- **Deliberate scope choice.**  Crash-safe typed-API replay is left to the HTTP layer's existing
+  `Idempotency-Key` (`weft-server/src/ingest.rs:701-709`).  The typed seal path with `None` is
+  append-only, matching rows-mode's documented "no idempotency key" contract.  No `Inputs` trait
+  method signatures were changed in this slice.
+- **Reviewer invariant.**  A seal ingest key is minted once per logical write call and is **never**
+  a function of the payload.  No call site may feed a content hash into `IngestBatch::key`.
+  Presenting the same explicit token with the same batch replays; presenting a different token (or
+  a fresh nonce) always yields a distinct key and therefore a distinct write — never a silent
+  replay of a stale receipt.
+- **Separate, still-open availability point.**  The surviving 64-bit FNV-1a fingerprint
+  (`weftdb/src/types/ingest.rs:162-180`) can produce a false `IdempotencyConflict`.
+  Not addressed here.
