@@ -424,13 +424,7 @@ impl Sha1 {
 
 #[cfg(test)]
 mod tests {
-	use std::str::FromStr;
-
 	use super::*;
-
-	fn bd(s: &str) -> BigDecimal {
-		BigDecimal::from_str(s).expect("decimal")
-	}
 
 	#[test]
 	fn uuid_v5_matches_the_rfc_4122_shape() {
