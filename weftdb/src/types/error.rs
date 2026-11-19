@@ -48,6 +48,9 @@ pub enum Error {
 
 	#[error("Transient MVCC error (retryable): {0}")]
 	TransientMvccError(String),
+
+	#[error("Operation rejected for a seal-backed aspect: {0}")]
+	SealBackedRejected(String),
 }
 
 impl Error {
