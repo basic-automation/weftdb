@@ -278,7 +278,7 @@ async fn purge_drops_a_fully_expired_segment_and_keeps_a_straddling_one() {
 	let after_expiry = store.read_time_range_of_with_expiry(ASPECT, crate::SeriesId::UNTAGGED, 0, 200, NOW_NS).await.expect("reads after the purge");
 	// A plain read does not apply the TTL, so it could use those rows: dropping the wholly
 	// expired frame must remove exactly its instants from a plain read and touch nothing else.
-	assert!(before_plain.0.iter().any(|&ts| ts == 60) && before_plain.0.iter().any(|&ts| ts == 79), "a plain read sees the wholly expired frame before the purge");
+	assert!(before_plain.0.contains(&60) && before_plain.0.contains(&79), "a plain read sees the wholly expired frame before the purge");
 	assert!(!after_plain.0.iter().any(|&ts| ts <= 79), "the dropped frame's instants leave the plain read: {:?}", after_plain.0.iter().filter(|&&ts| ts <= 79).copied().collect::<Vec<_>>());
 	assert_eq!(after_plain.0.len(), before_plain.0.len() - 20, "exactly the dropped frame's twenty rows go, no more");
 	assert_eq!(after_plain.0.first().copied(), Some(85), "the straddling frame still starts the plain read");
