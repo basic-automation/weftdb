@@ -10,6 +10,11 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **Multi-series crash cell (TAG-12, issue #341).** A new fault-injection test
+  (`multiseries_crash`) writes interleaved frames across 8 series and aborts at
+  `SFrameWritten`, proving every series remains consistent with its committed frames
+  after the kill.
+
 - **The bulk-ingest path (`ingest_batch`) now runs the fragmentation gate (#232).**
   A new `ingest_batch_with_gate(store, aspect_id, dataset_id, rows, squash_target_rows)`
   does the existing ingest then calls

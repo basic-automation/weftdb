@@ -8373,4 +8373,26 @@ not exist yet.
   timestamps and different values are all kept by both modes. No decision was taken on whether
   that should change.
 
-## 2026-11-19 — (empty, placeholder for the next decision)
+## 2026-11-19 — Multi-series crash cell (#341, TAG-12) (decided)
+
+- **What the multi-series cell proves.** When a process writing to 8 seal-backed aspects
+  in a single store is killed at `SFrameWritten` (the frame has reached disk but not yet
+  committed), every aspect independently recovers: the committed frames of each aspect
+  are exactly what a single-threaded replay of its committed batches would produce. No
+  aspect shows a value from a frame that never committed, and no aspect loses a value
+  whose frame did commit. The invariant holds because the seal store's frame write
+  (`write_seal_frame`) is write-once: a frame is fsynced before the fault point fires,
+  and the per-aspect generation counter ensures no frame name is reused, so crash litter
+  never becomes live data.
+- **What it does not prove.** This is a process-kill test, not a power-loss test. A
+  missing fsync (the kernel's write-back cache) is not detected — see the header of
+  `scripts/crash-matrix.sh` which already says a kill soak cannot see a missing fsync.
+  The test does not exercise the `SBetweenFrames` fault point (multi-frame chunks), the
+  `SDirSynced` point (directory sync after frame write), or the maintenance-path fault
+  points (`MPlanned`, `MPendingCommitted`, `MOutputWritten`, `MOutputSynced`, `MDirSynced`,
+  `MSwapped`). Those remain for future cells in the crash matrix.
+- **Why `SFrameWritten` was chosen.** It is the canonical mid-write point: the frame is
+  durably on disk but the index has not recorded it, so on recovery the orphan frame is
+  classified as crash litter. Every other point before commit (`SFrameSynced`, `SDirSynced`,
+  `SRowsInserted`) would leave a similarly orphaned frame; `SFrameWritten` is the earliest
+  fault point after the first durable write and thus the broadest mid-write signal.
