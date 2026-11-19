@@ -546,7 +546,10 @@ fn maintenance_segment_ceiling_from(value: Option<&str>) -> Option<u64> {
 /// | `us`   | Micros |
 /// | `ns`   | Nanos |
 fn row_expiry_policy_from(value: Option<&str>) -> row_expiry::RowExpiryPolicy {
-	use row_expiry::{RowExpiryPolicy, TimeUnit};
+	// `TimeUnit` comes from this module's own `weft_physical_type` import; the
+	// `row_expiry` module's import of it is private, so re-importing it from there
+	// would be E0603.
+	use row_expiry::RowExpiryPolicy;
 
 	fn parse_unit(s: &str) -> Option<(u64, TimeUnit)> {
 		if let Some(rest) = s.strip_suffix("ns") {

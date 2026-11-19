@@ -13,7 +13,7 @@ use weft_physical_type::{timestamp::TimeUnit, AspectSchema, PhysicalType};
 
 use super::{SegmentStore, SegmentStoreOptions};
 use crate::{
-	segment_store::row_expiry::{expired_cutoff, RowExpiryPolicy}, IngestBatch
+	segment_store::row_expiry::{expired_cutoff, is_row_expired, RowExpiryPolicy}, IngestBatch
 };
 
 fn bd(s: &str) -> BigDecimal {
