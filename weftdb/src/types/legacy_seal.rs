@@ -14,7 +14,7 @@
 //! range delete (design §8, S19).
 //!
 //! **Writes.** `batch_capture_measurements` on a seal-backed aspect is one
-//! [`SegmentStore::ingest`] call under a per-call token (UUIDv4 when the
+//! [`SegmentStore::ingest`] call under a per-call token (`UUIDv4` when the
 //! caller supplies none), so each logical write is one transaction —
 //! all-or-nothing — and a retry of the same call with the same explicit
 //! token replays the first commit's receipt instead of storing the rows
@@ -58,7 +58,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use bigdecimal::BigDecimal;
 use uuid::Uuid;
-use weft_physical_type::{crc32, widen_value_encoding, AspectSchema, PhysicalType, TimeUnit};
+use weft_physical_type::{widen_value_encoding, AspectSchema, PhysicalType, TimeUnit};
 
 use crate::{AspectId, DatasetId, IngestBatch, Measurement, MeasurementId, SegmentStore, TxId};
 
@@ -239,7 +239,7 @@ pub async fn ensure_declared(store: &SegmentStore, key: &str, values: &[BigDecim
 /// `dataset_id` is a **logical** multi-write identity: it is kept in the
 /// signature for back-compatibility but is **no longer part of the key**.
 /// The idempotency unit is the `idempotency_token`.  When `None`, a fresh
-/// UUIDv4 token is minted per call, making each call a new write
+/// `UUIDv4` token is minted per call, making each call a new write
 /// (append-only, matching rows-mode's "no idempotency key" contract).
 /// Pass an explicit token to make the call replayable: the same token
 /// with the same payload replays the first receipt; a different token (or
@@ -253,11 +253,11 @@ pub async fn ensure_declared(store: &SegmentStore, key: &str, values: &[BigDecim
 /// # Errors
 ///
 /// As [`SegmentStore::ingest`].
-pub async fn ingest_batch_with_gate(store: &SegmentStore, aspect_id: &AspectId, dataset_id: &DatasetId, idempotency_token: Option<&str>, rows: &[(i64, BigDecimal)], squash_target_rows: usize) -> Result<Vec<TxId>> {
+pub async fn ingest_batch_with_gate(store: &SegmentStore, aspect_id: &AspectId, _dataset_id: &DatasetId, idempotency_token: Option<&str>, rows: &[(i64, BigDecimal)], squash_target_rows: usize) -> Result<Vec<TxId>> {
 	let key = aspect_key(aspect_id);
 	let values: Vec<BigDecimal> = rows.iter().map(|(_, value)| value.clone()).collect();
 	ensure_declared(store, &key, &values).await?;
-	let token = idempotency_token.map(str::to_owned).unwrap_or_else(|| Uuid::new_v4().to_string());
+	let token = idempotency_token.map_or_else(|| Uuid::new_v4().to_string(), str::to_owned);
 	let idem = idempotency_key(&token);
 	let timestamps: Vec<i64> = rows.iter().map(|(timestamp, _)| *timestamp).collect();
 	let receipt = store.ingest(&key, &IngestBatch::dense(idem.clone(), timestamps, values)).await?;
@@ -464,8 +464,8 @@ mod tests {
 		let tok2 = "tok-2";
 		assert_eq!(idempotency_key(tok1), "legacy:tok-1");
 		assert_eq!(idempotency_key(tok2), "legacy:tok-2");
-		// Two different tokens give different keys for identical rows.
-		let rows = vec![(1_000, bd("1.5"))];
+		// Two different tokens give different keys even for an identical payload,
+		// because the payload is not part of the key.
 		let key1 = idempotency_key(tok1);
 		let key2 = idempotency_key(tok2);
 		assert_ne!(key1, key2, "different tokens ⇒ different keys, even with identical payload");
