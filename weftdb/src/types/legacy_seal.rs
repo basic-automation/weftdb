@@ -244,16 +244,23 @@ pub async fn ensure_declared(store: &SegmentStore, key: &str, values: &[BigDecim
 	Ok(widened)
 }
 
-/// Ingest one legacy batch into `store` under its derived key: the whole
-/// call is the store's one ingest transaction, and a retry replays it.
-/// Returns the synthetic `TxIds`, one per row, in row order.
+/// Ingest one legacy batch into `store` under its derived key, then run
+/// the store's fragmentation gate on the same aspect.
+///
+/// This is the entry point that every call path — single-row and bulk —
+/// should use so that bulk ingest converges the seal just as the
+/// single-row capture path does.
+///
+/// A gate error is logged at `tracing::debug!` and **never propagated**:
+/// an ingest must not fail because the maintenance step did. The returned
+/// `TxIds` are the same whether the gate ran or not.
 ///
 /// # Errors
 ///
 /// As [`SegmentStore::ingest`], including its typed idempotency conflict
 /// when the derived key was already committed with a different payload of
 /// the same length and CRC (a CRC collision, not a retry).
-pub async fn ingest_batch(store: &SegmentStore, aspect_id: &AspectId, dataset_id: &DatasetId, rows: &[(i64, BigDecimal)]) -> Result<Vec<TxId>> {
+pub async fn ingest_batch_with_gate(store: &SegmentStore, aspect_id: &AspectId, dataset_id: &DatasetId, rows: &[(i64, BigDecimal)], squash_target_rows: usize) -> Result<Vec<TxId>> {
 	let key = aspect_key(aspect_id);
 	let values: Vec<BigDecimal> = rows.iter().map(|(_, value)| value.clone()).collect();
 	ensure_declared(store, &key, &values).await?;
@@ -261,7 +268,23 @@ pub async fn ingest_batch(store: &SegmentStore, aspect_id: &AspectId, dataset_id
 	let timestamps: Vec<i64> = rows.iter().map(|(timestamp, _)| *timestamp).collect();
 	let receipt = store.ingest(&key, &IngestBatch::dense(idem.clone(), timestamps, values)).await?;
 	debug_assert_eq!(receipt.row_count, rows.len());
+	if let Err(e) = store.squash_aspect_to_target_rows_if_fragmented(&key, squash_target_rows).await {
+		tracing::debug!("Failed to run the fragmentation gate after ingesting a batch for aspect {aspect_id}; it is sealed: {e}");
+	}
 	Ok((0..rows.len()).map(|index| synthetic_tx_id(&idem, index)).collect())
+}
+
+/// Ingest one legacy batch, then run the fragmentation gate with
+/// [`SQUASH_TARGET_ROWS`].
+///
+/// This is the thin wrapper that existing callers continue to use with
+/// unchanged behaviour.
+///
+/// # Errors
+///
+/// As [`ingest_batch_with_gate`].
+pub async fn ingest_batch(store: &SegmentStore, aspect_id: &AspectId, dataset_id: &DatasetId, rows: &[(i64, BigDecimal)]) -> Result<Vec<TxId>> {
+	ingest_batch_with_gate(store, aspect_id, dataset_id, rows, SQUASH_TARGET_ROWS).await
 }
 
 /// Every row of a seal-backed aspect in `[start, end]`, sorted by timestamp.

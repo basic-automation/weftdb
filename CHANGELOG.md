@@ -10,6 +10,15 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **The bulk-ingest path (`ingest_batch`) now runs the fragmentation gate (#232).**
+  A new `ingest_batch_with_gate(store, aspect_id, dataset_id, rows, squash_target_rows)`
+  does the existing ingest then calls
+  `store.squash_aspect_to_target_rows_if_fragmented` with the supplied target, logging a
+  gate failure at `tracing::debug!` and never propagating it. The existing `ingest_batch`
+  is now a thin wrapper passing `SQUASH_TARGET_ROWS`. The duplicate gate calls at the two
+  `capture_measurement`-side call sites in `inputs.rs` were removed — they moved into the
+  bulk path.
+- **A refused maintenance plan has its own HTTP answer (#764).**- **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**- **`WEFT_MEMORY_BUDGET_BYTES` and the cgroup limit are now read and held (#788).**
 - **A fan-out benchmark arm — the cost of reading across many series (#809, TAG-12).**
 `weft-bench --fan-out` opens a real `SegmentStore`, ingests a seeded corpus of tagged series
 (1 000 rows each by default), and then reads every series at each rung of a series-count ladder
