@@ -619,9 +619,10 @@ impl SegmentStoreOptions {
 	/// `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES`
 	/// ([`max_maintenance_output_bytes`](Self::max_maintenance_output_bytes); a
 	/// positive whole number of bytes, else unbudgeted), and `WEFT_ROW_TTL`
-	/// ([`expiry`](Self::expiry); a whole positive number of the aspect's own time
-	/// unit as [`row_expiry::RowExpiryPolicy::Ttl`] stores; unset, `0`, empty or
-	/// unparseable → [`row_expiry::RowExpiryPolicy::NoExpiry`]), each as lenient
+	/// ([`expiry`](Self::expiry); a duration with an optional unit suffix (`ns`, `us`,
+	/// `ms`, `s`); a bare number is seconds; a positive TTL finer than the aspect's
+	/// tick clamps to one tick; unset, `0`, empty or unparseable →
+	/// [`row_expiry::RowExpiryPolicy::NoExpiry`]), each as lenient
 	/// as it documents. Explicit: nothing in the library calls it.
 	#[must_use]
 	pub fn from_env() -> Self {
