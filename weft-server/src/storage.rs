@@ -43,7 +43,7 @@ use sha2::{Digest, Sha256};
 use tracing::Instrument as _;
 
 use crate::{
-	error::{self, ApiError, SelectorQuery}, read_limits, state::AppState
+	error::{self, ApiError, SelectorQuery}, memory_budget::{MemoryBudget, Reservation}, read_limits, state::AppState
 };
 
 /// The tags of the series a stored read served, as the JSON bodies report them (TAG-10).
@@ -51,6 +51,35 @@ use crate::{
 /// `{}` for the untagged series 0, `{key: value}` for a tagged one, and `null` when the
 /// selector matched no series (the body is then empty).
 ///
+/// Reserve memory for a read result of `row_count` rows against the
+/// container memory budget (ROB-14 cut 2).
+///
+/// The per-row cost is a conservative estimate ([`ESTIMATED_BYTES_PER_ROW`])
+/// covering a timestamp (i64, 8 bytes) and a `BigDecimal` value (~32 bytes)
+/// plus `Vec` and growth overhead. The real response memory is format-dependent
+/// (Arrow, CSV, JSON) and would be more expensive to compute than the budget
+/// it guards.
+///
+/// Returns `Ok(None)` for an empty result set (no reservation needed).
+/// Returns `Err(ApiError)` with `Code::OverBudget` and `Retry-After` when
+/// the budget is exhausted.
+fn reserve_read_memory(budget: &MemoryBudget, row_count: usize) -> Result<Option<Reservation>, ApiError> {
+	let wanted = (row_count as u64).saturating_mul(read_limits::ESTIMATED_BYTES_PER_ROW);
+	if wanted == 0 {
+		return Ok(None);
+	}
+	match budget.try_reserve(wanted) {
+		Ok(guard) => {
+			tracing::trace!(row_count, wanted, "read memory reserved");
+			Ok(Some(guard))
+		}
+		Err(_err) => {
+			tracing::warn!(row_count, wanted, "read memory budget exhausted");
+			Err(ApiError::new(error::Code::OverBudget, "the memory budget is exhausted; retry after in-flight requests complete").with_retry_after(1))
+		}
+	}
+}
+
 pub type SeriesTags = Option<std::collections::BTreeMap<String, String>>;
 
 /// The one series a stored read targets, resolved once from the request's selector.
@@ -195,6 +224,7 @@ async fn require_schema(store: &weftdb::SegmentStore, aspect: &str) -> Result<we
 pub async fn storage_time_range_csv(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<TimeRangeParams>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let limits = state.read_limits();
+	let budget = state.memory_budget().clone();
 	drop(state);
 	require_schema(&store, &aspect).await?;
 	let target = resolve_target(&store, &aspect, &selector).await?;
@@ -207,6 +237,7 @@ pub async fn storage_time_range_csv(State(state): State<AppState>, Path(aspect):
 	})
 	.await?;
 	limits.check_rows(timestamps.len(), "this range export", None)?;
+	let _mem_guard = reserve_read_memory(&budget, timestamps.len())?;
 	drop(store);
 	let body = tracing::info_span!("storage.range.serialize", format = "csv").in_scope(|| render_csv(timestamps.into_iter().zip(values)));
 	Ok(csv_response(body))
@@ -226,6 +257,7 @@ pub async fn storage_time_range_csv(State(state): State<AppState>, Path(aspect):
 pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<ValueRangeParams>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let limits = state.read_limits();
+	let budget = state.memory_budget().clone();
 	drop(state);
 	let lo = parse_value_bound("lo", &params.lo)?;
 	let hi = parse_value_bound("hi", &params.hi)?;
@@ -240,6 +272,7 @@ pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect)
 	})
 	.await?;
 	limits.check_rows(timestamps.len(), "this value-range export", None)?;
+	let _mem_guard = reserve_read_memory(&budget, timestamps.len())?;
 	drop(store);
 	let body = tracing::info_span!("storage.value_range.serialize", format = "csv").in_scope(|| render_csv(timestamps.into_iter().zip(values.into_iter().map(Some))));
 	Ok(csv_response(body))
@@ -259,6 +292,7 @@ pub async fn storage_value_range_csv(State(state): State<AppState>, Path(aspect)
 pub async fn storage_time_range(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<TimeRangeParams>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let limits = state.read_limits();
+	let budget = state.memory_budget().clone();
 	drop(state);
 	let schema = require_schema(&store, &aspect).await?;
 	let target = resolve_target(&store, &aspect, &selector).await?;
@@ -271,6 +305,7 @@ pub async fn storage_time_range(State(state): State<AppState>, Path(aspect): Pat
 	})
 	.await?;
 	limits.check_rows(batch.num_rows(), "this range export", None)?;
+	let _mem_guard = reserve_read_memory(&budget, batch.num_rows())?;
 	drop(store);
 	let bytes = tracing::info_span!("storage.range.serialize", format = "arrow").in_scope(|| weft_arrow::write_ipc_stream(std::slice::from_ref(&batch))).map_err(|err| error::classify_read(&anyhow::Error::from(err)))?;
 	Ok(arrow_stream_response(bytes))
@@ -288,6 +323,7 @@ pub async fn storage_time_range(State(state): State<AppState>, Path(aspect): Pat
 pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<ValueRangeParams>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let limits = state.read_limits();
+	let budget = state.memory_budget().clone();
 	drop(state);
 	let lo = parse_value_bound("lo", &params.lo)?;
 	let hi = parse_value_bound("hi", &params.hi)?;
@@ -302,6 +338,7 @@ pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Pa
 	})
 	.await?;
 	limits.check_rows(batch.num_rows(), "this value-range export", None)?;
+	let _mem_guard = reserve_read_memory(&budget, batch.num_rows())?;
 	drop(store);
 	let bytes = tracing::info_span!("storage.value_range.serialize", format = "arrow").in_scope(|| weft_arrow::write_ipc_stream(std::slice::from_ref(&batch))).map_err(|err| error::classify_read(&anyhow::Error::from(err)))?;
 	Ok(arrow_stream_response(bytes))
@@ -321,6 +358,7 @@ pub async fn storage_value_range(State(state): State<AppState>, Path(aspect): Pa
 pub async fn storage_time_range_parquet(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<TimeRangeParams>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let limits = state.read_limits();
+	let budget = state.memory_budget().clone();
 	drop(state);
 	let schema = require_schema(&store, &aspect).await?;
 	let target = resolve_target(&store, &aspect, &selector).await?;
@@ -333,6 +371,7 @@ pub async fn storage_time_range_parquet(State(state): State<AppState>, Path(aspe
 	})
 	.await?;
 	limits.check_rows(batch.num_rows(), "this range export", None)?;
+	let _mem_guard = reserve_read_memory(&budget, batch.num_rows())?;
 	drop(store);
 	let bytes = tracing::info_span!("storage.range.serialize", format = "parquet").in_scope(|| weft_arrow::write_parquet(std::slice::from_ref(&batch))).map_err(|err| error::classify_read(&anyhow::Error::from(err)))?;
 	Ok(parquet_response(bytes))
@@ -351,6 +390,7 @@ pub async fn storage_time_range_parquet(State(state): State<AppState>, Path(aspe
 pub async fn storage_value_range_parquet(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<ValueRangeParams>) -> Result<Response, ApiError> {
 	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let limits = state.read_limits();
+	let budget = state.memory_budget().clone();
 	drop(state);
 	let lo = parse_value_bound("lo", &params.lo)?;
 	let hi = parse_value_bound("hi", &params.hi)?;
@@ -365,6 +405,7 @@ pub async fn storage_value_range_parquet(State(state): State<AppState>, Path(asp
 	})
 	.await?;
 	limits.check_rows(batch.num_rows(), "this value-range export", None)?;
+	let _mem_guard = reserve_read_memory(&budget, batch.num_rows())?;
 	drop(store);
 	let bytes = tracing::info_span!("storage.value_range.serialize", format = "parquet").in_scope(|| weft_arrow::write_parquet(std::slice::from_ref(&batch))).map_err(|err| error::classify_read(&anyhow::Error::from(err)))?;
 	Ok(parquet_response(bytes))
@@ -571,6 +612,7 @@ fn decode_cursor_v1(cursor: &str, selector: &weftdb::SeriesSelector, timestamps:
 pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<PointsRangeParams>) -> Result<Json<StoredRangeResponse>, ApiError> {
 	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let limits = state.read_limits();
+	let budget = state.memory_budget().clone();
 	drop(state);
 	let schema = store.schema_for(&aspect).await.map_err(|err| ApiError::internal(err.to_string()))?;
 	let Some(schema) = schema else {
@@ -585,6 +627,7 @@ pub async fn storage_time_range_json(State(state): State<AppState>, Path(aspect)
 		.map_err(|err| error::classify_read(&err))
 	})
 	.await?;
+	let _mem_guard = reserve_read_memory(&budget, timestamps.len())?;
 	drop(store);
 	let total = timestamps.len();
 	limits.check_rows(total, "this range read", Some("limit"))?;
@@ -688,6 +731,7 @@ pub struct ValuePointsParams {
 pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<ValuePointsParams>) -> Result<Json<StoredRangeResponse>, ApiError> {
 	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let limits = state.read_limits();
+	let budget = state.memory_budget().clone();
 	drop(state);
 	let lo = parse_value_bound("lo", &params.lo)?;
 	let hi = parse_value_bound("hi", &params.hi)?;
@@ -707,6 +751,7 @@ pub async fn storage_value_range_json(State(state): State<AppState>, Path(aspect
 		.map_err(|err| error::classify_read(&err))
 	})
 	.await?;
+	let _mem_guard = reserve_read_memory(&budget, raw_timestamps.len())?;
 	drop(store);
 	// Convert the raw non-optional values to Option<BigDecimal> so cursor functions
 	// share the same type as the time-range read.
@@ -778,6 +823,7 @@ pub struct StoredPointResponse {
 pub async fn storage_point(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<PointParams>) -> Result<Json<StoredPointResponse>, ApiError> {
 	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let limits = state.read_limits();
+	let budget = state.memory_budget().clone();
 	drop(state);
 	let schema = require_schema(&store, &aspect).await?;
 	let target = resolve_target(&store, &aspect, &selector).await?;
@@ -789,6 +835,7 @@ pub async fn storage_point(State(state): State<AppState>, Path(aspect): Path<Str
 		.map_err(|err| error::classify_read(&err))
 	})
 	.await?;
+	let _mem_guard = reserve_read_memory(&budget, 1)?;
 	drop(store);
 	let body = tracing::info_span!("storage.point.serialize", format = "json").in_scope(|| {
 		let found = value.is_some();
@@ -850,6 +897,7 @@ pub struct StoredPointsResponse {
 pub async fn storage_points(State(state): State<AppState>, Path(aspect): Path<String>, SelectorQuery(params, selector): SelectorQuery<MultiPointParams>) -> Result<Json<StoredPointsResponse>, ApiError> {
 	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let limits = state.read_limits();
+	let budget = state.memory_budget().clone();
 	drop(state);
 	let schema = require_schema(&store, &aspect).await?;
 	// Parse the comma-separated instants; a non-integer (or otherwise malformed) entry is a 400.
@@ -865,6 +913,7 @@ pub async fn storage_points(State(state): State<AppState>, Path(aspect): Path<St
 		.map_err(|err| error::classify_read(&err))
 	})
 	.await?;
+	let _mem_guard = reserve_read_memory(&budget, ts.len())?;
 	drop(store);
 	let body = tracing::info_span!("storage.points.serialize", count = ts.len(), format = "json").in_scope(|| {
 		let points = ts.iter().zip(values).map(|(&timestamp, v)| StoredPointEntry { timestamp, found: v.is_some(), value: v.map(|v| v.to_string()) }).collect();
@@ -1238,6 +1287,7 @@ pub struct StorageDownsampleParams {
 pub(crate) async fn storage_downsample_inner(state: AppState, aspect: &str, params: &StorageDownsampleParams, selector: &weftdb::SeriesSelector) -> Result<crate::downsample::DownsampleResponse, ApiError> {
 	let store = state.store().cloned().ok_or_else(ApiError::unconfigured)?;
 	let limits = state.read_limits();
+	let budget = state.memory_budget().clone();
 	let max_fill_buckets = state.interpolate_config().max_output_points();
 	drop(state);
 	let width = crate::downsample::parse_width_token(params.resolution.as_deref())?;
@@ -1259,10 +1309,20 @@ pub(crate) async fn storage_downsample_inner(state: AppState, aspect: &str, para
 	// refused before any segment is opened (ROB-12). A request that names neither is
 	// not refusals on a number it never gave: its grid is checked on the count the
 	// reduction actually produces, below.
-	if let (Some(start), Some(end)) = (params.start, params.end) {
+	// A request that names both bounds states its own grid, so an impossible one is
+	// refused before any segment is opened (ROB-12), and that same number is what the
+	// container memory budget reserves against (ROB-14 cut 2): the guard is taken
+	// before the read and held until the response is handed back, so the buckets are
+	// accounted while they are built and while they are serialized. A request that
+	// names neither bound is not refused on a number it never gave: its grid is
+	// checked, and reserved, on the count the reduction actually produces, below.
+	let mem_guard = if let (Some(start), Some(end)) = (params.start, params.end) {
 		let grid = read_limits::grid_buckets(i128::from(bound_nanos(start)?), i128::from(bound_nanos(end)?), width.step_nanos());
 		limits.check_downsample_buckets(grid)?;
-	}
+		reserve_read_memory(&budget, usize::try_from(grid).unwrap_or(usize::MAX))?
+	} else {
+		None
+	};
 
 	let target = resolve_target(&store, aspect, selector).await?;
 	let span = tracing::info_span!("downsample.range", %aspect, start, end, resolution = %width, buckets = tracing::field::Empty);
@@ -1288,6 +1348,7 @@ pub(crate) async fn storage_downsample_inner(state: AppState, aspect: &str, para
 	// The grid that was actually produced, which is what an unbounded window's cap has
 	// to go on — and the last chance to refuse before the buckets are serialized.
 	limits.check_downsample_buckets(u128::try_from(response.buckets).unwrap_or(u128::MAX))?;
+	let _mem_guard = mem_guard.map_or_else(|| reserve_read_memory(&budget, response.buckets), |guard| Ok(Some(guard)))?;
 	Ok(response)
 }
 
@@ -1363,7 +1424,7 @@ mod tests {
 	use weftdb::SegmentStore;
 
 	use super::{decode_cursor_v1, encode_cursor_v1, hash_selector};
-	use crate::{app_with_state, test_support::*, AppState};
+	use crate::{app_with_state, memory_budget::MemoryBudget, test_support::*, AppState};
 
 	/// Open a store under `dir`, declare `price` (F64, seconds), seal one batch, and
 	/// hand back the ready store. The significant-`Drop` `SegmentStore` lives only
@@ -2559,5 +2620,77 @@ mod tests {
 		// Non-hex content in selector hash field.
 		let err = decode_cursor_v1("01zzzzzzzzzzzzzzzz000000000000000000000000000000000000000000000000000000000000000000", &sel, &timestamps, &values).expect_err("non-hex rejects");
 		assert_eq!(err.code().status(), StatusCode::BAD_REQUEST, "non-hex → 400");
+	}
+	// -- Memory budget enforcement on read paths (ROB-14 cut 2) ---------------
+
+	/// Build a router whose state carries a sealed price store **and** a tiny
+	/// memory budget. We use state construction (not env mutation) so the test
+	/// does not need the `WEFT_MEMORY_BUDGET_BYTES` override or a process env.
+	async fn router_with_tight_budget() -> (TempDir, axum::Router, MemoryBudget) {
+		let dir = TempDir::new().expect("temp dir");
+		let store = sealed_price_store(&dir).await;
+		// A 64-byte budget means a single point read (1 row x 64 bytes/row) just
+		// fits, and nothing else does: a multi-point read with 2+ rows, or any
+		// read taken while the budget is already held, is refused.
+		let budget = MemoryBudget::new(Some(64));
+		let state = AppState::new().with_store(store).with_memory_budget(budget.clone());
+		(dir, app_with_state(state), budget)
+	}
+
+	#[tokio::test]
+	async fn read_refuses_when_budget_exhausted_and_recovers_after_drop() {
+		let (_dir, router, budget) = router_with_tight_budget().await;
+
+		// First read: a single point at t=120 fits in 64 bytes (1 x 64), and its
+		// guard is released when the handler returns — the counter says so.
+		let (status, body) = get_json(router.clone(), "/api/v1/storage/price/at?t=120").await;
+		assert_eq!(status, StatusCode::OK, "first read within budget should succeed");
+		assert_eq!(body["value"], "3.5");
+		assert_eq!(budget.reserved(), 0, "a completed read releases its reservation");
+
+		// Second read: a multi-point of 3 rows (3 x 64 = 192) exceeds the
+		// 64-byte budget, and a reservation of our own holds the whole budget as
+		// well, so the refusal cannot be a fluke of the limit alone. The
+		// reservation is made *before* the check_rows / drop(store), so the route
+		// answers 503 over_budget.
+		let hold = budget.try_reserve(64).expect("the hold is the whole budget");
+		let response = router.clone().oneshot(Request::builder().uri("/api/v1/storage/price/at-multi?t=100,110,120").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "over-budget read must refuse");
+		assert_eq!(budget.reserved(), 64, "the refused read must leave only the hold accounted — its own reservation rolled back");
+		assert!(response.headers().contains_key("retry-after"), "over-budget refusal must carry Retry-After");
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+		assert_eq!(json["code"], "over_budget", "refusal must use the over_budget wire code");
+
+		// Third read: the hold is released, so the budget is available again.
+		drop(hold);
+		assert_eq!(budget.reserved(), 0, "releasing the hold empties the accounting");
+		let (status, body) = get_json(router.clone(), "/api/v1/storage/price/at?t=140").await;
+		assert_eq!(status, StatusCode::OK, "after the guard drops the next read must succeed");
+		assert_eq!(body["value"], "5.5");
+	}
+
+	#[tokio::test]
+	async fn read_succeeds_with_unbounded_budget() {
+		let (_dir, router) = router_with_sealed_price().await;
+		// The default state has an unbounded budget (MemoryBudget::default).
+		// A large multi-point read must succeed as it always did.
+		let (status, _body) = get_json(router, "/api/v1/storage/price/at-multi?t=100,110,120,130,140").await;
+		assert_eq!(status, StatusCode::OK, "unbounded budget must not refuse");
+	}
+
+	#[tokio::test]
+	async fn budget_exhaustion_is_distinct_from_admission_shed() {
+		let (_dir, router, budget) = router_with_tight_budget().await;
+
+		// Hold the whole budget from outside the request path, so the next read
+		// must refuse on memory. The admission shedder is not involved: its own
+		// limits are nowhere near exhausted here, and it reports `overloaded`.
+		let _hold = budget.try_reserve(64).expect("the hold is the whole budget");
+		let response = router.clone().oneshot(Request::builder().uri("/api/v1/storage/price/at?t=110").body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+		let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+		assert_eq!(json["code"], "over_budget", "the refusal must be over_budget, not overloaded");
 	}
 }

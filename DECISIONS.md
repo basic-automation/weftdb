@@ -8260,3 +8260,61 @@ thing the check sits in front of.
   failure is logged at debug level. A batch that rewrites a timestamp an existing segment already
   holds can therefore still leave the stored row count above the number of rows a read returns,
   which is what #800 tracks.origin/mainorigin/main
+
+## 2026-11-17 — ROB-14 cut 2: enforce the container memory budget on request paths (shipped)
+- **MemoryBudget is now consulted on the server's request paths.** Cut 1 (#787) added the
+  machinery but no call sites; cut 2 adds the `try_reserve` calls.
+- **Ingest path.** `IngestBody::from_request` (`weft-server/src/ingest.rs`) reserves against the
+  memory budget using the same `reserved_bytes` (the declared `Content-Length` or the body cap) that
+  sizes the disk guard. A refusal is `503 over_budget` with `Retry-After: 1`. The guard is held for
+  the body's lifetime via the `_memory_guard: Option<Reservation>` field.
+- **Query/read path.** Every stored-data route in `weft-server/src/storage.rs` (13 handlers)
+  reserves a conservative per-row estimate (`ESTIMATED_BYTES_PER_ROW = 64` in `read_limits.rs`, a
+  doc comment explains the sizing rule and that it is an estimate, not exact accounting). The
+  `reserve_read_memory` helper clones the budget before `drop(state)`, reads the result rows, and
+  holds the guard through serialization.
+- **Refusal mapping.** `Code::OverBudget` → `503` with wire code `over_budget`. `with_retry_after(1)`
+  tells the caller to retry after 1 second. No new `Code`, status, or wire string was added; the
+  frozen code table at `error.rs:1138` is unchanged.
+- **Unbounded escape hatch.** When neither `WEFT_MEMORY_BUDGET_BYTES` nor a readable container limit
+  bounds the process, the budget is `MemoryBudget::new(None)` and every reservation succeeds —
+  behaviour is byte-for-byte what it was before this cut. Every test under default configuration
+  passes unchanged.
+- **Fixes.** Fixed a bug in the ingest code path (inherited from the initial cut-1 cherry-pick) where
+  the memory budget refusal used `.ok()`, silently swallowing a refused reservation. The corrected
+  code returns `Err` when the budget is exhausted.
+- **Gate.** This change was not compiled locally (the host has ~4 GB free and a build OOM-kills
+  the model server). Only the following were run: `rustfmt --edition 2021 --check` on touched
+  `.rs` files, `python3 scripts/ci/check-serial-order.py`, `python3 scripts/config/check_schema.py`
+  (both pre-existing warnings, unchanged by this cut), `git diff --check`.
+
+## 2026-11-17 — Where a memory reservation is taken matters more than its size (ROB-14 cut 2) (resolved)
+Cut 2 wires `MemoryBudget` into the request paths. Three judgement calls from the review of PR #805:
+- **The ingest reservation moved ahead of the body read.** `reserved_bytes` is known
+  from `content-length` (or the `WEFT_MAX_INGEST_BYTES` cap) before a single byte is
+  read, so `state.memory_budget().try_reserve(reserved_bytes)` now sits next to
+  `reserve_disk`, not after `check_body_truncation`. Reserving after the read would
+  only ever notice the pressure once the bytes were already in the process — which is
+  the failure this cut exists to prevent. The guard still lives for the body's whole
+  lifetime through `IngestBody::_memory_guard`.
+- **Downsample reserves against the grid the request declares, before the read.** When
+  both bounds are named, the bucket count is already refused against
+  `WEFT_MAX_DOWNSAMPLE_BUCKETS` at that point, so the same number reserves memory and
+  the guard covers bucket construction *and* serialization. A window naming neither
+  bound has no declared grid, so it is still accounted only on the count the reduction
+  actually produces — too late to bound the build, in time for the response body. That
+  asymmetry is deliberate: refusing an unbounded window on a number the client never
+  sent would break the documented contract, and the existing bucket cap plus
+  `WEFT_READ_TIMEOUT_SECS` are what hold that case.
+- **Budget tests must assert the counter, not only the status.** `oneshot` requests run
+  one at a time, so a read that succeeded has already released its reservation before
+  the next request arrives: a test that "fills the budget" with a sequential read and
+  then expects the next one to be refused proves nothing about contention. The helper
+  now hands the `MemoryBudget` back to the test, which holds it with
+  `try_reserve(64)` and asserts `reserved()` before and after — including that a
+  refused read leaves only the hold accounted, i.e. its own reservation rolled back.
+Left open on purpose: the reservation is an estimate (`ESTIMATED_BYTES_PER_ROW = 64`,
+`read_limits::ESTIMATED_BYTES_PER_ROW`), and per-format serialization cost (Arrow, CSV,
+JSON) is not accounted; the guard covers the response object, not the encoder's
+scratch. A cut that measured encoder peaks would need per-format cost tables that do
+not exist yet.
