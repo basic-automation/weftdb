@@ -210,8 +210,11 @@ a 1.0 compatibility promise.
 The legacy seal adapter no longer derives the idempotency key from a CRC-32 of the payload.
 Seal-backed typed-API writes without an explicit token now append (duplicate-timestamp writes
 resolve newer-wins at read, matching rows-mode's no-unique-constraint behaviour).  Callers who
-require byte-identical-retry replay must supply an explicit idempotency token (the HTTP
-`Idempotency-Key` path is unchanged).  The prior `legacy:{uuid}:{crc}:{n}` ledger rows are
+require byte-identical-retry replay must supply an explicit idempotency token.  Note that
+seal-backed aspects do not yet receive the HTTP `Idempotency-Key`: the convenience wrapper
+at `weftdb/src/types/legacy_seal.rs:290` passes `None`, so a retried HTTP ingest of the same
+body stores the batch twice on a seal-backed aspect.  Threading the request key into the
+seal gate is tracked in #823.  The prior `legacy:{uuid}:{crc}:{n}` ledger rows are
 inert historical entries; the adapter never looks them up.
 
 ## What is NOT guaranteed
