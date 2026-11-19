@@ -461,3 +461,42 @@ async fn seal_backed_capture_measurement_chunk_reaches_the_seal() -> Result<()> 
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
 	Ok(())
 }
+
+/// The count and the range-read length must agree after two batches whose timestamps
+/// overlap for the same series, even when the fragmentation gate is idle.
+///
+/// On `origin/main` without the `reconcile_overlaps` fix, the count is the sum of both
+/// segments' `row_count` (6) while the read merges newest-wins and returns 4 rows.
+/// The assertion then fails. After the fix, `reconcile_overlaps` folds the overlap at
+/// write time, so the count and the read agree.
+#[serial]
+#[tokio::test]
+async fn count_agrees_with_range_read_after_overlapping_ingests() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "count_parity", &splimes::Resolution::Milliseconds, None).await?.id();
+
+	let dataset = DatasetId::new();
+	let store = db.seal_store().await?;
+	let base = Utc::now().timestamp_millis();
+
+	// Two batches whose time ranges overlap.  target_rows=4 is small enough that
+	// the gate stays idle (segment_count(2) <= ideal(total_rows=6).div_ceil(4)=2).
+	// Without the reconcile_overlaps fix the count is the sum of both row_counts (6)
+	// while a range read returns 4 rows (newer-wins at the overlapping timestamps).
+	let rows1 = vec![(base, bd("10.0")), (base + 1000, bd("20.0")), (base + 2000, bd("30.0"))];
+	let rows2 = vec![(base + 1000, bd("21.0")), (base + 2000, bd("31.0")), (base + 3000, bd("40.0"))];
+
+	ingest_batch_with_gate(&store, &aspect_id, &dataset, &rows1, 4).await?;
+	ingest_batch_with_gate(&store, &aspect_id, &dataset, &rows2, 4).await?;
+
+	let count = db.get_measurements_count(&aspect_id).await?;
+	let read = read_rows(&store, &aspect_id, None, None).await?;
+
+	assert_eq!(count, read.len(), "the seal-backed count ({count}) equals the number of rows a range read returns ({}) after overlapping segments", read.len());
+
+	drop(store);
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}

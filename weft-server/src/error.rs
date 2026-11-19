@@ -270,7 +270,7 @@ impl Code {
 			Self::OutcomeUnknown => "the server cannot say whether the write committed",
 			Self::Poisoned => "the store is quarantined and needs an operator",
 			Self::QueryTimeout => "the server gave up on the operation at its deadline",
-			Self::OverBudget => "a maintenance plan was refused before it read anything, and nothing was written",
+			Self::OverBudget => "the server could not admit this request without exceeding a resource budget",
 			Self::InsufficientStorage => "the server's filesystem cannot take the write safely",
 			// A 4xx message is written for the caller and is never a cause string, so it is
 			// sent as the call site wrote it.
@@ -1209,7 +1209,7 @@ mod tests {
 		assert!(!response.headers().contains_key("retry-after"), "a refused plan is not a busy server");
 		let body = json_of(response).await;
 		assert_eq!(body["code"], "over_budget");
-		assert_eq!(body["error"], "a maintenance plan was refused before it read anything, and nothing was written", "a 5xx sends its sentence, never the cause string");
+		assert_eq!(body["error"], "the server could not admit this request without exceeding a resource budget", "a 5xx sends its sentence, never the cause string");
 		assert_eq!(body["details"]["budget_bytes"], 4096, "the ceiling the operator set is the point of the answer");
 		assert_eq!(body["details"]["planned_bytes"], 900_000, "and so is the size the pass would have needed");
 		assert_eq!(body["details"]["aspect"], "cpu.util", "the route already names the aspect in its path");

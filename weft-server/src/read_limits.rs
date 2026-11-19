@@ -42,6 +42,17 @@ use std::time::Duration;
 
 use crate::error::{ApiError, Code};
 
+/// The estimated memory cost (in bytes) per result row for a stored read,
+/// used as the basis for the memory budget reservation on the query/read path
+/// (ROB-14 cut 2).
+///
+/// This is a conservative estimate, not exact accounting: each result row
+/// holds a timestamp (i64, 8 bytes) and a `BigDecimal` value (~32 bytes on
+/// average), plus `Vec`/growth overhead. The real memory of a response is
+/// format-dependent (Arrow, CSV, JSON) and would be more expensive to
+/// compute than the budget it guards.
+pub const ESTIMATED_BYTES_PER_ROW: u64 = 64;
+
 /// Rows a paginated read returns when the request does not name a page size.
 pub const DEFAULT_PAGE_ROWS: usize = 10_000;
 /// The largest page size a request may name.
