@@ -85,8 +85,10 @@ async fn http_idem_key_prevents_second_store_on_seal_backed_aspect() {
 	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
 
 	let dir = tempfile::tempdir().expect("tempdir");
-	let store = Arc::new(SegmentStore::open(dir.path().join("store")).await.expect("store opens"));
-	let router = app_with_state(AppState::new().with_store(store));
+	// The store is handed straight to the router: binding it to a `let` first trips
+	// `clippy::significant_drop_tightening`, which `#![forbid(clippy::all)]` above
+	// cannot be downgraded to an `allow`. Same shape as `restore_into.rs:60`.
+	let router = app_with_state(AppState::new().with_store(Arc::new(SegmentStore::open(dir.path().join("store")).await.expect("store opens"))));
 
 	// 1. Declare the aspect via the HTTP API (→ SegmentStore::declare).
 	let (status, _headers, body) = send_json(
