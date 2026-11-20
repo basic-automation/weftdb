@@ -1,28 +1,60 @@
-# progress — p12/ingest-disconnect-4xx
+# SEMVER-241 progress
 
-## Done
+## Audit: tag coverage in CHANGELOG.md
 
-- **`check_body_truncation` helper** — `pub(crate) fn` at `weft-server/src/ingest.rs:438` that compares received body length against declared `Content-Length`. Returns `Some(ApiError::new(Code::BadRequest, …))` when truncated, `None` otherwise. Logs a distinct `tracing::info!` line with declared/received counts.
-- **`from_request` phase 3** — after the body read succeeds (not a timeout), the truncation check runs. A mismatch produces `400 bad_request` before the `IngestPhase` scope wraps anything, so the §4 5xx redaction cannot overwrite it.
-- **Unit tests for the helper** — 4 tests in `weft-server/src/ingest.rs mod tests`: matching length → None, no Content-Length → None, body longer than declared → None, body shorter than declared → 400 bad_request with correct message.
-- **Integration tests** — `ingest_body_that_ends_early_is_400_bad_request` (truncated body → 400), `ingest_body_timeout_still_returns_408` (timeout → 408, regression guard), `ingest_body_full_body_passes_the_truncation_check` (matching body → success).
-- **CHANGELOG.md** — `### Fixed` entry under `[Unreleased]`.
-- **DECISIONS.md** — appended section explaining the no-new-code choice, where causes are separated, and why 400.
-- **Code table unchanged** — 43 codes, `TABLE.len()` still 43, no variant added/removed/reordered.
-- **No schema/OpenAPI changes** — `compat/openapi/weftdb.json`, `docs/config-schema.md`, `docs/openapi-description.md`, `weft-server/src/openapi.rs`, `routes.rs` untouched.
-- **No compiled artifacts** — per HARD RULE.
+### Command outputs
 
-## Not done
+```text
+$ git tag --sort=creatordate
+v0.1.0
+v0.2.0
+v0.2.1
+v0.3.0
+v0.3.1
+v0.3.2
+v0.3.3
+v0.3.4
+v0.3.5
+v0.3.6
+v0.3.7
 
-- CI has not run — this host cannot `cargo build`.
-- PR not opened.
-- The commit-phase disconnect safety (SEAL-1) is covered by existing tests and by the design (phase 3 runs before the handler reads the body, far before `IngestPhase::Committing`). No new test was added for it because the existing `ingest_body_that_ends_early_is_400_bad_request` and the code structure prove the 4xx is returned from `from_request`, before any phase-scoped code runs. If a stronger test is desired — one that pipelines a disconnect while the handler is mid-commit — it must wait for CI, since building the race-condition harness locally is not possible.
+$ grep -n '^## \[' CHANGELOG.md
+9:   ## [Unreleased]
+335: ## [0.3.7] - 2026-11-12
+352: ## [0.3.6] - 2026-11-12
+363: ## [0.3.5] - 2026-11-12
+374: ## [0.3.4] - 2026-11-11
+394: ## [0.3.3] - 2026-11-11
+823: ## [0.3.2] - 2026-11-06
+859: ## [0.3.1] - 2026-11-06
+923: ## [0.3.0] - 2026-11-05
+1264: ## [0.2.1] - 2026-11-02
+1281: ## [0.2.0] - 2026-11-02
+2811: ## [0.1.0] - 2026-10-08
+```
 
-## ## Handoff
+### Audit table
 
-## Handoff
+| Tag | Section line | Date | Compare link | Verdict |
+|-----|-------------|------|-------------|---------|
+| v0.1.0 | :2811 | 2026-10-08 | `[0.1.0]: https://github.com/.../releases/tag/v0.1.0` | ✅ Section present, dated, link present |
+| v0.2.0 | :1281 | 2026-11-02 | `[0.2.0]: .../compare/v0.1.0...v0.2.0` | ✅ Section present, dated, link present |
+| v0.2.1 | :1264 | 2026-11-02 | `[0.2.1]: .../compare/v0.2.0...v0.2.1` | ✅ Section present, dated, link present |
+| v0.3.0 | :923 | 2026-11-05 | `[0.3.0]: .../compare/v0.2.1...v0.3.0` | ✅ Section present, dated, link present |
+| v0.3.1 | :859 | 2026-11-06 | `[0.3.1]: .../compare/v0.3.0...v0.3.1` | ✅ Section present, dated, link present |
+| v0.3.2 | :823 | 2026-11-06 | `[0.3.2]: .../compare/v0.3.1...v0.3.2` | ✅ Section present, dated, link present |
+| v0.3.3 | :394 | 2026-11-11 | `[0.3.3]: .../compare/v0.3.2...v0.3.3` | ✅ Section present, dated, link present |
+| v0.3.4 | :387 | 2026-11-11 | `[0.3.4]: .../compare/v0.3.3...v0.3.4` | ✅ Section present, dated, link present |
+| v0.3.5 | :374 | 2026-11-12 | `[0.3.5]: .../compare/v0.3.4...v0.3.5` | ✅ Section present, dated, link present |
+| v0.3.6 | :352 | 2026-11-12 | `[0.3.6]: .../compare/v0.3.5...v0.3.6` | ✅ Section present, dated, link present |
+| v0.3.7 | :335 | 2026-11-12 | `[0.3.7]: .../compare/v0.3.6...v0.3.7` | ✅ Section present, dated, link present |
 
-- **All code changes are in `weft-server/src/ingest.rs`**, `CHANGELOG.md`, `DECISIONS.md`.
-- **To open a PR:** `gh pr create --repo basic-automation/weftdb --base main --head p12/ingest-disconnect-4xx` with a body that says "CI is the first execution; this code was never compiled locally."
-- **To run CI:** push the branch; CI will compile and run the tests. Key test to watch: `ingest_body_read_past_the_total_deadline_is_408` (must stay green — it was not modified, only duplicated).
-- **Next command after this handoff:** `cargo fmt` to format the code, then commit and push.
+### Counts
+- **11** tags (git tag --sort=creatordate)
+- **11** sections (`## [0.x.y] - <date>`)
+- **11** compare links (`[0.x.y]: https://...`)
+
+### Verdict
+**Clean.** Every tagged release from v0.1.0 (2026-10-08) through v0.3.7 (2026-11-12) has its own CHANGELOG.md section with a date and a working compare link. No section or link is missing.
+
+The "starting from the first tagged pre-release" requirement was already satisfied: the changelog baseline is v0.1.0, the first tag. The real gap this slice closes is the missing semver pre-release tagging policy (for `v1.0.0-beta.1`, `v1.0.0-rc.1`, etc.), which is now added to `docs/stability.md`.

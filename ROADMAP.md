@@ -172,7 +172,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] README *Project status* table updated to reflect 1.0 and the status badge changed from `pre-beta`
 - [ ] **PAC-18** Cut 1.0.0: binaries, image, release notes
   - [ ] Approve and push the **v1.0.0** tag *(owner)*
-- [ ] **Semver policy + `CHANGELOG.md`**, starting from the first tagged pre-release
+- [x] **Semver policy + `CHANGELOG.md`**, starting from the first tagged pre-release
 
 ## Phase 22 — Connectors and ingest interop
 

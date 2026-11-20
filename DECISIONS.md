@@ -8562,3 +8562,29 @@ The exception for RUSTSEC-2026-0543 (unmaintained `chrono`) has carried the sent
 
 **What this does not do** — it does not fix the advisory. `arrow 60.1.0` still requires `chrono ^0.4.40`, chrono 0.4.45 is the newest release, and the nine manifests that depend on chrono directly plus the arrow-flight path that pulls it transitively cannot move off it. When 2027-01-31 passes, cargo-deny re-reports the advisory and emits `advisory-ignore-expired` at the value: that red is the point.
 Filed as #794; the exception itself is #790 and the migration is #791.
+
+## 2026-11-20 — "Starting from the first tagged pre-release" when every tag is 0.x (#241) (state)
+
+**Context.** ROADMAP.md line 175 reads "**Semver policy + `CHANGELOG.md`**, starting from
+ the first tagged pre-release". Every tag at the time of writing (v0.1.0 through v0.3.7) is a
+ 0.x ordinary release, not a semver pre-release. The audit found the changelog already
+ complete back to v0.1.0 (11 tags, 11 sections, 11 compare links).
+
+**What the line actually meant.** The "starting from the first tagged pre-release" half
+ was already satisfied. The missing half was a **pre-release sectioning policy** for
+ semver-style tags (v1.0.0-beta.1, v1.0.0-rc.1, …) that the roadmap intends to cut before
+ 1.0.0. The gap was not in the changelog's coverage of 0.x releases but in the documented
+ policy for how those future tags interact with CHANGELOG.md.
+
+**Chosen: the policy (docs/stability.md:47) states:**
+- 0.x tags are ordinary releases, not pre-releases.
+- Each pre-release tag gets its own CHANGELOG.md section, cut from Unreleased.
+- Betas accept fixes only; a new pre-release line (`.2`, `.3`) may be cut for a fix round.
+- Promoting an rc to v1.0.0 re-labels the section; nothing is rewritten or dropped.
+- Pre-release sections are **not** merged retroactively.
+
+**What promotion means.** Promoting an rc to v1.0.0 relabels the section's date to the v1.0.0
+ release date and its heading from `## [X.X.X-rc.N]` to `## [1.0.0]`; the entries themselves
+ are unchanged. This makes the changelog a faithful record of what each artifact contained,
+ not a curated narrative that hides the prerelease path. A reader comparing v1.0.0-beta.1
+ and v1.0.0 can see exactly what changed between them.
