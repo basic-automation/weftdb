@@ -8414,6 +8414,144 @@ The same brief describes #798: an aspect with more than 32 series causes
 
 The companion lesson is about fixtures, not production code. The #797 reproduction ingested both frames under the same idempotency key (`IngestBatch::dense("s1", …)` twice), and the second ingest was refused with "aspect "temp" already holds idempotency key "s1" for a different batch … nothing was written" — so the overlap the test meant to create never existed, and the test would have been vacuous even with the assertions rewritten. An idempotency key names one batch; series identity comes from the measurement tags. Two frames of one series therefore need two batch keys and the same (untagged) value shape.
 
+## 2026-11-17 — The expired-row purge runs unconditionally in every daemon tick (shipping)
+
+Issue #785, TTL cut 4. The store's `purge_expired` already returns cheaply when the policy is
+`NoExpiry` (checking `self.expiry == RowExpiryPolicy::NoExpiry` at the top and returning an empty
+`ExpirySweep`), so the daemon calls it unconditionally after the other sweeps on every tick,
+with no gate or config field. This avoids a future mistake where a config field tells the daemon
+to purge when the policy is NoExpiry, fooling nobody, or tells it not to purge when a TTL is set,
+deleting nothing until an operator notices.
+
+**Why not a metric for purge work.** The brief says not to invent metric names when log instead.
+`weft_reconcile_*` counters already count work passes, so a purge that dropped segments records
+through the existing `record_reconcile_sweep` path (one aspect cleaned with N segments dropped).
+A purge that dropped nothing is a quiet tick and records only a maintenance sweep, which is the
+existing idiom. No new Prometheus counter is needed.
+
+**Clock injection.** The tick calls `std::time::SystemTime::now()` through `now_ns()`, which is
+the same pattern the rest of the crate uses (the backup daemon calls `SystemTime::now()` for its
+labels; the ingest path does the same). The store's own tests call `purge_expired` with an
+explicit `now_ns` because the policy functions respect clock injection, matching the cut-1
+contract.
+
+**The purge tick duplicates the other sweeps' failure idiom.** One WARN per failed aspect (the
+sweep kind names `"expired-purge"`), breaker-skipped aspects counted in `busy` (the existing
+`ExpirySweep::busy` field covers both contention and breaker trips, since `purge_expired` does
+not separate them — matching how the store's own `purge_expired` reports `busy`), and the tick
+carries on past a failing aspect. A whole-sweep failure (the aspect list itself unreadable) is
+logged and the tick continues.origin/main
+
+origin/mainorigin/mainorigin/mainorigin/mainorigin/mainorigin/main
+## 2026-11-17 — What the fan-out arm measures, and what it refuses to be (TAG-12, #807) (decided)
+
+- **A cost curve, not a race.** `docs/benchmark-policy.md` governs measuring against another vendor,
+  and this arm races nothing: it publishes our own wall-time curve across a series-count ladder. The
+  module doc says so in its own words, because the file sits next to the arms that do engage those
+  rules and a reader should not have to open the policy to know which category a number came from.
+  The other half of TAG-12, the multi-series crash matrix, is claimed elsewhere, so this slice is the
+  measurement half only.
+- **A ladder, not a point.** `FanOutParams::default()` is 1, 10, 100, 1000 series at 1 000 rows each
+  under a 1 000-second read window, seeded by `DEFAULT_FAN_OUT_SEED`. A single series count cannot
+  show the shape of the curve, and publishing the seed means a run regenerates the corpus exactly.
+- **Ingest is setup and is excluded from the timed span.** The corpus is built once; each rung
+  re-reads the first N series from the same store. Timing the ingest as well would make this arm
+  measure writes, which the ingest-growth and online arms already do.
+- **Correctness is asserted inside the timed loop.** `run_fan_out` fails the run when a series does
+  not return exactly `rows_per_series` rows, because a fan-out curve from a store that quietly
+  returned fewer rows is not a measurement, and a number that is fast because it read less is the
+  worst kind of benchmark result.
+- **The tests take `serial_test`.** They open real stores under a temp root, so they run one at a
+  time rather than contending with each other; `weft-bench` had never needed the dependency before
+  because its other arms build segments in memory.
+- **CI is the first execution.** Nothing here was compiled or run locally: this host cannot build the
+  workspace without OOM-killing the model server.
+## 2026-11-17 — Seal-backed write guard: refuse rows-mode writes on seal-backed aspects (#801)
+
+### Refusal over implementation
+
+The three entry points (`replace_measurements_in_range`, `capture_new_measurement_chunk`,
+`compress_with_progress`, `set_compression_config`) could instead be routed to the seal store.
+Implementing seal-store range replacement or seal-store compression is a real design change
+and out of scope for this slice. Refusal is via `Error::SealBackedRejected(String)` — kept as
+a typed error so callers can handle it specifically, and rejected operations are surfaced
+up through the existing `Result` chain rather than silently succeeding with no effect.
+
+### `set_compression_config` gained a `&Database` parameter
+
+Because `Aspect` has no database handle or storage-mode field (it stores only metadata-db paths),
+the method could not consult the seal-backing of an aspect without adding a parameter. Both call
+sites in `weft-tui/src/app.rs` already had `db` in scope (`Database::existing` returns
+`Ok(_db)` / `Ok(db)`), so the signature change was minimal. `set_compression_config_local`
+(the in-memory path) was left unchanged: it has no database to consult, it is not reachable
+from a seal store, and it is used by tests that need to set a config without a live database.
+
+### Criterion 3: probe the schema, never swallow a failed lookup
+
+The old code answered `Err(_) => Rows`, so a Turso or I/O failure silently
+re-labelled a seal-backed aspect as rows mode and every guard this slice adds
+became skippable. `aspect_storage_mode` now asks `pragma_table_info('aspects')`
+whether the `storage_mode` column exists: only a genuinely absent column (a
+database created before D-S19, or no `aspects` table at all - that pragma simply
+returns no rows) means rows mode, and a probe or SELECT that *fails* propagates.
+No error-string matching: `git grep "no such column" origin/main -- weftdb` is
+empty, so this repo has no such idiom to follow, and a pragma names the thing
+being asked about instead of reading a diagnostic's wording. Upstream Turso
+does match the text (`core/connection.rs` `should_retry_cross_process_schema_lookup`
+tests `msg.contains("no such table")`), and its bindings expose only
+string-carrying variants (`Error(String)`, `Busy(String)`, `Readonly(String)`),
+so text matching would work but would be load-bearing on wording we do not own.
+
+The trade-off is recorded deliberately: `is_seal_backed` is called from twenty-
+plus read and write paths, so a metadata-lookup failure now fails those calls
+instead of quietly taking the rows-mode branch. An unknown storage mode must not
+default to the mode with the fewest guards; a transient metadata-DB problem
+becomes a visible error rather than a slow path.
+
+### The enumeration test must not create the file it forbids
+
+`seal_backed_write_entry_points_never_reach_measurements_db` first obtained the
+handle for the refusal probe with `Database::get_measurement_db`, which creates
+`aspects/<uuid>/measurements.db` on disk (`weftdb/src/types/database/mod.rs:1367`
+-> `weftdb/src/types/aspect.rs:477` -> `Builder::new_local(db_path).build()`), and
+then asserted that same path does not exist - an assertion that fails whatever
+the guards do. The probe now derives the path from the aspect id and passes a
+throwaway `:memory:` handle, so the non-existence assertion measures the guards.
+A second assertion re-reads the storage mode to prove a refusal never flips a
+seal-backed aspect back to rows mode.
+
+### Entry-point enumeration
+
+Criterion 4 is satisfied by a test that asserts each legacy write entry point on a seal-backed
+aspect either routes to the seal store or returns `Error::SealBackedRejected`. The covered
+entry points are: `capture_measurement_chunk` (already routed in #779),
+`capture_new_measurement_chunk`, `replace_measurements_in_range`, `batch_capture_measurements`
+(already routed in #779), `batch_capture_new_measurements` (already routed in #779),
+`capture_measurement` (routed in #779 via `capture_new_measurement`), and the compression path
+via `set_compression_config`/`compress`/`compress_with_progress`.
+
+### The legacy accessors, named, and what #802 still owns
+
+The typed mode is the single source of truth for these decisions:
+`Database::aspect_storage_mode` (`weftdb/src/types/database/mod.rs:1682`) and
+`Database::is_seal_backed` (`:1735`), both `async fn(&self, &AspectId)`.
+The four accessors criterion 4 names keep their pre-existing shape in this PR:
+
+- `DatabaseStructure::get_measurement_db(&self, &AspectId) -> Result<turso::Database>` (`mod.rs:1367`)
+- `DatabaseStructure::get_measurement_db_path(&self, &AspectId) -> Result<String>` (`mod.rs:1386`)
+- `Database::get_seal_store(&self) -> Result<LegacySealStore>` (`weftdb/src/seal_store.rs:31`)
+- `Inputs::get_current_txid(&self, &turso::Connection) -> Result<TxId>` (`weftdb/src/types/database/inputs.rs:2283`)
+
+They are async and return `Result`, but none of them reports the storage mode,
+so a caller can still ask a seal-backed aspect for a rows-mode handle and be
+handed one. What this PR does is refuse the writes that would have used such a
+handle (the four `SealBackedRejected` guards) rather than change signatures that
+24 crates and the TUI call. Converting the accessors themselves to return
+`Result<Option<...>>`/a typed mode error is #802's job, which is filed as
+"remove the fallbacks"; doing it here would mean an API break with no test of
+its own, and the ordering the operator set (#800 -> #801 -> #802 -> #803) keeps
+the fallback removal in #802 where its blast radius can be measured.
+
 ## 2026-11-19 — The row TTL carries a unit; bare numbers mean seconds (#799, TTL-UNIT)
 
 **Question.** `WEFT_ROW_TTL` was a bare number that every aspect read in its own time unit,
