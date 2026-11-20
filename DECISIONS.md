@@ -8563,7 +8563,7 @@ The exception for RUSTSEC-2026-0543 (unmaintained `chrono`) has carried the sent
 **What this does not do** — it does not fix the advisory. `arrow 60.1.0` still requires `chrono ^0.4.40`, chrono 0.4.45 is the newest release, and the nine manifests that depend on chrono directly plus the arrow-flight path that pulls it transitively cannot move off it. When 2027-01-31 passes, cargo-deny re-reports the advisory and emits `advisory-ignore-expired` at the value: that red is the point.
 Filed as #794; the exception itself is #790 and the migration is #791.
 
-## 2026-11-20 — "Starting from the first tagged pre-release" when every tag is 0.x (#241) (state)
+## 2026-11-20 — "Starting from the first tagged pre-release" when every tag is 0.x (#241) (landed as PR #831)
 
 **Context.** ROADMAP.md line 175 reads "**Semver policy + `CHANGELOG.md`**, starting from
  the first tagged pre-release". Every tag at the time of writing (v0.1.0 through v0.3.7) is a
