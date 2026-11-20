@@ -8562,3 +8562,36 @@ The exception for RUSTSEC-2026-0543 (unmaintained `chrono`) has carried the sent
 
 **What this does not do** — it does not fix the advisory. `arrow 60.1.0` still requires `chrono ^0.4.40`, chrono 0.4.45 is the newest release, and the nine manifests that depend on chrono directly plus the arrow-flight path that pulls it transitively cannot move off it. When 2027-01-31 passes, cargo-deny re-reports the advisory and emits `advisory-ignore-expired` at the value: that red is the point.
 Filed as #794; the exception itself is #790 and the migration is #791.
+
+## 2026-11-20 — Host capacity decides who builds, and what stays owner-gated (roadmap hygiene)
+
+**Ambiguous.** `ROADMAP.md` keeps listing TAG-12 (`:116`) and FRE-18 (`:383` wave line, issue #348)
+as open work, and the coordination rules invite an agent to claim the next unchecked item. Whether
+those items are actually available depends on machine state that the roadmap does not record.
+
+**Chosen.** Treat host capacity as a first-class gate and record it here rather than in a PR:
+
+- The host is back in the state that already stopped local Rust work in November: `free -g` reports
+  109 GB used and 15 GB available of 124 GB, load average ~29, with the local model server resident.
+  A `cargo` workspace build needs 6–10 GB on its own. **No worker slice is launched that builds the
+  workspace while `available` is under ~30 GB**; CI stays the only compile gate for store and server
+  changes. This is the same decision recorded earlier for the 5 GB case, restated with the threshold
+  so the next run does not re-litigate it.
+- TAG-12 (#341) is not one task. Its **multi-series crash cell** landed as PR #826; its **fan-out arm
+  is already held by #809** (`weft-bench/src/fan_out.rs` exists on `main`); its **TSBS half**
+  (`single-groupby-1-1-1` and `lastpoint` over the whole TSBS file tagged by `hostname`, through
+  `weft-xbench --tsbs`) needs a quiet host and the full dataset. Claiming "TAG-12" as a slice would
+  re-do landed work, so the remaining honest claim is the TSBS run plus fixtures, and both are
+  environment-gated.
+- FRE-18 (#348, "rc.1 freeze cut and layout-2 baseline fixtures") is a stub body whose real
+  prerequisites are the owner actions at `ROADMAP.md:122` (approve and push `v1.0.0-beta.1`) and its
+  own sub-issue #349 (`v1.0.0-rc.1` tag, marked owner). It is left **Needs human**.
+- Reviewer reliability is also a capacity question: the fixed reviewer route has now produced two
+  30-minute timeouts and one degenerate (incoherent) answer on large diffs. Briefs are capped at four
+  questions and twelve tool calls; a degenerate run is treated as "review not performed" and retried
+  once, and a second failure is escalated rather than looped.
+
+**Needs human:** the beta tag approval/push (`ROADMAP.md:122`, sub-issue #349), the honesty-page
+narrative (`:100`), making the ghcr.io package public (`:99`), the `parquet`/`arrow-buffer` upstream
+reports (`:101`), and D-S21's privileged power-loss validation (`:77`) — plus a quiet host window
+(and the T7 reference drive on 10 Gbps, `:112`) before the TSBS and calibration items can run.
