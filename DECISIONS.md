@@ -8635,3 +8635,33 @@ CI note while touching this file: `weftdb/src/lib.rs:2` carries
 arrives through `nursery`, so a public item whose first doc paragraph runs past a short summary line
 fails `cargo clippy --workspace --all-targets --all-features` with exit 101. Keep first paragraphs to
 one line and put the rest in a second paragraph.
+
+## 2026-11-19 — The row TTL carries a unit; bare numbers mean seconds (#799, TTL-UNIT)
+
+**Question.** `WEFT_ROW_TTL` was a bare number that every aspect read in its own time unit,
+so one operator setting meant wildly different real durations. Making the number mean one
+span is a semantic change to a live (Experimental) variable, and the repo has no precedent
+for changing a variable's meaning rather than adding a new one.
+
+**Decision.** Keep the name, change the meaning, and say so loudly: `RowExpiryPolicy::Ttl`
+now carries a `TimeUnit`; the value accepts an `ns`/`us`/`ms`/`s` suffix and a bare number is
+**seconds**; the conversion happens once per aspect and is saturating. Expiry is stated as one
+rule — `row_ts < cutoff(now, ttl)` — shared by the range-read filter and the purge sweep,
+because two implementations of "expired" is how the pre-1970 unsigned-age wrap survived.
+
+**Rejected.** Adding `WEFT_ROW_TTL_UNIT` alongside the number: two variables that must agree
+is the failure mode we are removing, not a way to preserve it. Also rejected: converting the
+count at the settings layer only, which leaves the store's own `from_env` path still
+unit-blind. Silently keeping "bare = aspect units" was rejected because that is the bug.
+
+**Boundary and residue.** A row whose age equals the TTL is **not** expired (strict `>`). A
+**positive** TTL finer than the aspect's resolution clamps to **one tick** — the newest tick's
+rows are kept — rather than saturating to 0, which would have expired every row aged at least one
+tick (a `500ms` TTL on a `Seconds` aspect would purge a series). An explicit `ttl == 0` still
+means "everything strictly before `now`", which is what `zero_ttl_expires_rows_strictly_before_now`
+pins; a blanket `.max(1)` would have broken that. Because the variable is `Experimental`, the settings-tier test list is unchanged and
+no deprecation window applies; `UPGRADING.md` carries a short "variables can change meaning"
+section instead. The store-side parser is the single parse point (`row_expiry_policy_from`,
+`weftdb/src/types/segment_store.rs`); `docs/config-schema.md` and the `settings.rs` `VarSpec`
+summary were rewritten to match, since both previously promised "there is no seconds-based
+conversion".
