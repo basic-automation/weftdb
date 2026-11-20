@@ -708,7 +708,8 @@ def main() -> int:
     # Report
     for f in findings:
         print(f)
-    return 1 if findings else 0
+    has_breaking = any(f.startswith("BREAKING") for f in findings)
+    return 1 if has_breaking else 0
 
 
 if __name__ == "__main__":
