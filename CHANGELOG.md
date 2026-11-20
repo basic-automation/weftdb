@@ -8,6 +8,19 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- **Legacy seal ingest gained a caller-identity idempotency entry point (#803).**
+  `ingest_batch_with_gate(store, aspect_id, _dataset_id, idempotency_token: &str, rows, squash_target_rows)`
+  keys the seal write `legacy:{token}` — the token is required, so a new caller cannot silently opt out
+  of replay protection: the same token with the same payload replays the first receipt, the same token
+  with a different payload is a loud `StoreError::IdempotencyConflict`, and distinct tokens always
+  write, even for identical rows under one `DatasetId`. The payload-derived key
+  `legacy:{dataset_id}:{payload_crc:08x}:{count}` and its `payload_crc` are unchanged, and the thin
+  `ingest_batch` wrapper that every legacy facade call site uses still derives its key from them — so
+  an identical re-run through that wrapper is still absorbed, and #803 stays open pending the
+  server-ledger identity under #768.
+
 ### Added
 
 - **The bulk-ingest path (`ingest_batch`) now runs the fragmentation gate (#232).**
