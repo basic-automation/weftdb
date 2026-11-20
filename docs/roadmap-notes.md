@@ -432,6 +432,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - **PAC-18** Dress rehearsal
 - **W15 · 1.0.0**
   - Write or approve the 1.0 release notes and upgrade notes before the cut *(owner)*
+  - **ROADMAP-236** The upgrade/rollback line was split (issue #236, PR #833). The upgrade half is exercised by the `compat` job's upgrade leg against the only pinned release, `v0.1.0` — the sole release whose store needs a layout migration. The rollback half was dropped from the line because FRE-16 (2026-11-10) declared rollback-after-writes unsupported for 1.0; only the `SUBSTITUTE_RUNNERS` stand-in covers it, which is explicitly not the leg.
   - **EVI-22** README 1.0 project status, badge and versions
   - → **PAC-18** Cut 1.0.0
     - Approve and push the **v1.0.0** tag *(owner)*
