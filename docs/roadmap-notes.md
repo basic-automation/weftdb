@@ -267,6 +267,7 @@ Dependencies were brought current and audited on 2026-10-05, `SECURITY.md` is on
 - **Public surface declared and frozen**
 - **Compatibility tests**
 - **Semver policy + `CHANGELOG.md`**, starting from the first tagged pre-release
+  *Closed 2026-11-20 (audit): 11 tags, 11 changelog sections, 11 compare links, baseline v0.1.0 2026-10-08. Pre-release policy at `docs/stability.md:47`.*
 - **Crate publishing split**
 - **Panic audit on server paths**
 - **Security process**
