@@ -454,6 +454,7 @@ The interpolation item (B-interp, Phase 5) is done.
 - **B-dedup** *(Phase 7 · partial)*
 - **B-sim** *(Phase 9 · partial)*
 - **B-precision** *(Phase 4/6 · partial)*
+  - 2026-11-20: BigDecimal precision-boundary inventory produced (`docs/research/bigdecimal-inventory.md`) (#840)
 - **B-resilience** *(Phase 4/7 · partial)*
 - **B-conncache** *(Phase 4/7 · partial)*
 - **B-msgpack** *(Phase 6 · absent)*
@@ -580,6 +581,17 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
       - **Research (2026-10-09) — a cheaper sketch index, if the sketch format is ever revised.**
       - **Positioning (2026-10-09) — exact percentiles are a differentiator against QuestDB.**
       - **NEXT — select on the mantissas when a partial is not merged.**
+- **DONE (2026-11-20) — Audit the other `weft-bench` workloads' generators for the same class of flattery (#396, PR #834).**
+  Generated corpus shapes for every generator were read from source and assessed against
+  the same flattery classes identified in #395 (2-decimal scale, regular timestamps,
+  FOR-friendly repetition, clean analytic signals).  The full write-up is at
+  `docs/research/bench-generator-audit.md`.  10 generators were audited (plus the
+  real-corpora entry points and size presets); 5 claims in `bench/claims.json` are
+  flagged **suspect**, 1 claim (`sketch-claim-corrected`) was already corrected by #398,
+  and the remaining claims are `unaffected` — 5 outright, plus the BTC arm of
+  `interp-latency`, which splits — because they run on real data or a different code path.  **No claim was withdrawn in this PR** — the suspect verdicts await a
+  coordinator decision, and #397 (a representative generator or real-corpus defaults)
+  stays open.
 - **The seven slow `weft-orchestration` tests are bounded, and the three failures #402 recorded have no subject left (closed 2026-11-11).** Two entries sat here, and `4de2c691` ("the roadmap is a phased checklist; the prose moves to basicautomation.io") cut both mid-sentence, which is why they read as open work: the second, "Re-measured 2026-10-09 — still unbounded", was the tail of the bound-the-seven-tests item, and the first was the note that three failures were hiding behind the `SKIP_SLOW_TESTS` guard.
   - The bound exists. Seven `timed out after 1200s (#404)` guards now sit in the harnesses — `test_api` (`weft-orchestration/src/lib.rs:1772`), `test_pipeline_api` (`:1983`), `test_api_precise` (`:2166`), `test_pipeline_api_precise` (`:2348`), `test_batch_processing` (`:2467`), `test_specific_process_batch` (`:2537`), `test_pipeline_api_with_fake_db` (`:2732`) — at 3x the 357 s in which all seven finished for real on a runner, with push and pull-request runs skipping them so the nightly schedule is what exercises them (`CHANGELOG.md:266`, #404 and #646).
   - #402 is closed as completed (2026-11-10) and recorded here as **closed on erasure, not on a fix**: `test_api_precise`, `test_pipeline_api_with_fake_db` and `test_pipeline_api_precise` exist on `main` only as runner names in `weft-orchestration/src/lib.rs`, the `Invalid time range: start time must be before end time` failure has no fix behind it, and the close-out's own words were "none can be identified — every CI run where the slow weft-orchestration tests actually execute shows all of them passing". The real defect that was fixed is the dictionary one: schema creation now runs in an exclusive transaction before the concurrent one opens, in `weftdb/src/types/database/inputs.rs:1426-1440`, which also restores the three dictionary tables the inline DDL omitted. If those test names turn up again, reopen #402 against the names rather than this entry — that is where the evidence lives.
@@ -793,3 +805,11 @@ baseline and classifies every difference against the six rule families in
 1. TSBS `single-groupby-1-1-1` and `lastpoint` as the first two tag-grouped queries in `weft-xbench`, after ingesting the whole TSBS file tagged by `hostname`.
 2. The fan-out benchmark. Both (1) and (2) are benchmarks, so they need a quiet host; this run's load average was 24–33 on 16 cores with the model server resident.
 3. "Tagged fixtures and freeze docs" needs the owner to say what it means. The tagged frame golden already exists (`weft-physical-type/tests/golden/frame_v7_envelope_series_key.bin`); a tagged whole-store compat fixture beside `weftdb/tests/fixtures/pre_v2_store` is the likely reading.
+
+**TSM-Bench query spec adoption (P394, 2026-11-20).** ROADMAP.md:246 ticked.
+`docs/research/tsm-bench-query-spec.md` published: Q1–Q7 canonical SQL extracted from the
+Khelifati et al. PVLDB 2023 paper; Garcia/Seltzer 2015 source unverifiable behind Cloudflare.
+Gap analysis: Q5 (`--gap-fill`) is the only existing arm that explicitly identifies itself as a
+TSM-Bench query; Q1 (`--range-fetch`) is the next closest; Q2/Q3/Q6/Q7 need new arms.
+Staged adoption plan with five stages (Q5 formalization → Q1 adaptation → Q4 stored-data path
+→ Q2/Q3/Q6/Q7 new arms → cross-engine gate). No cargo / no Rust files touched.

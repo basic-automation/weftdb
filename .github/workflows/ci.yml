@@ -207,7 +207,13 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # 75, not 60. The Windows leg's own work fits inside an hour; what the ceiling was cutting off
+    # is its tail. Run 44761112603 (push to main, 2026-11-20, job 136373576261): Build 15:17:02Z ->
+    # 15:34:23Z (17 min) success, Test 15:34:23Z -> 16:15:43Z (41 min) success, and the job was
+    # killed at 16:16:09Z, exactly 60:00 after it started, in `Post Run Swatinem/rust-cache`.
+    # Run 44751684242 finished the same leg in 51 min. A gate that is red on main is not a gate: it
+    # teaches everyone to merge over it. See #835 for the measurements and the alternatives rejected.
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
