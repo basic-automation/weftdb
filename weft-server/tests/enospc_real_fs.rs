@@ -66,7 +66,7 @@ async fn router_with_impossible_reserve() -> (TempDir, Router) {
 
 /// POST a JSON points body (a single point at timestamp 1, value 1.0).
 fn ingest_points_request() -> Request<Body> {
-	Request::builder().method("POST").uri(format!("/api/v1/storage/{ASPECT}/points")).header("content-type", "application/json").body(Body::from(r#"{"points":[{"t":1,"v":1.0}]}"#)).expect("builds the request")
+	Request::builder().method("POST").uri(format!("/api/v1/storage/{ASPECT}/points")).header("content-type", "application/json").body(Body::from(r#"{"points":[{"timestamp":1,"value":"1.0"}]}"#)).expect("builds the request")
 }
 
 /// Assert the response is `507 insufficient_storage`.
