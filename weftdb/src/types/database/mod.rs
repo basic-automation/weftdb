@@ -1133,8 +1133,8 @@ impl DatabaseStructure for Database {
 
 			// The aspect's storage mode is chosen here, at creation, and never
 			// switched afterwards (slice D-S19): a compression config forces
-			// rows mode, and WEFT_LEGACY_DEFAULT_STORAGE=segments makes new
-			// aspects seal-backed. A database created before D-S19 gains the
+			// rows mode, and since #768 made an unset WEFT_LEGACY_DEFAULT_STORAGE
+			// leave a new aspect seal-backed, `rows` is the explicit opt-out. A database created before D-S19 gains the
 			// column first, following the compression_config pattern.
 			self.ensure_storage_mode_column().await;
 			let storage_mode = crate::StorageMode::for_new_aspect(compression_config.is_some(), std::env::var(crate::legacy_seal::LEGACY_DEFAULT_STORAGE_ENV).ok().as_deref());
@@ -1680,7 +1680,31 @@ impl Database {
 	/// If the metadata database cannot be queried for a reason other than
 	/// the aspect or the column being absent.
 	pub async fn aspect_storage_mode(&self, aspect_id: &AspectId) -> Result<crate::StorageMode> {
+		// The storage mode decides which write guards apply, so a lookup that
+		// merely failed must not answer "rows mode": every guard would then be
+		// skippable on a seal-backed aspect (#801). Only two shapes honestly mean
+		// rows mode: the column is absent (a database created before D-S19), and
+		// the row or its value is missing. Anything else propagates.
 		let conn = Self::begin_concurrent(&self.metadata, &self.metadata_path, Some(self.cache.clone())).await?;
+		let probe = conn.as_ref().query("SELECT COUNT(*) FROM pragma_table_info('aspects') WHERE name = 'storage_mode'", turso::params![]).await;
+		let has_column = match probe {
+			Ok(mut rows) => match rows.next().await {
+				Ok(Some(row)) => matches!(row.get_value(0)?, turso::Value::Integer(count) if count > 0),
+				Ok(None) => false,
+				Err(error) => {
+					Self::commit_concurrent(&conn).await.ok();
+					return Err(anyhow::anyhow!("the storage-mode column probe failed: {error}"));
+				}
+			},
+			Err(error) => {
+				Self::commit_concurrent(&conn).await.ok();
+				return Err(anyhow::anyhow!("the storage-mode column probe failed: {error}"));
+			}
+		};
+		if !has_column {
+			Self::commit_concurrent(&conn).await.ok();
+			return Ok(crate::StorageMode::Rows);
+		}
 		let res = conn.as_ref().query("SELECT storage_mode FROM aspects WHERE id = ?", turso::params![aspect_id.as_uuid().to_string()]).await;
 		let mode = match res {
 			Ok(mut rows) => {
@@ -1693,8 +1717,10 @@ impl Database {
 				};
 				value.as_deref().map_or(crate::StorageMode::Rows, |text| crate::StorageMode::parse(Some(text)))
 			}
-			// A database created before D-S19 has no column to select.
-			Err(_) => crate::StorageMode::Rows,
+			Err(error) => {
+				Self::commit_concurrent(&conn).await.ok();
+				return Err(anyhow::anyhow!("the storage-mode lookup for aspect {aspect_id} failed: {error}"));
+			}
 		};
 		Self::commit_concurrent(&conn).await.ok();
 		Ok(mode)

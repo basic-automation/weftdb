@@ -310,8 +310,11 @@ impl Inputs for Database {
 	}
 
 	/// Capture a new measurement for a given aspect
-	/// No duplicate handling: a timestamp already stored is stored again, so a range read
+	/// For **rows mode**: a timestamp already stored is stored again, so a range read
 	/// returns both rows. Nothing is averaged and no error is raised (#232's audit).
+	/// For **seal-backed aspects**: at a shared timestamp only the newest call's rows
+	/// survive (rows inside one call are all kept). This is a behaviour change from rows
+	/// mode (#802, SEAL-DUP).
 	/// Uses Turso's concurrent writes feature for better performance and conflict resolution.
 	/// Also enqueues the measurement timestamp for incremental batch processing, in rows mode only.
 	///
@@ -332,9 +335,7 @@ impl Inputs for Database {
 				let store = self.seal_store().await?;
 				let tx_ids = crate::legacy_seal::ingest_batch(&store, aspect_id, dataset_id, &rows).await?;
 				self.forget_cached_earliest_measurement(aspect_id).await;
-				if let Err(e) = store.squash_aspect_to_target_rows_if_fragmented(&crate::legacy_seal::aspect_key(aspect_id), crate::legacy_seal::SQUASH_TARGET_ROWS).await {
-					tracing::debug!("Failed to run the fragmentation gate after capturing a measurement of aspect {aspect_id}; it is sealed: {e}");
-				}
+				// The fragmentation gate moved into the bulk path (ingest_batch now calls it internally).
 				drop(store);
 				return Ok(tx_ids.into_iter().next().unwrap_or_default());
 			}
@@ -443,9 +444,7 @@ impl Inputs for Database {
 				let store = self.seal_store().await?;
 				let tx_ids = crate::legacy_seal::ingest_batch(&store, aspect_id, dataset_id, &rows).await?;
 				self.forget_cached_earliest_measurement(aspect_id).await;
-				if let Err(e) = store.squash_aspect_to_target_rows_if_fragmented(&crate::legacy_seal::aspect_key(aspect_id), crate::legacy_seal::SQUASH_TARGET_ROWS).await {
-					tracing::debug!("Failed to run the fragmentation gate after capturing a new measurement of aspect {aspect_id}; it is sealed: {e}");
-				}
+				// The fragmentation gate moved into the bulk path (ingest_batch now calls it internally).
 				drop(store);
 				return Ok(tx_ids.into_iter().next().unwrap_or_default());
 			}
@@ -768,6 +767,13 @@ impl Inputs for Database {
 	/// committed before it were already committed, so the caller gets no partial
 	/// list; their timestamps are queued only after the last commit.
 	async fn capture_new_measurement_chunk(&self, aspect_id: &AspectId, db: &turso::Database, db_path: &str, dataset_id: &DatasetId, chunk: &[InputMeasurement], tx_ids: &[TxId]) -> Result<Vec<TxId>> {
+		// Refuse when the aspect is seal-backed: this entry point takes a
+		// caller-supplied rows-mode database handle and writes directly into
+		// it — no seal-backed dispatch exists.
+		if self.is_seal_backed(aspect_id).await? {
+			return Err(crate::Error::SealBackedRejected(format!("capture_new_measurement_chunk is not supported for seal-backed aspect {aspect_id}")).into());
+		}
+
 		legacy_metadata_write(async move {
 			let mut successful = Vec::new();
 			let mut successful_timestamps = Vec::new();
@@ -2126,6 +2132,12 @@ impl Inputs for Database {
 	/// Replace measurements in a time range with new compressed measurements.
 	/// This is an atomic delete + insert operation used during compression.
 	async fn replace_measurements_in_range(&self, aspect_id: &AspectId, dataset_id: &DatasetId, start: chrono::DateTime<chrono::Utc>, end: chrono::DateTime<chrono::Utc>, new_measurements: Vec<InputMeasurement>) -> Result<()> {
+		// Refuse when the aspect is seal-backed: this entry point writes to the
+		// per-aspect measurements.db that no seal-backed read ever consults.
+		if self.is_seal_backed(aspect_id).await? {
+			return Err(crate::Error::SealBackedRejected(format!("replace_measurements_in_range is not supported for seal-backed aspect {aspect_id}")).into());
+		}
+
 		legacy_metadata_write(async move {
 			if new_measurements.is_empty() {
 				// Just delete the range if no new measurements

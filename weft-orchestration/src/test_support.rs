@@ -35,6 +35,10 @@ static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// If the directory cannot be created, or `weftdb::data_dir()` does not resolve to it.
 pub fn data_dir() -> &'static Path {
 	let dir = DATA_DIR.get_or_init(|| {
+		// The suite builds and drains the legacy ingest queue, which only rows-mode
+		// ingest feeds: name the opt-out rather than relying on an absent variable,
+		// since #768 made an unset variable leave a new aspect seal-backed.
+		std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "rows");
 		let dir = match std::env::var_os("WEFT_DATA_DIR") {
 			Some(explicit) if !explicit.is_empty() => PathBuf::from(explicit),
 			_ => {

@@ -50,49 +50,115 @@ use weft_physical_type::timestamp::TimeUnit;
 
 /// Row-expiry policy attached per-aspect.
 ///
-/// `NoExpiry` lets every row live; `Ttl { ttl }` hides rows whose age in the aspect's
-/// time unit is strictly greater than `ttl`.
+/// `NoExpiry` lets every row live; `Ttl { ttl, unit }` hides rows whose age in the
+/// aspect's time unit is strictly greater than the TTL value **converted from the
+/// policy's unit to the aspect's unit**.
+///
+/// # Unit conversion
+///
+/// The TTL is converted once per comparison by dividing the TTL's nanosecond
+/// equivalent by the aspect's nanoseconds-per-unit. When the TTL is finer than the
+/// aspect's resolution (e.g. `500 ms` on a `Seconds` aspect), a positive TTL
+/// clamps to **one** tick (the newest tick's rows are kept). Only an explicit
+/// `ttl == 0` expires everything strictly before `now`.
+///
+/// The conversion is saturating for overflow: a TTL wider than `i64::MAX` ticks
+/// clamps to `i64::MAX`.
+///
+/// # Boundary
+///
+/// A row whose age equals the TTL is **not** expired (strict boundary).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowExpiryPolicy {
 	/// No expiry: every row is always visible (the default).
 	NoExpiry,
-	/// Rows whose age in the aspect's time unit is strictly greater than `ttl` are
-	/// expired and hidden from read paths. A row whose age exactly equals `ttl` is
-	/// **not** expired.
-	Ttl { ttl: u64 },
+	/// Rows whose age in the aspect's time unit is strictly greater than `ttl`
+	/// (converted from `unit` to the aspect's unit) are expired and hidden from
+	/// read paths. A row whose age exactly equals `ttl` is **not** expired.
+	///
+	/// `ttl` is a positive duration whose unit is `unit`. When converted to an
+	/// aspect coarser than `unit`, a positive TTL finer than the aspect's tick
+	/// clamps to **one** tick (the newest tick's rows are kept). An explicit
+	/// `ttl == 0` expires everything strictly before `now`.
+	///
+	/// The default unit is [`TimeUnit::Seconds`] when the policy is constructed
+	/// from an environment variable without an explicit suffix (bare numbers).
+	Ttl {
+		ttl: u64,
+		/// The time unit in which `ttl` is expressed.
+		unit: TimeUnit,
+	},
+}
+
+impl RowExpiryPolicy {
+	/// The TTL value converted from the policy's own unit to `aspect_unit`.
+	///
+	/// Returns `None` when the policy is `NoExpiry`. When the TTL is finer than
+	/// the aspect's tick, a **positive** TTL clamps to one tick (the newest tick's
+	/// rows are kept). Only an explicit `ttl == 0` returns `0`, meaning everything
+	/// strictly before `now` is expired.
+	#[must_use]
+	pub fn ttl_in_aspect_unit(&self, aspect_unit: &TimeUnit) -> Option<i64> {
+		match self {
+			Self::NoExpiry => None,
+			Self::Ttl { ttl, unit: ttl_unit } => {
+				let ttl = *ttl;
+				let ttl_ns = i128::from(ttl).checked_mul(i128::from(ttl_unit.nanos_per_unit())).unwrap_or(i128::MAX);
+				let result = ttl_ns / i128::from(aspect_unit.nanos_per_unit());
+				// A positive TTL finer than the aspect's tick clamps to one tick
+				// (the newest tick's rows are kept). Only an explicit ttl == 0
+				// expires everything strictly before now.
+				let clamped = if result == 0 && ttl > 0 { 1 } else { result };
+				Some(i64::try_from(clamped).unwrap_or(i64::MAX))
+			}
+		}
+	}
+
+	/// The cutoff timestamp (in `aspect_unit`) — handled the same way by both
+	/// `is_row_expired` and `expired_cutoff`.
+	#[must_use]
+	fn cutoff(&self, now_ns: i64, aspect_unit: TimeUnit) -> i64 {
+		match self {
+			Self::NoExpiry => i64::MIN,
+			Self::Ttl { .. } => {
+				let Some(ttl_in_unit) = self.ttl_in_aspect_unit(&aspect_unit) else {
+					return i64::MIN;
+				};
+				let now_unit = aspect_unit.from_nanos(now_ns);
+				if now_unit < ttl_in_unit {
+					i64::MIN
+				} else {
+					now_unit - ttl_in_unit
+				}
+			}
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Whether `row_ts` (an epoch in `unit`) is expired at `now_ns` (ns since epoch) under `policy`.
+/// Whether `row_ts` (an epoch in `aspect_unit`) is expired at `now_ns` (ns since epoch)
+/// under `policy`.
 ///
-/// `NoExpiry` → always `false`. `Ttl` → `(now - row_ts) > ttl` in the aspect's unit.
+/// `NoExpiry` → always `false`. `Ttl` → `row_ts < cutoff`, where cutoff is computed
+/// exactly as [`expired_cutoff`] computes it, so the read path and the purge path
+/// cannot disagree.
 ///
 /// # Design
 ///
 /// - `now_ns` is caller-supplied; the function never reads the wall clock.
 /// - A future row (`row_ts > now_unit`) is never expired.
 /// - The boundary is strict (age == ttl → not expired).
-/// - Arithmetic is infallible: `now_ns` as an i64 is in the representaable nanosecond
-///   range (years ~1677 to ~2262). The unit conversion is lossless in this range.
+/// - The TTL is converted from its own unit to the aspect's unit before comparison;
+///   a positive TTL finer than the aspect's resolution clamps to one tick (the
+///   newest tick's rows are kept). Only an explicit `ttl == 0` expires everything
+///   strictly before `now`.
 #[must_use]
-pub fn is_row_expired(policy: &RowExpiryPolicy, now_ns: i64, row_ts: i64, unit: &TimeUnit) -> bool {
-	match policy {
-		RowExpiryPolicy::NoExpiry => false,
-		RowExpiryPolicy::Ttl { ttl } => {
-			let now_unit = unit.from_nanos(now_ns);
-			if row_ts >= now_unit {
-				return false;
-			}
-			// A TTL wider than any age an i64 timestamp can express is
-			// unreachable, so saturating it keeps the comparison total.
-			let ttl = i64::try_from(*ttl).unwrap_or(i64::MAX);
-			// `now_unit > row_ts` here, so the age is positive.
-			now_unit.saturating_sub(row_ts) > ttl
-		}
-	}
+pub fn is_row_expired(policy: &RowExpiryPolicy, now_ns: i64, row_ts: i64, aspect_unit: &TimeUnit) -> bool {
+	let cutoff = policy.cutoff(now_ns, *aspect_unit);
+	row_ts < cutoff
 }
 
 /// Compute the cutoff timestamp (in the aspect's unit) for `policy` at `now_ns`.
@@ -100,25 +166,14 @@ pub fn is_row_expired(policy: &RowExpiryPolicy, now_ns: i64, row_ts: i64, unit: 
 /// A row with `timestamp < cutoff` is expired (strictly less than). For `NoExpiry` (or
 /// when `now - ttl` would underflow), returns `i64::MIN` so nothing is expired.
 ///
-/// The cutoff is `floor(now_ns_as_unit - ttl)`, a **strictly less than** boundary.
+/// The cutoff is `now_in_aspect_unit - ttl_in_aspect_unit`, a **strictly less than**
+/// boundary. The TTL is converted from its own unit to the aspect's unit before
+/// subtraction; a positive TTL finer than the aspect's resolution clamps to one
+/// tick (the newest tick's rows are kept). Only an explicit `ttl == 0` expires
+/// everything strictly before `now`.
 #[must_use]
 pub fn expired_cutoff(policy: &RowExpiryPolicy, now_ns: i64, unit: &TimeUnit) -> i64 {
-	match policy {
-		RowExpiryPolicy::NoExpiry => i64::MIN,
-		RowExpiryPolicy::Ttl { ttl } => {
-			let now_unit = unit.from_nanos(now_ns);
-			// A cutoff at or below the whole representable range means "nothing
-			// is expired", and Cut 1 reports that as `i64::MIN`: when the TTL
-			// is wider than `now_unit` itself (including a saturating huge TTL
-			// or a pre-epoch clock) the cutoff is refused rather than negative.
-			let ttl = i64::try_from(*ttl).unwrap_or(i64::MAX);
-			if now_unit < ttl {
-				i64::MIN
-			} else {
-				now_unit - ttl
-			}
-		}
-	}
+	policy.cutoff(now_ns, *unit)
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +196,12 @@ pub struct AspectExpirySwept {
 	pub oldest_expired_ts: Option<i64>,
 	/// Newest (maximum) timestamp of an expired row, if any were found.
 	pub newest_expired_ts: Option<i64>,
+	/// Segments that are wholly expired but overlap a surviving segment of the same
+	/// series and were therefore kept on disk to avoid shadow-reverting plain reads
+	/// (#797). A shadowed-and-kept segment is neither dropped (it would silently
+	/// reveal the superseded rows of the survivor) nor straddling (every row is
+	/// expired).
+	pub shadowed_and_kept: u64,
 	/// Whether the sweep ran to completion on this aspect (cut 1: always true on
 	/// success — no physical deletion yet).
 	pub completed: bool,
@@ -149,7 +210,7 @@ pub struct AspectExpirySwept {
 impl Default for AspectExpirySwept {
 	/// A successful pass with nothing to expire.
 	fn default() -> Self {
-		Self { rows_expired: 0, segments_dropped: 0, partial_segments: 0, oldest_expired_ts: None, newest_expired_ts: None, completed: true }
+		Self { rows_expired: 0, segments_dropped: 0, partial_segments: 0, shadowed_and_kept: 0, oldest_expired_ts: None, newest_expired_ts: None, completed: true }
 	}
 }
 
@@ -171,12 +232,15 @@ pub struct ExpirySweep {
 	pub segments_dropped: u64,
 	/// Total segments holding both expired and live rows across all aspects.
 	pub partial_segments: u64,
+	/// Segments that were wholly expired but kept on disk because they overlapped a
+	/// surviving segment of the same series (#797).
+	pub shadowed_and_kept: u64,
 }
 
 impl Default for ExpirySweep {
 	/// Empty sweep (no aspects scanned, nothing expired).
 	fn default() -> Self {
-		Self { aspects_cleaned: Vec::new(), busy: Vec::new(), failed: Vec::new(), rows_expired: 0u64, segments_dropped: 0u64, partial_segments: 0u64 }
+		Self { aspects_cleaned: Vec::new(), busy: Vec::new(), failed: Vec::new(), rows_expired: 0u64, segments_dropped: 0u64, partial_segments: 0u64, shadowed_and_kept: 0u64 }
 	}
 }
 
@@ -221,7 +285,7 @@ mod tests {
 
 	#[test]
 	fn ttl_hides_rows_older_than_now_minus_ttl() {
-		let policy = RowExpiryPolicy::Ttl { ttl: 10 };
+		let policy = RowExpiryPolicy::Ttl { ttl: 10, unit: TimeUnit::Seconds };
 		let unit = TimeUnit::Seconds;
 
 		let now_ns = ns(1000);
@@ -243,7 +307,7 @@ mod tests {
 
 	#[test]
 	fn boundary_age_equals_ttl_is_not_expired() {
-		let policy = RowExpiryPolicy::Ttl { ttl: 10 };
+		let policy = RowExpiryPolicy::Ttl { ttl: 10, unit: TimeUnit::Seconds };
 		let unit = TimeUnit::Seconds;
 
 		let now_ns = ns(1000);
@@ -259,7 +323,7 @@ mod tests {
 
 	#[test]
 	fn zero_ttl_expires_rows_strictly_before_now() {
-		let policy = RowExpiryPolicy::Ttl { ttl: 0 };
+		let policy = RowExpiryPolicy::Ttl { ttl: 0, unit: TimeUnit::Seconds };
 		let unit = TimeUnit::Seconds;
 
 		let now_ns = ns(1000);
@@ -276,7 +340,7 @@ mod tests {
 	fn clock_is_injected() {
 		// The function signature takes `now_ns: i64` — no SystemTime inside.
 		// This test asserts the contract: if we control now_ns, we control expiry.
-		let policy = RowExpiryPolicy::Ttl { ttl: 60 };
+		let policy = RowExpiryPolicy::Ttl { ttl: 60, unit: TimeUnit::Seconds };
 		let unit = TimeUnit::Seconds;
 
 		// Row at 0, now at 70 (age 70 > 60 → expired) vs now at 50 (age 50 ≤ 60 → visible).
@@ -288,20 +352,19 @@ mod tests {
 
 	#[test]
 	fn ttl_works_in_different_time_units() {
-		// TTL in seconds, but aspect uses Millis. Internally, conversion
-		// is done via `unit.from_nanos(now_ns)` — so TTL is interpreted in
-		// the aspect's time unit.
+		// Test that the TTL unit applies correctly across aspects.
+		// The TTL is now expressed in its own unit, not the aspect's unit.
 
-		// Seconds aspect: ttl = 1 → rows older than 1 second are expired.
-		let sec_policy = RowExpiryPolicy::Ttl { ttl: 1 };
+		// Seconds aspect: ttl = 1 second → rows older than 1 second are expired.
+		let sec_policy = RowExpiryPolicy::Ttl { ttl: 1, unit: TimeUnit::Seconds };
 		let sec_unit = TimeUnit::Seconds;
 
 		// now = 10s, row at 8s → age = 2 > 1 → expired.
 		assert!(is_row_expired(&sec_policy, ns(10), 8, &sec_unit), "seconds unit: age 2 > 1 → expired");
 		assert!(!is_row_expired(&sec_policy, ns(10), 9, &sec_unit), "seconds unit: age 1 == 1 → NOT expired");
 
-		// Millis aspect: ttl = 1000 → rows older than 1000 ms are expired.
-		let ms_policy = RowExpiryPolicy::Ttl { ttl: 1000 };
+		// Millis aspect: ttl = 1000 ms = 1 second → rows older than 1000 ms are expired.
+		let ms_policy = RowExpiryPolicy::Ttl { ttl: 1000, unit: TimeUnit::Millis };
 		let ms_unit = TimeUnit::Millis;
 
 		// now = 5_000_000_000 ns = 5000 ms
@@ -316,7 +379,7 @@ mod tests {
 
 	#[test]
 	fn future_rows_are_not_expired() {
-		let policy = RowExpiryPolicy::Ttl { ttl: 10 };
+		let policy = RowExpiryPolicy::Ttl { ttl: 10, unit: TimeUnit::Seconds };
 		let unit = TimeUnit::Seconds;
 
 		let now_ns = ns(100);
@@ -332,7 +395,7 @@ mod tests {
 		// A row at ts=990 has age == TTL → visible (strict boundary).
 		// The cutoff is a boundary value: rows with ts < cutoff are expired;
 		// rows with ts == cutoff have age == TTL and are NOT expired.
-		let policy = RowExpiryPolicy::Ttl { ttl: 10 };
+		let policy = RowExpiryPolicy::Ttl { ttl: 10, unit: TimeUnit::Seconds };
 		let unit = TimeUnit::Seconds;
 		assert_eq!(expired_cutoff(&policy, ns(1000), &unit), 990i64, "cutoff = now - ttl = 1000 - 10 = 990");
 		// The cutoff value 990, when used with strict '>' (not '>='), correctly means
@@ -343,12 +406,12 @@ mod tests {
 	#[test]
 	fn expired_cutoff_underflow_returns_min() {
 		// now_unit < ttl: most negative case.
-		let policy = RowExpiryPolicy::Ttl { ttl: 100 };
+		let policy = RowExpiryPolicy::Ttl { ttl: 100, unit: TimeUnit::Seconds };
 		let unit = TimeUnit::Seconds;
 		assert_eq!(expired_cutoff(&policy, ns(50), &unit), i64::MIN, "underflow: 50 < 100 → no expiry possible");
 
 		// Negative now (before epoch) with large TTL.
-		let policy_big = RowExpiryPolicy::Ttl { ttl: 10_000_000_000_000_000 };
+		let policy_big = RowExpiryPolicy::Ttl { ttl: 10_000_000_000_000_000, unit: TimeUnit::Seconds };
 		assert_eq!(expired_cutoff(&policy_big, ns(-500), &unit), i64::MIN, "very large TTL underflows");
 	}
 
@@ -361,5 +424,44 @@ mod tests {
 		assert_eq!(sweep.busy, [] as [String; 0]);
 		assert!(sweep.failed.is_empty());
 		assert_eq!(sweep.rows_expired, 0);
+	}
+
+	// ── TTL-UNIT: sub-tick clamp (positive TTL finer than the aspect's tick) ─
+
+	#[test]
+	fn sub_tick_ttl_clamps_to_one_tick_not_zero() {
+		let policy = RowExpiryPolicy::Ttl { ttl: 500, unit: TimeUnit::Millis };
+		let unit = TimeUnit::Seconds;
+
+		// ttl_in_aspect_unit must return 1, not 0.
+		assert_eq!(policy.ttl_in_aspect_unit(&unit), Some(1), "500 ms in a Seconds aspect clamps to 1 tick");
+
+		// Cutoff at now = 1000 s: cutoff = 1000 - 1 = 999.
+		assert_eq!(expired_cutoff(&policy, ns(1000), &unit), 999i64);
+
+		// Row at ts=998 (age 2 > 1) → expired.
+		assert!(is_row_expired(&policy, ns(1000), 998, &unit), "row at 998 is expired: age 2 > 1");
+
+		// Row at ts=999 (age 1 == 1) → NOT expired (strict boundary).
+		assert!(!is_row_expired(&policy, ns(1000), 999, &unit), "row at 999 is NOT expired: age 1 == 1");
+
+		// Row at ts=1000 (age 0 < 1) → NOT expired.
+		assert!(!is_row_expired(&policy, ns(1000), 1000, &unit), "row at 1000 (now) is NOT expired");
+	}
+
+	#[test]
+	fn sub_tick_clamp_preserves_explicit_zero_semantics() {
+		let unit = TimeUnit::Seconds;
+
+		// Explicit zero TTL must still return 0.
+		let zero = RowExpiryPolicy::Ttl { ttl: 0, unit: TimeUnit::Seconds };
+		assert_eq!(zero.ttl_in_aspect_unit(&unit), Some(0), "explicit ttl == 0 returns 0");
+
+		// With zero TTL, cutoff = now - 0 = now, so only rows strictly before now expire.
+		// Row at ts=999 (age 1 > 0) → expired.
+		assert!(is_row_expired(&zero, ns(1000), 999, &unit), "with ttl=0, row at 999 is expired");
+
+		// Row at ts=1000 (age 0) → visible.
+		assert!(!is_row_expired(&zero, ns(1000), 1000, &unit), "with ttl=0, row at 1000 is visible");
 	}
 }

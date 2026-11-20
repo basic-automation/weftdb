@@ -531,6 +531,45 @@ fn maintenance_segment_ceiling_from(value: Option<&str>) -> Option<u64> {
 	value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|ceiling| *ceiling > 0)
 }
 
+/// The row-expiry policy `WEFT_ROW_TTL` names: either a bare number (interpreted as
+/// seconds) or a number with a unit suffix (`s`, `ms`, `us`, `ns`). The value and unit
+/// are stored directly in [`RowExpiryPolicy::Ttl`]. Returns `NoExpiry` when the value is
+/// unset, `0`, empty, or unparseable.
+///
+/// # Suffix grammar
+///
+/// | Suffix | Unit |
+/// |--------|------|
+/// | (none) | Seconds |
+/// | `s`    | Seconds |
+/// | `ms`   | Millis |
+/// | `us`   | Micros |
+/// | `ns`   | Nanos |
+fn row_expiry_policy_from(value: Option<&str>) -> row_expiry::RowExpiryPolicy {
+	// `TimeUnit` comes from this module's own `weft_physical_type` import; the
+	// `row_expiry` module's import of it is private, so re-importing it from there
+	// would be E0603.
+	use row_expiry::RowExpiryPolicy;
+
+	fn parse_unit(s: &str) -> Option<(u64, TimeUnit)> {
+		// Longest suffix first: `ms` must win over `s`, and `ns`/`us` before either.
+		const SUFFIXES: &[(&str, TimeUnit)] = &[("ns", TimeUnit::Nanos), ("us", TimeUnit::Micros), ("ms", TimeUnit::Millis), ("s", TimeUnit::Seconds)];
+		for (suffix, unit) in SUFFIXES {
+			if let Some(rest) = s.strip_suffix(*suffix) {
+				return rest.trim().parse::<u64>().ok().map(|v| (v, *unit));
+			}
+		}
+		s.trim().parse::<u64>().ok().map(|v| (v, TimeUnit::Seconds))
+	}
+
+	value.and_then(|v| {
+		let v = v.trim();
+		parse_unit(v)
+	})
+	.filter(|(ttl, _)| *ttl > 0)
+	.map_or(RowExpiryPolicy::NoExpiry, |(ttl, unit)| RowExpiryPolicy::Ttl { ttl, unit })
+}
+
 /// The per-operation maintenance time budget `WEFT_MAINTENANCE_MAX_OP_SECONDS` names
 /// (ROB-20 G5): a positive whole number of seconds, or `None` (unbounded) when it is
 /// unset or anything else. Zero means "unbounded" rather than "no maintenance at all",
@@ -579,11 +618,15 @@ impl SegmentStoreOptions {
 	/// [`DEFAULT_DISK_RESERVE_BYTES`](crate::DEFAULT_DISK_RESERVE_BYTES)), and
 	/// `WEFT_MAINTENANCE_MAX_OUTPUT_BYTES`
 	/// ([`max_maintenance_output_bytes`](Self::max_maintenance_output_bytes); a
-	/// positive whole number of bytes, else unbudgeted), each as lenient
+	/// positive whole number of bytes, else unbudgeted), and `WEFT_ROW_TTL`
+	/// ([`expiry`](Self::expiry); a duration with an optional unit suffix (`ns`, `us`,
+	/// `ms`, `s`); a bare number is seconds; a positive TTL finer than the aspect's
+	/// tick clamps to one tick; unset, `0`, empty or unparseable →
+	/// [`row_expiry::RowExpiryPolicy::NoExpiry`]), each as lenient
 	/// as it documents. Explicit: nothing in the library calls it.
 	#[must_use]
 	pub fn from_env() -> Self {
-		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), decode_breaker: MaintenanceBreaker::decode_from_env(), suspect_frame_policy: std::env::var(SuspectFramePolicy::ENV_NAME).ok().as_deref().and_then(SuspectFramePolicy::parse).unwrap_or(DEFAULT_SUSPECT_FRAME_POLICY), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()), expiry: row_expiry::RowExpiryPolicy::NoExpiry, max_maintenance_output_bytes: maintenance_output_budget_from(std::env::var("WEFT_MAINTENANCE_MAX_OUTPUT_BYTES").ok().as_deref()), max_maintenance_segment_bytes: maintenance_segment_ceiling_from(std::env::var("WEFT_MAINTENANCE_MAX_SEGMENT_BYTES").ok().as_deref()), max_maintenance_op_seconds: maintenance_op_seconds_from(std::env::var("WEFT_MAINTENANCE_MAX_OP_SECONDS").ok().as_deref()) }
+		Self { checkpoints: CheckpointPolicy::from_env(), partials: PartialSidecarPolicy::from_env(), transposed: TransposedPolicy::from_env(), breaker: MaintenanceBreaker::from_env(), decode_breaker: MaintenanceBreaker::decode_from_env(), suspect_frame_policy: std::env::var(SuspectFramePolicy::ENV_NAME).ok().as_deref().and_then(SuspectFramePolicy::parse).unwrap_or(DEFAULT_SUSPECT_FRAME_POLICY), max_series_per_aspect: max_series_per_aspect_from(std::env::var("WEFT_MAX_SERIES_PER_ASPECT").ok().as_deref()), max_downsample_buckets: DEFAULT_MAX_DOWNSAMPLE_BUCKETS, max_point_batch: DEFAULT_MAX_POINT_BATCH, mmap_reads: mapped::mmap_reads_from(std::env::var("WEFT_SEGMENT_MMAP_READS").ok().as_deref()), disk_reserve_bytes: crate::disk_guard::disk_reserve_bytes_from(std::env::var("WEFT_DISK_RESERVE_BYTES").ok().as_deref()), expiry: row_expiry_policy_from(std::env::var("WEFT_ROW_TTL").ok().as_deref()), max_maintenance_output_bytes: maintenance_output_budget_from(std::env::var("WEFT_MAINTENANCE_MAX_OUTPUT_BYTES").ok().as_deref()), max_maintenance_segment_bytes: maintenance_segment_ceiling_from(std::env::var("WEFT_MAINTENANCE_MAX_SEGMENT_BYTES").ok().as_deref()), max_maintenance_op_seconds: maintenance_op_seconds_from(std::env::var("WEFT_MAINTENANCE_MAX_OP_SECONDS").ok().as_deref()) }
 	}
 
 	/// These options with `bytes` as the per-operation maintenance output budget

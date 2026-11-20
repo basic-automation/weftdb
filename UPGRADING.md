@@ -12,6 +12,17 @@ release pins that every compatibility gate checks are in
 
 ---
 
+## Duplicate timestamps on seal-backed aspects (#802, SEAL-DUP)
+
+Aspect storage mode differences: **rows mode** stores every row at every timestamp; a
+range read returns all of them. **Seal-backed aspects** at a shared timestamp keep only
+the newest call's rows (duplicates inside one call are all kept). This is a behaviour
+change for any aspect that becomes seal-backed, because the rows mode they replaced
+appended. A migrating deployment whose workload depends on reading back multiple rows at
+the same timestamp must pin `WEFT_LEGACY_DEFAULT_STORAGE=rows` to stay in rows mode.
+
+---
+
 ## Layout 1 → layout 2 (v0.1.0 → v0.2.0)
 
 Every WeftDB release since v0.2.0 writes store **layout 2**. A layout 1 store (written
@@ -191,6 +202,43 @@ These decisions are tracked as release-blocking items (see
 [`ROADMAP.md`](ROADMAP.md) and the 1.0 milestone). Until they are settled, the
 upgrade path documented here for 0.x releases is provisional and does not constitute
 a 1.0 compatibility promise.
+
+---
+
+## Unreleased — a caller-identity entry point for seal ingest (#803, #768)
+
+The legacy seal adapter's idempotency key is **unchanged**: `weftdb::legacy_seal::ingest_batch`,
+which every legacy facade call site uses, still derives `legacy:{dataset_id}:{crc32-of-payload}:{row-count}`
+from the payload, so an identical re-run of the same call is still absorbed as a replay of the first
+receipt.  That absorption is what issue #803 reports, and through this entry point it is not fixable:
+`batch_capture_measurements(aspect_id, dataset_id, rows)` carries no call identity, so a retry and an
+identical new call are the same request by construction.
+
+What this release adds is the entry point callers can use in the meantime:
+`weftdb::legacy_seal::ingest_batch_with_gate(store, aspect_id, dataset_id, idempotency_token, rows, squash_target_rows)`
+keys the write `legacy:{token}`.  The token argument is **required**, so a new caller cannot opt out of
+replay protection by accident: replaying a token with the same payload returns the first receipt, and
+presenting a different payload under a token that is already committed is a loud
+`IdempotencyConflict` (HTTP 409 over the server) rather than a silent absorb.  Distinct tokens always
+write, even for byte-identical rows under one `DatasetId`.
+
+HTTP clients are unaffected either way: the server never enters the seal gate — it puts the
+`Idempotency-Key` header into `IngestBatch.key` and the store's own idempotency ledger answers a replay
+with `replayed: true`, pinned by `weft-server/tests/seal_idem_http_replay.rs` (#824).  Ledger rows
+written under the payload-derived key keep their shape and stay in the ledger; nothing was renamed and
+no ledger rows were invalidated.
+
+---
+
+## Experimental variables can change meaning: `WEFT_ROW_TTL` (#799)
+
+`WEFT_ROW_TTL` is `Tier::Experimental`, and it changed meaning rather than being renamed.
+It used to be a bare count read **in each aspect's own time unit**, so one setting meant
+different real durations per aspect. It is now a duration with a unit: `90s`, `250ms`,
+`500us`, `2ns`, or a bare number meaning **seconds**. If you had it set, re-read the value:
+what you wrote as `3600` now expires rows older than 3600 **seconds** in every aspect, not
+3600 ticks of each aspect's unit. Nothing on disk records the old interpretation — expiry is
+a read-time and sweep-time rule — so there is no data to migrate.
 
 ---
 

@@ -4,6 +4,45 @@ Judgement calls made while working the 1.0 buildout, where the instruction set w
 self-conflicting and the choice is not visible in the diff. Recorded so the next session does not
 re-litigate them, and so a reader of a ticked roadmap item can see what it was decided to mean.
 
+## 2026-11-17 — SOA-15 part 2: the TTL lane opens its own store; it does not use the soak NullServer (ISSUE #727)
+
+**Context.** The 1.0 plan names SOA-15 part 2 as an exercise of the store's row-level TTL
+mechanism inside the soak harness. The soak already opens a `SegmentStore` under a
+`NullServer` (no HTTP, no daemon process), and every other lane — oracle, derived-read,
+backup, upgrade — operates through that server or through the existing library runner.
+SOA-15's TTL lane is the first lane that needs a *different* store configuration (the
+`RowExpiryPolicy::Ttl` variant and non-zero TTL), and it needs the expiry path the
+soak's main store never uses (the soak runs with `NoExpiry` and never ages out rows).
+
+**Chosen: the lane opens its own temporary `SegmentStore` with the target expiry policy,
+ingests a fixed set of rows, runs the sweep and purge, and records the verdict —
+then discards the store.** The lane runs between the last `record_step` and `harness.finish()`.
+The `run_ttl_lane()` function in `weft_bunch::soak_ttl` drives the whole sequence:
+configure a TTL, open, declare, ingest rows that straddle the cutoff, sweep, purge,
+read-back with the expiry-aware read path, close, report.
+
+**Rejected: making the soak's main store switch to a TTL policy for the lane.** The soak
+harness owns its store for many ticks and many lanes; changing its expiry mid-run would
+interfere with the oracle, derived-read and backup lanes' assumptions, and the
+`SegmentStoreOptions` are frozen at open time. A separate store is the cleanest isolation.
+
+**Rejected: running the TTL lane over HTTP.** The soak harness uses `NullServer` (no port,
+no process). Wiring a real server for the TTL lane alone would add complexity and CI
+infrastructure without exercising any HTTP expiry path (the reader already won't need one:
+`purge_expired` is a library call, not an endpoint). The lane tells the reader what it
+did in its report section.
+
+**Rejected: retaining the store after the lane finishes.** The lane is a one-shot check.
+Retaining the store would add state the soak harness does not need. The tempdir is
+dropped after the verdict is recorded.
+
+**Not vacuous.** The `NoExpiry` store reports 0 expired rows; the TTL store reports >0.
+The acceptance tests pin both.
+
+**Recorded in the soak run.** The verdict appears as `SoakRun::ttl` (v8 schema),
+serialised alongside the oracle, derived-read, backup and upgrade verdicts.
+The honesty section renders it.
+
 ## 2026-11-10 — `weft-orchestration` stays published; the residue is documentation and one stale member (REL-496)
 
 **The item offered two options — publish `weft-orchestration` or mark it `publish = false` —
@@ -8009,8 +8048,727 @@ modules are inside the defining module.
 - **Deadline computed once per sweep**: `maintenance_deadline()` in `maint.rs` computes `Instant::now() + Duration::from_secs(env_value)` once and the held paths check `Instant::now() >= deadline` between iterations, rather than recomputing seconds in a loop that might drift under scheduler delay.origin/main
 
 
+## 2026-11-16 — Naming the client abort without widening the frozen code table (shipped)
+
+- **The issue's premise was stale.** #742 described a disconnect and a deadline both ending up as
+  `408 body_timeout`. By the time the issue was filed, ROB-18 (merged) already distinguished three
+  outcomes: a deadline expiry (`ingest.rs:505-511`), a body-stream transport error (`ingest.rs:489`,
+  mapped to `400 bad_request`), and a premature EOF below the declared `Content-Length`
+  (`ingest.rs:446-457`, `check_body_truncation`). The real defect was narrower: two different
+  `bad_request` messages described the same condition (`client_disconnect`), and the stream-error arm
+  put a raw transport error string on the wire.
+- **A new `Code` variant was rejected.** The error-code table is a frozen 43-entry wire contract
+  (`TABLE` at `weft-server/src/error.rs:1138`, pinned at `assert_eq!(TABLE.len(), 43)`). A code the
+  caller cannot act on (an aborted client cannot read the answer) does not earn a slot in the
+  table. A non-standard `499` was also rejected because every `Code` carries a standard `StatusCode`
+  and the `status` method derives it from the variant (`ingest-server-failure` non-standard codes
+  break that invariant).
+- **The distinction lives in `details.reason`.** Both detection sites now produce the same labelled
+  wire answer: `400 bad_request` with message `"the client disconnected before completing the request
+  body"` and `details: {"reason": "client_disconnect"}`. The raw transport error goes to
+  `tracing::warn!` (`ingest.rs:489`, the stream-error arm) and `tracing::info!` (`ingest.rs:450`,
+  `check_body_truncation`), never onto the wire. The deadline arm (`ingest.rs:505-511`) stays
+  `408 body_timeout` untouched.
+- **Four tests added,** one of which (`a_body_that_never_finishes_is_a_deadline_not_a_disconnect`,
+  `start_paused`) proves that a stalled body is still a deadline and not a disconnect — the
+  regression guard the whole slice is about.origin/mainorigin/mainorigin/main
+
+## 2026-11-17 — Accepting RUSTSEC-2026-0543 (chrono unmaintained) with a reason and a written deadline, not weakening the gate (shipping)
+
+**What broke, with evidence.** `cargo deny check advisories` began failing on every branch
+pushed today: `error[unmaintained]: chrono is unmaintained / The chrono crate is
+unmaintained; all versions are affected`, with `advisories FAILED` while `bans`, `licenses`
+and `sources` stayed ok, against `Cargo.lock:64` `chrono 0.4.45`. The same job was green on
+main on 2026-11-15 (`docs/legal-review.md` records that), so the advisory database moved,
+not this repository. That one job turned green pull requests red, and through "main CI
+green" it gates the beta tag (TAG-12).
+
+**Why there is no upgrade.** crates.io reports chrono `max_stable = newest = 0.4.45`, so no
+release fixes it; RustSec's own line is "Solution: No safe upgrade is available!" and its
+recommended alternatives are `jiff` and `time`. The transitive path cannot be bumped either:
+arrow's newest stable is 60.1.0 and `arrow-array 60.0.0` requires `chrono ^0.4.40`. chrono
+is a direct dependency of nine manifests (the workspace `Cargo.toml` plus `weft-bench`,
+`weft-client`, `weft-line-protocol`, `weft-orchestration`, `weft-reduce`, `weft-server`,
+`weft-tui`, `weft-xbench`, `weftdb`) and arrives transitively through
+`arrow-cast`/`arrow-cmp`/`arrow-flight` into `weft-server`.
+
+**The options, and what was rejected.** `unmaintained = "none"` would blind the gate to
+every future unmaintained dependency to fix one we chose ourselves.
+`unmaintained = "workspace"` would not help: chrono *is* a direct dependency of workspace
+members. Dropping arrow means dropping the Flight SQL surface, a product decision rather
+than a dependency one. Migrating immediately is real work across nine crates and would not
+clear the advisory while arrow still pins chrono, so it makes nothing green sooner.
+
+**The choice, and why it is not a gate weakening.** One ignore entry in the shape the file
+itself asks for — a reason that carries the date to revisit, 2027-01-31. The date is
+load-bearing as a deadline, and it is written rather than enforced because the version CI
+runs cannot hold it: the action pin is cargo-deny 0.20.2, which answers an `expiry` key with
+`error[unexpected-keys]: found 1 unexpected keys, expected: ["id", "reason"]` at
+`deny.toml:17`. cargo-deny 0.21.0 (released 2026-11-16) added `advisories.ignore[].expiry`,
+`advisories.ignore-expiry` and `advisories.ignore[].allow`; #794 bumps the pin so the
+deadline can gate instead of merely remind, and `ignore[].allow` can then stop new edges
+onto chrono. `unused-ignored-advisory = "deny"` (0.19.0 or newer, so already legal) makes an
+ignore that stops matching an error, which removes the usual way exceptions rot: an entry
+left behind after the dependency is gone. Vulnerabilities, unsound advisories, bans,
+licences, sources and yank checking are unchanged.
+
+**Follow-ups.** #791 is the migration: our own nine uses first, then the arrow path (a newer
+arrow, a patch, or a scoped `allow` list once we are off it directly). #790 records the CI
+outage. The written date keeps the revisit visible even if both issues stall; # turns it
+into a gate as soon as the pin moves to a cargo-deny that can parse `expiry`.
+## 2026-11-17 — ROB-14 memory budget, cut 1: read, hold, account, do not enforce yet (shipped as #788)
+
+The limit is read in `weft-server`, not in `weftdb`. A container's `memory.max` is a process
+concern, and a published library must not go reading `/sys/fs/cgroup` to learn about its host.
+The read is plain `std::fs::read_to_string` of cgroup v2 `/sys/fs/cgroup/memory.max` with a
+fallback to v1 `/sys/fs/cgroup/memory/memory.limit_in_bytes`: `libc` is in the workspace but was
+not reached for, and two file reads do not earn a dependency. `max`, a missing file and an
+unreadable file all mean **unbounded**, so a sandbox or a CI runner that hides the limit can
+never turn into a deny-everything server. The operator's `WEFT_MEMORY_BUDGET_BYTES` is the
+**lower** target, capped by the cgroup (`min(override, cgroup)`), because an override above the
+physical ceiling is not something this process can honour.
+
+Accounting is one `Arc<AtomicU64>` on a `MemoryBudget` held in server state, not a field beside
+the disk guard. `disk_guard.admit_write` (`weftdb/src/types/segment_store/seal.rs:399`) protects
+a durable store resource; per-request RAM is an admission concern, and entangling them would make
+a query's byte estimate part of store durability. `Reservation::drop` releases the bytes, so a
+panic cannot leak the counter. Refusals will be **immediate, with no queue**: reuse
+`Code::OverBudget` (503 `over_budget`, no `Retry-After` — the code's own comment says waiting
+changes nothing) with the cause in `Envelope.details` as `kind: "memory"`, mirroring the disk
+shape at `weft-server/src/error.rs:1014`, which keeps the frozen 44-entry `Code` table untouched.
+429 `overloaded` stays what it was: transient concurrency, not a resource ceiling.
+
+The name is `WEFT_MEMORY_BUDGET_BYTES` (Experimental; `0`, `max`, unset or malformed means off)
+rather than `WEFT_CGROUP_MEMORY_BUDGET_BYTES`, because leaving it unset falls back to the cgroup
+instead of disabling the feature: the name says *budget*, which is what both sources feed.
+
+Cut discipline, so the roadmap stays honest: cut 1 reads, exposes and accounts. Cut 2 wires
+`try_reserve` into the ingest and query paths and emits the refusal, and **that** is what ticks
+`ROADMAP.md:89`. Cut 3 is the v1-fallback polish plus a ROB-24-style evidence run, and ticks
+`:121` (7.6 Quotas/limits). Cut 1 ticks neither line — the same discipline that kept the row-TTL
+line at `:91` open across its first two cuts. Follow-ups owed: cgroup platform hardening
+(`memory.high`, swap, nested or sandboxed cgroups), a refined query-side byte estimate to replace
+the coarse one, and the evidence run.
+
+One process note worth keeping: the implementing worker also edited the verification gate
+`scripts/config/check_schema.py`, scoping its tier-total checks to the newest version-table row,
+and bumped `config/schema.toml` from v2 to v3, both against the brief. The gate edit was reverted
+and the documentation counts restated instead — current totals in the version table's first row,
+historical counts written as words so the checker's digit scan cannot mistake them for present
+claims — and the schema version stayed at 2, since adding a variable changes what may be set, not
+the shape of the schema. **A failing gate is answered by changing what is checked, never the
+checker.**origin/mainorigin/mainorigin/main
+## 2026-11-16 — Flipping the storage-mode default, and why the roadmap's cost figure was not the gate (shipped)
+
+Issue #768 asked to flip new legacy aspects to seal-backed, "carrying the cost figure the flip needs"
+per the roadmap line. That figure never becomes a gate: `float_roundtrip` prices serde_json f64
+round-trip in an ingest or interpolate body (`weft-server/benches/json_body_cost.rs`), which is
+orthogonal to where a new aspect stores its rows, and the seal path's real costs, one-row ingest as a
+full seal commit, the fragmentation gate, read fan-out, shipped and were characterised in S19 and S20.
+Deciding the flip on a measurement of something else would have bought a number and learned nothing, so
+the line was re-read rather than satisfied, and the flip's actual consequence, the one-way downgrade
+door, is what the PR documents.
+
+What the flip touches is one branch. `StorageMode::for_new_aspect` answers `Segments` when
+`WEFT_LEGACY_DEFAULT_STORAGE` is unset, and otherwise routes the value through `StorageMode::parse`
+unchanged, so `rows` is the explicit opt-out and `segments` still means what it meant. That last part is
+load-bearing: `parse` is how a stored mode is read back, and `NULL`, the mode of every aspect any
+released build created, parses to rows mode. Leaving the set-value branch alone means a typo'd value
+falls back to the shape every released Weft can read instead of silently sealing an aspect, and editing
+`parse` was the one way to corrupt existing stores. The `#[default] Rows` on the enum stays too: it
+describes a struct default, not a creation policy, and changing it would silently move every
+`StorageMode::default()` call site.
+
+Blast radius was measured rather than assumed. Every suite whose premise is the legacy **queue**,
+`db_tests`, `legacy_queue_crash`, `rob5_queue_consumer_panics`, `dictionary_bounded`, orchestration's
+`test_support::data_dir` fixture and `debug_batch_test`, now names `rows` explicitly, because
+seal-backed ingest never queues and those suites would otherwise have tested an empty queue while
+believing they tested a consumer; `change_log_tests` and the renamed `legacy_seal_tests` rows-mode test
+say `rows` where they meant `unset`. `new_api_tests` and its stress sibling were deliberately left on
+the new default: 25 tests that use only the mode-agnostic new API are the soak coverage for
+seal-backed-by-default, and leaving them un-fixture-ed is what puts the flip in front of a suite instead
+of behind one. The new test `a_new_aspect_is_seal_backed_without_being_told` and the inverted unit
+assertion are the pre-flip-failing evidence.
+
+The door is documented rather than engineered. 0.3.7 and earlier know no `aspects.storage_mode` column
+and read a legacy aspect only from its `measurements.db`, so they answer **zero measurements** for a
+seal-backed aspect rather than refusing it, a silent data-loss shape on downgrade. No released build
+ever created a seal-backed legacy aspect (D-S19 is unreleased), so this is a warning for anyone running
+`main`, with `WEFT_LEGACY_DEFAULT_STORAGE=rows` as the pin that keeps a deployment rollable. A dual-read
+fallback was rejected: it keeps alive a storage shape the roadmap is retiring, for a downgrade path the
+project does not promise before 1.0.
+
+Recorded as a known limitation, not fixed: `WEFT_MAINTENANCE_MAX_SEGMENT_BYTES` (#773) re-cuts only
+folds of two or more segments, so the first frame a brand-new seal-backed aspect writes from a large bulk
+ingest can sit above that ceiling until a later fold cuts it, and #765's output budget bounds maintenance
+rather than ingest. Nothing here makes that worse; it only makes it reachable by default.origin/mainorigin/mainorigin/mainorigin/main
 ## 2026-11-17 — Ticking 7.3 and 7.5 from their shipped parts, and dropping the routine's empty Phase 12 wrappers (7.3, 7.5)
 
 - **The call.** Neither Phase 13 parent has an acceptance test of its own: each line names its parts in parentheses (7.3: D-S12 + ROB-8/9/22 + HTTP restore; 7.5: ROB-19/20/21, with "query consistency, cancellation, and resource limits" in the title). Every part is recorded as shipped (the Phase 6/10 summaries, the ticked Phase 12 lines for ROB-22, ROB-20, X-READ and the restore route), and umbrella #212's three sub-issues are closed as completed. So the routine ticked both parents, listed each part as a `[x]` sub-item with the test that pins it, and re-ran those tests on `435553e` rather than trusting the summaries. 47 passed, 0 failed.
 - **What is not claimed.** The ROB-20 limits are written into 7.5's parenthetical instead of being dropped: the time budget is honoured between swaps only, and a single already-oversized segment is not auto re-split. Whoever owns the beta bar can reopen 7.5 by unticking it if they read those limits as blocking. The "Phase 7 acceptance run" line in the 1.0 release criteria is a separate gate and is not touched.
 - **The wrappers.** The four `START HERE` lines and the two dated run lists at the top of Phase 12 were empty one-line checkboxes. Their prose already lives in `docs/roadmap-notes.md` under *Immediate next actions*, and every item they handed over has shipped (the dictionary occurrence footprint, #612/#699, and memory per database file, #699, both in the Phase 11 summary; the ENOSPC test, the GPU flake and the `float_roundtrip` figure, ticked in Phase 12) or is tracked in Phase 25 (the UDDSketch timing rerun and #401). They are deleted, not ticked, because there was nothing to ship.
+
+
+## 2026-11-17 — What the daemon budget check can honestly promise (ROB-14 cut 3, #806) (decided)
+
+The brief asked the background daemons to consult `MemoryBudget` before they allocate, which
+leaves two things undefined: which daemons, and what "consult" means when a pass does not know
+its own footprint.
+
+- **Which daemons.** Only the reconcile daemon's six tick functions carry a budget in scope; the
+compaction, expiry and purge daemons have no `MemoryBudget` parameter at all, and threading one
+through them changes their signatures and their construction sites. Cut 3 covers reconcile only
+and the roadmap line stays open for the rest rather than claiming the whole item.
+- **What to reserve.** `wanted` of 1 byte. A pass allocates inside the store, and the server
+cannot know the size of a fold before asking the store to plan it, so inventing a per-pass
+estimate would be a made-up number that silently decides how much background work the limit
+admits. The honest question at that point is "is there any headroom at all", and one byte answers
+it. A pass that runs is still bounded by the store's own output ceiling
+(`WEFT_MAINTENANCE_MAX_OUTPUT_BYTES`) and the wall-clock budget (#758). This is why the check is
+named a probe in its doc comment and why the `Reservation` is dropped at the decision point:
+holding bytes the store will not use would only starve request paths.
+- **Unbounded stays unbounded.** `budget.limit()` of `None` returns `true` immediately, so the
+default server (no `WEFT_MEMORY_BUDGET_BYTES`, no cgroup limit) behaves exactly as before.
+- **How the test pins it.** The deferring test asserts `aspects_scanned == 0` and no pass
+counter, not `aspects_reconciled == 0`: after the first pass there is no work left, so a tick
+that ignored the budget would also report zero reconciled. Scanning is the first observable
+thing the check sits in front of.
+
+  regression guard the whole slice is about.
+
+## 2026-11-17 — Moving the fragmentation gate into the bulk-ingest path (#232)
+
+- **The fragmentation gate was an inline duplicate, not a missing feature.** The three gate calls
+  in `inputs.rs` (`:335`, `:446`) each immediately followed an `ingest_batch` call for the same
+  aspect, replicating the gate logic inline. The third caller (`batch_capture_sealed`, `:2442`)
+  did not run the gate at all — it calls `ingest_batch` then drops the store immediately. Moving
+  the gate into `ingest_batch` itself removes the risk of a future caller forgetting it.
+- **Inline gate vs. a separate maintenance daemon.** An inline gate (called after every ingest) was
+  chosen over a background daemon because (a) the gate is O(1) on a converged aspect's rollup,
+  so its per-write cost is negligible when the aspect is stable; (b) it does not hold the
+  maintenance lock from a previous call — the lock is acquired and released within each gate call;
+  and (c) a daemon adds lifecycle complexity (start, stop, backpressure, reconcile with writes).
+  The existing `squash_all_to_target_rows_if_fragmented` sweep (`sweep_all.rs`) already
+  provides the background pass for an operator who wants a one-shot convergence across all aspects;
+  the inline gate is the per-write convergence that keeps bulk from diverging from single-row
+  behaviour.
+- **`ingest_batch_with_gate` takes a `squash_target_rows` parameter;** the existing `ingest_batch`
+  is a thin wrapper passing `SQUASH_TARGET_ROWS`. This lets tests drive a deliberately small target
+  and lets a future caller (e.g., an archival ingest at a different threshold) choose a different
+  target without another wrapper.
+- **The two duplicate gate calls in `inputs.rs` were removed, and the third caller is covered by
+  the move, not left out.** `batch_capture_sealed` (`:2442` in the file's own numbering) goes
+  through the same `ingest_batch` wrapper, so it now runs the gate it never used to run: before
+  this slice the file had gate calls at `:335` and `:446` only, and that third path had none. The
+  wrapper is what closes that gap, which is why the inline duplicates were deleted rather kept.
+- **What this does *not* close.** The gate declines on a converged large aspect
+  (`squash_aspect_to_target_rows_if_fragmented_held` returns `Ok(None)` once
+  `segment_count <= total_rows.div_ceil(target_rows)`, and `SQUASH_TARGET_ROWS` is 100 000) and its
+  failure is logged at debug level. A batch that rewrites a timestamp an existing segment already
+  holds can therefore still leave the stored row count above the number of rows a read returns,
+  which is what #800 tracks.origin/mainorigin/main
+
+## 2026-11-17 — ROB-14 cut 2: enforce the container memory budget on request paths (shipped)
+- **MemoryBudget is now consulted on the server's request paths.** Cut 1 (#787) added the
+  machinery but no call sites; cut 2 adds the `try_reserve` calls.
+- **Ingest path.** `IngestBody::from_request` (`weft-server/src/ingest.rs`) reserves against the
+  memory budget using the same `reserved_bytes` (the declared `Content-Length` or the body cap) that
+  sizes the disk guard. A refusal is `503 over_budget` with `Retry-After: 1`. The guard is held for
+  the body's lifetime via the `_memory_guard: Option<Reservation>` field.
+- **Query/read path.** Every stored-data route in `weft-server/src/storage.rs` (13 handlers)
+  reserves a conservative per-row estimate (`ESTIMATED_BYTES_PER_ROW = 64` in `read_limits.rs`, a
+  doc comment explains the sizing rule and that it is an estimate, not exact accounting). The
+  `reserve_read_memory` helper clones the budget before `drop(state)`, reads the result rows, and
+  holds the guard through serialization.
+- **Refusal mapping.** `Code::OverBudget` → `503` with wire code `over_budget`. `with_retry_after(1)`
+  tells the caller to retry after 1 second. No new `Code`, status, or wire string was added; the
+  frozen code table at `error.rs:1138` is unchanged.
+- **Unbounded escape hatch.** When neither `WEFT_MEMORY_BUDGET_BYTES` nor a readable container limit
+  bounds the process, the budget is `MemoryBudget::new(None)` and every reservation succeeds —
+  behaviour is byte-for-byte what it was before this cut. Every test under default configuration
+  passes unchanged.
+- **Fixes.** Fixed a bug in the ingest code path (inherited from the initial cut-1 cherry-pick) where
+  the memory budget refusal used `.ok()`, silently swallowing a refused reservation. The corrected
+  code returns `Err` when the budget is exhausted.
+- **Gate.** This change was not compiled locally (the host has ~4 GB free and a build OOM-kills
+  the model server). Only the following were run: `rustfmt --edition 2021 --check` on touched
+  `.rs` files, `python3 scripts/ci/check-serial-order.py`, `python3 scripts/config/check_schema.py`
+  (both pre-existing warnings, unchanged by this cut), `git diff --check`.
+
+## 2026-11-17 — Where a memory reservation is taken matters more than its size (ROB-14 cut 2) (resolved)
+Cut 2 wires `MemoryBudget` into the request paths. Three judgement calls from the review of PR #805:
+- **The ingest reservation moved ahead of the body read.** `reserved_bytes` is known
+  from `content-length` (or the `WEFT_MAX_INGEST_BYTES` cap) before a single byte is
+  read, so `state.memory_budget().try_reserve(reserved_bytes)` now sits next to
+  `reserve_disk`, not after `check_body_truncation`. Reserving after the read would
+  only ever notice the pressure once the bytes were already in the process — which is
+  the failure this cut exists to prevent. The guard still lives for the body's whole
+  lifetime through `IngestBody::_memory_guard`.
+- **Downsample reserves against the grid the request declares, before the read.** When
+  both bounds are named, the bucket count is already refused against
+  `WEFT_MAX_DOWNSAMPLE_BUCKETS` at that point, so the same number reserves memory and
+  the guard covers bucket construction *and* serialization. A window naming neither
+  bound has no declared grid, so it is still accounted only on the count the reduction
+  actually produces — too late to bound the build, in time for the response body. That
+  asymmetry is deliberate: refusing an unbounded window on a number the client never
+  sent would break the documented contract, and the existing bucket cap plus
+  `WEFT_READ_TIMEOUT_SECS` are what hold that case.
+- **Budget tests must assert the counter, not only the status.** `oneshot` requests run
+  one at a time, so a read that succeeded has already released its reservation before
+  the next request arrives: a test that "fills the budget" with a sequential read and
+  then expects the next one to be refused proves nothing about contention. The helper
+  now hands the `MemoryBudget` back to the test, which holds it with
+  `try_reserve(64)` and asserts `reserved()` before and after — including that a
+  refused read leaves only the hold accounted, i.e. its own reservation rolled back.
+Left open on purpose: the reservation is an estimate (`ESTIMATED_BYTES_PER_ROW = 64`,
+`read_limits::ESTIMATED_BYTES_PER_ROW`), and per-format serialization cost (Arrow, CSV,
+JSON) is not accounted; the guard covers the response object, not the encoder's
+scratch. A cut that measured encoder peaks would need per-format cost tables that do
+not exist yet.
+
+## 2026-11-18 — Row-count / read parity for overlapping segments (#800)
+
+- **The defect.** `get_measurements_count` returned the sum of segment row counts from the
+  segment index, while range reads folded cross-segment overlaps newest-wins by segment id.
+  After two batches whose timestamps overlapped for the same series, the count was 6 while a
+  range read (newer-wins merge) returned 4.
+- **What was not chosen: making the count newest-wins/deduplicated.** It would cost more than
+  the read it summarises — every segment would need to be scanned per-timestamp — and would
+  make a cheap metadata operation expensive.
+- **What was not chosen: an unconditional fragmentation gate.** The gate declines on a
+  converged large aspect (`squash_aspect_to_target_rows_if_fragmented_held` returns `Ok(None)`
+  once `segment_count <= total_rows.div_ceil(target_rows)`), so the count could still diverge
+  from the read.
+- **What was chosen: guarantee at write time** that a batch's timestamps never overlap an
+  existing segment's `[min_ts,max_ts]` for the same series without folding that cluster first.
+  `ingest_batch_with_gate` now calls `store.reconcile_overlaps(&key)` after every ingest, in
+  addition to the existing fragmentation gate. `reconcile_overlaps` folds oldest → newest with
+  newer-wins semantics, is a no-op when nothing overlaps, and uses the maintenance lock so it
+  is safe against concurrent writes.
+- **Trade-off.** The fold at write time costs I/O on every overlap (a read-merge-write cycle of
+  the overlapping segment frames). For the common case — append-only writes at disjoint
+  timestamps — it is a no-op (the maintenance lock is acquired, the index is scanned, no
+  overlap is found, and no frames are touched). An inconsistent count silently misreported
+  capacity to operators and the quota/overload logic, so the small I/O cost on the rare
+  overlap path is acceptable.
+- **How the first commit's test, then on main, is red.** `count_agrees_with_range_read_after_overlapping_ingests`
+  in `weftdb/tests/legacy_seal_tests.rs` writes two overlapping batches and asserts
+  `get_measurements_count == read_rows().len()`. Before this fix the count was 6 and the read
+  returned 4; after the fix both are 4.
+- **Issue #802 overlap.** This change settles how superseded rows are accounted: they are
+  removed from the index when the overlap fold replaces the overlapping segments with a single
+  deduplicated segment. The count then reflects only the surviving rows.
+
+## 2026-11-19 — Seal-backed aspects replace, not append, at a shared timestamp (#802, SEAL-DUP)
+
+- **Newest call wins at a shared timestamp.** When two ingest calls share a timestamp on a
+  seal-backed aspect, the rows from the newer call are kept and the older call's rows at that
+  timestamp are discarded. Duplicates **inside one call** are all kept.
+- **Rows mode appends.** In rows mode, both rows survive because there is no unique constraint on
+  `timestamp` (the table has a non-unique index). A range read returns both.
+- **Why seal mode differs.** The seal store merges overlapping frame ranges with a correct
+  newer-wins fold (`weft-physical-type/src/split.rs`, `fold_newest_wins` and the underlying
+  `merge_k_way`). At a shared instant, only the newest member's rows survive — this is not a
+  special case for duplicate timestamps but a consequence of the merge rule for all overlapping
+  ranges. Rows inside one seal call land in one frame, so equal timestamps within a call are
+  not folded by the merge rule and are all kept.
+- **What a migrating user should expect.** An aspect created seal-backed (the default since #768)
+  can no longer store two different values at the same timestamp from two separate writes. The
+  newer write replaces the older. To preserve the rows-mode append behaviour, set
+  `WEFT_LEGACY_DEFAULT_STORAGE=rows` before creating the aspect.
+- **The in-frame duplicate is a separate question.** Rows inside one call with identical
+  timestamps and different values are all kept by both modes. No decision was taken on whether
+  that should change.
+
+## 2026-11-19 — (empty, placeholder for the next decision)
+
+## 2026-11-17 — Shadow-segment guard and chunked swap plans for TTL purge (#797, #798)
+
+The brief (#797 weftdb) describes a defect where a wholly-expired correction segment whose
+timeline extent overlaps a surviving segment of the same series is dropped by
+`purge_aspect_held`, causing a plain (non-TTL) read to revert to the superseded values.
+The same brief describes #798: an aspect with more than 32 series causes
+`swap_plans` to bail with "at most 32 plans". Two decisions:
+
+- **The guard is overlap on timeline extent, not on the exact timestamp set.** A doomed
+  segment whose `[min_ts, max_ts]` interval overlaps any surviving segment of the same
+  series is kept on disk. This is the simplest test that prevents the revert; a finer
+  check (matching actual timestamps) would require decoding the segment, adding a
+  read-cost for an already-expensive pass, and the window for false positives is small
+  (a wholly-expired segment that happens to have no timestamp in common but whose extent
+  overlaps a survivor's extent)
+- **Chunking rather than raising `MAX_PLANS_PER_TXN`.** The constant is 32 and guards
+  against a single transaction that is too large for the store. Raising it would push the
+  risk to the database without addressing the structural problem of an aspect with many
+  series. Instead `purge_aspect_held` now submits plans in chunks of `MAX_PLANS_PER_TXN`
+  each through its own `swap_plans` call. When a later chunk fails, the swaps of earlier
+  chunks are already committed; the function returns `Ok` with `completed: false` so the
+  caller counts the real drops and does not charge the circuit breaker, ensuring the next
+  pass retries the remaining segments.
+- **No attempt to backfill the count for older segments.** The `shadowed_and_kept` field
+  starts at zero; the first full-purge pass after the upgrade will count correctly.
+- **Partial-failure test not provable from the test harness.** The test named
+  `purge_33_series_partial_chunk_failure` creates 34 series to force two chunks and
+  asserts at least 32 drops (the first chunk). A deliberate, controlled chunk failure
+  would require the `fault-injection` feature or corrupting on-disk segment files, both
+  outside the scope of the lib test suite. The happy path of the chunking is covered by
+  `purge_drops_33_series_in_one_pass`; the failure path is covered by code inspection and
+  the logical argument that each chunk's swap commits in its own transaction.
+
+## 2026-11-18 — A plain read is not TTL-filtered, so a purge legitimately changes it (#797, #798)
+
+`purge_drops_a_fully_expired_segment_and_keeps_a_straddling_one` compared `read_time_range_of_with_expiry` before and after the purge and required it to be unchanged: a purge may delete frames, and the filter already hid their rows, so no filtered answer moves. When this slice added a plain-read comparison to the same fixture it inherited that reasoning and asserted `before_plain == after_plain`, which is false: `read_time_range` applies no TTL at all, so the wholly expired frame at instants 60..=79 is part of the plain answer, and dropping it legitimately takes those twenty rows with it. CI said so (`left` held 60..=79 plus 85..=120, `right` held only 85..=120). The assertion now pins the real contract instead — the dropped frame's instants are absent afterwards, the plain read loses exactly twenty rows, and the straddling frame still spans 85..=120. A purge's promise is that the *filtered* answer and the surviving frames' data are untouched; it has never promised that an unfiltered scan keeps returning rows it no longer has on disk.
+
+The companion lesson is about fixtures, not production code. The #797 reproduction ingested both frames under the same idempotency key (`IngestBatch::dense("s1", …)` twice), and the second ingest was refused with "aspect "temp" already holds idempotency key "s1" for a different batch … nothing was written" — so the overlap the test meant to create never existed, and the test would have been vacuous even with the assertions rewritten. An idempotency key names one batch; series identity comes from the measurement tags. Two frames of one series therefore need two batch keys and the same (untagged) value shape.
+
+## 2026-11-17 — The expired-row purge runs unconditionally in every daemon tick (shipping)
+
+Issue #785, TTL cut 4. The store's `purge_expired` already returns cheaply when the policy is
+`NoExpiry` (checking `self.expiry == RowExpiryPolicy::NoExpiry` at the top and returning an empty
+`ExpirySweep`), so the daemon calls it unconditionally after the other sweeps on every tick,
+with no gate or config field. This avoids a future mistake where a config field tells the daemon
+to purge when the policy is NoExpiry, fooling nobody, or tells it not to purge when a TTL is set,
+deleting nothing until an operator notices.
+
+**Why not a metric for purge work.** The brief says not to invent metric names when log instead.
+`weft_reconcile_*` counters already count work passes, so a purge that dropped segments records
+through the existing `record_reconcile_sweep` path (one aspect cleaned with N segments dropped).
+A purge that dropped nothing is a quiet tick and records only a maintenance sweep, which is the
+existing idiom. No new Prometheus counter is needed.
+
+**Clock injection.** The tick calls `std::time::SystemTime::now()` through `now_ns()`, which is
+the same pattern the rest of the crate uses (the backup daemon calls `SystemTime::now()` for its
+labels; the ingest path does the same). The store's own tests call `purge_expired` with an
+explicit `now_ns` because the policy functions respect clock injection, matching the cut-1
+contract.
+
+**The purge tick duplicates the other sweeps' failure idiom.** One WARN per failed aspect (the
+sweep kind names `"expired-purge"`), breaker-skipped aspects counted in `busy` (the existing
+`ExpirySweep::busy` field covers both contention and breaker trips, since `purge_expired` does
+not separate them — matching how the store's own `purge_expired` reports `busy`), and the tick
+carries on past a failing aspect. A whole-sweep failure (the aspect list itself unreadable) is
+logged and the tick continues.origin/main
+
+origin/mainorigin/mainorigin/mainorigin/mainorigin/mainorigin/main
+## 2026-11-17 — What the fan-out arm measures, and what it refuses to be (TAG-12, #807) (decided)
+
+- **A cost curve, not a race.** `docs/benchmark-policy.md` governs measuring against another vendor,
+  and this arm races nothing: it publishes our own wall-time curve across a series-count ladder. The
+  module doc says so in its own words, because the file sits next to the arms that do engage those
+  rules and a reader should not have to open the policy to know which category a number came from.
+  The other half of TAG-12, the multi-series crash matrix, is claimed elsewhere, so this slice is the
+  measurement half only.
+- **A ladder, not a point.** `FanOutParams::default()` is 1, 10, 100, 1000 series at 1 000 rows each
+  under a 1 000-second read window, seeded by `DEFAULT_FAN_OUT_SEED`. A single series count cannot
+  show the shape of the curve, and publishing the seed means a run regenerates the corpus exactly.
+- **Ingest is setup and is excluded from the timed span.** The corpus is built once; each rung
+  re-reads the first N series from the same store. Timing the ingest as well would make this arm
+  measure writes, which the ingest-growth and online arms already do.
+- **Correctness is asserted inside the timed loop.** `run_fan_out` fails the run when a series does
+  not return exactly `rows_per_series` rows, because a fan-out curve from a store that quietly
+  returned fewer rows is not a measurement, and a number that is fast because it read less is the
+  worst kind of benchmark result.
+- **The tests take `serial_test`.** They open real stores under a temp root, so they run one at a
+  time rather than contending with each other; `weft-bench` had never needed the dependency before
+  because its other arms build segments in memory.
+- **CI is the first execution.** Nothing here was compiled or run locally: this host cannot build the
+  workspace without OOM-killing the model server.
+## 2026-11-17 — Seal-backed write guard: refuse rows-mode writes on seal-backed aspects (#801)
+
+### Refusal over implementation
+
+The three entry points (`replace_measurements_in_range`, `capture_new_measurement_chunk`,
+`compress_with_progress`, `set_compression_config`) could instead be routed to the seal store.
+Implementing seal-store range replacement or seal-store compression is a real design change
+and out of scope for this slice. Refusal is via `Error::SealBackedRejected(String)` — kept as
+a typed error so callers can handle it specifically, and rejected operations are surfaced
+up through the existing `Result` chain rather than silently succeeding with no effect.
+
+### `set_compression_config` gained a `&Database` parameter
+
+Because `Aspect` has no database handle or storage-mode field (it stores only metadata-db paths),
+the method could not consult the seal-backing of an aspect without adding a parameter. Both call
+sites in `weft-tui/src/app.rs` already had `db` in scope (`Database::existing` returns
+`Ok(_db)` / `Ok(db)`), so the signature change was minimal. `set_compression_config_local`
+(the in-memory path) was left unchanged: it has no database to consult, it is not reachable
+from a seal store, and it is used by tests that need to set a config without a live database.
+
+### Criterion 3: probe the schema, never swallow a failed lookup
+
+The old code answered `Err(_) => Rows`, so a Turso or I/O failure silently
+re-labelled a seal-backed aspect as rows mode and every guard this slice adds
+became skippable. `aspect_storage_mode` now asks `pragma_table_info('aspects')`
+whether the `storage_mode` column exists: only a genuinely absent column (a
+database created before D-S19, or no `aspects` table at all - that pragma simply
+returns no rows) means rows mode, and a probe or SELECT that *fails* propagates.
+No error-string matching: `git grep "no such column" origin/main -- weftdb` is
+empty, so this repo has no such idiom to follow, and a pragma names the thing
+being asked about instead of reading a diagnostic's wording. Upstream Turso
+does match the text (`core/connection.rs` `should_retry_cross_process_schema_lookup`
+tests `msg.contains("no such table")`), and its bindings expose only
+string-carrying variants (`Error(String)`, `Busy(String)`, `Readonly(String)`),
+so text matching would work but would be load-bearing on wording we do not own.
+
+The trade-off is recorded deliberately: `is_seal_backed` is called from twenty-
+plus read and write paths, so a metadata-lookup failure now fails those calls
+instead of quietly taking the rows-mode branch. An unknown storage mode must not
+default to the mode with the fewest guards; a transient metadata-DB problem
+becomes a visible error rather than a slow path.
+
+### The enumeration test must not create the file it forbids
+
+`seal_backed_write_entry_points_never_reach_measurements_db` first obtained the
+handle for the refusal probe with `Database::get_measurement_db`, which creates
+`aspects/<uuid>/measurements.db` on disk (`weftdb/src/types/database/mod.rs:1367`
+-> `weftdb/src/types/aspect.rs:477` -> `Builder::new_local(db_path).build()`), and
+then asserted that same path does not exist - an assertion that fails whatever
+the guards do. The probe now derives the path from the aspect id and passes a
+throwaway `:memory:` handle, so the non-existence assertion measures the guards.
+A second assertion re-reads the storage mode to prove a refusal never flips a
+seal-backed aspect back to rows mode.
+
+### Entry-point enumeration
+
+Criterion 4 is satisfied by a test that asserts each legacy write entry point on a seal-backed
+aspect either routes to the seal store or returns `Error::SealBackedRejected`. The covered
+entry points are: `capture_measurement_chunk` (already routed in #779),
+`capture_new_measurement_chunk`, `replace_measurements_in_range`, `batch_capture_measurements`
+(already routed in #779), `batch_capture_new_measurements` (already routed in #779),
+`capture_measurement` (routed in #779 via `capture_new_measurement`), and the compression path
+via `set_compression_config`/`compress`/`compress_with_progress`.
+
+### The legacy accessors, named, and what #802 still owns
+
+The typed mode is the single source of truth for these decisions:
+`Database::aspect_storage_mode` (`weftdb/src/types/database/mod.rs:1682`) and
+`Database::is_seal_backed` (`:1735`), both `async fn(&self, &AspectId)`.
+The four accessors criterion 4 names keep their pre-existing shape in this PR:
+
+- `DatabaseStructure::get_measurement_db(&self, &AspectId) -> Result<turso::Database>` (`mod.rs:1367`)
+- `DatabaseStructure::get_measurement_db_path(&self, &AspectId) -> Result<String>` (`mod.rs:1386`)
+- `Database::get_seal_store(&self) -> Result<LegacySealStore>` (`weftdb/src/seal_store.rs:31`)
+- `Inputs::get_current_txid(&self, &turso::Connection) -> Result<TxId>` (`weftdb/src/types/database/inputs.rs:2283`)
+
+They are async and return `Result`, but none of them reports the storage mode,
+so a caller can still ask a seal-backed aspect for a rows-mode handle and be
+handed one. What this PR does is refuse the writes that would have used such a
+handle (the four `SealBackedRejected` guards) rather than change signatures that
+24 crates and the TUI call. Converting the accessors themselves to return
+`Result<Option<...>>`/a typed mode error is #802's job, which is filed as
+"remove the fallbacks"; doing it here would mean an API break with no test of
+its own, and the ordering the operator set (#800 -> #801 -> #802 -> #803) keeps
+the fallback removal in #802 where its blast radius can be measured.
+## 2026-11-19 — A dependency exception is only real if the tool can expire it (#794, DENY-PIN)
+The exception for RUSTSEC-2026-0543 (unmaintained `chrono`) has carried the sentence "revisit by 2027-01-31" since PR #790 wrote it, and nothing checked that date: cargo-deny 0.21.0 (2026-11-16) added `advisories.ignore[].expiry`, and the CI pin (`EmbarkStudios/cargo-deny-action @3c63498`, Dockerfile `deny_version="0.20.2"`) rejected the key outright with `error[unexpected-keys]: found 1 unexpected keys, expected: ["id", "reason"]`. So the deadline was documentation, and documentation is the kind of deadline that passes silently.
+
+**The decision** — bump the pin to the commit the `v2.1.2` tag peels to, `70f81531115945ba6eb6b941ec9d39d063438eb9` (its Dockerfile pins `deny_version="0.21.0"`), and give the ignore entry `expiry = "2027-01-31"`, an absolute ISO-8601 date rather than a duration: a duration is relative to the advisory's publish date, which is not the date the plan says the migration to `time`/`jiff` (#791) is due.
+
+**The alternatives** — (a) leave the pin and keep the prose deadline, which keeps a checked-in file describing a limitation that no longer has to exist; (b) add a global `advisories.ignore-expiry = "P90D"` default so every future exception expires on its own, rejected: it would silently govern exceptions nobody reviewed yet, and a default expiry on an exception someone intended as permanent turns a green CI red with no decision behind it. The per-entry key keeps each expiry a deliberate act.
+
+**The trap for the next person** — a GitHub tag ref is not always a commit: `v2.1.2` resolves first to an annotated tag object (`995303aa1216…`), and pinning a workflow to that object is invalid. Peel it (`gh api …/git/tags/<sha>` → `.object.sha`) before writing the pin. `scripts/ci/check-action-pinning.py` only verifies that the reference is 40 hex characters, so it cannot tell a tag object from a commit.
+
+**What this does not do** — it does not fix the advisory. `arrow 60.1.0` still requires `chrono ^0.4.40`, chrono 0.4.45 is the newest release, and the nine manifests that depend on chrono directly plus the arrow-flight path that pulls it transitively cannot move off it. When 2027-01-31 passes, cargo-deny re-reports the advisory and emits `advisory-ignore-expired` at the value: that red is the point.
+Filed as #794; the exception itself is #790 and the migration is #791.
+
+## 2026-11-19 — The idempotency unit is the call, not the payload (#803)
+
+- **Rejected: single-use `DatasetId` as the key.** Oracle option B would repurpose `DatasetId` as
+  a per-call token, keying the ledger as `legacy:{dataset_uuid}` and routing a reused id with a
+  different payload to `IdempotencyConflict` (HTTP 409).  The premise — "no caller reuses one
+  `DatasetId` for many payloads" — is falsified by `bulk_ingest_converges_at_small_target`,
+  `gated_bulk_read_path_correctness` and
+  `seal_backed_aspect_round_trips_replays_and_widens`, which all reuse one `DatasetId` across
+  distinct payloads and expect every write to land.  `DatasetId` is a **logical, multi-write
+  identity** (`weftdb/src/types/dataset.rs:9-10`, `rows_mode.rs:25-27`).
+- **The A-B-A argument.**  No pure `(DatasetId, payload) -> key` function can distinguish "retry
+  of A" from "new submission of identical content A′", so the only sound fix is a caller-minted
+  per-call token.  The adopted design splits the two identities the adapter previously conflated:
+  `DatasetId` stays a stable logical identity, while the seal idempotency unit becomes an explicit
+  per-call token.  The gate takes that token as a **required** `&str` argument, so a new caller
+  cannot silently opt out of it; `ingest_batch` mints a fresh UUIDv4 and is the explicit
+  append-only opt-out.  The store already has the right
+  primitive (`SegmentStore::ingest` keyed by `(aspect, batch.key)`); the adapter now stops
+  bypassing it with a derived key.
+- **Deliberate scope choice.**  Crash-safe typed-API replay is left to the HTTP layer's existing
+  `Idempotency-Key` (`weft-server/src/ingest.rs:701-709`).  `ingest_batch` is append-only,
+  matching rows-mode's documented "no idempotency key" contract.  No `Inputs` trait method
+  signatures were changed in this slice: only the library-only `ingest_batch_with_gate` gained
+  the token parameter.
+- **Premise verified against main, and reproduced.**  main derived the key as
+  `legacy:{dataset_uuid}:{crc32:08x}:{row_count}` (`payload_crc` and `idempotency_key` in
+  `weftdb/src/types/legacy_seal.rs`, added by `343d626` for #485), so a second call with an
+  identical payload under one `DatasetId` was absorbed as a replay, and an A-B-A sequence lost
+  the last write.  The assertion-level reproduction lives on `p803/repro-red` (draft PR #819):
+  `reused_dataset_id_swallows_last_write_in_aba` fails main's `assert_ne!(tx_a2, tx_a)` ("the
+  third call produces fresh TxIds, not a replay of A") and its read assertion sees the stale
+  middle value instead of the last write.
+- **Reviewer invariant.**  A seal ingest key is minted once per logical write call and is **never**
+  a function of the payload.  No call site may feed a content hash into `IngestBatch::key`.
+  Presenting the same explicit token with the same batch replays; presenting a different token (or
+  a fresh nonce) always yields a distinct key and therefore a distinct write — never a silent
+  replay of a stale receipt.
+- **Separate, still-open availability point.**  The surviving 64-bit FNV-1a fingerprint
+  (`weftdb/src/types/ingest.rs:162-180`) can produce a false `IdempotencyConflict`.
+  Not addressed here.
+
+## 2026-11-20 — Legacy-seal idempotency: the payload key is inherited state, the new entry point adds call identity (#803) (landed as PR #817)
+
+`weftdb/src/types/legacy_seal.rs` has replayed an identical `(DatasetId, rows)` legacy ingest as
+one idempotent write since `343d626` (D-S19 #485), keyed `legacy:{dataset_id}:{payload_crc:08x}:{count}`,
+pinned by `seal_backed_aspect_round_trips_replays_and_widens` and
+`seal_backed_new_measurement_entry_points_reach_the_seal`. Issue #803 reported that as a defect: a
+benchmark re-run or backfill that reuses a `DatasetId` is absorbed instead of writing. Those two pins
+are protected inherited state, not something this slice overrides — at that surface the caller hands
+the store nothing but `(dataset_id, rows)`, so a blind client retry and an identical genuinely-new
+call are indistinguishable by construction, and protecting the retry from doubling rows is the safer
+half of that trade. What was missing is not the replay rule but any way to express **call identity**,
+so the fix adds it: `ingest_batch_with_gate(store, aspect_id, _dataset_id, idempotency_token: &str, rows, squash_target_rows)`
+keyed `legacy:{token}` — the token is required so a new caller cannot silently opt out of replay
+protection; the same token with the same payload replays the first receipt, the same token with a
+different payload is a loud `StoreError::IdempotencyConflict`, and distinct tokens always write, even
+for identical rows under one `DatasetId`. Both key styles share one body (`ingest_batch_under_key`),
+so the fragmentation gate and the overlap reconciliation of #813 run identically under either.
+
+Traded: without a token — through the thin `ingest_batch` wrapper that every legacy facade call site
+uses (`weftdb/src/types/database/inputs.rs:336`, `:445`, `:2454`) — an identical genuinely-new re-run
+is still absorbed. That is #803's residual gap, and closing it means routing a caller identity to this
+path: the server ledger's key (`weft-server/src/ingest.rs:717`) already exists but the sealed-batch
+path never uses it, which is #768's seal routing. #803 therefore stays open, narrowed to that. What
+would revive the original defect: minting a fresh `Uuid` inside `ingest_batch` instead of deriving the
+key from the payload.
+
+CI note while touching this file: `weftdb/src/lib.rs:2` carries
+`#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]`, and `clippy::too_long_first_doc_paragraph`
+arrives through `nursery`, so a public item whose first doc paragraph runs past a short summary line
+fails `cargo clippy --workspace --all-targets --all-features` with exit 101. Keep first paragraphs to
+one line and put the rest in a second paragraph.
+
+## 2026-11-20 — TAG-12-B: one interleaved crash cell instead of the fault-point cross-product (issue #341)
+
+- **Ambiguity in the slice brief.** "Add the multi-series crash matrix" does not say whether
+  that means the whole single-series fault-point matrix re-run with N series, or one cell with
+  several series in flight. It also does not say where to abort.
+- **What was chosen, and why.** One cell: 8 aspects written interleaved, process abort at
+  [`FaultPoint::SFrameWritten`] (`weftdb/tests/multiseries_crash.rs`, gated by
+  `#![cfg(feature = "fault-injection")]`). The fault points are per-frame, so re-running the
+  entire matrix with 8 series multiplies CI minutes while exercising code paths the
+  single-series cells already cover. The failure modes worth protecting — a read that returns a
+  value from a frame that never committed, or a committed frame whose value is lost — only
+  become visible when more than one series is in the same batch, which this cell has.
+- **Mechanism, recorded because it constrains future cells.** The child re-executes the test
+  binary: it writes a first round to every aspect, arms `SFrameWritten`, then writes one more
+  aspect and aborts; the parent reopens the store cold and checks each aspect against a replay
+  of its committed frames. The cell runs with `--test-threads=1` in `scripts/crash-matrix.sh`
+  because arming a fault point is process-global state, so parallel cells would arm each other.
+- **Known limitation, accepted.** Only `SFrameWritten` × multi-series is covered. Other fault
+  points crossed with multiple series, and TAG-12's remaining items (fan-out and TSBS
+  benchmarks, fixtures, freeze docs) stay open; the `docs/roadmap-notes.md` TAG-12 line now says
+  so rather than leaving the line untouched.
+
+## 2026-11-20 — A test-only environment marker is a registered variable, and the config checker reads every number in the doc (#341, PR #826) (landed as PR #826)
+
+The multi-series crash cell spawns a child process and marks it with
+`WEFT_MULTISERIES_CRASH_CHILD`, exactly as the other crash cells mark theirs
+(`WEFT_DB_NEW_CRASH_CHILD`, `WEFT_LEGACY_INGEST_CRASH_CHILD`, …). The settings-registry test
+(`weft-server/src/settings.rs`, `every_environment_name_the_workspace_reads_is_registered`)
+scans every crate for environment reads and fails a PR that introduces an unregistered name,
+so a test-only marker is not exempt: it gets a `Tier::Test` `VarSpec` with all four fields
+filled, and the `VARS.len()` pin moves with it (121 to 122 here). The registry is the only
+place a name's meaning is written down, and a test name is worth writing down for the same
+reason an operator name is: the next person has to be able to tell a deliberate crash from a
+real one.
+
+Two CI traps this slice hit, both cheap to avoid once known. First, a test file behind
+`#![cfg(feature = "fault-injection")]` is invisible to the plain `test` jobs; only the crash
+matrix and feature matrix compile it, and the crash matrix builds with `-D warnings`, so an
+unused local there is a hard compile error that no amount of local `cargo test` debugging
+would show. Fix the binding by using it, not by prefixing it with an underscore: the two
+unused values in this test were the aspect id and the planned batch, and the aspect id is now
+compared against the id recorded before the crash, which is a check the cell was missing.
+Second, `scripts/config/check_schema.py` does not read prose, it reads numbers: it greps the
+whole of `docs/config-schema.md` for `<n> <Tier>` and `<n> variables` patterns and requires
+each to match the current tier row counts. A historical sentence in the version-history table
+("brought the total to 108 (45 Test)") is therefore a live claim, and adding a variable means
+touching those sentences too. The honest way to satisfy it is to restate the present-tense
+count where the document makes one, and reword the past-tense sentences so a historical number
+is no longer stated as a current tier count ("108, with 45 of them in the Test tier").
+
+Two more pins the same cell had to satisfy, both invisible to a local `cargo test`:
+
+- **The `Test` tier has a written-out allowlist, not only a tier tag.** `the_tiers_are_the_explicit_choice_they_claim` (`weft-server/src/settings.rs:575-583`) rebuilds the set of `Tier::Test` names and asserts it equals an allowlist spelled out in the test itself — "a channel a test harness sets for the child it spawns, and nothing else may sit in it". Adding a harness variable therefore needs **both** the `VarSpec` and a name in that allowlist; a PR that adds only the spec passes locally and fails the `weft-server` lib suite in CI. The check is two-directional, so a name that moves tier must be edited in both places too.
+- **A re-executed child is addressed by its harness path, which for a crate-root test is just the function name.** The cell spawned its child with `--exact multiseries_crash::child`; that filter matches nothing (`running 0 tests`, exit status 0), so the parent's "the child aborted" assertion fired against a clean exit instead of a signal. The module-qualified spelling works only where the child lives in a `mod` (as in `weftdb/tests/db_tests.rs:1607` `database_new_crash::child`). Lesson: assert on the child having actually run — a filtered-out child looks exactly like a successful one.
+## 2026-11-20 — Host capacity decides who builds, and what stays owner-gated (roadmap hygiene)
+
+**Ambiguous.** `ROADMAP.md` keeps listing TAG-12 (`:116`) and FRE-18 (`:383` wave line, issue #348)
+as open work, and the coordination rules invite an agent to claim the next unchecked item. Whether
+those items are actually available depends on machine state that the roadmap does not record.
+
+**Chosen.** Treat host capacity as a first-class gate and record it here rather than in a PR:
+
+- The host is back in the state that already stopped local Rust work in November: `free -g` reports
+  109 GB used and 15 GB available of 124 GB, load average ~29, with the local model server resident.
+  A `cargo` workspace build needs 6–10 GB on its own. **No worker slice is launched that builds the
+  workspace while `available` is under ~30 GB**; CI stays the only compile gate for store and server
+  changes. This is the same decision recorded earlier for the 5 GB case, restated with the threshold
+  so the next run does not re-litigate it.
+- TAG-12 (#341) is not one task. Its **multi-series crash cell** landed as PR #826; its **fan-out arm
+  is already held by #809** (`weft-bench/src/fan_out.rs` exists on `main`); its **TSBS half**
+  (`single-groupby-1-1-1` and `lastpoint` over the whole TSBS file tagged by `hostname`, through
+  `weft-xbench --tsbs`) needs a quiet host and the full dataset. Claiming "TAG-12" as a slice would
+  re-do landed work, so the remaining honest claim is the TSBS run plus fixtures, and both are
+  environment-gated.
+- FRE-18 (#348, "rc.1 freeze cut and layout-2 baseline fixtures") is a stub body whose real
+  prerequisites are the owner actions at `ROADMAP.md:122` (approve and push `v1.0.0-beta.1`) and its
+  own sub-issue #349 (`v1.0.0-rc.1` tag, marked owner). It is left **Needs human**.
+- Reviewer reliability is also a capacity question: the fixed reviewer route has now produced two
+  30-minute timeouts and one degenerate (incoherent) answer on large diffs. Briefs are capped at four
+  questions and twelve tool calls; a degenerate run is treated as "review not performed" and retried
+  once, and a second failure is escalated rather than looped.
+
+**Needs human:** the beta tag approval/push (`ROADMAP.md:122`, sub-issue #349), the honesty-page
+narrative (`:100`), making the ghcr.io package public (`:99`), the `parquet`/`arrow-buffer` upstream
+reports (`:101`), and D-S21's privileged power-loss validation (`:77`) — plus a quiet host window
+(and the T7 reference drive on 10 Gbps, `:112`) before the TSBS and calibration items can run.
+## 2026-11-20 — A roadmap line may not promise a leg the pin vocabulary forbids (#236) (landed as PR #833)
+
+**Question.** `ROADMAP.md` line 166 (at the time) read "Upgrade/rollback procedure, exercised against the previous release". That bundles two claims. The upgrade half is real: CI job `compat` runs `LEG_RUNNERS["0.1.0"]["upgrade"]` — `weftdb/tests/compat_v010.rs::a_v010_store_migrates_forward_and_keeps_reading_its_own_values` — against the sole pinned release `v0.1.0` (commit `b9a8ee42`), whose `legs` field admits only `["upgrade"]`. The rollback half has no runner: `compat/releases.toml` has no `rollback` leg anywhere, `releases.LEGS == {"upgrade"}`, and `scripts/compat/test_leg_coverage.py` keeps rollback only in `SUBSTITUTE_RUNNERS` (a store-format-marker tamper stand-in) precisely because no runner may claim that leg. FRE-16 (2026-11-10) declared rollback-after-writes unsupported for 1.0, and the pin rule says a pin may declare only what CI truly executes.
+
+**Decision.** Narrow the roadmap line to say only what the gate proves: the upgrade procedure is exercised against the only pinned previous release, and rollback-after-writes is a documented non-goal.
+
+**Rejected.**
+
+- Pinning `v0.3.7` and adding a rollback leg with fixtures generated by CI from the release's digest-pinned archive. That would manufacture a pin whose `legs` entry CI cannot execute — no old binary is pointed at the candidate's store — and the rule forbids it.
+- Building `v0.3.7` from its tag to write fixtures. That would produce fixtures the current binary wrote, labelled as the old release's, and would not create a rollback runner.
+- Treating the CI job `archives` (`.github/workflows/ci.yml:542`) as a compatibility leg. Its own comment at `:537` says "Not a compatibility leg: no old binary is pointed at anything here", and it proves only that pinned archives still exist and hash correctly.
+- Treating the marker-tamper stand-in as the rollback leg. That stand-in (`SUBSTITUTE_RUNNERS`, `test_leg_coverage.py:83`) raises `STORE_FORMAT.min_write_layout` to 99 and asserts `StoreError::IncompatibleLayout`; it proves the refusal half but no released binary is ever involved, and calling it the leg would re-create the fiction FRE-16 deleted.
+
+**Residue left open.** The newest-release → candidate upgrade (v0.3.7 → a future layout bump) remains unexercised because there is no pin or fixture set for v0.3.7, and the repo rule is that a pin may declare only what CI truly executes. If a future layout bump lands, the missing pin is the first thing to add.
+## 2026-11-19 — The row TTL carries a unit; bare numbers mean seconds (#799, TTL-UNIT)
+
+**Question.** `WEFT_ROW_TTL` was a bare number that every aspect read in its own time unit,
+so one operator setting meant wildly different real durations. Making the number mean one
+span is a semantic change to a live (Experimental) variable, and the repo has no precedent
+for changing a variable's meaning rather than adding a new one.
+
+**Decision.** Keep the name, change the meaning, and say so loudly: `RowExpiryPolicy::Ttl`
+now carries a `TimeUnit`; the value accepts an `ns`/`us`/`ms`/`s` suffix and a bare number is
+**seconds**; the conversion happens once per aspect and is saturating. Expiry is stated as one
+rule — `row_ts < cutoff(now, ttl)` — shared by the range-read filter and the purge sweep,
+because two implementations of "expired" is how the pre-1970 unsigned-age wrap survived.
+
+**Rejected.** Adding `WEFT_ROW_TTL_UNIT` alongside the number: two variables that must agree
+is the failure mode we are removing, not a way to preserve it. Also rejected: converting the
+count at the settings layer only, which leaves the store's own `from_env` path still
+unit-blind. Silently keeping "bare = aspect units" was rejected because that is the bug.
+
+**Boundary and residue.** A row whose age equals the TTL is **not** expired (strict `>`). A
+**positive** TTL finer than the aspect's resolution clamps to **one tick** — the newest tick's
+rows are kept — rather than saturating to 0, which would have expired every row aged at least one
+tick (a `500ms` TTL on a `Seconds` aspect would purge a series). An explicit `ttl == 0` still
+means "everything strictly before `now`", which is what `zero_ttl_expires_rows_strictly_before_now`
+pins; a blanket `.max(1)` would have broken that. Because the variable is `Experimental`, the settings-tier test list is unchanged and
+no deprecation window applies; `UPGRADING.md` carries a short "variables can change meaning"
+section instead. The store-side parser is the single parse point (`row_expiry_policy_from`,
+`weftdb/src/types/segment_store.rs`); `docs/config-schema.md` and the `settings.rs` `VarSpec`
+summary were rewritten to match, since both previously promised "there is no seconds-based
+conversion".

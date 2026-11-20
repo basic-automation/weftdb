@@ -82,11 +82,20 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [x] **FRE-10a** Contract tests: probes, compute endpoints, metrics and roles
 - [ ] **ROB-14** Cgroup-aware memory budget with per-request reservations
 - [x] Restoring *into a chosen new root* over HTTP (7.3) (#213, 2026-11-14: `POST /api/v1/storage/restore/into?label=...&name=...` into `WEFT_RESTORE_BASE_DIR`; the offline drill at `weft-server/src/restore.rs` is unchanged)
-- [ ] Store-side row-level TTL/expiry (prerequisite for the SOA-15 TTL lane) *(cut 1 shipped 2026-11-15 in #752: the policy, the read-path filter and a report-only sweep; cut 2 shipped 2026-11-16 in #775: `purge_expired` drops whole segments whose every row is expired, and the reaper unlinks them; the rows inside a partially expired frame and the server surface — env var, settings entry, route — are cut 3 and are NOT shipped)*
+- [x] Store-side row-level TTL/expiry (prerequisite for the SOA-15 TTL lane) *(cut 1 shipped 2026-11-15 in #752: the policy, the read-path filter and a report-only sweep; cut 2 shipped 2026-11-16 in #775: `purge_expired` drops whole segments whose every row is expired, and the reaper unlinks them; cut 3, the environment switch, landed in #784 for issue #783: the `WEFT_ROW_TTL` env var, the settings entry and the config-schema docs; cut 4, the daemon call site, shipped 2026-11-17 in #786 for issue #785: `reconcile_tick_purge_expired` in `weft-server/src/reconcile_daemon.rs` calls `SegmentStore::purge_expired` on the daemon's own tick and records the sweep, so expiry no longer waits for an operator call; with `NoExpiry` the tick is a recorded no-op)*
 - [x] Real-filesystem ENOSPC test for #656 on the injectable space source (#694 merged)
-- [ ] **Measurement bulk ingest routed through the `.weftseg` seal** *(part 1 shipped 2026-11-16: the two legacy bulk writers that do not read the stored range first now route to the seal store for a seal-backed aspect. Still unticked because new aspects are still created in rows mode, and flipping that default is #768, which carries the cost figure the flip needs)*
+- [x] **Measurement bulk ingest routed through the `.weftseg` seal** *(part 1 shipped 2026-11-16: the two legacy bulk writers that do not read the stored range first were routed through the seal store, and the aspect's own latest-timestamp read was fixed to consult it. #768 then made new legacy aspects seal-backed by default, with `WEFT_LEGACY_DEFAULT_STORAGE=rows` as the opt-out, so a fresh deployment writes sealed frames through every ingest entry point)*
 - [x] **CI**
 - [x] Packaging (1.0 minimum)
+- [ ] **Row-TTL purge defects** *(found 2026-11-17 by a read-only audit of #776; nothing on `main` calls `purge_expired` yet, so these gate the daemon call site in #785)*
+  - [x] **TTL-PURGE** Dropping an expired segment must not bring back the values it superseded in a surviving overlapping segment (#797, 2026-11-19: `purge_aspect_held` keeps a wholly-expired segment on disk when its `[min_ts, max_ts]` extent overlaps a surviving segment of the same series, so a plain read cannot revert to superseded values)
+  - [x] **TTL-PURGE** An aspect with more than 32 series with expired segments can be purged, and partial drops are counted (#798, 2026-11-19: the swap plans are applied in chunks that stay inside the store's per-transaction plan ceiling, and the sweep report counts the aspects and segments it actually dropped)
+  - [x] **TTL-UNIT** The row TTL carries a unit instead of being a bare number read in each aspect's own time unit (#799, 2026-11-19: `RowExpiryPolicy::Ttl` carries a `TimeUnit`, `WEFT_ROW_TTL` takes an `ns`/`us`/`ms`/`s` suffix with bare = seconds, and the read filter and the purge sweep share one cutoff rule)
+- [ ] **Legacy seal routing defects** *(found 2026-11-17 by a read-only audit of #769, #770 and #780; these gate the seal-backed default in #768)*
+  - [x] **SEAL-COUNT** The count of a seal-backed aspect agrees with what a range read returns after a batch rewrites a timestamp (#800, 2026-11-19: `ingest_batch_with_gate` now folds overlapping clusters with `SegmentStore::reconcile_overlaps` after every ingest, so the segment index stays overlap-free and the rollup count equals the read)
+  - [x] **SEAL-REPLACE** `replace_measurements_in_range` and `compress()` never write to the unread rows file of a seal-backed aspect (#801, 2026-11-19: the rows-mode-only entry points refuse up front with `Error::SealBackedRejected` when the aspect is seal-backed; `set_compression_config` and `capture_new_measurement_chunk` are covered by the same guard)
+  - [x] **SEAL-DUP** The replace-not-append rule for duplicate timestamps is documented and pinned by a test (#802)
+  - [ ] **SEAL-IDEM** A reused `DatasetId` cannot lose a write or fail on a CRC-32 collision (#803; 2026-11-20: **narrowed, still open** — the payload-derived key `legacy:{dataset_id}:{payload_crc}:{count}` is inherited state that its own landed tests pin, so the fix lands a caller-identity entry point (`ingest_batch_with_gate`) whose token is required and whose reuse with a different payload is a loud `IdempotencyConflict`; the remaining half, a *call* identity that survives to the seal path, depends on #768)
 - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
 - [ ] Write or approve the honesty-page narrative *(owner)*
 - [ ] Report the three `parquet` 60.0.0 decoder panics and the `arrow-buffer` 60.0.0 panic upstream to apache/arrow-rs *(owner: outward-facing)*
@@ -95,8 +104,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [x] Guard the `#[serial]`-above-`#[test]` ordering (#726, 2026-11-13: the guard reads the keyed `#[serial(key)]` form too and requires a test attribute in the same attribute block; either position in that block serialises, so the "above" ordering is no longer enforced)
 
 ## Phase 13 — Contract candidate (was W9 gates and W11)
-
-- [x] **7.3 Corruption detection** (D-S12 + ROB-8/9/22 + HTTP restore) *(reconciled 2026-11-17 by the routine from its five parts, all shipped; the evidence tests below were re-run on `435553e` and pass. Umbrella #212's three sub-issues #213/#214/#215 are closed as completed.)*
+- [x] **7.3 Corruption detection** (D-S12 + ROB-8/9/22 + HTTP restore) (2026-11-20 audit: every named component is closed. D-S12 landed 2026-10-29 (`DECISIONS.md:3570`) — startup recovery, quarantine with TTL (`weftdb/src/types/quarantine.rs`) and the fsck endpoint (`weft-server/src/routes.rs:967` `POST /api/v1/storage/fsck`, scope `maintain`); ROB-8 frame decode hardening (#265), ROB-9 mutation harness for frames, sidecars and Parquet (#315) and ROB-22 frame-fault policy verification (#446) plus the suspect-frame policy and background-decode crash-loop breaker (#720) are closed; restoring into a chosen new root over HTTP landed 2026-11-14 (#213, `POST /api/v1/storage/restore/into?label=…&name=…` → `WEFT_RESTORE_BASE_DIR/<name>`)
   - [x] D-S12 startup recovery, quarantine with TTL, the fsck endpoint and the `/ready` report (Phase 6; `POST /api/v1/storage/fsck` in `weft-server/src/routes.rs`; `startup_recovery_quarantines_a_corrupt_frame`, `fsck_rebuilds_a_row_whose_length_is_stale`)
   - [x] ROB-8 hardened frame decoding (Phase 6; `weft-server/tests/frame_fault.rs`)
   - [x] ROB-9 mutation harness over frames, sidecars and Parquet (Phase 10; `weft-arrow-store/tests/parquet_mutation.rs`, `weft-physical-type/tests/mutation.rs`)
@@ -119,7 +127,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
   - [ ] TSBS tag-grouped query suite in `weft-xbench` (`--tsbs` reads only `host_0` today; `single-groupby-*`, `double-groupby-*`, `lastpoint`, `high-cpu-*` group by `hostname`)
   - [ ] Tagged fixtures and freeze docs
 - [x] **ROB-24** Limits and overload evidence; frozen configuration documentation
-- [ ] **SOA-15** part 2: TTL lane
+- [x] **SOA-15** part 2: TTL lane
 
 ## Phase 14 — Beta tag (was W11)
 
@@ -167,7 +175,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 ## Phase 20 — 1.0 claims and release notes (was W14 and W15)
 
 - [ ] Every performance claim in the README links to a benchmark artifact
-- [ ] Upgrade/rollback procedure, exercised against the previous release
+- [x] Upgrade procedure exercised against the pinned previous release (v0.1.0, layout 1 → 2); rollback-after-writes is a documented non-goal for 1.0 (FRE-16)
 - [ ] Write or approve the 1.0 release notes and upgrade notes before the cut *(owner)*
 - [ ] **EVI-22** README 1.0 project status, badge and versions
 

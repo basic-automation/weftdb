@@ -217,6 +217,7 @@ The licensing decisions are made. Every WeftDB crate is `MIT OR Apache-2.0`, Jus
 
 - **7.2 WAL & crash consistency**
 - **7.3 Corruption detection**
+  *Closed 2026-11-20 (audit): every component named by the roadmap line is on main. D-S12 (2026-10-29, `DECISIONS.md:3570`) gave startup recovery, quarantine with a TTL (`weftdb/src/types/quarantine.rs`) and the fsck route (`weft-server/src/routes.rs:967`); ROB-8 (#265), ROB-9 (#315) and ROB-22 (#446 frame-fault policy verification, #720 suspect-frame policy and background-decode crash-loop breaker) are closed; restore into a chosen new root over HTTP landed 2026-11-14 (#213). The offline drill at `weft-server/src/restore.rs:65` is unchanged.*
 - **7.4 Whole-store backup manifest**
   *Closed 2026-11-05 (audit): whole-store manifest `weftdb-whole-store-backup/1` shipped in D-S16 (#483).*
 - **7.4 Documented RPO/RTO** against the measured snapshot cadence
@@ -239,6 +240,14 @@ The licensing decisions are made. Every WeftDB crate is `MIT OR Apache-2.0`, Jus
   the rows-mode handle. The line stays unticked: new aspects are still created in rows mode
   (`StorageMode::for_new_aspect`, `weftdb/src/types/legacy_seal.rs:126-135`), and flipping that
   default is **#768**, which carries the ingest/read cost figure the flip needs.*
+
+  *Audit 2026-11-16, #768 (the flip): it shipped, and the figure named above is not a
+  gate at all. `float_roundtrip` prices the JSON body of an ingest or interpolate request, not
+  where a new aspect puts its rows, and the seal path's real costs, one-row ingest as a full
+  seal commit, the fragmentation gate, read fan-out, were already characterised in S19 and S20.
+  What the flip does need stating is the one-way door: an unset variable now leaves a new aspect
+  seal-backed, and 0.3.7 or earlier read zero measurements from such an aspect instead of
+  refusing it. The gate was the downgrade note in `docs/upgrade-notes.md`, not a benchmark.*
 - **B-tags**
 
 ### Security & packaging *(Phase 8 minimum)*
@@ -371,14 +380,16 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - → **SOA-15** soak.yml nightly workflow, TTL lane and nightly-to-nightly comparison
     *Updated 2026-11-09: parts 1 (nightly workflow with active cron `0 7 * * *`) and 3
     (nightly-to-nightly comparison with first-night-no-baseline path) shipped in #616 and
-    verified present on `origin/main`. Part 2 (TTL lane) remains blocked: the store has a row-level TTL
-    and a purge (`SegmentStore::purge_expired`, #775), but no way to configure one through the
-    server — `from_env` still hard-codes `NoExpiry` and there is no settings variable — so a
-    soak still cannot exercise the lane (`weft-bench/src/soak.rs` uses `NullServer`, and
-    `weftdb/src/types/segment_store.rs` only ever purged expired *quarantine* records; `weft-bench/src/soak.rs` uses `NullServer` so no
-    server endpoint can be exercised). Adding a TTL lane requires a store-side TTL feature
-    first. The workflow already reports the TTL lane as `"not tested"` in its honesty section
-    (`weft-bench/src/soak_report.rs` lines 610-611).*
+    verified present on `origin/main`. Part 2 (TTL lane) is active on this branch —
+    `WEFT_ROW_TTL` reaches `SegmentStoreOptions::from_env` (`#784` on main), and the soak
+    drives a store-side TTL lane (`weft-bench/src/soak_ttl.rs`) that exercises
+    `read_time_range_of_with_expiry`, `expiry_sweep` and `purge_expired`. The honesty
+    section renders the verdict. The lane opens its own temporary store (the soak uses
+    `NullServer`, so no server endpoint is exercised). It proves the expiry-aware read
+    filter, the sweep and purge plumbing, and that a `NoExpiry` store reports 0 expired
+    rows while a TTL store with aged rows reports >0. Still not covered: HTTP-level
+    expiry, cross-restart TTL persistence, and concurrent expiry with other
+    maintenance operations.*
 - **W9 · Read semantics, limits, upgrade legs**
   - read lane
   - maint lane
@@ -406,7 +417,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - → **SOA-17** Calibration on a pre-grown store, frozen acceptance profiles, `scripts/crash-soak.sh`
   - **FRE-10b** Contract tests
   - → **FRE-16** CI compatibility gates
-  - **TAG-12** Multi-series crash matrix, fan-out and TSBS benchmarks, fixtures, freeze docs
+  - **TAG-12** Multi-series crash cell landed (issue #341); the fan-out arm landed in #809; TSBS benchmarks, fixtures, freeze docs still outstanding
   - **ROB-24** Limits and overload evidence
 - **W12 · Phase 7 acceptance**
   - **SOA-18** 24 h acceptance run on the reference SSD, published as an artifact
@@ -421,6 +432,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - **PAC-18** Dress rehearsal
 - **W15 · 1.0.0**
   - Write or approve the 1.0 release notes and upgrade notes before the cut *(owner)*
+  - **ROADMAP-236** The upgrade/rollback line was split (issue #236, PR #833). The upgrade half is exercised by the `compat` job's upgrade leg against the only pinned release, `v0.1.0` — the sole release whose store needs a layout migration. The rollback half was dropped from the line because FRE-16 (2026-11-10) declared rollback-after-writes unsupported for 1.0; only the `SUBSTITUTE_RUNNERS` stand-in covers it, which is explicitly not the leg.
   - **EVI-22** README 1.0 project status, badge and versions
   - → **PAC-18** Cut 1.0.0
     - Approve and push the **v1.0.0** tag *(owner)*
@@ -730,6 +742,27 @@ test that completes normally without setting the env var.
 Env var: `WEFT_MAINTENANCE_MAX_OP_SECONDS` (`Tier::Experimental`), parsed at
 `SegmentStoreOptions::from_env()` in `segment_store.rs:538-539`. Unset = unbounded.
 
+## Routine 2026-11-19 — Phase 12 wrapper reconcile, Turso re-check, handoff
+
+**Wrapper reconcile.** The six empty wrapper lines at the top of Phase 12 in `ROADMAP.md` were removed: the four `START HERE` lines (2026-11-11 filed, 2026-11-11 rewritten, 2026-10-11, 2026-10-09) and the two dated routine lists (2026-10-08, 2026-09-23). They had no sub-items left. Each item their prose (under "Immediate next actions" above) still names was checked against `ROADMAP.md` before the delete:
+
+- UDDSketch timing rerun on a quiet host: the open sub-item under **NEXT — UDDSketch** in Phase 25.
+- Real-filesystem ENOSPC test for #656: ticked in Phase 12.
+- Select on the mantissas when a partial is not merged (#401): the open item in Phase 25.
+- Dictionary occurrence footprint: shipped in 0.3.3 (#699), as recorded above.
+- The GPU-contention flake and the `float_roundtrip` whole-request figure: both ticked in Phase 12.
+- Memory per database file (the RSS question filed 2026-11-08): no `ROADMAP.md` line. It stays as prose above, because the owner's `p12/fanctl-correlation-growth` lane is working on it now (per-row memory probe, connection reuse). No item was added, to avoid claiming it.
+
+The matching empty bold headers in this file ("START HERE (filed 2026-10-11 …)", "(2026-10-08 list.)" and so on, under "Immediate next actions") are left as they are. They are a record, and this run did not change those lines.
+
+**Research: Turso MVCC checkpoint fix, re-checked 2026-11-19.** All primary sources:
+
+- [tursodatabase/turso#7480](https://github.com/tursodatabase/turso/issues/7480) is still **open**.
+- The fix, [turso#9770](https://github.com/tursodatabase/turso/pull/9770), is still **unmerged**. A stale-bot warning on 2026-11-16 said it would close after 7 days without activity. The author rebased it onto current `main` on 2026-11-17, with the regression test moved to `tests/integration/mvcc/database.rs`. Turso's automated reviewer marked it "looks good to merge" on 2026-11-18, but no maintainer has approved it.
+- [Releases](https://github.com/tursodatabase/turso/releases): stable is still **0.8.3** (2026-10-12). The newest prerelease is 0.8.4-pre.3 (2026-11-12), and its notes have no MVCC checkpoint or logical-log line. The workspace pins `turso = "0.8"` (resolved 0.8.1).
+- Conclusion: nothing has changed for this repo. The non-Linux SIGKILL exclusion stands. Watch #9770 for a merge before the stale window closes again, and then for the first release that carries it.
+
+**Handoff for the next run.** Phase 12's open items are all held: ROB-14 (the `p787` and `p810` lanes, active 2026-11-17; cut 2 merged in #805), TTL-PURGE and TTL-UNIT (#810, the `p799` worktree), and SEAL-* (#811–#819). The rest are owner-gated. In Phase 13, the TAG-12 fan-out arm is held by #809. TAG-12's TSBS half (`single-groupby-1-1-1` and `lastpoint` over the whole TSBS file tagged by `hostname`) still needs a quiet host. On 2026-11-19 the host had a load average of 36 and 9 GB of 124 GB available, with a 59 GB `strata` process resident.
 ## Routine run (2026-11-17): 7.3/7.5 reconcile, TAG-12 multi-series crash cell, Turso and TSBS research
 
 **Reconcile.** 7.3 and 7.5 were ticked from their parts, each pinned by a test re-run on `435553e` (47 passed); see DECISIONS 2026-11-17. The six empty routine wrappers at the top of Phase 12 were deleted; their prose stays above under *Immediate next actions*.
