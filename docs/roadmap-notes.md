@@ -576,7 +576,7 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
       - **Research (2026-10-09) — a cheaper sketch index, if the sketch format is ever revised.**
       - **Positioning (2026-10-09) — exact percentiles are a differentiator against QuestDB.**
       - **NEXT — select on the mantissas when a partial is not merged.**
-- **DONE (2026-11-20) — Audit the other `weft-bench` workloads' generators for the same class of flattery (#396, PR #<n>).**
+- **DONE (2026-11-20) — Audit the other `weft-bench` workloads' generators for the same class of flattery (#396, PR #834).**
   Generated corpus shapes for every generator were read from source and assessed against
   the same flattery classes identified in #395 (2-decimal scale, regular timestamps,
   FOR-friendly repetition, clean analytic signals).  The full write-up is at

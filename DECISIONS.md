@@ -8636,7 +8636,7 @@ arrives through `nursery`, so a public item whose first doc paragraph runs past 
 fails `cargo clippy --workspace --all-targets --all-features` with exit 101. Keep first paragraphs to
 one line and put the rest in a second paragraph.
 
-## 2026-11-20 — An audit may flag a published claim but not withdraw it (#396) (landed as PR #<n>)
+## 2026-11-20 — An audit may flag a published claim but not withdraw it (#396) (landed as PR #834)
 
 **The question.**  Issue #396 asked for an audit of the remaining `weft-bench` generators for the same
 class of corpus-shape flattery that #395 and #398 found in the ingest and `sketch_p99` workloads.
