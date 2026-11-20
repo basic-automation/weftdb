@@ -8563,6 +8563,79 @@ The exception for RUSTSEC-2026-0543 (unmaintained `chrono`) has carried the sent
 **What this does not do** — it does not fix the advisory. `arrow 60.1.0` still requires `chrono ^0.4.40`, chrono 0.4.45 is the newest release, and the nine manifests that depend on chrono directly plus the arrow-flight path that pulls it transitively cannot move off it. When 2027-01-31 passes, cargo-deny re-reports the advisory and emits `advisory-ignore-expired` at the value: that red is the point.
 Filed as #794; the exception itself is #790 and the migration is #791.
 
+## 2026-11-19 — The idempotency unit is the call, not the payload (#803)
+
+- **Rejected: single-use `DatasetId` as the key.** Oracle option B would repurpose `DatasetId` as
+  a per-call token, keying the ledger as `legacy:{dataset_uuid}` and routing a reused id with a
+  different payload to `IdempotencyConflict` (HTTP 409).  The premise — "no caller reuses one
+  `DatasetId` for many payloads" — is falsified by `bulk_ingest_converges_at_small_target`,
+  `gated_bulk_read_path_correctness` and
+  `seal_backed_aspect_round_trips_replays_and_widens`, which all reuse one `DatasetId` across
+  distinct payloads and expect every write to land.  `DatasetId` is a **logical, multi-write
+  identity** (`weftdb/src/types/dataset.rs:9-10`, `rows_mode.rs:25-27`).
+- **The A-B-A argument.**  No pure `(DatasetId, payload) -> key` function can distinguish "retry
+  of A" from "new submission of identical content A′", so the only sound fix is a caller-minted
+  per-call token.  The adopted design splits the two identities the adapter previously conflated:
+  `DatasetId` stays a stable logical identity, while the seal idempotency unit becomes an explicit
+  per-call token.  The gate takes that token as a **required** `&str` argument, so a new caller
+  cannot silently opt out of it; `ingest_batch` mints a fresh UUIDv4 and is the explicit
+  append-only opt-out.  The store already has the right
+  primitive (`SegmentStore::ingest` keyed by `(aspect, batch.key)`); the adapter now stops
+  bypassing it with a derived key.
+- **Deliberate scope choice.**  Crash-safe typed-API replay is left to the HTTP layer's existing
+  `Idempotency-Key` (`weft-server/src/ingest.rs:701-709`).  `ingest_batch` is append-only,
+  matching rows-mode's documented "no idempotency key" contract.  No `Inputs` trait method
+  signatures were changed in this slice: only the library-only `ingest_batch_with_gate` gained
+  the token parameter.
+- **Premise verified against main, and reproduced.**  main derived the key as
+  `legacy:{dataset_uuid}:{crc32:08x}:{row_count}` (`payload_crc` and `idempotency_key` in
+  `weftdb/src/types/legacy_seal.rs`, added by `343d626` for #485), so a second call with an
+  identical payload under one `DatasetId` was absorbed as a replay, and an A-B-A sequence lost
+  the last write.  The assertion-level reproduction lives on `p803/repro-red` (draft PR #819):
+  `reused_dataset_id_swallows_last_write_in_aba` fails main's `assert_ne!(tx_a2, tx_a)` ("the
+  third call produces fresh TxIds, not a replay of A") and its read assertion sees the stale
+  middle value instead of the last write.
+- **Reviewer invariant.**  A seal ingest key is minted once per logical write call and is **never**
+  a function of the payload.  No call site may feed a content hash into `IngestBatch::key`.
+  Presenting the same explicit token with the same batch replays; presenting a different token (or
+  a fresh nonce) always yields a distinct key and therefore a distinct write — never a silent
+  replay of a stale receipt.
+- **Separate, still-open availability point.**  The surviving 64-bit FNV-1a fingerprint
+  (`weftdb/src/types/ingest.rs:162-180`) can produce a false `IdempotencyConflict`.
+  Not addressed here.
+
+## 2026-11-20 — Legacy-seal idempotency: the payload key is inherited state, the new entry point adds call identity (#803) (landed as PR #817)
+
+`weftdb/src/types/legacy_seal.rs` has replayed an identical `(DatasetId, rows)` legacy ingest as
+one idempotent write since `343d626` (D-S19 #485), keyed `legacy:{dataset_id}:{payload_crc:08x}:{count}`,
+pinned by `seal_backed_aspect_round_trips_replays_and_widens` and
+`seal_backed_new_measurement_entry_points_reach_the_seal`. Issue #803 reported that as a defect: a
+benchmark re-run or backfill that reuses a `DatasetId` is absorbed instead of writing. Those two pins
+are protected inherited state, not something this slice overrides — at that surface the caller hands
+the store nothing but `(dataset_id, rows)`, so a blind client retry and an identical genuinely-new
+call are indistinguishable by construction, and protecting the retry from doubling rows is the safer
+half of that trade. What was missing is not the replay rule but any way to express **call identity**,
+so the fix adds it: `ingest_batch_with_gate(store, aspect_id, _dataset_id, idempotency_token: &str, rows, squash_target_rows)`
+keyed `legacy:{token}` — the token is required so a new caller cannot silently opt out of replay
+protection; the same token with the same payload replays the first receipt, the same token with a
+different payload is a loud `StoreError::IdempotencyConflict`, and distinct tokens always write, even
+for identical rows under one `DatasetId`. Both key styles share one body (`ingest_batch_under_key`),
+so the fragmentation gate and the overlap reconciliation of #813 run identically under either.
+
+Traded: without a token — through the thin `ingest_batch` wrapper that every legacy facade call site
+uses (`weftdb/src/types/database/inputs.rs:336`, `:445`, `:2454`) — an identical genuinely-new re-run
+is still absorbed. That is #803's residual gap, and closing it means routing a caller identity to this
+path: the server ledger's key (`weft-server/src/ingest.rs:717`) already exists but the sealed-batch
+path never uses it, which is #768's seal routing. #803 therefore stays open, narrowed to that. What
+would revive the original defect: minting a fresh `Uuid` inside `ingest_batch` instead of deriving the
+key from the payload.
+
+CI note while touching this file: `weftdb/src/lib.rs:2` carries
+`#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]`, and `clippy::too_long_first_doc_paragraph`
+arrives through `nursery`, so a public item whose first doc paragraph runs past a short summary line
+fails `cargo clippy --workspace --all-targets --all-features` with exit 101. Keep first paragraphs to
+one line and put the rest in a second paragraph.
+
 ## 2026-11-20 — "Starting from the first tagged pre-release" when every tag is 0.x (#241) (landed as PR #831)
 
 **Context.** ROADMAP.md line 175 reads "**Semver policy + `CHANGELOG.md`**, starting from
