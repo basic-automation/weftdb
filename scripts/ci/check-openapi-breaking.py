@@ -503,7 +503,17 @@ def _compare_request_body(
     if not base_rb and not curr_rb:
         return
     if not base_rb and curr_rb:
-        return  # new request body is additive
+        # A new request body is additive when optional, but a *required*
+        # request body forces clients to send data they did not need to
+        # send before, which is the same class as adding a required query
+        # parameter (docs/stability.md line 35: "adding a required query
+        # parameter is breaking").
+        if curr_rb.get("required", False):
+            findings.append(
+                f"BREAKING added-required-requestBody {path_hint}: "
+                "absent -> required"
+            )
+        return
     if base_rb and not curr_rb:
         findings.append(
             f"BREAKING removed-requestBody {path_hint}: "
@@ -529,6 +539,12 @@ def _compare_responses(
     curr_resp = curr_op.get("responses", {})
     for code in sorted(set(base_resp) | set(curr_resp)):
         if code not in base_resp:
+            # Adding a new response status code is additive (non-breaking),
+            # analogous to adding a new route (docs/stability.md line 32).
+            findings.append(
+                f"INFO added-response-code {path_hint}.responses.{code}: "
+                "absent -> present"
+            )
             continue
         if code not in curr_resp:
             findings.append(

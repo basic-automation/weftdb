@@ -917,5 +917,178 @@ class AdditionalParamChangesTest(unittest.TestCase):
         )
 
 
+# ===================================================================
+# Response status-code changes
+# ===================================================================
+
+class ResponseStatusCodeAdditionsTest(unittest.TestCase):
+    """Adding a new response status code is additive (non-breaking)."""
+
+    def test_added_response_code_is_info(self) -> None:
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body({"type": "string"}),
+                    },
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body({"type": "string"}),
+                        "201": _json_body({"type": "string"}),
+                    },
+                ),
+            },
+        })
+        base_norm = cob._normalise(base)
+        curr_norm = cob._normalise(curr)
+        findings = cob.compare(base_norm, curr_norm)
+        info_findings = [f for f in findings if "INFO" in f]
+        breaking_findings = [f for f in findings if "BREAKING" in f]
+        self.assertGreater(len(info_findings), 0,
+                           f"expected INFO finding, got {findings}")
+        self.assertEqual(len(breaking_findings), 0,
+                         f"expected no BREAKING findings, got {findings}")
+        self.assertTrue(
+            any("added-response-code" in f for f in findings),
+            f"expected added-response-code finding, got {findings}",
+        )
+
+    def test_removed_response_code_fails(self) -> None:
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body({"type": "string"}),
+                        "201": _json_body({"type": "string"}),
+                    },
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body({"type": "string"}),
+                    },
+                ),
+            },
+        })
+        base_norm = cob._normalise(base)
+        curr_norm = cob._normalise(curr)
+        findings = cob.compare(base_norm, curr_norm)
+        self.assertTrue(
+            any("BREAKING" in f and "removed-response" in f for f in findings),
+            f"expected removed-response finding, got {findings}",
+        )
+
+
+# ===================================================================
+# Request body changes
+# ===================================================================
+
+class RequestBodyChangesTest(unittest.TestCase):
+    """New required request body is breaking."""
+
+    def test_new_required_request_body_fails(self) -> None:
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "post": _make_op(
+                    responses={"200": _json_body({"type": "string"})},
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "post": _make_op(
+                    request_body={
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "object"},
+                            }
+                        },
+                    },
+                    responses={"200": _json_body({"type": "string"})},
+                ),
+            },
+        })
+        base_norm = cob._normalise(base)
+        curr_norm = cob._normalise(curr)
+        findings = cob.compare(base_norm, curr_norm)
+        self.assertTrue(
+            any("BREAKING" in f and "added-required-requestBody" in f for f in findings),
+            f"expected added-required-requestBody finding, got {findings}",
+        )
+
+    def test_new_optional_request_body_passes(self) -> None:
+        """A new *optional* request body is additive."""
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "post": _make_op(
+                    responses={"200": _json_body({"type": "string"})},
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "post": _make_op(
+                    request_body={
+                        "required": False,
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "object"},
+                            }
+                        },
+                    },
+                    responses={"200": _json_body({"type": "string"})},
+                ),
+            },
+        })
+        base_norm = cob._normalise(base)
+        curr_norm = cob._normalise(curr)
+        findings = cob.compare(base_norm, curr_norm)
+        breaking = [f for f in findings if "BREAKING" in f]
+        self.assertEqual(
+            len(breaking), 0,
+            f"expected no BREAKING findings for optional body, got {findings}",
+        )
+
+    def test_removed_request_body_fails(self) -> None:
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "post": _make_op(
+                    request_body={
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "object"},
+                            }
+                        },
+                    },
+                    responses={"200": _json_body({"type": "string"})},
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "post": _make_op(
+                    responses={"200": _json_body({"type": "string"})},
+                ),
+            },
+        })
+        base_norm = cob._normalise(base)
+        curr_norm = cob._normalise(curr)
+        findings = cob.compare(base_norm, curr_norm)
+        self.assertTrue(
+            any("BREAKING" in f and "removed-requestBody" in f for f in findings),
+            f"expected removed-requestBody finding, got {findings}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
