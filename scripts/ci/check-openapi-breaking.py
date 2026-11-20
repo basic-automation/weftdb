@@ -309,6 +309,28 @@ def _compare_schemas(
         )
         return
 
+    # --- Constraint keys (tightening or loosening any is breaking) ---
+    _CONSTRAINT_KEYS = [
+        "minLength", "maxLength", "minimum", "maximum",
+        "exclusiveMinimum", "exclusiveMaximum", "pattern",
+        "enum", "maxItems", "minItems", "uniqueItems", "format",
+    ]
+    for key in _CONSTRAINT_KEYS:
+        base_val = base_schema.get(key)
+        curr_val = curr_schema.get(key)
+        if base_val != curr_val:
+            enum_reorder = (
+                key == "enum"
+                and isinstance(base_val, list)
+                and isinstance(curr_val, list)
+                and sorted(base_val) == sorted(curr_val)
+            )
+            if not enum_reorder:
+                findings.append(
+                f"BREAKING constraint-{key} {path_hint}: "
+                f"{base_val!r} -> {curr_val!r}"
+            )
+
     # --- Properties ---
     base_props = base_schema.get("properties", {})
     curr_props = curr_schema.get("properties", {})

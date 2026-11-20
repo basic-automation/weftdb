@@ -319,11 +319,162 @@ class TypeChangeTest(unittest.TestCase):
 
 
 # ===================================================================
+# Constraint-key changes (tightening or loosening is breaking)
+# ===================================================================
+
+class ConstraintKeyTest(unittest.TestCase):
+    """Constraint-key changes (tightening or loosening) are breaking."""
+
+    def _make_leaf_spec(self, base_schema: dict, curr_schema: dict) -> tuple:
+        """Return (normalised_base, normalised_current) for a leaf schema."""
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    parameters=[{
+                        "in": "query",
+                        "name": "p",
+                        "required": False,
+                        "schema": base_schema,
+                    }],
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    parameters=[{
+                        "in": "query",
+                        "name": "p",
+                        "required": False,
+                        "schema": curr_schema,
+                    }],
+                ),
+            },
+        })
+        return cob._normalise(base), cob._normalise(curr)
+
+    # --- minLength ---
+    def test_minLength_tighten_fails(self) -> None:
+        bn, cn = self._make_leaf_spec(
+            {"type": "string", "minLength": 1},
+            {"type": "string", "minLength": 5},
+        )
+        findings = cob.compare(bn, cn)
+        self.assertTrue(
+            any("constraint-minLength" in f for f in findings),
+            f"expected constraint-minLength finding, got {findings}",
+        )
+
+    def test_minLength_loosen_fails(self) -> None:
+        bn, cn = self._make_leaf_spec(
+            {"type": "string", "minLength": 5},
+            {"type": "string", "minLength": 1},
+        )
+        findings = cob.compare(bn, cn)
+        self.assertTrue(
+            any("constraint-minLength" in f for f in findings),
+            f"expected constraint-minLength finding, got {findings}",
+        )
+
+    # --- minimum ---
+    def test_minimum_tighten_fails(self) -> None:
+        bn, cn = self._make_leaf_spec(
+            {"type": "integer", "minimum": 0},
+            {"type": "integer", "minimum": 10},
+        )
+        findings = cob.compare(bn, cn)
+        self.assertTrue(
+            any("constraint-minimum" in f for f in findings),
+            f"expected constraint-minimum finding, got {findings}",
+        )
+
+    def test_minimum_loosen_fails(self) -> None:
+        bn, cn = self._make_leaf_spec(
+            {"type": "integer", "minimum": 10},
+            {"type": "integer", "minimum": 0},
+        )
+        findings = cob.compare(bn, cn)
+        self.assertTrue(
+            any("constraint-minimum" in f for f in findings),
+            f"expected constraint-minimum finding, got {findings}",
+        )
+
+    # --- pattern ---
+    def test_pattern_tighten_fails(self) -> None:
+        bn, cn = self._make_leaf_spec(
+            {"type": "string", "pattern": "[a-z]+"},
+            {"type": "string", "pattern": "^[a-z]+$"},
+        )
+        findings = cob.compare(bn, cn)
+        self.assertTrue(
+            any("constraint-pattern" in f for f in findings),
+            f"expected constraint-pattern finding, got {findings}",
+        )
+
+    def test_pattern_loosen_fails(self) -> None:
+        bn, cn = self._make_leaf_spec(
+            {"type": "string", "pattern": "^[a-z]+$"},
+            {"type": "string", "pattern": "[a-z]+"},
+        )
+        findings = cob.compare(bn, cn)
+        self.assertTrue(
+            any("constraint-pattern" in f for f in findings),
+            f"expected constraint-pattern finding, got {findings}",
+        )
+
+    # --- enum ---
+    def test_enum_change_fails(self) -> None:
+        bn, cn = self._make_leaf_spec(
+            {"type": "string", "enum": ["a", "b"]},
+            {"type": "string", "enum": ["a", "b", "c"]},
+        )
+        findings = cob.compare(bn, cn)
+        self.assertTrue(
+            any("constraint-enum" in f for f in findings),
+            f"expected constraint-enum finding, got {findings}",
+        )
+
+    def test_enum_reorder_passes(self) -> None:
+        """Reordering enum values is not flagged."""
+        bn, cn = self._make_leaf_spec(
+            {"type": "string", "enum": ["a", "b", "c"]},
+            {"type": "string", "enum": ["c", "a", "b"]},
+        )
+        findings = cob.compare(bn, cn)
+        self.assertFalse(
+            any("constraint-enum" in f for f in findings),
+            f"expected no constraint-enum finding, got {findings}",
+        )
+
+    # --- format ---
+    def test_format_tighten_fails(self) -> None:
+        bn, cn = self._make_leaf_spec(
+            {"type": "string", "format": "date"},
+            {"type": "string", "format": "date-time"},
+        )
+        findings = cob.compare(bn, cn)
+        self.assertTrue(
+            any("constraint-format" in f for f in findings),
+            f"expected constraint-format finding, got {findings}",
+        )
+
+    def test_format_loosen_fails(self) -> None:
+        bn, cn = self._make_leaf_spec(
+            {"type": "string", "format": "date-time"},
+            {"type": "string", "format": "date"},
+        )
+        findings = cob.compare(bn, cn)
+        self.assertTrue(
+            any("constraint-format" in f for f in findings),
+            f"expected constraint-format finding, got {findings}",
+        )
+
+
+# ===================================================================
 # Nullable changes (both OpenAPI spellings)
 # ===================================================================
 
 class NullableToAlwaysPresentTest(unittest.TestCase):
-    """Nullable -> always-present response field is also breaking (tightening)."""
     """Nullable -> always-present response field is also breaking (tightening)."""
 
     def _non_nullify_via_nullable_false(self) -> None:
