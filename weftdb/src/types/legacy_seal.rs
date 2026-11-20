@@ -14,15 +14,14 @@
 //! range delete (design §8, S19).
 //!
 //! **Writes.** `batch_capture_measurements` on a seal-backed aspect is one
-//! [`SegmentStore::ingest`] call under the derived key
-//! `legacy:{dataset_id}:{payload_crc:08x}:{n}` (`payload_crc` is the CRC-32
-//! of the batch's canonical rows, `n` its row count), so the whole call is
-//! one transaction — all-or-nothing — and a retry of the same call replays
-//! the first commit's receipt instead of storing the rows twice. The
-//! returned `TxIds` are synthetic: `UUIDv5` over the idempotency key and the row
-//! index (the only production caller ignores them). `capture_measurement`
-//! is a one-row ingest under the same derivation, followed by the store's
-//! O(1) fragmentation gate.
+//! [`SegmentStore::ingest`] call under a per-call token (`UUIDv4` when the
+//! caller supplies none), so each logical write is one transaction —
+//! all-or-nothing — and a retry of the same call with the same explicit
+//! token replays the first commit's receipt instead of storing the rows
+//! twice. The returned `TxIds` are synthetic: `UUIDv5` over the
+//! idempotency key and the row index (the only production caller ignores
+//! them). `capture_measurement` is a one-row ingest, followed by the
+//! store's O(1) fragmentation gate.
 //!
 //! **Change log (D-S20).** Seal-backed ingest never touches the
 //! per-timestamp unbatched queue rows mode feeds. Each seal-store commit
@@ -179,6 +178,18 @@ pub fn idempotency_key(dataset_id: &DatasetId, rows: &[(i64, BigDecimal)]) -> St
 	format!("legacy:{}:{:08x}:{}", dataset_id.as_uuid(), payload_crc(rows), rows.len())
 }
 
+/// The seal-store idempotency key of an identity-aware call: `legacy:{token}`.
+///
+/// The token is the caller's per-call identity — what a retry must reproduce —
+/// and the payload is deliberately absent from the key. Two genuinely new calls
+/// therefore get two keys even when their rows are identical, which the derived
+/// [`idempotency_key`] cannot express: at that surface a retry and an identical
+/// new submission are indistinguishable by construction (issue #803).
+#[must_use]
+pub fn idempotency_key_for_token(token: &str) -> String {
+	format!("legacy:{token}")
+}
+
 /// A `UUIDv5` (RFC 4122 §4.3, SHA-1 name-based) over `name` in the URL namespace.
 ///
 /// The workspace's `uuid` build does not enable its `v5` feature, and the synthetic ids of this module
@@ -244,12 +255,13 @@ pub async fn ensure_declared(store: &SegmentStore, key: &str, values: &[BigDecim
 	Ok(widened)
 }
 
-/// Ingest one legacy batch into `store` under its derived key, then run
-/// the store's fragmentation gate on the same aspect.
+/// Ingest one legacy batch under a fully formed seal idempotency key.
 ///
-/// This is the entry point that every call path — single-row and bulk —
-/// should use so that bulk ingest converges the seal just as the
-/// single-row capture path does.
+/// `idem` is the key exactly as it goes to [`SegmentStore::ingest`] and as
+/// `synthetic_tx_id` derives the receipt from; it is never re-wrapped here.
+/// Both key styles share this body, so the fragmentation gate and the overlap
+/// reconciliation of #813 run identically under the payload-derived
+/// [`idempotency_key`] and the identity-aware [`idempotency_key_for_token`].
 ///
 /// A gate error is logged at `tracing::debug!` and **never propagated**:
 /// an ingest must not fail because the maintenance step did. The returned
@@ -257,16 +269,13 @@ pub async fn ensure_declared(store: &SegmentStore, key: &str, values: &[BigDecim
 ///
 /// # Errors
 ///
-/// As [`SegmentStore::ingest`], including its typed idempotency conflict
-/// when the derived key was already committed with a different payload of
-/// the same length and CRC (a CRC collision, not a retry).
-pub async fn ingest_batch_with_gate(store: &SegmentStore, aspect_id: &AspectId, dataset_id: &DatasetId, rows: &[(i64, BigDecimal)], squash_target_rows: usize) -> Result<Vec<TxId>> {
+/// As [`SegmentStore::ingest`].
+async fn ingest_batch_under_key(store: &SegmentStore, aspect_id: &AspectId, idem: &str, rows: &[(i64, BigDecimal)], squash_target_rows: usize) -> Result<Vec<TxId>> {
 	let key = aspect_key(aspect_id);
 	let values: Vec<BigDecimal> = rows.iter().map(|(_, value)| value.clone()).collect();
 	ensure_declared(store, &key, &values).await?;
-	let idem = idempotency_key(dataset_id, rows);
 	let timestamps: Vec<i64> = rows.iter().map(|(timestamp, _)| *timestamp).collect();
-	let receipt = store.ingest(&key, &IngestBatch::dense(idem.clone(), timestamps, values)).await?;
+	let receipt = store.ingest(&key, &IngestBatch::dense(idem.to_string(), timestamps, values)).await?;
 	debug_assert_eq!(receipt.row_count, rows.len());
 	if let Err(e) = store.squash_aspect_to_target_rows_if_fragmented(&key, squash_target_rows).await {
 		tracing::debug!("Failed to run the fragmentation gate after ingesting a batch for aspect {aspect_id}; it is sealed: {e}");
@@ -279,20 +288,52 @@ pub async fn ingest_batch_with_gate(store: &SegmentStore, aspect_id: &AspectId, 
 	if let Err(e) = store.reconcile_overlaps(&key).await {
 		tracing::debug!("Failed to reconcile overlaps after ingesting a batch for aspect {aspect_id}; the count and the read may disagree: {e}");
 	}
-	Ok((0..rows.len()).map(|index| synthetic_tx_id(&idem, index)).collect())
+	Ok((0..rows.len()).map(|index| synthetic_tx_id(idem, index)).collect())
 }
 
-/// Ingest one legacy batch, then run the fragmentation gate with
-/// [`SQUASH_TARGET_ROWS`].
+/// Ingest one legacy batch under the caller's per-call identity token.
 ///
-/// This is the thin wrapper that existing callers continue to use with
-/// unchanged behaviour.
+/// The identity-aware entry point (issue #803): `idempotency_token` is **required**
+/// so a new caller cannot silently opt out of replay protection, and the key is
+/// `legacy:{token}` from [`idempotency_key_for_token`], with the payload
+/// deliberately absent. The same token with the same payload replays the first
+/// receipt; the same token with a different payload is a loud
+/// `StoreError::IdempotencyConflict`; distinct tokens always write, even for
+/// identical rows under one `DatasetId`.
+///
+/// `dataset_id` stays in the signature for back-compatibility and is a **logical**
+/// multi-write identity, not part of the key. Identity-aware callers — a benchmark
+/// re-run, a backfill, and later the server ledger's `IngestBatch.key` once the
+/// seal routing of #768 lands — pass a fresh token per call.
+///
+/// A gate error is logged at `tracing::debug!` and never propagated, as in the
+/// shared body.
+///
+/// # Errors
+///
+/// As [`SegmentStore::ingest`].
+pub async fn ingest_batch_with_gate(store: &SegmentStore, aspect_id: &AspectId, _dataset_id: &DatasetId, idempotency_token: &str, rows: &[(i64, BigDecimal)], squash_target_rows: usize) -> Result<Vec<TxId>> {
+	let idem = idempotency_key_for_token(idempotency_token);
+	ingest_batch_under_key(store, aspect_id, &idem, rows, squash_target_rows).await
+}
+
+/// Ingest one legacy batch under the idempotency key derived from its payload.
+///
+/// This is the wrapper every legacy facade call site uses, and its behaviour is
+/// the replay unit `343d626` (#485) decided: an identical `(dataset_id, rows)`
+/// call replays the first receipt instead of storing the batch twice, which is
+/// what protects a blind client retry from doubling rows. It cannot tell that
+/// retry from an identical genuinely-new submission — only the caller can — so an
+/// identical re-run through this wrapper is still absorbed. That is the residual
+/// gap of #803: closing it needs a caller identity to reach this path, and callers
+/// that need per-call semantics use [`ingest_batch_with_gate`].
 ///
 /// # Errors
 ///
 /// As [`ingest_batch_with_gate`].
 pub async fn ingest_batch(store: &SegmentStore, aspect_id: &AspectId, dataset_id: &DatasetId, rows: &[(i64, BigDecimal)]) -> Result<Vec<TxId>> {
-	ingest_batch_with_gate(store, aspect_id, dataset_id, rows, SQUASH_TARGET_ROWS).await
+	let idem = idempotency_key(dataset_id, rows);
+	ingest_batch_under_key(store, aspect_id, &idem, rows, SQUASH_TARGET_ROWS).await
 }
 
 /// Every row of a seal-backed aspect in `[start, end]`, sorted by timestamp.
@@ -472,5 +513,18 @@ mod tests {
 		assert_ne!(key, idempotency_key(&dataset, &[(1_000, bd("1.5"))]), "a different batch derives a different key");
 		assert_eq!(synthetic_tx_id(&key, 0), synthetic_tx_id(&key, 0), "a retry derives the same TxIds");
 		assert_ne!(synthetic_tx_id(&key, 0), synthetic_tx_id(&key, 1));
+	}
+
+	#[test]
+	fn idempotency_key_for_token_names_the_call_not_the_payload() {
+		// Two tokens over an identical payload give different keys: the call is the
+		// unit, so a re-run is never absorbed as a replay (#803).
+		let rows = vec![(1_000, bd("1.5")), (2_000, bd("-2"))];
+		let key1 = idempotency_key_for_token("tok-1");
+		let key2 = idempotency_key_for_token("tok-2");
+		assert_eq!(key1, "legacy:tok-1");
+		assert_ne!(key1, key2, "different tokens ⇒ different keys, identical payload or not");
+		assert_ne!(key1, idempotency_key(&DatasetId::from_uuid(Uuid::nil()), &rows), "the two key styles do not collide");
+		assert_eq!(synthetic_tx_id(&key1, 0), synthetic_tx_id(&key1, 0), "a retry of one token derives the same TxIds");
 	}
 }
