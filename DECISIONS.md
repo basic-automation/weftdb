@@ -8565,13 +8565,24 @@ the fallback removal in #802 where its blast radius can be measured.
   of A" from "new submission of identical content A′", so the only sound fix is a caller-minted
   per-call token.  The adopted design splits the two identities the adapter previously conflated:
   `DatasetId` stays a stable logical identity, while the seal idempotency unit becomes an explicit
-  per-call token (UUIDv4 when the caller supplies `None`).  The store already has the right
+  per-call token.  The gate takes that token as a **required** `&str` argument, so a new caller
+  cannot silently opt out of it; `ingest_batch` mints a fresh UUIDv4 and is the explicit
+  append-only opt-out.  The store already has the right
   primitive (`SegmentStore::ingest` keyed by `(aspect, batch.key)`); the adapter now stops
   bypassing it with a derived key.
 - **Deliberate scope choice.**  Crash-safe typed-API replay is left to the HTTP layer's existing
-  `Idempotency-Key` (`weft-server/src/ingest.rs:701-709`).  The typed seal path with `None` is
-  append-only, matching rows-mode's documented "no idempotency key" contract.  No `Inputs` trait
-  method signatures were changed in this slice.
+  `Idempotency-Key` (`weft-server/src/ingest.rs:701-709`).  `ingest_batch` is append-only,
+  matching rows-mode's documented "no idempotency key" contract.  No `Inputs` trait method
+  signatures were changed in this slice: only the library-only `ingest_batch_with_gate` gained
+  the token parameter.
+- **Premise verified against main, and reproduced.**  main derived the key as
+  `legacy:{dataset_uuid}:{crc32:08x}:{row_count}` (`payload_crc` and `idempotency_key` in
+  `weftdb/src/types/legacy_seal.rs`, added by `343d626` for #485), so a second call with an
+  identical payload under one `DatasetId` was absorbed as a replay, and an A-B-A sequence lost
+  the last write.  The assertion-level reproduction lives on `p803/repro-red` (draft PR #819):
+  `reused_dataset_id_swallows_last_write_in_aba` fails main's `assert_ne!(tx_a2, tx_a)` ("the
+  third call produces fresh TxIds, not a replay of A") and its read assertion sees the stale
+  middle value instead of the last write.
 - **Reviewer invariant.**  A seal ingest key is minted once per logical write call and is **never**
   a function of the payload.  No call site may feed a content hash into `IngestBatch::key`.
   Presenting the same explicit token with the same batch replays; presenting a different token (or
