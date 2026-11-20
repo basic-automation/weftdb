@@ -23,6 +23,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **Multi-series crash cell (TAG-12, issue #341).** A new fault-injection test
+  (`multiseries_crash`) writes interleaved frames across 8 series, then aborts the process
+  with SIGABRT part-way through a second batch on one of them. The parent reopens the
+  store cold and checks that every series still reads back exactly the rows that committed
+  before the kill, and that each series name still resolves to the id recorded before the
+  crash. Replaying the store's committed frames series by series, which is the stronger
+  claim the roadmap's crash-matrix line asks for, is a separate TAG-12 item and is not
+  asserted here. Registering the cell's child marker `WEFT_MULTISERIES_CRASH_CHILD` added
+  one Test-tier settings variable.
+
 - **The bulk-ingest path (`ingest_batch`) now runs the fragmentation gate (#232).**
   A new `ingest_batch_with_gate(store, aspect_id, dataset_id, rows, squash_target_rows)`
   does the existing ingest then calls

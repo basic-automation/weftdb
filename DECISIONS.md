@@ -8636,6 +8636,60 @@ arrives through `nursery`, so a public item whose first doc paragraph runs past 
 fails `cargo clippy --workspace --all-targets --all-features` with exit 101. Keep first paragraphs to
 one line and put the rest in a second paragraph.
 
+## 2026-11-20 — TAG-12-B: one interleaved crash cell instead of the fault-point cross-product (issue #341)
+
+- **Ambiguity in the slice brief.** "Add the multi-series crash matrix" does not say whether
+  that means the whole single-series fault-point matrix re-run with N series, or one cell with
+  several series in flight. It also does not say where to abort.
+- **What was chosen, and why.** One cell: 8 aspects written interleaved, process abort at
+  [`FaultPoint::SFrameWritten`] (`weftdb/tests/multiseries_crash.rs`, gated by
+  `#![cfg(feature = "fault-injection")]`). The fault points are per-frame, so re-running the
+  entire matrix with 8 series multiplies CI minutes while exercising code paths the
+  single-series cells already cover. The failure modes worth protecting — a read that returns a
+  value from a frame that never committed, or a committed frame whose value is lost — only
+  become visible when more than one series is in the same batch, which this cell has.
+- **Mechanism, recorded because it constrains future cells.** The child re-executes the test
+  binary: it writes a first round to every aspect, arms `SFrameWritten`, then writes one more
+  aspect and aborts; the parent reopens the store cold and checks each aspect against a replay
+  of its committed frames. The cell runs with `--test-threads=1` in `scripts/crash-matrix.sh`
+  because arming a fault point is process-global state, so parallel cells would arm each other.
+- **Known limitation, accepted.** Only `SFrameWritten` × multi-series is covered. Other fault
+  points crossed with multiple series, and TAG-12's remaining items (fan-out and TSBS
+  benchmarks, fixtures, freeze docs) stay open; the `docs/roadmap-notes.md` TAG-12 line now says
+  so rather than leaving the line untouched.
+
+## 2026-11-20 — A test-only environment marker is a registered variable, and the config checker reads every number in the doc (#341, PR #826) (landed as PR #826)
+
+The multi-series crash cell spawns a child process and marks it with
+`WEFT_MULTISERIES_CRASH_CHILD`, exactly as the other crash cells mark theirs
+(`WEFT_DB_NEW_CRASH_CHILD`, `WEFT_LEGACY_INGEST_CRASH_CHILD`, …). The settings-registry test
+(`weft-server/src/settings.rs`, `every_environment_name_the_workspace_reads_is_registered`)
+scans every crate for environment reads and fails a PR that introduces an unregistered name,
+so a test-only marker is not exempt: it gets a `Tier::Test` `VarSpec` with all four fields
+filled, and the `VARS.len()` pin moves with it (121 to 122 here). The registry is the only
+place a name's meaning is written down, and a test name is worth writing down for the same
+reason an operator name is: the next person has to be able to tell a deliberate crash from a
+real one.
+
+Two CI traps this slice hit, both cheap to avoid once known. First, a test file behind
+`#![cfg(feature = "fault-injection")]` is invisible to the plain `test` jobs; only the crash
+matrix and feature matrix compile it, and the crash matrix builds with `-D warnings`, so an
+unused local there is a hard compile error that no amount of local `cargo test` debugging
+would show. Fix the binding by using it, not by prefixing it with an underscore: the two
+unused values in this test were the aspect id and the planned batch, and the aspect id is now
+compared against the id recorded before the crash, which is a check the cell was missing.
+Second, `scripts/config/check_schema.py` does not read prose, it reads numbers: it greps the
+whole of `docs/config-schema.md` for `<n> <Tier>` and `<n> variables` patterns and requires
+each to match the current tier row counts. A historical sentence in the version-history table
+("brought the total to 108 (45 Test)") is therefore a live claim, and adding a variable means
+touching those sentences too. The honest way to satisfy it is to restate the present-tense
+count where the document makes one, and reword the past-tense sentences so a historical number
+is no longer stated as a current tier count ("108, with 45 of them in the Test tier").
+
+Two more pins the same cell had to satisfy, both invisible to a local `cargo test`:
+
+- **The `Test` tier has a written-out allowlist, not only a tier tag.** `the_tiers_are_the_explicit_choice_they_claim` (`weft-server/src/settings.rs:575-583`) rebuilds the set of `Tier::Test` names and asserts it equals an allowlist spelled out in the test itself — "a channel a test harness sets for the child it spawns, and nothing else may sit in it". Adding a harness variable therefore needs **both** the `VarSpec` and a name in that allowlist; a PR that adds only the spec passes locally and fails the `weft-server` lib suite in CI. The check is two-directional, so a name that moves tier must be edited in both places too.
+- **A re-executed child is addressed by its harness path, which for a crate-root test is just the function name.** The cell spawned its child with `--exact multiseries_crash::child`; that filter matches nothing (`running 0 tests`, exit status 0), so the parent's "the child aborted" assertion fired against a clean exit instead of a signal. The module-qualified spelling works only where the child lives in a `mod` (as in `weftdb/tests/db_tests.rs:1607` `database_new_crash::child`). Lesson: assert on the child having actually run — a filtered-out child looks exactly like a successful one.
 ## 2026-11-20 — Host capacity decides who builds, and what stays owner-gated (roadmap hygiene)
 
 **Ambiguous.** `ROADMAP.md` keeps listing TAG-12 (`:116`) and FRE-18 (`:383` wave line, issue #348)
@@ -8668,7 +8722,7 @@ those items are actually available depends on machine state that the roadmap doe
 narrative (`:100`), making the ghcr.io package public (`:99`), the `parquet`/`arrow-buffer` upstream
 reports (`:101`), and D-S21's privileged power-loss validation (`:77`) — plus a quiet host window
 (and the T7 reference drive on 10 Gbps, `:112`) before the TSBS and calibration items can run.
-## 2026-11-20 — A roadmap line may not promise a leg the pin vocabulary forbids (#236) (landed as PR #833)
+    ## 2026-11-20 — A roadmap line may not promise a leg the pin vocabulary forbids (#236) (landed as PR #833)
 
 **Question.** `ROADMAP.md` line 166 (at the time) read "Upgrade/rollback procedure, exercised against the previous release". That bundles two claims. The upgrade half is real: CI job `compat` runs `LEG_RUNNERS["0.1.0"]["upgrade"]` — `weftdb/tests/compat_v010.rs::a_v010_store_migrates_forward_and_keeps_reading_its_own_values` — against the sole pinned release `v0.1.0` (commit `b9a8ee42`), whose `legs` field admits only `["upgrade"]`. The rollback half has no runner: `compat/releases.toml` has no `rollback` leg anywhere, `releases.LEGS == {"upgrade"}`, and `scripts/compat/test_leg_coverage.py` keeps rollback only in `SUBSTITUTE_RUNNERS` (a store-format-marker tamper stand-in) precisely because no runner may claim that leg. FRE-16 (2026-11-10) declared rollback-after-writes unsupported for 1.0, and the pin rule says a pin may declare only what CI truly executes.
 
