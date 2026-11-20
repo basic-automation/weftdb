@@ -2179,7 +2179,7 @@ TMPDIR=<fast disk> cargo run --release --manifest-path weft-xbench/Cargo.toml --
 Engines you do not name are skipped. `--uci FILE` and `--tsbs FILE` add real corpora,
 `--cold-hook CMD` adds OS-cold and post-restart reps, and `combine RUN.json… --out DIR` pools
 separate runs. The current published result is
-[`bench/reports/phase1-pooled/`](../bench/reports/phase1-pooled/README.md): two pooled runs at
+[`bench/reports/phase1-pooled/`](../bench/reports/phase1-pooled/README.md) <!-- claim:cross-engine-2026-11-02 -->: two pooled runs at
 `small` and `medium` scale on one host. 319 of 320 gates pass; of the 105 verdicts that hold in
 both runs, WeftDB wins 17, all against portable SQL, and loses 85, including every load and
 every comparison with client-side interpolation. Treat a margin under about 1.5× as unsettled.

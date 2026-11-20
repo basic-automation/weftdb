@@ -175,7 +175,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 
 ## Phase 20 — 1.0 claims and release notes (was W14 and W15)
 
-- [ ] Every performance claim in the README links to a benchmark artifact
+- [x] Every performance claim in the README links to a benchmark artifact
 - [x] Upgrade procedure exercised against the pinned previous release (v0.1.0, layout 1 → 2); rollback-after-writes is a documented non-goal for 1.0 (FRE-16)
 - [ ] Write or approve the 1.0 release notes and upgrade notes before the cut *(owner)*
 - [ ] **EVI-22** README 1.0 project status, badge and versions

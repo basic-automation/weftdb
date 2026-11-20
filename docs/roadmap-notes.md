@@ -276,7 +276,8 @@ Dependencies were brought current and audited on 2026-10-05, `SECURITY.md` is on
 
 ### Claims & documentation
 
-- Every performance claim in the README links to a benchmark artifact (the [governing rule](#weftdb-roadmap))
+- [x] Every performance claim in the README links to a benchmark artifact (the [governing rule](#weftdb-roadmap))
+  — ticked by [CLAIMS-243](https://github.com/basic-automation/weftdb/pull/832): the README has no bare numeric figures; its qualitative claims point at the committed pooled report at `bench/reports/phase1-pooled/`. Registry entry `cross-engine-2026-11-02` added.
 - First cross-engine report
 - Honesty pages shipped (see [Commercial thesis](https://basicautomation.io/projects/weftdb/docs/commercial-thesis))
 - Legal review of competitor benchmark-publication terms + codec licenses (see [Legal review](#legal-review))
