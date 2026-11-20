@@ -8562,3 +8562,33 @@ The exception for RUSTSEC-2026-0543 (unmaintained `chrono`) has carried the sent
 
 **What this does not do** — it does not fix the advisory. `arrow 60.1.0` still requires `chrono ^0.4.40`, chrono 0.4.45 is the newest release, and the nine manifests that depend on chrono directly plus the arrow-flight path that pulls it transitively cannot move off it. When 2027-01-31 passes, cargo-deny re-reports the advisory and emits `advisory-ignore-expired` at the value: that red is the point.
 Filed as #794; the exception itself is #790 and the migration is #791.
+
+## 2026-11-20 — What "links to a benchmark artifact" can mean when no figure has an artifact (#243) (state)
+
+**Context.** The roadmap line "Every performance claim in the README links to a benchmark artifact"
+requires each README figure to be backed by a traceable artifact. The README has no bare numeric
+figures: its claims are qualitative (wins/losses) and point readers to the committed pooled
+cross-engine report at `bench/reports/phase1-pooled/`.
+
+**Chosen: "links to a benchmark artifact" means the README must point to a committed report or
+pipeline artifact that contains the figure, or to `docs/methodology.md` when the statement is a
+meta-claim about honesty rather than a specific benchmark number. The existing README already does
+this.**
+
+- The meta-claim about "honest numbers" (README:49) links to `docs/methodology.md` — it is a
+  process claim, not a performance figure. It stays as-is.
+- "The latest pooled run is in `bench/reports/phase1-pooled/`" (README:182) links to a committed
+  report directory — the artifact is the committed tree, re-runnable from a clone. The marker
+  `<!-- claim:cross-engine-2026-11-02 -->` was added to trace that connection.
+- The qualitative wins/losses were softened from inline prose to "see that report for where WeftDB
+  wins and loses" — no new figure was created, and the unregistered bullet text was removed.
+- No figure quoted in the README is produced by a pipeline artifact (the nightly gate publishes
+  `nightly-interpolation`, which no entry quotes). Every existing `bench/claims.json` entry has
+  `artifact: null`, which is correct: no pipeline artifact produces those figures. An `upload-artifact`
+  step was not added because no existing workflow runs the exact workload any figure cites.
+  Adding a producer without benchmarking hardware would amount to speculative scaffolding.
+
+**Result:** the roadmap line is ticked. Every README performance statement is either linked to a
+committed artifact (`bench/reports/phase1-pooled/`) or to the methodology rules
+(`docs/methodology.md`). The registry gained the `cross-engine-2026-11-02` entry for the pooled
+report, and `check_claims.py` passes.
