@@ -1,8 +1,8 @@
-# progress — FRE-18A
+# progress — FRE-18A / FRE-18B
 
-## Done
+## Done (FRE-18a)
 
-All deliverables for issue #838 (FRE-18a) are implemented, committed, pushed, and the PR is open.
+All original deliverables for issue #838 (FRE-18a) are implemented, committed, pushed, and the PR is open.
 
 - **Baseline copy** — `compat/openapi/baseline/weftdb.json` (byte-identical to the committed spec) + `compat/openapi/baseline/README.md` explaining the convention.
 - **Checker** — `scripts/ci/check-openapi-breaking.py` (Python 3 stdlib only). Exits 2 (missing baseline), 1 (breaking change found), 0 (clean).
@@ -19,7 +19,26 @@ All deliverables for issue #838 (FRE-18a) are implemented, committed, pushed, an
 - `python3 scripts/ci/check-action-pinning.py` → OK
 - No staged files remain, working tree clean.
 
-## Not done
+## Handoff — FRE-18b (this run)
 
+**Commit range:** b81b2a8..4666aab on `fre18a/openapi-breaking-check`
+
+**Done:**
+- AC-1: Baseline digest (`sha256`) + CI `run:` step + bump protocol in README.
+- AC-2: Symmetric nullable rule (both directions, both spellings `nullable: true|false` and `type: [..., "null"]`).
+- AC-3: 12 constraint keys (minLength, maxLength, minimum, maximum, exclusiveMinimum, exclusiveMaximum, pattern, enum, maxItems, minItems, uniqueItems, format) with two-direction tests.
+- AC-4: Response status-code additions (INFO, non-breaking) and new required request body (BREAKING).
+- AC-5: Named gaps in docstring and `docs/stability.md`.
+- AC-6: Missing tests (nullable-reverse, optional→required, empty paths, unreadable, truncated JSON, key-reorder-only, version-only).
+- Exit code: only BREAKING findings return 1, INFO-only findings return 0.
+- Default-added-to-existing-param now flagged (was gap #2, now implemented).
+- All 39 checker tests pass (34 + 5 new).
+- All 73 discovery tests pass.
+- Probe matrix: 20/20 exit codes match expectations.
+- PR body updated, comment with probe matrix posted.
+- Pushed: 3 new commits on `fre18a/openapi-breaking-check`.
+
+**Not done:**
 - **Do not merge** — left for reviewer.
-- CI workflow will trigger automatically on push (no runner constraints for Python steps).
+- `ROADMAP.md:150` unticked (this is one clause of FRE-18, not the freeze cut).
+- CI workflow will trigger automatically on push.
