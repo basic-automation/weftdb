@@ -104,6 +104,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [x] Guard the `#[serial]`-above-`#[test]` ordering (#726, 2026-11-13: the guard reads the keyed `#[serial(key)]` form too and requires a test attribute in the same attribute block; either position in that block serialises, so the "above" ordering is no longer enforced)
 
 ## Phase 13 — Contract candidate (was W9 gates and W11)
+
 - [x] **7.3 Corruption detection** (D-S12 + ROB-8/9/22 + HTTP restore) (2026-11-20 audit: every named component is closed. D-S12 landed 2026-10-29 (`DECISIONS.md:3570`) — startup recovery, quarantine with TTL (`weftdb/src/types/quarantine.rs`) and the fsck endpoint (`weft-server/src/routes.rs:967` `POST /api/v1/storage/fsck`, scope `maintain`); ROB-8 frame decode hardening (#265), ROB-9 mutation harness for frames, sidecars and Parquet (#315) and ROB-22 frame-fault policy verification (#446) plus the suspect-frame policy and background-decode crash-loop breaker (#720) are closed; restoring into a chosen new root over HTTP landed 2026-11-14 (#213, `POST /api/v1/storage/restore/into?label=…&name=…` → `WEFT_RESTORE_BASE_DIR/<name>`)
   - [x] D-S12 startup recovery, quarantine with TTL, the fsck endpoint and the `/ready` report (Phase 6; `POST /api/v1/storage/fsck` in `weft-server/src/routes.rs`; `startup_recovery_quarantines_a_corrupt_frame`, `fsck_rebuilds_a_row_whose_length_is_stale`)
   - [x] ROB-8 hardened frame decoding (Phase 6; `weft-server/tests/frame_fault.rs`)
