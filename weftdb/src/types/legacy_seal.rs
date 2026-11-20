@@ -238,13 +238,12 @@ pub async fn ensure_declared(store: &SegmentStore, key: &str, values: &[BigDecim
 ///
 /// `dataset_id` is a **logical** multi-write identity: it is kept in the
 /// signature for back-compatibility but is **no longer part of the key**.
-/// The idempotency unit is the `idempotency_token`.  When `None`, a fresh
-/// `UUIDv4` token is minted per call, making each call a new write
-/// (append-only, matching rows-mode's "no idempotency key" contract).
-/// Pass an explicit token to make the call replayable: the same token
-/// with the same payload replays the first receipt; a different token (or
-/// a fresh `None`) always yields a distinct key and therefore a distinct
-/// write.
+/// The idempotency unit is the `idempotency_token` — the token is
+/// **required** so a new caller cannot silently opt out.  The same token
+/// with the same payload replays the first receipt; a different token
+/// always yields a distinct key and therefore a distinct write.  Use
+/// [`ingest_batch`] for the append-only convenience (which mints a fresh
+/// UUID per call).
 ///
 /// A gate error is logged at `tracing::debug!` and **never propagated**:
 /// an ingest must not fail because the maintenance step did. The returned
@@ -253,12 +252,11 @@ pub async fn ensure_declared(store: &SegmentStore, key: &str, values: &[BigDecim
 /// # Errors
 ///
 /// As [`SegmentStore::ingest`].
-pub async fn ingest_batch_with_gate(store: &SegmentStore, aspect_id: &AspectId, _dataset_id: &DatasetId, idempotency_token: Option<&str>, rows: &[(i64, BigDecimal)], squash_target_rows: usize) -> Result<Vec<TxId>> {
+pub async fn ingest_batch_with_gate(store: &SegmentStore, aspect_id: &AspectId, _dataset_id: &DatasetId, idempotency_token: &str, rows: &[(i64, BigDecimal)], squash_target_rows: usize) -> Result<Vec<TxId>> {
 	let key = aspect_key(aspect_id);
 	let values: Vec<BigDecimal> = rows.iter().map(|(_, value)| value.clone()).collect();
 	ensure_declared(store, &key, &values).await?;
-	let token = idempotency_token.map_or_else(|| Uuid::new_v4().to_string(), str::to_owned);
-	let idem = idempotency_key(&token);
+	let idem = idempotency_key(idempotency_token);
 	let timestamps: Vec<i64> = rows.iter().map(|(timestamp, _)| *timestamp).collect();
 	let receipt = store.ingest(&key, &IngestBatch::dense(idem.clone(), timestamps, values)).await?;
 	debug_assert_eq!(receipt.row_count, rows.len());
@@ -277,8 +275,9 @@ pub async fn ingest_batch_with_gate(store: &SegmentStore, aspect_id: &AspectId, 
 }
 
 /// Ingest one legacy batch, minting a fresh idempotency token per call
-/// (append-only behaviour), then run the fragmentation gate with
-/// [`SQUASH_TARGET_ROWS`].
+/// (append-only behaviour, opting out of replay protection — exactly like
+/// passing no HTTP `Idempotency-Key`), then run the fragmentation gate
+/// with [`SQUASH_TARGET_ROWS`].
 ///
 /// This is the thin wrapper that existing callers continue to use with
 /// unchanged behaviour.
@@ -287,7 +286,8 @@ pub async fn ingest_batch_with_gate(store: &SegmentStore, aspect_id: &AspectId, 
 ///
 /// As [`ingest_batch_with_gate`].
 pub async fn ingest_batch(store: &SegmentStore, aspect_id: &AspectId, dataset_id: &DatasetId, rows: &[(i64, BigDecimal)]) -> Result<Vec<TxId>> {
-	ingest_batch_with_gate(store, aspect_id, dataset_id, None, rows, SQUASH_TARGET_ROWS).await
+	let token = Uuid::new_v4().to_string();
+	ingest_batch_with_gate(store, aspect_id, dataset_id, &token, rows, SQUASH_TARGET_ROWS).await
 }
 
 /// Every row of a seal-backed aspect in `[start, end]`, sorted by timestamp.

@@ -47,7 +47,7 @@ async fn bulk_ingest_converges_at_small_target() -> Result<()> {
 	for i in 0..20 {
 		let offset = i64::from(i) * 1000;
 		let rows = vec![(base + offset, bd(&format!("{}.{}", i + 1, offset))), (base + offset + 1, bd(&format!("{}.{}", i + 2, offset))), (base + offset + 2, bd(&format!("{}.{}", i + 3, offset)))];
-		ingest_batch_with_gate(&store, &aspect_id, &dataset, None, &rows, 4).await?;
+		ingest_batch_with_gate(&store, &aspect_id, &dataset, &Uuid::new_v4().to_string(), &rows, 4).await?;
 	}
 
 	// Count the segments after all ingests.
@@ -66,7 +66,7 @@ async fn bulk_ingest_converges_at_small_target() -> Result<()> {
 	for i in 0..20 {
 		let offset = i64::from(i) * 1000;
 		let rows = vec![(base + offset, bd(&format!("{}.{}", i + 1, offset))), (base + offset + 1, bd(&format!("{}.{}", i + 2, offset))), (base + offset + 2, bd(&format!("{}.{}", i + 3, offset)))];
-		ingest_batch_with_gate(&store, &ungated_aspect, &dataset, None, &rows, 2).await?;
+		ingest_batch_with_gate(&store, &ungated_aspect, &dataset, &Uuid::new_v4().to_string(), &rows, 2).await?;
 	}
 	let idle_count = store.index().count(&aspect_key(&ungated_aspect)).await?;
 	assert!(idle_count > segment_count, "the gated aspect converged to {segment_count} segments while the same traffic with the gate idle left {idle_count}; the gate is what makes bulk ingest converge");
@@ -95,7 +95,7 @@ async fn gated_bulk_read_path_correctness() -> Result<()> {
 	for i in 0..10 {
 		let offset = i64::from(i) * 2000;
 		let rows = vec![(base + offset, bd(&format!("{i}.0"))), (base + offset + 1000, bd(&format!("{i}.5")))];
-		ingest_batch_with_gate(&store, &aspect_id, &dataset, None, &rows, 4).await?;
+		ingest_batch_with_gate(&store, &aspect_id, &dataset, &Uuid::new_v4().to_string(), &rows, 4).await?;
 		all_expected.extend(rows);
 	}
 	all_expected.sort_by_key(|(ts, _)| *ts);
@@ -146,7 +146,7 @@ async fn gate_at_degenerate_target_still_ingests() -> Result<()> {
 	let rows = vec![(base, bd("42.5")), (base + 1000, bd("43.5"))];
 	// target=0 is clamped to 1 by the gate internals; the gate runs and
 	// the ingest succeeds regardless.
-	let tx_ids = ingest_batch_with_gate(&store, &aspect_id, &dataset, None, &rows, 0).await?;
+	let tx_ids = ingest_batch_with_gate(&store, &aspect_id, &dataset, &Uuid::new_v4().to_string(), &rows, 0).await?;
 	assert_eq!(tx_ids.len(), 2, "two TxIds returned despite gate target=0");
 
 	// Rows are readable.
@@ -161,8 +161,7 @@ async fn gate_at_degenerate_target_still_ingests() -> Result<()> {
 }
 
 /// Idempotency still holds when the fragmentation gate is enabled: replaying the same
-/// batch with the same explicit token returns the same synthetic `TxIds` and does not
-/// duplicate rows.
+/// batch returns the same synthetic `TxIds` and does not duplicate rows.
 #[serial]
 #[tokio::test]
 async fn gated_ingest_idempotent_replay() -> Result<()> {
@@ -175,16 +174,15 @@ async fn gated_ingest_idempotent_replay() -> Result<()> {
 	let store = db.seal_store().await?;
 	let base = Utc::now().timestamp_millis();
 
-	let token = "replay-token";
 	let rows = vec![(base, bd("10.0")), (base + 1000, bd("20.0")), (base + 2000, bd("30.0"))];
 
-	// First call with explicit token.
-	let tx1 = ingest_batch_with_gate(&store, &aspect_id, &dataset, Some(token), &rows, 4).await?;
+	// First call.
+	let tx1 = ingest_batch_with_gate(&store, &aspect_id, &dataset, "gated-replay-token", &rows, 4).await?;
 	assert_eq!(tx1.len(), 3, "first call returns 3 TxIds");
 
-	// Replay the same batch with the same token.
-	let tx2 = ingest_batch_with_gate(&store, &aspect_id, &dataset, Some(token), &rows, 4).await?;
-	assert_eq!(tx2, tx1, "replay with the same token returns the same TxIds");
+	// Replay the same batch.
+	let tx2 = ingest_batch_with_gate(&store, &aspect_id, &dataset, "gated-replay-token", &rows, 4).await?;
+	assert_eq!(tx2, tx1, "replay returns the same TxIds");
 
 	// No duplicate rows.
 	let read_back = read_rows(&store, &aspect_id, None, None).await?;
@@ -195,7 +193,7 @@ async fn gated_ingest_idempotent_replay() -> Result<()> {
 	Ok(())
 }
 use weftdb::{
-	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, Database, DatasetId, InputMeasurement, StorageMode
+	database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, Database, DatasetId, InputMeasurement, StorageMode, TxId
 };
 
 fn bd(s: &str) -> BigDecimal {
@@ -225,12 +223,11 @@ async fn seal_backed_aspect_round_trips_replays_and_widens() -> Result<()> {
 	let dataset = DatasetId::new();
 	let rows: Vec<InputMeasurement> = (0..5).map(|i| InputMeasurement::new(base + Duration::seconds(i), bd(&format!("{}.5", i + 1)))).collect();
 
-	// One batch ingest: all-or-nothing.  Without an explicit token each call mints a
-	// fresh nonce, so a second call with the same payload is a new write.
+	// One batch ingest: all-or-nothing, and a retry replays it.
 	let tx1 = db.batch_capture_measurements(aspect_id, dataset, rows.clone()).await?;
 	let tx2 = db.batch_capture_measurements(aspect_id, dataset, rows.clone()).await?;
-	assert_ne!(tx2, tx1, "a second call without an explicit token produces fresh TxIds");
-	assert_eq!(db.get_measurements_count(&aspect_id).await?, 10, "both writes landed, giving 2x the rows");
+	assert_eq!(tx1, tx2, "a retry of the same call returns the same synthetic TxIds");
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 5, "the replay stored nothing twice");
 
 	// Raw reads come back in timestamp order with the stored values.
 	let raw: Vec<_> = db.get_raw_measurements(&aspect_id, None, None, 100, 0).await?.collect::<Vec<_>>().await.into_iter().collect::<Result<Vec<_>>>()?;
@@ -361,14 +358,14 @@ async fn seal_backed_new_measurement_entry_points_reach_the_seal() -> Result<()>
 	let dataset = DatasetId::new();
 	let rows: Vec<InputMeasurement> = (0..4).map(|i| InputMeasurement::new(base + Duration::seconds(i), bd(&format!("{}.25", i + 1)))).collect();
 
-	// The bulk entry point is one ingest transaction.  Without an explicit token each
-	// call mints a fresh nonce, so a repeated call with the same payload is a new write.
+	// The bulk entry point is one ingest transaction, and a repeated call replays the
+	// store's receipt instead of storing the batch twice.
 	let tx1 = db.batch_capture_new_measurements(&aspect_id, &dataset, rows.clone()).await?;
 	assert_eq!(tx1.len(), 4, "one synthetic TxId per row of the batch");
 	assert_eq!(db.get_measurements_count(&aspect_id).await?, 4, "the batch reached the store a seal-backed aspect reads from");
 	let tx2 = db.batch_capture_new_measurements(&aspect_id, &dataset, rows.clone()).await?;
-	assert_ne!(tx2, tx1, "a second call without an explicit token produces fresh TxIds");
-	assert_eq!(db.get_measurements_count(&aspect_id).await?, 8, "both writes landed, giving 2x the rows");
+	assert_eq!(tx2, tx1, "a repeated call replays the seal store's receipt");
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 4, "the replay stored nothing twice");
 
 	// An empty batch is a no-op, not the adapter's empty-payload error, and it is
 	// checked before the seal dispatch so both modes behave the same.
@@ -429,49 +426,6 @@ async fn seal_backed_new_measurement_entry_points_reach_the_seal() -> Result<()>
 	Ok(())
 }
 
-/// No pure `(DatasetId, payload) -> key` derivation can satisfy both replay of a retry and
-/// fresh-key for an identical resubmission after a different write (the A-B-A hole).  The fix
-/// makes the idempotency unit a caller-supplied per-call token instead:
-///
-///   (a) same explicit token + identical payload → replay (tx2 == tx1, one row).
-///   (b) different token (or None) + identical payload → a real second write (tx2 != tx1,
-///       two rows).
-#[serial]
-#[tokio::test]
-async fn reused_dataset_id_swallows_last_write_in_aba() -> Result<()> {
-	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
-	let (_dir, db) = setup().await?;
-	let subject = db.observe_subject("s").await?;
-	let aspect_id = db.track_aspect(&subject.id(), "reused_id", &splimes::Resolution::Milliseconds, None).await?.id();
-
-	let dataset = DatasetId::new();
-	let store = db.seal_store().await?;
-	let base = Utc::now().timestamp_millis();
-
-	// --- (a) Same explicit token + identical payload → replay ---
-	let replay_token = "replay-aba";
-	let tx1 = ingest_batch_with_gate(&store, &aspect_id, &dataset, Some(replay_token), &[(base, bd("5"))], 4).await?;
-	assert_eq!(tx1.len(), 1, "first call returns one TxId");
-	let after_first = read_rows(&store, &aspect_id, None, None).await?;
-	assert_eq!(after_first.len(), 1, "one row after first call");
-
-	let tx2 = ingest_batch_with_gate(&store, &aspect_id, &dataset, Some(replay_token), &[(base, bd("5"))], 4).await?;
-	assert_eq!(tx2, tx1, "same token + same payload replays, returning the same TxId");
-	let after_replay = read_rows(&store, &aspect_id, None, None).await?;
-	assert_eq!(after_replay.len(), 1, "replay stored nothing twice");
-
-	// --- (b) Different token (or None) + identical payload → a real second write ---
-	let fresh_token = "fresh-aba";
-	let tx3 = ingest_batch_with_gate(&store, &aspect_id, &dataset, Some(fresh_token), &[(base, bd("5"))], 4).await?;
-	assert_ne!(tx3, tx1, "different token produces fresh TxIds");
-	let after_fresh = read_rows(&store, &aspect_id, None, None).await?;
-	assert_eq!(after_fresh.len(), 2, "a different token landed a second row at the same timestamp");
-
-	drop(store);
-	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
-	Ok(())
-}
-
 /// `capture_measurement_chunk` was the remaining entry point that did not route
 /// to the seal store on a seal-backed aspect (#779 follow-up for the #232 class).
 /// Without the fix, a chunk written through this path lands in the per-aspect
@@ -508,41 +462,6 @@ async fn seal_backed_capture_measurement_chunk_reaches_the_seal() -> Result<()> 
 	Ok(())
 }
 
-/// A **red** test on `main` -- two separate calls with one `DatasetId` and the **identical**
-/// single row write an identical key, and the second call replays the first's receipt -
-/// silently losing the write.  After the fix each call with `None` (the default) mints a
-/// fresh token, so the second write lands and the read returns **two** rows at that
-/// timestamp (matching rows-mode's append contract, which seal must match).
-#[serial]
-#[tokio::test]
-async fn identical_resubmission_under_one_dataset_id_is_not_silently_dropped() -> Result<()> {
-	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
-	let (_dir, db) = setup().await?;
-	let subject = db.observe_subject("s").await?;
-	let aspect_id = db.track_aspect(&subject.id(), "identical_resubmission", &splimes::Resolution::Milliseconds, None).await?.id();
-
-	let dataset = DatasetId::new();
-	let store = db.seal_store().await?;
-	let base = Utc::now().timestamp_millis();
-
-	// Two separate write calls, same DatasetId, same single row.
-	let tx1 = ingest_batch_with_gate(&store, &aspect_id, &dataset, None, &[(base, bd("5"))], 4).await?;
-	assert_eq!(tx1.len(), 1, "first call returns one TxId");
-	let tx2 = ingest_batch_with_gate(&store, &aspect_id, &dataset, None, &[(base, bd("5"))], 4).await?;
-	assert_eq!(tx2.len(), 1, "second call returns one TxId");
-
-	// *** Red assertion: the read must return two rows, proving the second call was not silently dropped. ***
-	let read_back = read_rows(&store, &aspect_id, None, None).await?;
-	assert_eq!(read_back.len(), 2, "two rows at the same timestamp: the second call was not silently dropped (bug: 1 on main)");
-
-	// Both rows have the value we wrote (the store's newer-wins merge preserves both).
-	let matching = read_back.iter().filter(|(_, v)| *v == bd("5")).count();
-	assert_eq!(matching, 2, "both stored rows carry the written value");
-
-	drop(store);
-	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
-	Ok(())
-}
 /// The count and the range-read length must agree after two batches whose timestamps
 /// overlap for the same series, even when the fragmentation gate is idle.
 ///
@@ -569,13 +488,321 @@ async fn count_agrees_with_range_read_after_overlapping_ingests() -> Result<()> 
 	let rows1 = vec![(base, bd("10.0")), (base + 1000, bd("20.0")), (base + 2000, bd("30.0"))];
 	let rows2 = vec![(base + 1000, bd("21.0")), (base + 2000, bd("31.0")), (base + 3000, bd("40.0"))];
 
-	ingest_batch_with_gate(&store, &aspect_id, &dataset, None, &rows1, 4).await?;
-	ingest_batch_with_gate(&store, &aspect_id, &dataset, None, &rows2, 4).await?;
+	ingest_batch_with_gate(&store, &aspect_id, &dataset, "overlap-491", &rows1, 4).await?;
+	ingest_batch_with_gate(&store, &aspect_id, &dataset, "overlap-492", &rows2, 4).await?;
 
 	let count = db.get_measurements_count(&aspect_id).await?;
 	let read = read_rows(&store, &aspect_id, None, None).await?;
 
 	assert_eq!(count, read.len(), "the seal-backed count ({count}) equals the number of rows a range read returns ({}) after overlapping segments", read.len());
+
+	drop(store);
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
+
+/// #801 reproduction: `replace_measurements_in_range` on a seal-backed aspect
+/// writes to the per-aspect rows-mode `measurements.db` that no seal-backed read
+/// consults, so the compressed data is stored and reported as success while the
+/// stored (sealed) data is unchanged. After the fix it must return
+/// `Error::SealBackedRejected`.
+#[serial]
+#[tokio::test]
+async fn seal_backed_replace_measurements_in_range_refuses() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "sealed_replace", &splimes::Resolution::Milliseconds, None).await?.id();
+	assert_eq!(db.aspect_storage_mode(&aspect_id).await?, StorageMode::Segments, "the aspect is created seal-backed");
+
+	let base = Utc.with_ymd_and_hms(2024, 5, 1, 0, 0, 0).unwrap();
+	let dataset = DatasetId::new();
+	let rows: Vec<InputMeasurement> = (0..3).map(|i| InputMeasurement::new(base + Duration::seconds(i), bd(&format!("{}.0", i + 1)))).collect();
+
+	// Ingest some rows first
+	db.batch_capture_measurements(aspect_id, dataset, rows.clone()).await?;
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 3);
+
+	// Try to replace the range. Before the fix this succeeds (writing to
+	// measurements.db). After the fix it returns SealBackedRejected.
+	let err = db.replace_measurements_in_range(&aspect_id, &dataset, base, base + Duration::seconds(2), rows).await.unwrap_err();
+	assert!(err.downcast_ref::<weftdb::Error>().is_some_and(|e| matches!(e, weftdb::Error::SealBackedRejected(_))), "replace_measurements_in_range must return a typed error for a seal-backed aspect: {err}");
+
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
+
+/// #801 reproduction: `capture_new_measurement_chunk` on a seal-backed aspect
+/// writes rows into the caller-supplied rows-mode database handle, which seals
+/// never read from. After the fix it must return `Error::SealBackedRejected`,
+/// since the call site is a rows-mode-only helper that is not reachable from
+/// the seal-dispatched bulk entry points.
+#[serial]
+#[tokio::test]
+async fn seal_backed_capture_new_measurement_chunk_refuses() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "sealed_chunk_refuse", &splimes::Resolution::Milliseconds, None).await?.id();
+	assert_eq!(db.aspect_storage_mode(&aspect_id).await?, StorageMode::Segments, "the aspect is created seal-backed");
+
+	let base = Utc.with_ymd_and_hms(2024, 6, 1, 0, 0, 0).unwrap();
+	let dataset = DatasetId::new();
+	let chunk: Vec<InputMeasurement> = (0..2).map(|i| InputMeasurement::new(base + Duration::seconds(i), bd(&format!("{}.0", i + 1)))).collect();
+
+	// Get the rows-mode database handles as the caller of this entry point would.
+	let db_path = db.get_measurement_db_path(&aspect_id).await?;
+	let db_handle = db.get_measurement_db(&aspect_id).await?;
+	let tx_ids: Vec<TxId> = chunk.iter().map(|_| TxId::new()).collect();
+
+	// This entry point takes a caller-supplied rows-mode handle and writes
+	// directly into it — no seal-backed dispatch exists. Before the fix this
+	// succeeds. After the fix it returns SealBackedRejected.
+	let err = Inputs::capture_new_measurement_chunk(&db, &aspect_id, &db_handle, &db_path, &dataset, &chunk, &tx_ids).await.unwrap_err();
+	assert!(err.downcast_ref::<weftdb::Error>().is_some_and(|e| matches!(e, weftdb::Error::SealBackedRejected(_))), "capture_new_measurement_chunk must return a typed error for a seal-backed aspect: {err}");
+
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
+
+/// #801 criterion 4: every legacy write entry point on a seal-backed aspect
+/// either reaches the seal store or returns `Error::SealBackedRejected`, and
+/// after any of them the per-aspect rows-mode `measurements.db` file does not
+/// exist (the seal is the only store this aspect uses).
+#[serial]
+#[tokio::test]
+async fn seal_backed_write_entry_points_never_reach_measurements_db() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "sealed_enum", &splimes::Resolution::Milliseconds, None).await?.id();
+	assert_eq!(db.aspect_storage_mode(&aspect_id).await?, StorageMode::Segments, "the aspect is created seal-backed");
+
+	let base = Utc.with_ymd_and_hms(2024, 8, 1, 0, 0, 0).unwrap();
+	let dataset = DatasetId::new();
+
+	// 1. batch_capture_measurements (already routed to seal in #779)
+	let rows: Vec<InputMeasurement> = (0..3).map(|i| InputMeasurement::new(base + Duration::seconds(i), bd(&format!("{}.0", i + 1)))).collect();
+	let tx_ids = db.batch_capture_measurements(aspect_id, dataset, rows).await?;
+	assert_eq!(tx_ids.len(), 3, "batch_capture_measurements reached the seal");
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 3);
+
+	// 2. capture_new_measurement (already routed to seal in #779)
+	db.capture_new_measurement(&aspect_id, &dataset, &InputMeasurement::new(base + Duration::hours(1), bd("42.0"))).await?;
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 4);
+
+	// 3. batch_capture_new_measurements (already routed to seal in #779)
+	let more_rows: Vec<InputMeasurement> = (0..2).map(|i| InputMeasurement::new(base + Duration::hours(2) + Duration::seconds(i), bd(&format!("{}.0", i + 10)))).collect();
+	let tx_ids2 = db.batch_capture_new_measurements(&aspect_id, &dataset, more_rows).await?;
+	assert_eq!(tx_ids2.len(), 2);
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 6);
+
+	// 4. capture_measurement_chunk (already routed to seal in #779)
+	let chunk_rows: Vec<InputMeasurement> = (0..2).map(|i| InputMeasurement::new(base + Duration::hours(3) + Duration::seconds(i), bd(&format!("{}.0", i + 20)))).collect();
+	let tx_ids3 = db.capture_measurement_chunk(&aspect_id, DatasetId::new(), &chunk_rows).await?;
+	assert_eq!(tx_ids3.len(), 2);
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 8);
+
+	// 5. capture_new_measurement_chunk must refuse. The path and the turso handle are
+	// derived without calling get_measurement_db, which creates the very
+	// measurements.db file this test asserts is never created (the assertion below
+	// would then be false whatever the guards do).
+	let db_dir = std::path::Path::new(db.metadata_path()).parent().expect("db dir").to_path_buf();
+	let db_path = db_dir.join("aspects").join(aspect_id.as_uuid().to_string()).join("measurements.db").to_string_lossy().into_owned();
+	let db_handle = turso::Builder::new_local(":memory:").build().await.expect("throwaway handle for the refusal probe");
+	let refuse_tx_ids: Vec<TxId> = (0..2).map(|_| TxId::new()).collect();
+	let err = Inputs::capture_new_measurement_chunk(&db, &aspect_id, &db_handle, &db_path, &dataset, &chunk_rows, &refuse_tx_ids).await.unwrap_err();
+	assert!(err.downcast_ref::<weftdb::Error>().is_some_and(|e| matches!(e, weftdb::Error::SealBackedRejected(_))), "capture_new_measurement_chunk must refuse seal-backed: {err}");
+
+	// 6. replace_measurements_in_range must refuse
+	let err2 = db.replace_measurements_in_range(&aspect_id, &dataset, base, base + Duration::hours(10), Vec::new()).await.unwrap_err();
+	assert!(err2.downcast_ref::<weftdb::Error>().is_some_and(|e| matches!(e, weftdb::Error::SealBackedRejected(_))), "replace_measurements_in_range must refuse seal-backed: {err2}");
+
+	// 7. set_compression_config + compress must refuse
+	let mut aspect = db.get_aspect(&aspect_id).await?;
+	let err3 = aspect.set_compression_config(&db, Some(weftdb::CompressionConfig { enabled: true, time_based: None, size_based: None, ..Default::default() })).await.unwrap_err();
+	assert!(err3.downcast_ref::<weftdb::Error>().is_some_and(|e| matches!(e, weftdb::Error::SealBackedRejected(_))), "set_compression_config must refuse seal-backed: {err3}");
+
+	// 8. compress must refuse (local config needed since set_compression_config refused)
+	aspect.set_compression_config_local(Some(weftdb::CompressionConfig { enabled: true, time_based: None, size_based: None, ..Default::default() }));
+	let err4 = aspect.compress(&db).await.unwrap_err();
+	assert!(err4.downcast_ref::<weftdb::Error>().is_some_and(|e| matches!(e, weftdb::Error::SealBackedRejected(_))), "compress must refuse seal-backed: {err4}");
+	// `Aspect` owns database handles, so `clippy::significant_drop_tightening` wants it
+	// released before the filesystem assertions below rather than at end of scope.
+	drop(aspect);
+
+	// Assert the rows-mode measurements.db file was never created for this aspect.
+	let measurements_db = db_dir.join("aspects").join(aspect_id.as_uuid().to_string()).join("measurements.db");
+	assert!(!measurements_db.exists(), "the rows-mode measurements.db must not exist for a seal-backed aspect");
+	assert_eq!(db.aspect_storage_mode(&aspect_id).await?, StorageMode::Segments, "the refusals must not flip a seal-backed aspect back to rows mode");
+
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
+/// on a seal-backed aspect reads from the seal store, then deletes and inserts
+/// rows in the per-aspect `measurements.db` that nothing reads, and reports
+/// success — so the sealed data is unchanged while the metadata says compression
+/// ran. After the fix it must return `Error::SealBackedRejected`.
+#[serial]
+#[tokio::test]
+async fn seal_backed_compress_with_progress_refuses() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "sealed_compress", &splimes::Resolution::Milliseconds, None).await?.id();
+	assert_eq!(db.aspect_storage_mode(&aspect_id).await?, StorageMode::Segments, "the aspect is created seal-backed");
+
+	// Ingest a few rows so compress has data to process.
+	let base = Utc.with_ymd_and_hms(2024, 7, 1, 0, 0, 0).unwrap();
+	let rows: Vec<InputMeasurement> = (0..10).map(|i| InputMeasurement::new(base + Duration::hours(i), bd(&format!("{}.0", i + 1)))).collect();
+	db.batch_capture_measurements(aspect_id, DatasetId::new(), rows).await?;
+	assert_eq!(db.get_measurements_count(&aspect_id).await?, 10);
+
+	// Set a compression config locally (the aspect was created without one).
+	// Must enable compression so the test hits the seal guard rather than
+	// returning early from the `!config.enabled` shortcut.
+	let mut aspect = db.get_aspect(&aspect_id).await?;
+	aspect.set_compression_config_local(Some(weftdb::CompressionConfig { enabled: true, time_based: None, size_based: None, ..Default::default() }));
+
+	let err = aspect.compress_with_progress(&db, None).await.unwrap_err();
+	assert!(err.downcast_ref::<weftdb::Error>().is_some_and(|e| matches!(e, weftdb::Error::SealBackedRejected(_))), "compress_with_progress must return a typed error for a seal-backed aspect: {err}");
+	drop(aspect);
+
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// SEAL-IDEM pins (#803): the idempotency unit of a gated seal ingest is the
+// **call token**, never the payload. These pins fail if the key is derived from
+// the rows, if the token is ignored, or if a reused `DatasetId` enters the key.
+// ---------------------------------------------------------------------------
+
+/// One token replayed with one payload returns the first receipt and writes nothing twice.
+#[serial]
+#[tokio::test]
+async fn gate_one_token_replays_the_first_receipt() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "pin_replay", &splimes::Resolution::Milliseconds, None).await?.id();
+	let dataset = DatasetId::new();
+	let store = db.seal_store().await?;
+	let base = Utc::now().timestamp_millis();
+	let rows = vec![(base, bd("1.0")), (base + 1000, bd("2.0"))];
+
+	let tx1 = ingest_batch_with_gate(&store, &aspect_id, &dataset, "pin-replay-token", &rows, 4).await?;
+	let tx2 = ingest_batch_with_gate(&store, &aspect_id, &dataset, "pin-replay-token", &rows, 4).await?;
+	assert_eq!(tx1, tx2, "the replay returns the first receipt");
+	let read_back = read_rows(&store, &aspect_id, None, None).await?;
+	assert_eq!(read_back.len(), 2, "the replay wrote nothing twice");
+
+	drop(store);
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
+
+/// The same token offered a different payload is a **loud** conflict, and nothing lands.
+#[serial]
+#[tokio::test]
+async fn gate_one_token_different_payload_is_a_loud_conflict() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "pin_conflict", &splimes::Resolution::Milliseconds, None).await?.id();
+	let dataset = DatasetId::new();
+	let store = db.seal_store().await?;
+	let base = Utc::now().timestamp_millis();
+	let first = vec![(base, bd("1.0")), (base + 1000, bd("2.0"))];
+	let other = vec![(base, bd("9.0")), (base + 1000, bd("8.0"))];
+
+	ingest_batch_with_gate(&store, &aspect_id, &dataset, "pin-conflict-token", &first, 4).await?;
+	let err = ingest_batch_with_gate(&store, &aspect_id, &dataset, "pin-conflict-token", &other, 4).await.expect_err("a different payload under one token must be refused");
+	let store_err = err.downcast_ref::<weftdb::Error>().expect("a weftdb error");
+	assert!(matches!(store_err, weftdb::Error::IdempotencyConflict { key, .. } if key == "legacy:pin-conflict-token"), "the conflict must name the offered key: {store_err}");
+	let read_back = read_rows(&store, &aspect_id, None, None).await?;
+	assert_eq!(read_back.len(), 2, "the conflict must write nothing");
+	assert_eq!(read_back[0].1, bd("1.0"), "the refused batch must not replace the recorded rows");
+
+	drop(store);
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
+
+/// Two calls of one payload under distinct tokens are two calls: both land, and the
+/// row count stays one per timestamp because seal rows are keyed by (series, timestamp).
+#[serial]
+#[tokio::test]
+async fn gate_distinct_tokens_same_timestamps_never_double_a_row() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "pin_distinct", &splimes::Resolution::Milliseconds, None).await?.id();
+	let dataset = DatasetId::new();
+	let store = db.seal_store().await?;
+	let base = Utc::now().timestamp_millis();
+	let first = vec![(base, bd("1.0")), (base + 1000, bd("2.0"))];
+	let second = vec![(base, bd("3.0")), (base + 1000, bd("4.0"))];
+
+	let tx1 = ingest_batch_with_gate(&store, &aspect_id, &dataset, "pin-distinct-a", &first, 4).await?;
+	let tx2 = ingest_batch_with_gate(&store, &aspect_id, &dataset, "pin-distinct-b", &second, 4).await?;
+	assert_ne!(tx1, tx2, "distinct tokens are distinct calls");
+	let read_back = read_rows(&store, &aspect_id, None, None).await?;
+	assert_eq!(read_back.len(), 2, "one row per timestamp, never two");
+	assert_eq!(read_back[0].1, bd("3.0"), "the later call wins at a shared timestamp");
+
+	drop(store);
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
+
+/// A-B-A over the same timestamps: the **last** write is what a reader sees, and no
+/// write is swallowed or duplicated on the way.
+#[serial]
+#[tokio::test]
+async fn gate_abba_over_shared_timestamps_keeps_the_last_write() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "pin_abba", &splimes::Resolution::Milliseconds, None).await?.id();
+	let dataset = DatasetId::new();
+	let store = db.seal_store().await?;
+	let base = Utc::now().timestamp_millis();
+	let a = vec![(base, bd("1.0")), (base + 3_600_000, bd("1.0"))];
+	let b = vec![(base, bd("2.0")), (base + 3_600_000, bd("2.0"))];
+
+	ingest_batch_with_gate(&store, &aspect_id, &dataset, "pin-abba-a1", &a, 4).await?;
+	ingest_batch_with_gate(&store, &aspect_id, &dataset, "pin-abba-b1", &b, 4).await?;
+	ingest_batch_with_gate(&store, &aspect_id, &dataset, "pin-abba-a2", &a, 4).await?;
+
+	let read_back = read_rows(&store, &aspect_id, None, None).await?;
+	assert_eq!(read_back.len(), 2, "A-B-A must not accumulate rows: {read_back:?}");
+	assert_eq!(read_back[0].1, bd("1.0"), "the last write (A again) must be what a reader sees");
+
+	drop(store);
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
+
+/// `DatasetId` is a logical identity only: sharing it across calls cannot dedupe a
+/// write, and cannot collide them.
+#[serial]
+#[tokio::test]
+async fn gate_dataset_id_is_not_part_of_the_idempotency_key() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "pin_dataset", &splimes::Resolution::Milliseconds, None).await?.id();
+	let dataset = DatasetId::new();
+	let store = db.seal_store().await?;
+	let base = Utc::now().timestamp_millis();
+	let rows = vec![(base, bd("1.0"))];
+
+	let tx1 = ingest_batch_with_gate(&store, &aspect_id, &dataset, "pin-dataset-a", &rows, 4).await?;
+	let tx2 = ingest_batch_with_gate(&store, &aspect_id, &dataset, "pin-dataset-b", &rows, 4).await?;
+	assert_ne!(tx1, tx2, "the key cannot be built from (dataset id, rows)");
+	let read_back = read_rows(&store, &aspect_id, None, None).await?;
+	assert_eq!(read_back.len(), 1, "the second call landed and collapsed onto the same timestamp");
 
 	drop(store);
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
