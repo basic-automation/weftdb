@@ -8551,32 +8551,36 @@ handle (the four `SealBackedRejected` guards) rather than change signatures that
 "remove the fallbacks"; doing it here would mean an API break with no test of
 its own, and the ordering the operator set (#800 -> #801 -> #802 -> #803) keeps
 the fallback removal in #802 where its blast radius can be measured.
-## 2026-11-19 — The idempotency unit is the call, not the payload (#803)
+## 2026-11-19 — A dependency exception is only real if the tool can expire it (#794, DENY-PIN)
+The exception for RUSTSEC-2026-0543 (unmaintained `chrono`) has carried the sentence "revisit by 2027-01-31" since PR #790 wrote it, and nothing checked that date: cargo-deny 0.21.0 (2026-11-16) added `advisories.ignore[].expiry`, and the CI pin (`EmbarkStudios/cargo-deny-action @3c63498`, Dockerfile `deny_version="0.20.2"`) rejected the key outright with `error[unexpected-keys]: found 1 unexpected keys, expected: ["id", "reason"]`. So the deadline was documentation, and documentation is the kind of deadline that passes silently.
 
-- **Rejected: single-use `DatasetId` as the key.** Oracle option B would repurpose `DatasetId` as
-  a per-call token, keying the ledger as `legacy:{dataset_uuid}` and routing a reused id with a
-  different payload to `IdempotencyConflict` (HTTP 409).  The premise — "no caller reuses one
-  `DatasetId` for many payloads" — is falsified by `bulk_ingest_converges_at_small_target`,
-  `gated_bulk_read_path_correctness` and
-  `seal_backed_aspect_round_trips_replays_and_widens`, which all reuse one `DatasetId` across
-  distinct payloads and expect every write to land.  `DatasetId` is a **logical, multi-write
-  identity** (`weftdb/src/types/dataset.rs:9-10`, `rows_mode.rs:25-27`).
-- **The A-B-A argument.**  No pure `(DatasetId, payload) -> key` function can distinguish "retry
-  of A" from "new submission of identical content A′", so the only sound fix is a caller-minted
-  per-call token.  The adopted design splits the two identities the adapter previously conflated:
-  `DatasetId` stays a stable logical identity, while the seal idempotency unit becomes an explicit
-  per-call token (UUIDv4 when the caller supplies `None`).  The store already has the right
-  primitive (`SegmentStore::ingest` keyed by `(aspect, batch.key)`); the adapter now stops
-  bypassing it with a derived key.
-- **Deliberate scope choice.**  Crash-safe typed-API replay is left to the HTTP layer's existing
-  `Idempotency-Key` (`weft-server/src/ingest.rs:701-709`).  The typed seal path with `None` is
-  append-only, matching rows-mode's documented "no idempotency key" contract.  No `Inputs` trait
-  method signatures were changed in this slice.
-- **Reviewer invariant.**  A seal ingest key is minted once per logical write call and is **never**
-  a function of the payload.  No call site may feed a content hash into `IngestBatch::key`.
-  Presenting the same explicit token with the same batch replays; presenting a different token (or
-  a fresh nonce) always yields a distinct key and therefore a distinct write — never a silent
-  replay of a stale receipt.
-- **Separate, still-open availability point.**  The surviving 64-bit FNV-1a fingerprint
-  (`weftdb/src/types/ingest.rs:162-180`) can produce a false `IdempotencyConflict`.
-  Not addressed here.
+**The decision** — bump the pin to the commit the `v2.1.2` tag peels to, `70f81531115945ba6eb6b941ec9d39d063438eb9` (its Dockerfile pins `deny_version="0.21.0"`), and give the ignore entry `expiry = "2027-01-31"`, an absolute ISO-8601 date rather than a duration: a duration is relative to the advisory's publish date, which is not the date the plan says the migration to `time`/`jiff` (#791) is due.
+
+**The alternatives** — (a) leave the pin and keep the prose deadline, which keeps a checked-in file describing a limitation that no longer has to exist; (b) add a global `advisories.ignore-expiry = "P90D"` default so every future exception expires on its own, rejected: it would silently govern exceptions nobody reviewed yet, and a default expiry on an exception someone intended as permanent turns a green CI red with no decision behind it. The per-entry key keeps each expiry a deliberate act.
+
+**The trap for the next person** — a GitHub tag ref is not always a commit: `v2.1.2` resolves first to an annotated tag object (`995303aa1216…`), and pinning a workflow to that object is invalid. Peel it (`gh api …/git/tags/<sha>` → `.object.sha`) before writing the pin. `scripts/ci/check-action-pinning.py` only verifies that the reference is 40 hex characters, so it cannot tell a tag object from a commit.
+
+**What this does not do** — it does not fix the advisory. `arrow 60.1.0` still requires `chrono ^0.4.40`, chrono 0.4.45 is the newest release, and the nine manifests that depend on chrono directly plus the arrow-flight path that pulls it transitively cannot move off it. When 2027-01-31 passes, cargo-deny re-reports the advisory and emits `advisory-ignore-expired` at the value: that red is the point.
+Filed as #794; the exception itself is #790 and the migration is #791.
+
+## 2026-11-20 — TAG-12-B: one interleaved crash cell instead of the fault-point cross-product (issue #341)
+
+- **Ambiguity in the slice brief.** "Add the multi-series crash matrix" does not say whether
+  that means the whole single-series fault-point matrix re-run with N series, or one cell with
+  several series in flight. It also does not say where to abort.
+- **What was chosen, and why.** One cell: 8 aspects written interleaved, process abort at
+  [`FaultPoint::SFrameWritten`] (`weftdb/tests/multiseries_crash.rs`, gated by
+  `#![cfg(feature = "fault-injection")]`). The fault points are per-frame, so re-running the
+  entire matrix with 8 series multiplies CI minutes while exercising code paths the
+  single-series cells already cover. The failure modes worth protecting — a read that returns a
+  value from a frame that never committed, or a committed frame whose value is lost — only
+  become visible when more than one series is in the same batch, which this cell has.
+- **Mechanism, recorded because it constrains future cells.** The child re-executes the test
+  binary: it writes a first round to every aspect, arms `SFrameWritten`, then writes one more
+  aspect and aborts; the parent reopens the store cold and checks each aspect against a replay
+  of its committed frames. The cell runs with `--test-threads=1` in `scripts/crash-matrix.sh`
+  because arming a fault point is process-global state, so parallel cells would arm each other.
+- **Known limitation, accepted.** Only `SFrameWritten` × multi-series is covered. Other fault
+  points crossed with multiple series, and TAG-12's remaining items (fan-out and TSBS
+  benchmarks, fixtures, freeze docs) stay open; the `docs/roadmap-notes.md` TAG-12 line now says
+  so rather than leaving the line untouched.
