@@ -8844,6 +8844,7 @@ section instead. The store-side parser is the single parse point (`row_expiry_po
 summary were rewritten to match, since both previously promised "there is no seconds-based
 conversion".
 
+
 ## 2026-11-17 — Ticking 7.3 and 7.5 from their shipped parts, and dropping the routine's empty Phase 12 wrappers (7.3, 7.5)
 
 - **The call.** Neither Phase 13 parent has an acceptance test of its own: each line names its parts in parentheses (7.3: D-S12 + ROB-8/9/22 + HTTP restore; 7.5: ROB-19/20/21, with "query consistency, cancellation, and resource limits" in the title). Every part is recorded as shipped (the Phase 6/10 summaries, the ticked Phase 12 lines for ROB-22, ROB-20, X-READ and the restore route), and umbrella #212's three sub-issues are closed as completed. So the routine ticked both parents, listed each part as a `[x]` sub-item with the test that pins it, and re-ran those tests on `435553e` rather than trusting the summaries. 47 passed, 0 failed.
@@ -8886,19 +8887,19 @@ debug steps in the same job (row-expiry, and the maintenance-budget one from #75
 file, left alone because they belong to other slices' diagnoses — whoever's diagnosis they served
 should remove them. And the general rule this slice is really about: before treating a CI failure as
 a code signal, check whether the steps that would have caught the code actually ran.
-
 ## 2026-11-20 — Which paper defines the TSM-Bench query spec (#394)
 
 **Question.** The brief for this slice names "Garcia, Seltzer, VLDB 2015" as the TSM-Bench paper. Which paper is the canonical source for the seven query definitions?
 
 **Decision.** Adopt the Khelifati et al. PVLDB 2023 paper ("TSM-Bench: Benchmarking Time Series Database Systems for Monitoring Applications", PVLDB 16(11), doi:10.14778/3611479.3611532) as the canonical spec. The paper's §3.3 defines Q1–Q7 with canonical SQL. The Garcia/Seltzer 2015 PDF at vldb.org/pvldb/vol8/p2030-garcia.pdf is behind Cloudflare and could not be read; no Garcia/Seltzer reference appears in the PVLDB 2023 paper's bibliography. The codebase already cites the PVLDB 2023 paper (gap_fill.rs:5: "PVLDB 16(11)"). The brief's citation appears to be an error; this is documented in the spec doc as unresolved.
 
-**Rejected.** Using the Garcia/Seltzer 2015 paper as primary source — it cannot be read and the community uniformly cites the 2023 paper. Waiting for the 2015 paper to become accessible — the adoption does not depend on 
+**Rejected.** Using the Garcia/Seltzer 2015 paper as primary source — it cannot be read and the community uniformly cites the 2023 paper. Waiting for the 2015 paper to become accessible — the adoption does not depend on it.
+
 **Residue.** The Garcia/Seltzer 2015 paper may contain a different or earlier query specification. If it becomes accessible, re-check whether its definitions supersede or supplement the PVLDB 2023 spec. The implementation slice should read the PVLDB 2023 paper text (obtained) before coding each arm.
 
 ## 2026-11-20 — TSM-Bench Q1–Q10 includes Q8–Q10 (#394)
 
-**Question.** The adoption brief refers to "ten query numbers, Q1–Q10." The PVLDB 2023 paper defines only Q1–Q7. What are Q8, Q9, and Q10?
+**Question.** The adoption brief refers to "ten query numbers, Q1–Q10." The PVLDB 2023 paper defines only Q1–Q7. What are Q8–Q10?
 
 **Decision.** No Q8–Q10 exist in the published TSM-Bench spec. The paper defines seven queries; the repository's queries.sql files for each system contain only q1–q7. Q8–Q10 are not adopted because no canonical definition exists. The spec doc states this explicitly in §1's "Queries we deliberately do not run" table.
 
