@@ -20,10 +20,11 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use bigdecimal::BigDecimal;
 use chrono::{TimeZone, Utc};
+use futures::StreamExt;
 use serial_test::serial;
 use uuid::Uuid;
 use weftdb::{
-	clear_connection_cache_by_name, database::traits::DatabaseStructure, durable::fault::{self, FaultAction, FaultPoint, FAULT_ENV}, Database, DatasetId, InputMeasurement, Outputs
+	clear_connection_cache_by_name, database::traits::{AspectStructure, DatabaseStructure, Inputs}, durable::fault::{self, FaultAction, FaultPoint, FAULT_ENV}, Database, DatasetId, InputMeasurement, Outputs
 };
 
 /// The env var naming the test database. The child reads this to know which database to
