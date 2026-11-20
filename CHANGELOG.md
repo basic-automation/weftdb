@@ -120,6 +120,17 @@ origin/main
 
 ### Changed
 
+- **One row TTL now means one real span, not one number per aspect (#799).** `WEFT_ROW_TTL`
+  was a bare number that each aspect read **in its own time unit**, so `3600` expired
+  hour-resolution rows at once while nanosecond-resolution rows were effectively immortal.
+  The policy carries a `TimeUnit`: the value may be written with a suffix (`ns`, `us`, `ms`,
+  `s`) and **a bare number is now seconds**, converted once per aspect into that aspect's
+  unit. Expiry is one shared cutoff rule (`row_ts < cutoff`) for the range read and the purge
+  sweep, which also removes an unsigned-age wrap for a wall clock before 1970. The variable
+  is `Experimental`, so no migration window applies: an operator who meant "3600 ticks of
+  this aspect" writes that unit explicitly now. A positive TTL finer than the aspect's
+  resolution clamps to one tick (the newest tick's rows are kept). Only an explicit
+  `ttl == 0` expires everything strictly before `now`.
 - **The supply-chain gate now carries one dated exception (#790).** `cargo deny check advisories` started failing on every branch, including main, when RustSec marked `chrono` unmaintained (RUSTSEC-2026-0543) and said no safe upgrade exists: 0.4.45 is the newest release, and arrow 60.1.0 requires chrono ^0.4.40, so neither our direct uses nor the `arrow-flight` path can move off it. The advisory is accepted in `deny.toml` with a written reason naming 2027-01-31 as the revisit date, so the gate stays meaningful for everything else and the exception cannot outlive its intent in silence; an ignore that no longer matches an advisory is now itself an error. A machine-enforced `expiry` on the ignore needs cargo-deny 0.21.0 while CI pins 0.20.2 through the action, so the date is written for now and #794 bumps that pin. Moving time handling to `time` or `jiff` is #791.
 
 - **A client that aborts the request body answers `400 bad_request` with a labelled message and `details.reason: "client_disconnect"` (#742).** Both detection sites (body-stream transport error and premature EOF short of Content-Length) now produce the same wire answer instead of different text; the raw transport error is kept off the wire. The deadline timeout (`408 body_timeout`) is unchanged.

@@ -10,7 +10,7 @@
 //!
 //! **How the lane works.** The caller opens a [`SegmentStore`] with
 //! [`SegmentStoreOptions`] whose `expiry` field is
-//! [`RowExpiryPolicy::Ttl { ttl }`] instead of the default
+//! [`RowExpiryPolicy::Ttl`] instead of the default
 //! [`RowExpiryPolicy::NoExpiry`]. After the soak has written enough
 //! ticks that some rows' ages exceed the configured TTL, the caller
 //! calls [`SegmentStore::purge_expired`] (or the report-only
@@ -92,7 +92,9 @@ pub enum TtlPolicyLabel {
 	/// The store was opened with [`RowExpiryPolicy::NoExpiry`].
 	#[default]
 	NoExpiry,
-	/// The store was opened with [`RowExpiryPolicy::Ttl { ttl }`].
+	/// The store was opened with [`RowExpiryPolicy::Ttl`].  The label
+	/// carries the TTL value only: this lane always opens the store with the TTL in
+	/// seconds, so the number below is a count of seconds.
 	Ttl { ttl: u64 },
 }
 
@@ -100,7 +102,7 @@ impl From<&RowExpiryPolicy> for TtlPolicyLabel {
 	fn from(policy: &RowExpiryPolicy) -> Self {
 		match policy {
 			RowExpiryPolicy::NoExpiry => Self::NoExpiry,
-			RowExpiryPolicy::Ttl { ttl } => Self::Ttl { ttl: *ttl },
+			RowExpiryPolicy::Ttl { ttl, unit: _ } => Self::Ttl { ttl: *ttl },
 		}
 	}
 }
@@ -157,7 +159,7 @@ pub async fn run_ttl_lane(ttl_secs: u64, now_ns: i64) -> anyhow::Result<TtlLaneV
 	use weftdb::SeriesId;
 
 	let dir = tempfile::tempdir().map_err(|e| anyhow::anyhow!("failed to create temp dir for TTL lane: {e}"))?;
-	let opts = SegmentStoreOptions::default().with_expiry(RowExpiryPolicy::Ttl { ttl: ttl_secs });
+	let opts = SegmentStoreOptions::default().with_expiry(RowExpiryPolicy::Ttl { ttl: ttl_secs, unit: TimeUnit::Seconds });
 	let store = SegmentStore::open_with_options(dir.path(), opts).await?;
 
 	let aspect = "ttl_lane_temp";
@@ -203,7 +205,7 @@ pub async fn run_ttl_lane(ttl_secs: u64, now_ns: i64) -> anyhow::Result<TtlLaneV
 		return Err(anyhow::anyhow!("TTL lane: after purge_expired the read returned {} rows, expected the {} live rows", after_purge.len(), live_ts.len()));
 	}
 
-	let rowexp = RowExpiryPolicy::Ttl { ttl: ttl_secs };
+	let rowexp = RowExpiryPolicy::Ttl { ttl: ttl_secs, unit: TimeUnit::Seconds };
 	let policy_label = TtlPolicyLabel::from(&rowexp);
 
 	// Build the combined report from purge (which includes the drops).
@@ -261,7 +263,7 @@ mod tests {
 	#[test]
 	fn ttl_policy_label_from_row_expiry_policy() {
 		assert_eq!(TtlPolicyLabel::from(&RowExpiryPolicy::NoExpiry), TtlPolicyLabel::NoExpiry,);
-		assert_eq!(TtlPolicyLabel::from(&RowExpiryPolicy::Ttl { ttl: 7200 }), TtlPolicyLabel::Ttl { ttl: 7200 },);
+		assert_eq!(TtlPolicyLabel::from(&RowExpiryPolicy::Ttl { ttl: 7200, unit: TimeUnit::Seconds }), TtlPolicyLabel::Ttl { ttl: 7200 },);
 	}
 
 	#[test]
@@ -314,7 +316,7 @@ mod tests {
 		let ttl_secs = 10u64;
 
 		let dir = tempfile::tempdir().expect("tempdir");
-		let opts = SegmentStoreOptions::default().with_expiry(RowExpiryPolicy::Ttl { ttl: ttl_secs });
+		let opts = SegmentStoreOptions::default().with_expiry(RowExpiryPolicy::Ttl { ttl: ttl_secs, unit: TimeUnit::Seconds });
 		let store = SegmentStore::open_with_options(dir.path(), opts).await.expect("open");
 
 		store.declare("roundtrip", &AspectSchema::new(PhysicalType::F64, BigDecimal::from_str("0").unwrap(), TimeUnit::Seconds)).await.expect("declare");
