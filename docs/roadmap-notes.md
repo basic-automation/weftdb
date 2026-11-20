@@ -267,6 +267,7 @@ Dependencies were brought current and audited on 2026-10-05, `SECURITY.md` is on
 - **Public surface declared and frozen**
 - **Compatibility tests**
 - **Semver policy + `CHANGELOG.md`**, starting from the first tagged pre-release
+  *Closed 2026-11-20 (audit): 11 tags, 11 changelog sections, 11 compare links, baseline v0.1.0 2026-10-08. Pre-release policy at `docs/stability.md:47`.*
 - **Crate publishing split**
 - **Panic audit on server paths**
 - **Security process**
@@ -275,7 +276,8 @@ Dependencies were brought current and audited on 2026-10-05, `SECURITY.md` is on
 
 ### Claims & documentation
 
-- Every performance claim in the README links to a benchmark artifact (the [governing rule](#weftdb-roadmap))
+- [x] Every performance claim in the README links to a benchmark artifact (the [governing rule](#weftdb-roadmap))
+  — ticked by [CLAIMS-243](https://github.com/basic-automation/weftdb/pull/832): the README has no bare numeric figures; its qualitative claims point at the committed pooled report at `bench/reports/phase1-pooled/`. Registry entry `cross-engine-2026-11-02` added.
 - First cross-engine report
 - Honesty pages shipped (see [Commercial thesis](https://basicautomation.io/projects/weftdb/docs/commercial-thesis))
 - Legal review of competitor benchmark-publication terms + codec licenses (see [Legal review](#legal-review))
@@ -579,6 +581,17 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
       - **Research (2026-10-09) — a cheaper sketch index, if the sketch format is ever revised.**
       - **Positioning (2026-10-09) — exact percentiles are a differentiator against QuestDB.**
       - **NEXT — select on the mantissas when a partial is not merged.**
+- **DONE (2026-11-20) — Audit the other `weft-bench` workloads' generators for the same class of flattery (#396, PR #834).**
+  Generated corpus shapes for every generator were read from source and assessed against
+  the same flattery classes identified in #395 (2-decimal scale, regular timestamps,
+  FOR-friendly repetition, clean analytic signals).  The full write-up is at
+  `docs/research/bench-generator-audit.md`.  10 generators were audited (plus the
+  real-corpora entry points and size presets); 5 claims in `bench/claims.json` are
+  flagged **suspect**, 1 claim (`sketch-claim-corrected`) was already corrected by #398,
+  and the remaining claims are `unaffected` — 5 outright, plus the BTC arm of
+  `interp-latency`, which splits — because they run on real data or a different code path.  **No claim was withdrawn in this PR** — the suspect verdicts await a
+  coordinator decision, and #397 (a representative generator or real-corpus defaults)
+  stays open.
 - **The seven slow `weft-orchestration` tests are bounded, and the three failures #402 recorded have no subject left (closed 2026-11-11).** Two entries sat here, and `4de2c691` ("the roadmap is a phased checklist; the prose moves to basicautomation.io") cut both mid-sentence, which is why they read as open work: the second, "Re-measured 2026-10-09 — still unbounded", was the tail of the bound-the-seven-tests item, and the first was the note that three failures were hiding behind the `SKIP_SLOW_TESTS` guard.
   - The bound exists. Seven `timed out after 1200s (#404)` guards now sit in the harnesses — `test_api` (`weft-orchestration/src/lib.rs:1772`), `test_pipeline_api` (`:1983`), `test_api_precise` (`:2166`), `test_pipeline_api_precise` (`:2348`), `test_batch_processing` (`:2467`), `test_specific_process_batch` (`:2537`), `test_pipeline_api_with_fake_db` (`:2732`) — at 3x the 357 s in which all seven finished for real on a runner, with push and pull-request runs skipping them so the nightly schedule is what exercises them (`CHANGELOG.md:266`, #404 and #646).
   - #402 is closed as completed (2026-11-10) and recorded here as **closed on erasure, not on a fix**: `test_api_precise`, `test_pipeline_api_with_fake_db` and `test_pipeline_api_precise` exist on `main` only as runner names in `weft-orchestration/src/lib.rs`, the `Invalid time range: start time must be before end time` failure has no fix behind it, and the close-out's own words were "none can be identified — every CI run where the slow weft-orchestration tests actually execute shows all of them passing". The real defect that was fixed is the dictionary one: schema creation now runs in an exclusive transaction before the concurrent one opens, in `weftdb/src/types/database/inputs.rs:1426-1440`, which also restores the three dictionary tables the inline DDL omitted. If those test names turn up again, reopen #402 against the names rather than this entry — that is where the evidence lives.
@@ -764,3 +777,31 @@ The matching empty bold headers in this file ("START HERE (filed 2026-10-11 …)
 - Conclusion: nothing has changed for this repo. The non-Linux SIGKILL exclusion stands. Watch #9770 for a merge before the stale window closes again, and then for the first release that carries it.
 
 **Handoff for the next run.** Phase 12's open items are all held: ROB-14 (the `p787` and `p810` lanes, active 2026-11-17; cut 2 merged in #805), TTL-PURGE and TTL-UNIT (#810, the `p799` worktree), and SEAL-* (#811–#819). The rest are owner-gated. In Phase 13, the TAG-12 fan-out arm is held by #809. TAG-12's TSBS half (`single-groupby-1-1-1` and `lastpoint` over the whole TSBS file tagged by `hostname`) still needs a quiet host. On 2026-11-19 the host had a load average of 36 and 9 GB of 124 GB available, with a 59 GB `strata` process resident.
+## Routine run (2026-11-17): 7.3/7.5 reconcile, TAG-12 multi-series crash cell, Turso and TSBS research
+
+**Reconcile.** 7.3 and 7.5 were ticked from their parts, each pinned by a test re-run on `435553e` (47 passed); see DECISIONS 2026-11-17. The six empty routine wrappers at the top of Phase 12 were deleted; their prose stays above under *Immediate next actions*.
+
+**TAG-12, the multi-series crash matrix.** Three new cells in `Failure::ALL` (now six), so `--crash-matrix`, `scripts/crash-matrix.sh` and `crash-matrix.yml` pick them up with no wiring. All three use three series `host=s0..s2` of one aspect, each storing corpus value + series number, so a row from the wrong series reads wrong. The checks are per series (`resolve_series` + `read_time_range_of`).
+- `kill-ingest-tagged`: SIGKILL after a seeded number of acknowledged tagged ingests. Each series holds exactly its acknowledged rows (only the in-flight series may hold one batch more), then everything resumes to whole.
+- `kill-compaction-tagged`: SIGKILL a seeded number of ms into compacting interleaved series. `fsck` is clean, every series is exact, and a rerun stays exact.
+- `corrupt-segment-tagged`: one flipped byte. Served rows are right, losses are quarantined, and at most one series loses rows. Every observed run quarantined the flipped segment and lost 5 rows from one series only.
+- Each cell fails a wrong-series mutant (`crash_matrix_tests` for the ingest cell; the real CLI for the other two).
+- **Not measured:** the matrix's CI wall-clock. The tagged cells do about 3× the ingest work of their untagged twins, and `scripts/crash-matrix.sh` defaults to `--rows 100000 --reps 2 --seeds 3`. The first `crash-matrix.yml` run after merge is the measurement; if it runs long, lower `--rows` for the tagged cells instead of dropping them.
+- **Runtime evidence:** this run's scratch dir `/mnt/deepmem/Development/weftdb-routine/runs/20261117-025714/` (logs `test-weft-bench-full-3.log`, `good-compaction.log`, `mutant-compaction.log`, `good-corrupt.log`, `mutant-corrupt.log`). The reopen times in those logs come from spinning disk on a box at load 24–33, so they are not a performance figure.
+
+**Research: the non-Linux SIGKILL exclusion still stands.** [tursodatabase/turso#7480](https://github.com/tursodatabase/turso/issues/7480) (an MVCC checkpoint truncates the logical log before the WAL, and the store then refuses to open with `Corrupt("WAL has committed frames but logical log header is missing")`) is **open**, last updated 2026-11-13. A commenter confirmed that a plain SIGKILL during an ordinary `wal_checkpoint(TRUNCATE)` reaches the state. The candidate fix, [turso#9770](https://github.com/tursodatabase/turso/pull/9770) ("complete an interrupted TRUNCATE checkpoint when the log is empty"), is **open and unmerged** (updated 2026-11-16). A maintainer's interim advice is to open such databases in experimental passive-checkpoint mode ([turso#9749](https://github.com/tursodatabase/turso/issues/9749), also open). `crash_matrix_tests.rs` deliberately does not take that route. The [release list](https://github.com/tursodatabase/turso/releases) has v0.8.3 as latest stable and v0.8.4-pre.3 (2026-11-12) and v0.9.0-pre.2 as pre-releases; this workspace pins `turso` 0.8.1. Nothing here clears the exclusion. Re-check when #9770 merges and ships in a stable release.
+
+**Research: what the TSBS half of TAG-12 has to run.** The [TSBS README](https://github.com/timescale/tsbs) (repo active, pushed 2026-11-16) defines the devops/cpu-only queries over the `hostname` tag: `single-groupby-{1,5}-{1,8}-{1,12}` (MAX of 1 or 5 metrics for 1 or 8 hosts, every 5 min, over 1 or 12 h), `double-groupby-{1,5,all}` (mean per host per hour over 24 h), `high-cpu-{1,all}`, `lastpoint` and `groupby-orderby-limit`. `weft-xbench --tsbs` keeps only `host_0`'s `usage_user` today, so the suite needs the whole file ingested tagged by `hostname`. That is now possible (TAG-11), and the `8`-host variants are the fan-out case.
+
+**Next (tomorrow).** Every TAG-12 sub-item left needs either a quiet host or a spec:
+1. TSBS `single-groupby-1-1-1` and `lastpoint` as the first two tag-grouped queries in `weft-xbench`, after ingesting the whole TSBS file tagged by `hostname`.
+2. The fan-out benchmark. Both (1) and (2) are benchmarks, so they need a quiet host; this run's load average was 24–33 on 16 cores with the model server resident.
+3. "Tagged fixtures and freeze docs" needs the owner to say what it means. The tagged frame golden already exists (`weft-physical-type/tests/golden/frame_v7_envelope_series_key.bin`); a tagged whole-store compat fixture beside `weftdb/tests/fixtures/pre_v2_store` is the likely reading.
+
+**TSM-Bench query spec adoption (P394, 2026-11-20).** ROADMAP.md:246 ticked.
+`docs/research/tsm-bench-query-spec.md` published: Q1–Q7 canonical SQL extracted from the
+Khelifati et al. PVLDB 2023 paper; Garcia/Seltzer 2015 source unverifiable behind Cloudflare.
+Gap analysis: Q5 (`--gap-fill`) is the only existing arm that explicitly identifies itself as a
+TSM-Bench query; Q1 (`--range-fetch`) is the next closest; Q2/Q3/Q6/Q7 need new arms.
+Staged adoption plan with five stages (Q5 formalization → Q1 adaptation → Q4 stored-data path
+→ Q2/Q3/Q6/Q7 new arms → cross-engine gate). No cargo / no Rust files touched.
