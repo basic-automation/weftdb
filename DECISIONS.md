@@ -8690,6 +8690,38 @@ Two more pins the same cell had to satisfy, both invisible to a local `cargo tes
 
 - **The `Test` tier has a written-out allowlist, not only a tier tag.** `the_tiers_are_the_explicit_choice_they_claim` (`weft-server/src/settings.rs:575-583`) rebuilds the set of `Tier::Test` names and asserts it equals an allowlist spelled out in the test itself — "a channel a test harness sets for the child it spawns, and nothing else may sit in it". Adding a harness variable therefore needs **both** the `VarSpec` and a name in that allowlist; a PR that adds only the spec passes locally and fails the `weft-server` lib suite in CI. The check is two-directional, so a name that moves tier must be edited in both places too.
 - **A re-executed child is addressed by its harness path, which for a crate-root test is just the function name.** The cell spawned its child with `--exact multiseries_crash::child`; that filter matches nothing (`running 0 tests`, exit status 0), so the parent's "the child aborted" assertion fired against a clean exit instead of a signal. The module-qualified spelling works only where the child lives in a `mod` (as in `weftdb/tests/db_tests.rs:1607` `database_new_crash::child`). Lesson: assert on the child having actually run — a filtered-out child looks exactly like a successful one.
+## 2026-11-20 — Host capacity decides who builds, and what stays owner-gated (roadmap hygiene)
+
+**Ambiguous.** `ROADMAP.md` keeps listing TAG-12 (`:116`) and FRE-18 (`:383` wave line, issue #348)
+as open work, and the coordination rules invite an agent to claim the next unchecked item. Whether
+those items are actually available depends on machine state that the roadmap does not record.
+
+**Chosen.** Treat host capacity as a first-class gate and record it here rather than in a PR:
+
+- The host is back in the state that already stopped local Rust work in November: `free -g` reports
+  109 GB used and 15 GB available of 124 GB, load average ~29, with the local model server resident.
+  A `cargo` workspace build needs 6–10 GB on its own. **No worker slice is launched that builds the
+  workspace while `available` is under ~30 GB**; CI stays the only compile gate for store and server
+  changes. This is the same decision recorded earlier for the 5 GB case, restated with the threshold
+  so the next run does not re-litigate it.
+- TAG-12 (#341) is not one task. Its **multi-series crash cell** landed as PR #826; its **fan-out arm
+  is already held by #809** (`weft-bench/src/fan_out.rs` exists on `main`); its **TSBS half**
+  (`single-groupby-1-1-1` and `lastpoint` over the whole TSBS file tagged by `hostname`, through
+  `weft-xbench --tsbs`) needs a quiet host and the full dataset. Claiming "TAG-12" as a slice would
+  re-do landed work, so the remaining honest claim is the TSBS run plus fixtures, and both are
+  environment-gated.
+- FRE-18 (#348, "rc.1 freeze cut and layout-2 baseline fixtures") is a stub body whose real
+  prerequisites are the owner actions at `ROADMAP.md:122` (approve and push `v1.0.0-beta.1`) and its
+  own sub-issue #349 (`v1.0.0-rc.1` tag, marked owner). It is left **Needs human**.
+- Reviewer reliability is also a capacity question: the fixed reviewer route has now produced two
+  30-minute timeouts and one degenerate (incoherent) answer on large diffs. Briefs are capped at four
+  questions and twelve tool calls; a degenerate run is treated as "review not performed" and retried
+  once, and a second failure is escalated rather than looped.
+
+**Needs human:** the beta tag approval/push (`ROADMAP.md:122`, sub-issue #349), the honesty-page
+narrative (`:100`), making the ghcr.io package public (`:99`), the `parquet`/`arrow-buffer` upstream
+reports (`:101`), and D-S21's privileged power-loss validation (`:77`) — plus a quiet host window
+(and the T7 reference drive on 10 Gbps, `:112`) before the TSBS and calibration items can run.
 ## 2026-11-20 — A roadmap line may not promise a leg the pin vocabulary forbids (#236) (landed as PR #833)
 
 **Question.** `ROADMAP.md` line 166 (at the time) read "Upgrade/rollback procedure, exercised against the previous release". That bundles two claims. The upgrade half is real: CI job `compat` runs `LEG_RUNNERS["0.1.0"]["upgrade"]` — `weftdb/tests/compat_v010.rs::a_v010_store_migrates_forward_and_keeps_reading_its_own_values` — against the sole pinned release `v0.1.0` (commit `b9a8ee42`), whose `legs` field admits only `["upgrade"]`. The rollback half has no runner: `compat/releases.toml` has no `rollback` leg anywhere, `releases.LEGS == {"upgrade"}`, and `scripts/compat/test_leg_coverage.py` keeps rollback only in `SUBSTITUTE_RUNNERS` (a store-format-marker tamper stand-in) precisely because no runner may claim that leg. FRE-16 (2026-11-10) declared rollback-after-writes unsupported for 1.0, and the pin rule says a pin may declare only what CI truly executes.
