@@ -8551,6 +8551,18 @@ handle (the four `SealBackedRejected` guards) rather than change signatures that
 "remove the fallbacks"; doing it here would mean an API break with no test of
 its own, and the ordering the operator set (#800 -> #801 -> #802 -> #803) keeps
 the fallback removal in #802 where its blast radius can be measured.
+## 2026-11-19 — A dependency exception is only real if the tool can expire it (#794, DENY-PIN)
+The exception for RUSTSEC-2026-0543 (unmaintained `chrono`) has carried the sentence "revisit by 2027-01-31" since PR #790 wrote it, and nothing checked that date: cargo-deny 0.21.0 (2026-11-16) added `advisories.ignore[].expiry`, and the CI pin (`EmbarkStudios/cargo-deny-action @3c63498`, Dockerfile `deny_version="0.20.2"`) rejected the key outright with `error[unexpected-keys]: found 1 unexpected keys, expected: ["id", "reason"]`. So the deadline was documentation, and documentation is the kind of deadline that passes silently.
+
+**The decision** — bump the pin to the commit the `v2.1.2` tag peels to, `70f81531115945ba6eb6b941ec9d39d063438eb9` (its Dockerfile pins `deny_version="0.21.0"`), and give the ignore entry `expiry = "2027-01-31"`, an absolute ISO-8601 date rather than a duration: a duration is relative to the advisory's publish date, which is not the date the plan says the migration to `time`/`jiff` (#791) is due.
+
+**The alternatives** — (a) leave the pin and keep the prose deadline, which keeps a checked-in file describing a limitation that no longer has to exist; (b) add a global `advisories.ignore-expiry = "P90D"` default so every future exception expires on its own, rejected: it would silently govern exceptions nobody reviewed yet, and a default expiry on an exception someone intended as permanent turns a green CI red with no decision behind it. The per-entry key keeps each expiry a deliberate act.
+
+**The trap for the next person** — a GitHub tag ref is not always a commit: `v2.1.2` resolves first to an annotated tag object (`995303aa1216…`), and pinning a workflow to that object is invalid. Peel it (`gh api …/git/tags/<sha>` → `.object.sha`) before writing the pin. `scripts/ci/check-action-pinning.py` only verifies that the reference is 40 hex characters, so it cannot tell a tag object from a commit.
+
+**What this does not do** — it does not fix the advisory. `arrow 60.1.0` still requires `chrono ^0.4.40`, chrono 0.4.45 is the newest release, and the nine manifests that depend on chrono directly plus the arrow-flight path that pulls it transitively cannot move off it. When 2027-01-31 passes, cargo-deny re-reports the advisory and emits `advisory-ignore-expired` at the value: that red is the point.
+Filed as #794; the exception itself is #790 and the migration is #791.
+
 ## 2026-11-19 — The idempotency unit is the call, not the payload (#803)
 
 - **Rejected: single-use `DatasetId` as the key.** Oracle option B would repurpose `DatasetId` as

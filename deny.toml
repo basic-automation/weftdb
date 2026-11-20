@@ -12,13 +12,14 @@ ignore = [
     # upgrade. As of 2026-11-17 the newest release is 0.4.45, and arrow 60.1.0 still
     # requires chrono ^0.4.40, so neither the nine manifests that depend on chrono
     # directly nor the arrow-flight path that pulls it in transitively can move off it.
-    # The date below is a deadline on purpose, but it is written rather than enforced:
-    # cargo-deny 0.21.0 (2026-11-16) added an `expiry` key for ignore entries, and the CI
-    # pin (EmbarkStudios/cargo-deny-action v2, Dockerfile `deny_version="0.20.2"`) rejects
-    # it with `error[unexpected-keys]: found 1 unexpected keys, expected: ["id", "reason"]`.
-    # #794 bumps that pin; until it lands this deadline is held by the reason text and by
-    # `DECISIONS.md`. Filed as #790.
-    { id = "RUSTSEC-2026-0543", reason = "unmaintained, no upgrade path: chrono 0.4.45 is the newest release and arrow 60.1.0 requires chrono ^0.4.40; moving to time or jiff is #791; revisit by 2027-01-31" },
+    # The deadline is enforced, not just written: `expiry` is an absolute ISO-8601 date,
+    # and once it passes cargo-deny re-reports the advisory and emits
+    # `advisory-ignore-expired` pointing at the value, so the exception cannot silently
+    # outlive its date. cargo-deny 0.21.0 (2026-11-16) added the key; the previous CI pin
+    # (EmbarkStudios/cargo-deny-action v2 = Dockerfile `deny_version="0.20.2"`) rejected it
+    # with `error[unexpected-keys]: found 1 unexpected keys, expected: ["id", "reason"]`,
+    # which is why the exception was documentation-only until #794 bumped the pin.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, no upgrade path: chrono 0.4.45 is the newest release and arrow 60.1.0 requires chrono ^0.4.40; moving to time or jiff is #791", expiry = "2027-01-31" },
 ]
 
 # An ignore that stops matching is a bug, not a free pass: the entry is stale, the
