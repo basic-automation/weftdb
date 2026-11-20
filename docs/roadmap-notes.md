@@ -739,3 +739,25 @@ test that completes normally without setting the env var.
 
 Env var: `WEFT_MAINTENANCE_MAX_OP_SECONDS` (`Tier::Experimental`), parsed at
 `SegmentStoreOptions::from_env()` in `segment_store.rs:538-539`. Unset = unbounded.
+
+## Routine 2026-11-19 — Phase 12 wrapper reconcile, Turso re-check, handoff
+
+**Wrapper reconcile.** The six empty wrapper lines at the top of Phase 12 in `ROADMAP.md` were removed: the four `START HERE` lines (2026-11-11 filed, 2026-11-11 rewritten, 2026-10-11, 2026-10-09) and the two dated routine lists (2026-10-08, 2026-09-23). They had no sub-items left. Each item their prose (under "Immediate next actions" above) still names was checked against `ROADMAP.md` before the delete:
+
+- UDDSketch timing rerun on a quiet host: the open sub-item under **NEXT — UDDSketch** in Phase 25.
+- Real-filesystem ENOSPC test for #656: ticked in Phase 12.
+- Select on the mantissas when a partial is not merged (#401): the open item in Phase 25.
+- Dictionary occurrence footprint: shipped in 0.3.3 (#699), as recorded above.
+- The GPU-contention flake and the `float_roundtrip` whole-request figure: both ticked in Phase 12.
+- Memory per database file (the RSS question filed 2026-11-08): no `ROADMAP.md` line. It stays as prose above, because the owner's `p12/fanctl-correlation-growth` lane is working on it now (per-row memory probe, connection reuse). No item was added, to avoid claiming it.
+
+The matching empty bold headers in this file ("START HERE (filed 2026-10-11 …)", "(2026-10-08 list.)" and so on, under "Immediate next actions") are left as they are. They are a record, and this run did not change those lines.
+
+**Research: Turso MVCC checkpoint fix, re-checked 2026-11-19.** All primary sources:
+
+- [tursodatabase/turso#7480](https://github.com/tursodatabase/turso/issues/7480) is still **open**.
+- The fix, [turso#9770](https://github.com/tursodatabase/turso/pull/9770), is still **unmerged**. A stale-bot warning on 2026-11-16 said it would close after 7 days without activity. The author rebased it onto current `main` on 2026-11-17, with the regression test moved to `tests/integration/mvcc/database.rs`. Turso's automated reviewer marked it "looks good to merge" on 2026-11-18, but no maintainer has approved it.
+- [Releases](https://github.com/tursodatabase/turso/releases): stable is still **0.8.3** (2026-10-12). The newest prerelease is 0.8.4-pre.3 (2026-11-12), and its notes have no MVCC checkpoint or logical-log line. The workspace pins `turso = "0.8"` (resolved 0.8.1).
+- Conclusion: nothing has changed for this repo. The non-Linux SIGKILL exclusion stands. Watch #9770 for a merge before the stale window closes again, and then for the first release that carries it.
+
+**Handoff for the next run.** Phase 12's open items are all held: ROB-14 (the `p787` and `p810` lanes, active 2026-11-17; cut 2 merged in #805), TTL-PURGE and TTL-UNIT (#810, the `p799` worktree), and SEAL-* (#811–#819). The rest are owner-gated. In Phase 13, the TAG-12 fan-out arm is held by #809. TAG-12's TSBS half (`single-groupby-1-1-1` and `lastpoint` over the whole TSBS file tagged by `hostname`) still needs a quiet host. On 2026-11-19 the host had a load average of 36 and 9 GB of 124 GB available, with a 59 GB `strata` process resident.
