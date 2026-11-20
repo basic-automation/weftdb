@@ -8636,6 +8636,60 @@ arrives through `nursery`, so a public item whose first doc paragraph runs past 
 fails `cargo clippy --workspace --all-targets --all-features` with exit 101. Keep first paragraphs to
 one line and put the rest in a second paragraph.
 
+## 2026-11-20 — "Starting from the first tagged pre-release" when every tag is 0.x (#241) (landed as PR #831)
+
+**Context.** ROADMAP.md line 175 reads "**Semver policy + `CHANGELOG.md`**, starting from
+ the first tagged pre-release". Every tag at the time of writing (v0.1.0 through v0.3.7) is a
+ 0.x ordinary release, not a semver pre-release. The audit found the changelog already
+ complete back to v0.1.0 (11 tags, 11 sections, 11 compare links).
+
+**What the line actually meant.** The "starting from the first tagged pre-release" half
+ was already satisfied. The missing half was a **pre-release sectioning policy** for
+ semver-style tags (v1.0.0-beta.1, v1.0.0-rc.1, …) that the roadmap intends to cut before
+ 1.0.0. The gap was not in the changelog's coverage of 0.x releases but in the documented
+ policy for how those future tags interact with CHANGELOG.md.
+
+**Chosen: the policy (docs/stability.md:47) states:**
+- 0.x tags are ordinary releases, not pre-releases.
+- Each pre-release tag gets its own CHANGELOG.md section, cut from Unreleased.
+- Betas accept fixes only; a new pre-release line (`.2`, `.3`) may be cut for a fix round.
+- Promoting an rc to v1.0.0 re-labels the section; nothing is rewritten or dropped.
+- Pre-release sections are **not** merged retroactively.
+
+**What promotion means.** Promoting an rc to v1.0.0 relabels the section's date to the v1.0.0
+ release date and its heading from `## [X.X.X-rc.N]` to `## [1.0.0]`; the entries themselves
+ are unchanged. This makes the changelog a faithful record of what each artifact contained,
+ not a curated narrative that hides the prerelease path. A reader comparing v1.0.0-beta.1
+ and v1.0.0 can see exactly what changed between them.
+## 2026-11-20 — What "links to a benchmark artifact" can mean when no figure has an artifact (#243) (landed as PR #832)
+
+**Context.** The roadmap line "Every performance claim in the README links to a benchmark artifact"
+requires each README figure to be backed by a traceable artifact. The README has no bare numeric
+figures: its claims are qualitative (wins/losses) and point readers to the committed pooled
+cross-engine report at `bench/reports/phase1-pooled/`.
+
+**Chosen: "links to a benchmark artifact" means the README must point to a committed report or
+pipeline artifact that contains the figure, or to `docs/methodology.md` when the statement is a
+meta-claim about honesty rather than a specific benchmark number. The existing README already does
+this.**
+
+- The meta-claim about "honest numbers" (README:49) links to `docs/methodology.md` — it is a
+  process claim, not a performance figure. It stays as-is.
+- "The latest pooled run is in `bench/reports/phase1-pooled/`" (README:182) links to a committed
+  report directory — the artifact is the committed tree, re-runnable from a clone. The marker
+  `<!-- claim:cross-engine-2026-11-02 -->` was added to trace that connection.
+- The qualitative wins/losses were softened from inline prose to "see that report for where WeftDB
+  wins and loses" — no new figure was created, and the unregistered bullet text was removed.
+- No figure quoted in the README is produced by a pipeline artifact (the nightly gate publishes
+  `nightly-interpolation`, which no entry quotes). Every existing `bench/claims.json` entry has
+  `artifact: null`, which is correct: no pipeline artifact produces those figures. An `upload-artifact`
+  step was not added because no existing workflow runs the exact workload any figure cites.
+  Adding a producer without benchmarking hardware would amount to speculative scaffolding.
+
+**Result:** the roadmap line is ticked. Every README performance statement is either linked to a
+committed artifact (`bench/reports/phase1-pooled/`) or to the methodology rules
+(`docs/methodology.md`). The registry gained the `cross-engine-2026-11-02` entry for the pooled
+report, and `check_claims.py` passes.
 ## 2026-11-20 — TAG-12-B: one interleaved crash cell instead of the fault-point cross-product (issue #341)
 
 - **Ambiguity in the slice brief.** "Add the multi-series crash matrix" does not say whether
@@ -8783,3 +8837,9 @@ and the breaker would always pass — a gate that never fires.
 baseline could be moved to a tag reference. Until then, the committed copy is the only reliable
 anchor.
 
+
+## 2026-11-17 — Ticking 7.3 and 7.5 from their shipped parts, and dropping the routine's empty Phase 12 wrappers (7.3, 7.5)
+
+- **The call.** Neither Phase 13 parent has an acceptance test of its own: each line names its parts in parentheses (7.3: D-S12 + ROB-8/9/22 + HTTP restore; 7.5: ROB-19/20/21, with "query consistency, cancellation, and resource limits" in the title). Every part is recorded as shipped (the Phase 6/10 summaries, the ticked Phase 12 lines for ROB-22, ROB-20, X-READ and the restore route), and umbrella #212's three sub-issues are closed as completed. So the routine ticked both parents, listed each part as a `[x]` sub-item with the test that pins it, and re-ran those tests on `435553e` rather than trusting the summaries. 47 passed, 0 failed.
+- **What is not claimed.** The ROB-20 limits are written into 7.5's parenthetical instead of being dropped: the time budget is honoured between swaps only, and a single already-oversized segment is not auto re-split. Whoever owns the beta bar can reopen 7.5 by unticking it if they read those limits as blocking. The "Phase 7 acceptance run" line in the 1.0 release criteria is a separate gate and is not touched.
+- **The wrappers.** The four `START HERE` lines and the two dated run lists at the top of Phase 12 were empty one-line checkboxes. Their prose already lives in `docs/roadmap-notes.md` under *Immediate next actions*, and every item they handed over has shipped (the dictionary occurrence footprint, #612/#699, and memory per database file, #699, both in the Phase 11 summary; the ENOSPC test, the GPU flake and the `float_roundtrip` figure, ticked in Phase 12) or is tracked in Phase 25 (the UDDSketch timing rerun and #401). They are deleted, not ticked, because there was nothing to ship.
