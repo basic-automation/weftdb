@@ -23,6 +23,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **Multi-series crash cell (TAG-12, issue #341).** A new fault-injection test
+  (`multiseries_crash`) writes interleaved frames across 8 series, then aborts the process
+  with SIGABRT part-way through a second batch on one of them. The parent reopens the
+  store cold and checks that every series still reads back exactly the rows that committed
+  before the kill, and that each series name still resolves to the id recorded before the
+  crash. Replaying the store's committed frames series by series, which is the stronger
+  claim the roadmap's crash-matrix line asks for, is a separate TAG-12 item and is not
+  asserted here. Registering the cell's child marker `WEFT_MULTISERIES_CRASH_CHILD` added
+  one Test-tier settings variable.
+
 - **The bulk-ingest path (`ingest_batch`) now runs the fragmentation gate (#232).**
   A new `ingest_batch_with_gate(store, aspect_id, dataset_id, rows, squash_target_rows)`
   does the existing ingest then calls
@@ -249,6 +259,20 @@ origin/main
 
 ### Testing
 
+- **Multi-series cells in the crash matrix (TAG-12).** `weft-bench --failure kill-ingest-tagged`
+  (and every `--crash-matrix` run, which takes `Failure::ALL`) kills a child process with `SIGKILL`
+  while it ingests each batch into three tagged series of one aspect (`host=s0..s2`) through the
+  tagged `SegmentStore::ingest` path. Each series holds values offset by its own number, so a row
+  served from the wrong series reads back wrong. The reopened store must hold exactly each series'
+  acknowledged rows, and only the series whose ingest was in flight may hold that one batch more;
+  then every series resumes and must finish whole. `--failure kill-compaction-tagged` seals the
+  same three series batch by batch, so their segments interleave, and kills a child compacting the
+  aspect. Every series must still hold all of its rows exactly, `fsck` must quarantine nothing,
+  and a rerun of the compaction must keep them exact. Like the other SIGKILL cells, both run on
+  Linux only (tursodatabase/turso#7480). `--failure corrupt-segment-tagged` flips one seeded byte
+  in a closed store of the three series. Every row a series still serves must be its own series'
+  right value, rows a series lost must be under a quarantine record, and because a segment
+  belongs to one series, at most one series may lose rows.
 - **The compatibility-leg gate maps legs to things, and carries a category for stand-ins
   (#762).** `scripts/compat/test_leg_coverage.py` compared a pinned release's declared legs
   against a set holding the one string `"upgrade"`, in one direction, and named no test, no
