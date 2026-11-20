@@ -796,3 +796,11 @@ The matching empty bold headers in this file ("START HERE (filed 2026-10-11 …)
 1. TSBS `single-groupby-1-1-1` and `lastpoint` as the first two tag-grouped queries in `weft-xbench`, after ingesting the whole TSBS file tagged by `hostname`.
 2. The fan-out benchmark. Both (1) and (2) are benchmarks, so they need a quiet host; this run's load average was 24–33 on 16 cores with the model server resident.
 3. "Tagged fixtures and freeze docs" needs the owner to say what it means. The tagged frame golden already exists (`weft-physical-type/tests/golden/frame_v7_envelope_series_key.bin`); a tagged whole-store compat fixture beside `weftdb/tests/fixtures/pre_v2_store` is the likely reading.
+
+**TSM-Bench query spec adoption (P394, 2026-11-20).** ROADMAP.md:246 ticked.
+`docs/research/tsm-bench-query-spec.md` published: Q1–Q7 canonical SQL extracted from the
+Khelifati et al. PVLDB 2023 paper; Garcia/Seltzer 2015 source unverifiable behind Cloudflare.
+Gap analysis: Q5 (`--gap-fill`) is the only existing arm that explicitly identifies itself as a
+TSM-Bench query; Q1 (`--range-fetch`) is the next closest; Q2/Q3/Q6/Q7 need new arms.
+Staged adoption plan with five stages (Q5 formalization → Q1 adaptation → Q4 stored-data path
+→ Q2/Q3/Q6/Q7 new arms → cross-engine gate). No cargo / no Rust files touched.
