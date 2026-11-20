@@ -105,8 +105,16 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 
 ## Phase 13 — Contract candidate (was W9 gates and W11)
 
-- [ ] **7.3 Corruption detection** (D-S12 + ROB-8/9/22 + HTTP restore)
-- [ ] **7.5 Compaction** with query consistency, cancellation, and resource limits (ROB-19/20/21)
+- [x] **7.3 Corruption detection** (D-S12 + ROB-8/9/22 + HTTP restore) (2026-11-20 audit: every named component is closed. D-S12 landed 2026-10-29 (`DECISIONS.md:3570`) — startup recovery, quarantine with TTL (`weftdb/src/types/quarantine.rs`) and the fsck endpoint (`weft-server/src/routes.rs:967` `POST /api/v1/storage/fsck`, scope `maintain`); ROB-8 frame decode hardening (#265), ROB-9 mutation harness for frames, sidecars and Parquet (#315) and ROB-22 frame-fault policy verification (#446) plus the suspect-frame policy and background-decode crash-loop breaker (#720) are closed; restoring into a chosen new root over HTTP landed 2026-11-14 (#213, `POST /api/v1/storage/restore/into?label=…&name=…` → `WEFT_RESTORE_BASE_DIR/<name>`)
+  - [x] D-S12 startup recovery, quarantine with TTL, the fsck endpoint and the `/ready` report (Phase 6; `POST /api/v1/storage/fsck` in `weft-server/src/routes.rs`; `startup_recovery_quarantines_a_corrupt_frame`, `fsck_rebuilds_a_row_whose_length_is_stale`)
+  - [x] ROB-8 hardened frame decoding (Phase 6; `weft-server/tests/frame_fault.rs`)
+  - [x] ROB-9 mutation harness over frames, sidecars and Parquet (Phase 10; `weft-arrow-store/tests/parquet_mutation.rs`, `weft-physical-type/tests/mutation.rs`)
+  - [x] ROB-22 suspect-frame policy and decode crash-loop breaker (Phase 12, #740; `suspect_frame_policy_tests`, `types::quarantine::tests`)
+  - [x] Restore into a chosen new root over HTTP (Phase 12, #739; `weft-server/tests/restore_into.rs`)
+- [x] **7.5 Compaction** with query consistency, cancellation, and resource limits (ROB-19/20/21) *(reconciled 2026-11-17 by the routine from its parts, all shipped; the evidence tests below were re-run on `435553e` and pass. The limits ROB-20's line states carry over: the time budget is honoured between swaps only, and one already-oversized segment is not auto re-split.)*
+  - [x] Query consistency: readers never error or see a merged member beside its output (`swap_tests::a_reader_looping_during_merges_never_errors_or_sees_a_member_beside_its_output`), with read-time newer-wins across overlapping segments (X-READ, Phase 12)
+  - [x] Cancellation: ROB-21 (`MaintenanceCancel` on the store-wide sweeps, RAII guards, maintenance metrics; `segment_store::cancel_tests`, `weft-server/tests/maintenance_busy.rs`)
+  - [x] Resource limits: ROB-19 scheduler with per-aspect breaker, and ROB-20 byte, disk-reserve and time budgets with `merge_k_way` and output re-split (#765, #761, #781, #772, #773)
 - [x] **Compatibility tests** (FRE-13 + PAC-14a) (2026-11-16, #240: legs A and C are on main and green — run 43759178987 at `8b00486` succeeded, and all ten `weftdb/tests/compat_v010.rs` tests report `ok` in `test (ubuntu|windows|macos)`, including `v010_compat_fre13_upgrade_contract` (leg A: a store the real v0.1.0 binary wrote, read by this build) and `v010_compat_fre13_rollback_after_writes_loses_nothing` (leg C); `UPGRADING.md` and `compat/releases.toml` pin v0.1.0. The third leg those files name, `binary` — a released binary reading a store this build wrote — still has **no** runner: that gap is #762, and it is not claimed by this line.)
 - [ ] Ship honesty pages / **Honesty pages shipped** (EVI-16, EVI-17 and the owner narrative)
 - [ ] Move the T7 reference drive (`/mnt/weftbench`) to a 10 Gbps port before calibration *(owner)*
@@ -114,6 +122,11 @@ The phase also cleared the remaining loose ends. The stale README status was fix
   - [x] Extend the release tag grammar to `vX.Y.Z-beta.N` (`TAG_RE` in `scripts/release/verify.sh`)
 - [x] **FRE-10b** Contract tests: storage and operator endpoints, plus coverage
 - [ ] **TAG-12** Multi-series crash matrix, fan-out and TSBS benchmarks, fixtures, freeze docs
+  - [x] Multi-series ingest crash cell: `kill-ingest-tagged` in `Failure::ALL` (2026-11-17, `routine/weftdb-2026-11-17`: three tagged series of one aspect, per-series acknowledged-rows and exactness gate, resume to whole; `crash_matrix_tests` passes it at seeds 5 and 6, and a wrong-series read mutant fails it. Linux only, like the other SIGKILL cells, until tursodatabase/turso#7480 is fixed)
+  - [x] Tagged `kill-compaction` and `corrupt-segment` cells (2026-11-17, `routine/weftdb-2026-11-17`: `kill-compaction-tagged` (every series exact after a SIGKILLed compaction, `fsck` clean, rerun exact) and `corrupt-segment-tagged` (served rows are their own series' values, losses are quarantined, at most one series loses rows); each fails a wrong-series mutant through the CLI. The matrix is six cells, and its CI runtime with the three tagged cells is not yet measured)
+  - [ ] Fan-out benchmark (one tagged write or read across many series)
+  - [ ] TSBS tag-grouped query suite in `weft-xbench` (`--tsbs` reads only `host_0` today; `single-groupby-*`, `double-groupby-*`, `lastpoint`, `high-cpu-*` group by `hostname`)
+  - [ ] Tagged fixtures and freeze docs
 - [x] **ROB-24** Limits and overload evidence; frozen configuration documentation
 - [x] **SOA-15** part 2: TTL lane
 
@@ -172,7 +185,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] README *Project status* table updated to reflect 1.0 and the status badge changed from `pre-beta`
 - [ ] **PAC-18** Cut 1.0.0: binaries, image, release notes
   - [ ] Approve and push the **v1.0.0** tag *(owner)*
-- [ ] **Semver policy + `CHANGELOG.md`**, starting from the first tagged pre-release
+- [x] **Semver policy + `CHANGELOG.md`**, starting from the first tagged pre-release
 
 ## Phase 22 — Connectors and ingest interop
 

@@ -2043,13 +2043,23 @@ What it does today:
   an hour went 0.18 → 0.25 ms, a day 0.25 → 0.30 ms and 30 days held (1.51 → 1.50 ms), while
   the year window got faster (13.8 → 11.3 ms); the store went 1.414 → 1.357 B/pt, where
   single-block output gave 1.341 (2026-11-03).
-- **Failure tests** (`--ingest --failure kill-ingest|kill-compaction|corrupt-segment|all`) — a
+- **Failure tests** (`--ingest --failure kill-ingest|kill-ingest-tagged|kill-compaction|kill-compaction-tagged|corrupt-segment|corrupt-segment-tagged|all`) — a
   benchmark of a healthy store says nothing about the one a crash leaves. A child process (this
   binary) seals the corpus, or compacts a store of it, and is killed with `SIGKILL` at a seeded
   point; or one seeded byte of a closed store's segment is flipped. The reopened store must hold
   every acknowledged row exactly, at most the batch in flight beyond them, and set a damaged
   segment aside rather than serve it: open-time recovery quarantined the frame for every one of
-  143 byte positions flipped in a probe. Each test is one report; its latency is the reopen time.
+  143 byte positions flipped in a probe. `kill-ingest-tagged` (TAG-12) kills the child while it
+  ingests every batch into three tagged series of one aspect (`host=s0..s2`, each holding
+  different values) through the tagged ingest path: each series must hold exactly its own
+  acknowledged rows, only the series in flight may hold one batch more, and every series must
+  then resume and finish whole. `kill-compaction-tagged` kills a compaction of those three series
+  (sealed batch by batch, so their segments interleave): every series must still hold all of its
+  rows exactly, `fsck` must quarantine nothing, and a rerun of the compaction must keep them exact.
+  `corrupt-segment-tagged` flips a byte in a store of those three series: every row a series still
+  serves must be its own right value, and because a segment belongs to one series, at most one
+  series may lose rows.
+  Each test is one report; its latency is the reopen time.
 - **Crash matrix** (`--ingest --crash-matrix`, `scripts/crash-matrix.sh`, `.github/workflows/crash-matrix.yml`) — the subprocess SIGKILL soak as one judged matrix (D-S21, SOA-9 `crash_kill9`): every failure test at every matrix seed (3 seeds by default, `--crash-matrix-seeds`), one report holding every cell, and the run fails if any cell fails. The script adds the fault-injection crash matrix (`weftdb`'s swap-point matrix, the orchestration legacy-queue crash test, the server's poisoned-ready test) and stages the report through EVI-4's artifact pipeline as the `bench-report` artifact. The matrix claims process-crash durability only: a kill soak cannot see a missing fsync, so the privileged power-loss validation stays an owner task.
 - **More report surfaces** (`--markdown-report`, `--csv-report`, `--prom`, or
   `weft-bench export REPORT.json --format md|csv|prom`) — the same results as a Markdown table, CSV
