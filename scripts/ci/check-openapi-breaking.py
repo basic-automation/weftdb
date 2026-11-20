@@ -284,14 +284,20 @@ def _compare_schemas(
             )
         return
 
-    # --- Nullable change ---
+    # --- Nullable change (both directions) ---
     base_null = _has_nullable(base_schema)
     curr_null = _has_nullable(curr_schema)
-    if not base_null and curr_null:
-        findings.append(
-            f"BREAKING always-present-nullable {path_hint}: "
-            "not nullable -> nullable"
-        )
+    if base_null != curr_null:
+        if not base_null and curr_null:
+            findings.append(
+                f"BREAKING always-present-nullable {path_hint}: "
+                "not nullable -> nullable"
+            )
+        else:
+            findings.append(
+                f"BREAKING nullable-always-present {path_hint}: "
+                "nullable -> not nullable"
+            )
 
     # --- Type shape change ---
     base_clean = _without_nullable(base_schema)

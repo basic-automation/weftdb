@@ -322,6 +322,139 @@ class TypeChangeTest(unittest.TestCase):
 # Nullable changes (both OpenAPI spellings)
 # ===================================================================
 
+class NullableToAlwaysPresentTest(unittest.TestCase):
+    """Nullable -> always-present response field is also breaking (tightening)."""
+    """Nullable -> always-present response field is also breaking (tightening)."""
+
+    def _non_nullify_via_nullable_false(self) -> None:
+        """3.0 spelling:``nullable: true`` -> ``nullable: false``."""
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body(
+                            _obj_schema(
+                                {
+                                    "total": {
+                                        "type": "integer",
+                                        "nullable": True,
+                                    }
+                                },
+                                ["total"],
+                            )
+                        ),
+                    },
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body(
+                            _obj_schema(
+                                {"total": {"type": "integer"}}, ["total"]
+                            )
+                        ),
+                    },
+                ),
+            },
+        })
+        base_norm = cob._normalise(base)
+        curr_norm = cob._normalise(curr)
+        findings = cob.compare(base_norm, curr_norm)
+        self.assertTrue(
+            any("BREAKING" in f and "nullable" in f for f in findings),
+            f"expected a nullable finding, got {findings}",
+        )
+
+    def test_nullable_true_to_false_fails(self) -> None:
+        self._non_nullify_via_nullable_false()
+
+    def test_nullable_type_array_to_single_fails(self) -> None:
+        """3.1 spelling: ``type: ["integer", "null"]`` -> ``type: "integer"``."""
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body(
+                            _obj_schema(
+                                {
+                                    "total": {
+                                        "type": ["integer", "null"],
+                                    }
+                                },
+                                ["total"],
+                            )
+                        ),
+                    },
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body(
+                            _obj_schema(
+                                {"total": {"type": "integer"}}, ["total"]
+                            )
+                        ),
+                    },
+                ),
+            },
+        })
+        base_norm = cob._normalise(base)
+        curr_norm = cob._normalise(curr)
+        findings = cob.compare(base_norm, curr_norm)
+        self.assertTrue(
+            any("BREAKING" in f and "nullable" in f for f in findings),
+            f"expected a nullable finding, got {findings}",
+        )
+
+    def test_delete_nullable_key_fails(self) -> None:
+        """Deleting ``"nullable": true`` key (becomes absent) is breaking."""
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body(
+                            _obj_schema(
+                                {
+                                    "total": {
+                                        "type": "integer",
+                                        "nullable": True,
+                                    }
+                                },
+                                ["total"],
+                            )
+                        ),
+                    },
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body(
+                            _obj_schema(
+                                {"total": {"type": "integer"}}, ["total"]
+                            )
+                        ),
+                    },
+                ),
+            },
+        })
+        base_norm = cob._normalise(base)
+        curr_norm = cob._normalise(curr)
+        findings = cob.compare(base_norm, curr_norm)
+        self.assertTrue(
+            any("BREAKING" in f and "nullable" in f for f in findings),
+            f"expected a nullable finding, got {findings}",
+        )
+
+
 class AlwaysPresentToNullableTest(unittest.TestCase):
     """Always-present -> nullable response field is breaking."""
 
