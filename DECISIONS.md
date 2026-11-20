@@ -8765,3 +8765,49 @@ section instead. The store-side parser is the single parse point (`row_expiry_po
 `weftdb/src/types/segment_store.rs`); `docs/config-schema.md` and the `settings.rs` `VarSpec`
 summary were rewritten to match, since both previously promised "there is no seconds-based
 conversion".
+
+## 2026-11-20 — BigDecimal precision-boundary inventory (#840)
+
+**Context.** The B-precision roadmap item (Phase 4/6 · partial) calls for a BigDecimal math audit.
+This slice (BPREC-1) produces a comprehensive inventory of every place BigDecimal gains or loses
+precision, grouped by crate, with each site labelled exact, lossy by construction, or lossy by policy.
+
+**Question.** How should the inventory judge precision boundaries where the code uses a shortest
+round-trip decimal (`decimal_from_f64`) rather than the exact binary expansion (`BigDecimal::from_f64`)?
+
+**Decision.** Label every `decimal_from_f64` and `widen_json_value` site **exact**. The shortest
+round-trip decimal is a deliberate design choice (decision 11, FRE-8b) that keeps the decimal the
+client wrote, not the binary expansion. The conversion is information-preserving for every input
+that passes through it: it is the decimal the sender would recognize, and it round-trips to the
+same `f64`. Sites using `BigDecimal::from_f64` (exact binary expansion) are labelled **lossy by
+construction**, since those appear only in test fixtures and synthetic-value generation.
+
+**Question.** Sites that already use `f64` for arithmetic (e.g., comparison thresholds, bench
+metrics, chart axes) and then construct a `BigDecimal` — are they "lossy by construction"?
+
+**Decision.** Yes, they are **lossy by construction**. The precision was already lost at the `f64`
+hop, and the subsequent `BigDecimal::from_f64` (or equivalent) just records the already-rounded
+value. The inventory lists the `to_f64` extraction site, not the re-construction, as the precision
+boundary.
+
+**Question.** Division operations (`fill.rs:200`, `scaled.rs:281`) use BigDecimal's own division
+(default 100 decimal places). How should these be labelled?
+
+**Decision.** **Lossy by policy** — the division precision is a finite (though large) limit, and
+non-terminating rationals will be truncated. 100 decimal places is sufficient for every practical
+measurement value in the workspace, but the API boundary is still a lossy choice and is labelled
+accordingly.
+
+**Boundary and residue.** This inventory covers every BigDecimal mention in the workspace
+(~1,620 total across 12 crates) and every precision-bearing pattern. It does **not** propose
+any fix, change, or migration: it is a factual starting point for subsequent B-precision slices
+that may improve simplification, division precision docs, or integer-native reduction paths.
+The `ROADMAP.md` line 283 stays unticked — only the inventory half of the B-precision item is
+complete.
+
+**Rejected.** Proposing a default division precision change or a `Decimal128` scale recommendation
+in this slice — those are scope for later slices. Also rejected: silently marking sites "needs
+attention" where the code already documents its trade-off.
+
+**Needs human.** None: this is a read-only inventory with no code changes and no merge conflict
+risk.

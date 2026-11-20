@@ -452,6 +452,7 @@ The interpolation item (B-interp, Phase 5) is done.
 - **B-dedup** *(Phase 7 · partial)*
 - **B-sim** *(Phase 9 · partial)*
 - **B-precision** *(Phase 4/6 · partial)*
+  - 2026-11-20: BigDecimal precision-boundary inventory produced (`docs/research/bigdecimal-inventory.md`) (#840)
 - **B-resilience** *(Phase 4/7 · partial)*
 - **B-conncache** *(Phase 4/7 · partial)*
 - **B-msgpack** *(Phase 6 · absent)*
