@@ -155,6 +155,15 @@ jobs:
       - run: python3 -m unittest discover -s scripts/ci -p 'test_check_openapi_breaking.py' -v
         env:
           PYTHONDONTWRITEBYTECODE: "1"
+      # The baseline is a copy of the spec it polices; a PR must not move it
+      # silently. Assert the committed baseline matches its recorded digest (#838).
+      - run: |
+          expected=$(awk '{print $1}' compat/openapi/baseline/weftdb.json.sha256)
+          actual=$(sha256sum compat/openapi/baseline/weftdb.json | awk '{print $1}')
+          if [ "$expected" != "$actual" ]; then
+            echo "compat/openapi/baseline/weftdb.json moved without updating compat/openapi/baseline/weftdb.json.sha256" >&2
+            exit 1
+          fi
 
   # weft-xbench is its own workspace (it builds DuckDB from C++), so nothing else builds it on
   # every push. Its lock is seeded from the workspace's; this fails when a shared dependency
