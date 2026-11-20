@@ -718,8 +718,8 @@ async fn gate_one_token_different_payload_is_a_loud_conflict() -> Result<()> {
 
 	ingest_batch_with_gate(&store, &aspect_id, &dataset, "pin-conflict-token", &first, 4).await?;
 	let err = ingest_batch_with_gate(&store, &aspect_id, &dataset, "pin-conflict-token", &other, 4).await.expect_err("a different payload under one token must be refused");
-	let store_err = err.downcast_ref::<weftdb::Error>().expect("a weftdb error");
-	assert!(matches!(store_err, weftdb::Error::IdempotencyConflict { key, .. } if key == "legacy:pin-conflict-token"), "the conflict must name the offered key: {store_err}");
+	let store_err = err.downcast_ref::<weftdb::StoreError>().expect("a weftdb StoreError");
+	assert!(matches!(store_err, weftdb::StoreError::IdempotencyConflict { key, .. } if key == "legacy:pin-conflict-token"), "the conflict must name the offered key: {store_err}");
 	let read_back = read_rows(&store, &aspect_id, None, None).await?;
 	assert_eq!(read_back.len(), 2, "the conflict must write nothing");
 	assert_eq!(read_back[0].1, bd("1.0"), "the refused batch must not replace the recorded rows");
