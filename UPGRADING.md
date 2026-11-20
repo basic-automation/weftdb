@@ -205,21 +205,28 @@ a 1.0 compatibility promise.
 
 ---
 
-## Unreleased — seal idempotency key change (#803)
+## Unreleased — a caller-identity entry point for seal ingest (#803, #768)
 
-The legacy seal adapter no longer derives the idempotency key from a CRC-32 of the payload.
-Seal-backed typed-API writes without an explicit token now append (duplicate-timestamp writes
-resolve newer-wins at read, matching rows-mode's no-unique-constraint behaviour).  Callers who
-require byte-identical-retry replay must supply an explicit idempotency token: pass one to
-`weftdb::legacy_seal::ingest_batch_with_gate` — the token is a **required** argument, so the same
-token replayed with the same payload replays the receipt, while presenting a different payload
-under the same token is a loud `IdempotencyConflict` (HTTP 409).  Callers that want append-only
-semantics use `weftdb::legacy_seal::ingest_batch`, which mints a fresh token per call — exactly
-like an HTTP request with no `Idempotency-Key`.  HTTP clients are unaffected by this change: the server
-never enters the seal gate — it puts the `Idempotency-Key` header into `IngestBatch.key` and
-the store's own idempotency ledger answers a replay with `replayed: true`, pinned by
-`weft-server/tests/seal_idem_http_replay.rs` (#824).  The prior `legacy:{uuid}:{crc}:{n}`
-ledger rows are inert historical entries; the adapter never looks them up.
+The legacy seal adapter's idempotency key is **unchanged**: `weftdb::legacy_seal::ingest_batch`,
+which every legacy facade call site uses, still derives `legacy:{dataset_id}:{crc32-of-payload}:{row-count}`
+from the payload, so an identical re-run of the same call is still absorbed as a replay of the first
+receipt.  That absorption is what issue #803 reports, and through this entry point it is not fixable:
+`batch_capture_measurements(aspect_id, dataset_id, rows)` carries no call identity, so a retry and an
+identical new call are the same request by construction.
+
+What this release adds is the entry point callers can use in the meantime:
+`weftdb::legacy_seal::ingest_batch_with_gate(store, aspect_id, dataset_id, idempotency_token, rows, squash_target_rows)`
+keys the write `legacy:{token}`.  The token argument is **required**, so a new caller cannot opt out of
+replay protection by accident: replaying a token with the same payload returns the first receipt, and
+presenting a different payload under a token that is already committed is a loud
+`IdempotencyConflict` (HTTP 409 over the server) rather than a silent absorb.  Distinct tokens always
+write, even for byte-identical rows under one `DatasetId`.
+
+HTTP clients are unaffected either way: the server never enters the seal gate — it puts the
+`Idempotency-Key` header into `IngestBatch.key` and the store's own idempotency ledger answers a replay
+with `replayed: true`, pinned by `weft-server/tests/seal_idem_http_replay.rs` (#824).  Ledger rows
+written under the payload-derived key keep their shape and stay in the ledger; nothing was renamed and
+no ledger rows were invalidated.
 
 ## What is NOT guaranteed
 
