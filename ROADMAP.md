@@ -250,7 +250,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
   - [ ] **NEXT — the sidecar build.**
   - [ ] *(original item)* **a `ScaledI64`-native reduction fast path in `weft-reduce`**
 - [ ] **BENCHMARK HYGIENE — the synthetic ingest corpus flatters WeftDB, by a lot (measured 2026-07-23).**
-  - [ ] Audit the other `weft-bench` workloads' generators for the same class of flattery
+  - [x] Audit the other `weft-bench` workloads' generators for the same class of flattery *(audited 2026-11-20, #396 → `docs/research/bench-generator-audit.md`)*
     - [ ] **NEXT — a representative storage generator, or real-corpus defaults.**
     - [ ] **FOUND (2026-10-09) — `sketch_p99`'s published ~2.6× speed-up over exact `p99` was the generator's.**
       - [ ] **Research (2026-10-09) — a cheaper sketch index, if the sketch format is ever revised.**
