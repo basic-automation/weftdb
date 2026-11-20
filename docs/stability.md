@@ -44,6 +44,25 @@ assume that every route in that release's OpenAPI spec works as documented. The 
 maps one-to-one with the HTTP API; a client upgrade may lag the server by one minor
 version, but the SDK's own changelog names any compatibility shifts.
 
+### Pre-release tags (1.0.0-beta.1, 1.0.0-rc.1, …)
+
+`0.x` tags are ordinary releases, not semver pre-releases; the changelog baseline is
+`v0.1.0` (2026-10-08) and every release since has a section. Starting with the 1.0
+series:
+
+1. A semver pre-release tag (`v1.0.0-beta.1`, `v1.0.0-rc.1`, …) gets **its own**
+   `CHANGELOG.md` section, cut from `## [Unreleased]` at tag time with the tag date;
+   `Unreleased` then starts fresh.
+2. Between a beta and its first rc: fixes only, no new features and no breaking
+   changes; a new pre-release line (`.2`, `.3`) may be cut for a fix round, each
+   with its own section.
+3. Promoting an rc to `v1.0.0` moves that section's entries into the
+   `## [1.0.0] - <date>` section unchanged; nothing is rewritten or dropped in
+   promotion.
+4. Pre-release sections are **not** merged into one another retroactively: the notes
+   published at a beta are the notes that beta shipped with, so a reader can diff what
+   a given artifact contains.
+
 ---
 
 ## Surface stability table
