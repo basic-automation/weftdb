@@ -583,8 +583,8 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
   `docs/research/bench-generator-audit.md`.  10 generators were audited (plus the
   real-corpora entry points and size presets); 5 claims in `bench/claims.json` are
   flagged **suspect**, 1 claim (`sketch-claim-corrected`) was already corrected by #398,
-  and the remaining 8 claims are `unaffected` because they run on real data or a different
-  code path.  **No claim was withdrawn in this PR** — the suspect verdicts await a
+  and the remaining claims are `unaffected` — 5 outright, plus the BTC arm of
+  `interp-latency`, which splits — because they run on real data or a different code path.  **No claim was withdrawn in this PR** — the suspect verdicts await a
   coordinator decision, and #397 (a representative generator or real-corpus defaults)
   stays open.
 - **The seven slow `weft-orchestration` tests are bounded, and the three failures #402 recorded have no subject left (closed 2026-11-11).** Two entries sat here, and `4de2c691` ("the roadmap is a phased checklist; the prose moves to basicautomation.io") cut both mid-sentence, which is why they read as open work: the second, "Re-measured 2026-10-09 — still unbounded", was the tail of the bound-the-seven-tests item, and the first was the note that three failures were hiding behind the `SKIP_SLOW_TESTS` guard.
