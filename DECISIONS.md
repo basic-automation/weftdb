@@ -8636,6 +8636,84 @@ arrives through `nursery`, so a public item whose first doc paragraph runs past 
 fails `cargo clippy --workspace --all-targets --all-features` with exit 101. Keep first paragraphs to
 one line and put the rest in a second paragraph.
 
+## 2026-11-20 — "Starting from the first tagged pre-release" when every tag is 0.x (#241) (landed as PR #831)
+
+**Context.** ROADMAP.md line 175 reads "**Semver policy + `CHANGELOG.md`**, starting from
+ the first tagged pre-release". Every tag at the time of writing (v0.1.0 through v0.3.7) is a
+ 0.x ordinary release, not a semver pre-release. The audit found the changelog already
+ complete back to v0.1.0 (11 tags, 11 sections, 11 compare links).
+
+**What the line actually meant.** The "starting from the first tagged pre-release" half
+ was already satisfied. The missing half was a **pre-release sectioning policy** for
+ semver-style tags (v1.0.0-beta.1, v1.0.0-rc.1, …) that the roadmap intends to cut before
+ 1.0.0. The gap was not in the changelog's coverage of 0.x releases but in the documented
+ policy for how those future tags interact with CHANGELOG.md.
+
+**Chosen: the policy (docs/stability.md:47) states:**
+- 0.x tags are ordinary releases, not pre-releases.
+- Each pre-release tag gets its own CHANGELOG.md section, cut from Unreleased.
+- Betas accept fixes only; a new pre-release line (`.2`, `.3`) may be cut for a fix round.
+- Promoting an rc to v1.0.0 re-labels the section; nothing is rewritten or dropped.
+- Pre-release sections are **not** merged retroactively.
+
+**What promotion means.** Promoting an rc to v1.0.0 relabels the section's date to the v1.0.0
+ release date and its heading from `## [X.X.X-rc.N]` to `## [1.0.0]`; the entries themselves
+ are unchanged. This makes the changelog a faithful record of what each artifact contained,
+ not a curated narrative that hides the prerelease path. A reader comparing v1.0.0-beta.1
+ and v1.0.0 can see exactly what changed between them.
+## 2026-11-20 — What "links to a benchmark artifact" can mean when no figure has an artifact (#243) (landed as PR #832)
+
+**Context.** The roadmap line "Every performance claim in the README links to a benchmark artifact"
+requires each README figure to be backed by a traceable artifact. The README has no bare numeric
+figures: its claims are qualitative (wins/losses) and point readers to the committed pooled
+cross-engine report at `bench/reports/phase1-pooled/`.
+
+**Chosen: "links to a benchmark artifact" means the README must point to a committed report or
+pipeline artifact that contains the figure, or to `docs/methodology.md` when the statement is a
+meta-claim about honesty rather than a specific benchmark number. The existing README already does
+this.**
+
+- The meta-claim about "honest numbers" (README:49) links to `docs/methodology.md` — it is a
+  process claim, not a performance figure. It stays as-is.
+- "The latest pooled run is in `bench/reports/phase1-pooled/`" (README:182) links to a committed
+  report directory — the artifact is the committed tree, re-runnable from a clone. The marker
+  `<!-- claim:cross-engine-2026-11-02 -->` was added to trace that connection.
+- The qualitative wins/losses were softened from inline prose to "see that report for where WeftDB
+  wins and loses" — no new figure was created, and the unregistered bullet text was removed.
+- No figure quoted in the README is produced by a pipeline artifact (the nightly gate publishes
+  `nightly-interpolation`, which no entry quotes). Every existing `bench/claims.json` entry has
+  `artifact: null`, which is correct: no pipeline artifact produces those figures. An `upload-artifact`
+  step was not added because no existing workflow runs the exact workload any figure cites.
+  Adding a producer without benchmarking hardware would amount to speculative scaffolding.
+
+**Result:** the roadmap line is ticked. Every README performance statement is either linked to a
+committed artifact (`bench/reports/phase1-pooled/`) or to the methodology rules
+(`docs/methodology.md`). The registry gained the `cross-engine-2026-11-02` entry for the pooled
+report, and `check_claims.py` passes.
+## 2026-11-20 — An audit may flag a published claim but not withdraw it (#396) (landed as PR #834)
+
+**The question.**  Issue #396 asked for an audit of the remaining `weft-bench` generators for the same
+class of corpus-shape flattery that #395 and #398 found in the ingest and `sketch_p99` workloads.
+If the audit finds that a published figure rests on a flattering generator, should this PR silently
+re-run the bench and edit the claim?
+
+**The decision.**  No.  An audit PR that edits claims would rewrite published figures mid-PR without
+coordinator review.  The delegation is: audit + flag, coordinator decides withdrawals.  A suspect
+verdict in `docs/research/bench-generator-audit.md` names the claim and the shape problem but does
+not change, withdraw, or retract any number.  The flag is informative, not prescriptive — the
+coordinator reads it and decides.
+
+**What was rejected.**  (a) Silently re-running affected benches in this PR — that would change
+published figures as a side-effect of the audit, with no separate approval.  (b) Deleting suspect
+figures outright — even a correctly identified flattery does not imply the direction of the correction,
+and withdrawing without a replacement figure makes the README less useful.  (c) Changing generator
+defaults — that would invalidate every stored report that cites the old defaults (the bench output
+embeds the profile name and its parameter hash), and the audit has not determined the correct new
+default.
+
+**The residue.**  Five claims are flagged suspect; none is withdrawn.  The suspect-verdict set is
+unresolved — a coordinator may decide to retract, re-measure with a representative generator, or
+wait for #397.  Issue #397 (a representative storage generator or real-corpus defaults) stays open.
 ## 2026-11-20 — TAG-12-B: one interleaved crash cell instead of the fault-point cross-product (issue #341)
 
 - **Ambiguity in the slice brief.** "Add the multi-series crash matrix" does not say whether
@@ -8766,19 +8844,61 @@ section instead. The store-side parser is the single parse point (`row_expiry_po
 summary were rewritten to match, since both previously promised "there is no seconds-based
 conversion".
 
+## 2026-11-17 — Ticking 7.3 and 7.5 from their shipped parts, and dropping the routine's empty Phase 12 wrappers (7.3, 7.5)
+
+- **The call.** Neither Phase 13 parent has an acceptance test of its own: each line names its parts in parentheses (7.3: D-S12 + ROB-8/9/22 + HTTP restore; 7.5: ROB-19/20/21, with "query consistency, cancellation, and resource limits" in the title). Every part is recorded as shipped (the Phase 6/10 summaries, the ticked Phase 12 lines for ROB-22, ROB-20, X-READ and the restore route), and umbrella #212's three sub-issues are closed as completed. So the routine ticked both parents, listed each part as a `[x]` sub-item with the test that pins it, and re-ran those tests on `435553e` rather than trusting the summaries. 47 passed, 0 failed.
+- **What is not claimed.** The ROB-20 limits are written into 7.5's parenthetical instead of being dropped: the time budget is honoured between swaps only, and a single already-oversized segment is not auto re-split. Whoever owns the beta bar can reopen 7.5 by unticking it if they read those limits as blocking. The "Phase 7 acceptance run" line in the 1.0 release criteria is a separate gate and is not touched.
+- **The wrappers.** The four `START HERE` lines and the two dated run lists at the top of Phase 12 were empty one-line checkboxes. Their prose already lives in `docs/roadmap-notes.md` under *Immediate next actions*, and every item they handed over has shipped (the dictionary occurrence footprint, #612/#699, and memory per database file, #699, both in the Phase 11 summary; the ENOSPC test, the GPU flake and the `float_roundtrip` figure, ticked in Phase 12) or is tracked in Phase 25 (the UDDSketch timing rerun and #401). They are deleted, not ticked, because there was nothing to ship.
+## 2026-11-20 — A CI leg that dies in its own cache-save post step is a budget bug, not a code signal (#835)
+
+**Question.** Four docs-only pull requests (#830, #831, #832, #834) each ended their CI run with
+exactly one non-green check, `test (windows-latest)`, marked `cancelled` at exactly one hour — and
+`main` showed the same thing twice (runs 44761112603 at `1c32c44`, 44751023989 at `1de5435`). An
+agent that gates merges on "all checks pass" cannot merge anything, and a human who merges over it
+is making an unrecorded judgement about what the red means. Both outcomes are worse than the cost of
+the fix.
+
+**Decision.** Read the leg's step table before deciding what a cancelled leg means. On run
+44761112603, job 136373576261: `Build` (`cargo build --workspace --all-targets --locked`) succeeded
+15:17:02Z → 15:34:23Z, 17 min; `Test` (`cargo test --workspace --locked -- --test-threads=4`)
+succeeded 15:34:23Z → 16:15:43Z, 41 min; every `if: failure()` step was skipped; the only cancelled
+step was `Post Run Swatinem/rust-cache` at 16:15:43Z → 16:16:09Z, with the job killed at 16:16:09Z,
+exactly 60:00 after it started. Run 44751684242 finished the same leg in 51 min. So the work fits
+and the ceiling is landing on the tail — the cache save, and on a slower runner the last minutes of
+the test step. Raised `timeout-minutes` on the `test` job from 60 to 75
+(`.github/workflows/ci.yml:193`), the only line changed, and left the `features` job's 60
+(`.github/workflows/ci.yml:318`) alone because that job never came near the ceiling.
+
+**Rejected.** Narrowing the Windows leg to a subset of crates: the portability claim is that the
+workspace builds and its tests pass on Windows, and a quieter leg is a smaller claim wearing the same
+badge. Splitting build and test into two jobs with an artifact between them: that answers a
+cache-miss cost we never measured — the build was 12-17 min, which is not the problem. Leaving the
+number alone and re-running the leg: `gh run rerun --failed` produced attempt 2 on three pull
+requests and they went the same way; re-running a budget bug is a coin flip. Merging the four
+docs-only pull requests over the cancelled leg without opening the issue first: the override is
+defensible when the step table shows Build and Test both succeeded, but it is only defensible if
+somebody wrote that down — so the issue, the measurements, and this entry come before the merges.
+
+**Residue.** The nightly `schedule` legs do not set `SKIP_SLOW_TESTS`, so the full suite's Windows
+wall-clock is still unmeasured; if the schedule starts timing out, the honest answer is a separate
+budget for the scheduled leg, not a bigger number for every leg. The two TEMPORARY `if: failure()`
+debug steps in the same job (row-expiry, and the maintenance-budget one from #758) are still in the
+file, left alone because they belong to other slices' diagnoses — whoever's diagnosis they served
+should remove them. And the general rule this slice is really about: before treating a CI failure as
+a code signal, check whether the steps that would have caught the code actually ran.
+
 ## 2026-11-20 — Which paper defines the TSM-Bench query spec (#394)
 
 **Question.** The brief for this slice names "Garcia, Seltzer, VLDB 2015" as the TSM-Bench paper. Which paper is the canonical source for the seven query definitions?
 
 **Decision.** Adopt the Khelifati et al. PVLDB 2023 paper ("TSM-Bench: Benchmarking Time Series Database Systems for Monitoring Applications", PVLDB 16(11), doi:10.14778/3611479.3611532) as the canonical spec. The paper's §3.3 defines Q1–Q7 with canonical SQL. The Garcia/Seltzer 2015 PDF at vldb.org/pvldb/vol8/p2030-garcia.pdf is behind Cloudflare and could not be read; no Garcia/Seltzer reference appears in the PVLDB 2023 paper's bibliography. The codebase already cites the PVLDB 2023 paper (gap_fill.rs:5: "PVLDB 16(11)"). The brief's citation appears to be an error; this is documented in the spec doc as unresolved.
 
-**Rejected.** Using the Garcia/Seltzer 2015 paper as primary source — it cannot be read and the community uniformly cites the 2023 paper. Waiting for the 2015 paper to become accessible — the adoption does not depend on it.
-
+**Rejected.** Using the Garcia/Seltzer 2015 paper as primary source — it cannot be read and the community uniformly cites the 2023 paper. Waiting for the 2015 paper to become accessible — the adoption does not depend on 
 **Residue.** The Garcia/Seltzer 2015 paper may contain a different or earlier query specification. If it becomes accessible, re-check whether its definitions supersede or supplement the PVLDB 2023 spec. The implementation slice should read the PVLDB 2023 paper text (obtained) before coding each arm.
 
 ## 2026-11-20 — TSM-Bench Q1–Q10 includes Q8–Q10 (#394)
 
-**Question.** The adoption brief refers to "ten query numbers, Q1–Q10." The PVLDB 2023 paper defines only Q1–Q7. What are Q8–Q10?
+**Question.** The adoption brief refers to "ten query numbers, Q1–Q10." The PVLDB 2023 paper defines only Q1–Q7. What are Q8, Q9, and Q10?
 
 **Decision.** No Q8–Q10 exist in the published TSM-Bench spec. The paper defines seven queries; the repository's queries.sql files for each system contain only q1–q7. Q8–Q10 are not adopted because no canonical definition exists. The spec doc states this explicitly in §1's "Queries we deliberately do not run" table.
 

@@ -144,6 +144,19 @@
       "measured": "2026-10-12",
       "reproducible_from_clone": false,
       "notes": "Observation about tokio's sleep-after-work interval, not a performance claim."
+    },
+    {
+      "id": "cross-engine-2026-11-02",
+      "artifact": null,
+      "section": "Cross-engine benchmark (weft-xbench)",
+      "kind": "reproducible",
+      "figures": ["319 of 320 gates pass", "WeftDB wins 17", "loses 85", "every comparison with client-side interpolation"],
+      "source": "bench/reports/phase1-pooled/",
+      "command": "cargo build --locked --release --manifest-path weft-xbench/Cargo.toml; TMPDIR=/path/on/disk/under/test target/release/weft-xbench --scales small,medium --reps 10 --load-reps 3 --uci household_power_consumption.txt --tsbs cpu-only.lp --clickhouse URL --timescale URL --questdb HOST:PORT --influxdb3 URL --iotdb URL --out run-1 (run twice), then target/release/weft-xbench combine run-1/xbench.json run-2/xbench.json --out pooled",
+      "dataset": "UCI household_power_consumption.txt and TSBS cpu-only.lp (corpora not committed; SHA-256s and the TSBS generator commit are in bench/reports/phase1-pooled/README.md), plus generated series",
+      "measured": "2026-11-02",
+      "reproducible_from_clone": true,
+      "notes": "Pooled run from two separate full runs. Report and data committed in bench/reports/phase1-pooled/. Host is not priced cloud hardware, so no cost figure."
     }
   ]
 }
