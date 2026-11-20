@@ -8844,7 +8844,8 @@ section instead. The store-side parser is the single parse point (`row_expiry_po
 summary were rewritten to match, since both previously promised "there is no seconds-based
 conversion".
 
-  ## 2026-11-17 — Ticking 7.3 and 7.5 from their shipped parts, and dropping the routine's empty Phase 12 wrappers (7.3, 7.5)
+
+## 2026-11-17 — Ticking 7.3 and 7.5 from their shipped parts, and dropping the routine's empty Phase 12 wrappers (7.3, 7.5)
 
 - **The call.** Neither Phase 13 parent has an acceptance test of its own: each line names its parts in parentheses (7.3: D-S12 + ROB-8/9/22 + HTTP restore; 7.5: ROB-19/20/21, with "query consistency, cancellation, and resource limits" in the title). Every part is recorded as shipped (the Phase 6/10 summaries, the ticked Phase 12 lines for ROB-22, ROB-20, X-READ and the restore route), and umbrella #212's three sub-issues are closed as completed. So the routine ticked both parents, listed each part as a `[x]` sub-item with the test that pins it, and re-ran those tests on `435553e` rather than trusting the summaries. 47 passed, 0 failed.
 - **What is not claimed.** The ROB-20 limits are written into 7.5's parenthetical instead of being dropped: the time budget is honoured between swaps only, and a single already-oversized segment is not auto re-split. Whoever owns the beta bar can reopen 7.5 by unticking it if they read those limits as blocking. The "Phase 7 acceptance run" line in the 1.0 release criteria is a separate gate and is not touched.
@@ -8915,7 +8916,6 @@ a code signal, check whether the steps that would have caught the code actually 
 **Rejected.** Publishing numbers as part of the adoption — they would skip the claims review process. Also rejected: making the adoption a single monolithic implementation slice — the staged plan allows incremental review and avoids the 45-minute timebox limit.
 
 **Residue.** The number-publishing policy (§3 of benchmark-policy.md) applies once numbers exist. The first published TSM-Bench number must go through the normal claims PR flow.
-
 ## 2026-11-20 — BigDecimal precision-boundary inventory (#840)
 
 **Context.** The B-precision roadmap item (Phase 4/6 · partial) calls for a BigDecimal math audit.
