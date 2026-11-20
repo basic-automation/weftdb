@@ -416,7 +416,7 @@ On packaging, PAC-1b added the stripped dist profile with a third-party licence 
   - → **SOA-17** Calibration on a pre-grown store, frozen acceptance profiles, `scripts/crash-soak.sh`
   - **FRE-10b** Contract tests
   - → **FRE-16** CI compatibility gates
-  - **TAG-12** Multi-series crash cell landed (issue #341), fan-out and TSBS benchmarks, fixtures, freeze docs still outstanding
+  - **TAG-12** Multi-series crash cell landed (issue #341); the fan-out arm landed in #809; TSBS benchmarks, fixtures, freeze docs still outstanding
   - **ROB-24** Limits and overload evidence
 - **W12 · Phase 7 acceptance**
   - **SOA-18** 24 h acceptance run on the reference SSD, published as an artifact

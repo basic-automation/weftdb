@@ -8584,3 +8584,31 @@ Filed as #794; the exception itself is #790 and the migration is #791.
   points crossed with multiple series, and TAG-12's remaining items (fan-out and TSBS
   benchmarks, fixtures, freeze docs) stay open; the `docs/roadmap-notes.md` TAG-12 line now says
   so rather than leaving the line untouched.
+
+## 2026-11-20 — A test-only environment marker is a registered variable, and the config checker reads every number in the doc (#341, PR #826) (landed as PR #826)
+
+The multi-series crash cell spawns a child process and marks it with
+`WEFT_MULTISERIES_CRASH_CHILD`, exactly as the other crash cells mark theirs
+(`WEFT_DB_NEW_CRASH_CHILD`, `WEFT_LEGACY_INGEST_CRASH_CHILD`, …). The settings-registry test
+(`weft-server/src/settings.rs`, `every_environment_name_the_workspace_reads_is_registered`)
+scans every crate for environment reads and fails a PR that introduces an unregistered name,
+so a test-only marker is not exempt: it gets a `Tier::Test` `VarSpec` with all four fields
+filled, and the `VARS.len()` pin moves with it (121 to 122 here). The registry is the only
+place a name's meaning is written down, and a test name is worth writing down for the same
+reason an operator name is: the next person has to be able to tell a deliberate crash from a
+real one.
+
+Two CI traps this slice hit, both cheap to avoid once known. First, a test file behind
+`#![cfg(feature = "fault-injection")]` is invisible to the plain `test` jobs; only the crash
+matrix and feature matrix compile it, and the crash matrix builds with `-D warnings`, so an
+unused local there is a hard compile error that no amount of local `cargo test` debugging
+would show. Fix the binding by using it, not by prefixing it with an underscore: the two
+unused values in this test were the aspect id and the planned batch, and the aspect id is now
+compared against the id recorded before the crash, which is a check the cell was missing.
+Second, `scripts/config/check_schema.py` does not read prose, it reads numbers: it greps the
+whole of `docs/config-schema.md` for `<n> <Tier>` and `<n> variables` patterns and requires
+each to match the current tier row counts. A historical sentence in the version-history table
+("brought the total to 108 (45 Test)") is therefore a live claim, and adding a variable means
+touching those sentences too. The honest way to satisfy it is to restate the present-tense
+count where the document makes one, and reword the past-tense sentences so a historical number
+is no longer stated as a current tier count ("108, with 45 of them in the Test tier").

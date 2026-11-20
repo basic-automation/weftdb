@@ -5,13 +5,16 @@
 //! After an abort at [`FaultPoint::SFrameWritten`] during an interleaved write across 8
 //! series (aspects), every aspect's committed frames are consistent, independently
 //! recoverable, and readable. No aspect shows a value from a frame that never committed,
-//! and no aspect loses a value whose frame committed. Each aspect's data matches what a
-//! single-threaded replay of its committed frames would produce.
+//! and no aspect loses a value whose frame committed. The check is at the read surface:
+//! each aspect must return exactly the batch that committed before the abort, and the
+//! name → id mapping recorded before the crash must still resolve the same way after a
+//! cold reopen. Enumerating the store's committed frames and replaying them series by
+//! series is a separate TAG-12 (#341) item and is not asserted here.
 //!
 //! This is a process-kill test: the child re-executes this binary, writes a first round
 //! of measurements to every aspect, arms the `SFrameWritten` fault point, and then writes
-//! to one more aspect — which aborts. The parent then reopens the store cold and verifies
-//! per-aspect consistency.
+//! a second batch to `series_0`, whose abort is what the cell is testing. The parent then
+//! reopens the store cold and verifies per-aspect consistency.
 
 #![cfg(feature = "fault-injection")]
 
@@ -187,7 +190,10 @@ async fn a_multiseries_crash_at_sframe_written_is_recoverable() -> Result<()> {
 	for i in 0..N_SERIES {
 		let aspect_name = format!("series_{i}");
 		let aspect = db.get_aspect_by_name(&aspect_name).await?;
-		let aspect_id = aspect_ids[i];
+		// A cold reopen must resolve the series name to the id recorded before the crash,
+		// or the reads below would be checking some other series.
+		assert_eq!(aspect.id(), aspect_ids[i], "aspect {i} ({aspect_name}): the name resolved to a different id after the crash");
+		let aspect_id = aspect.id();
 
 		// Read all measurements for this aspect.
 		let measurements: Vec<_> = db.get_raw_measurements(&aspect_id, None, None, 1000, 0).await?.collect::<Vec<_>>().await;
@@ -196,8 +202,8 @@ async fn a_multiseries_crash_at_sframe_written_is_recoverable() -> Result<()> {
 		// cross-contamination, no phantom data from the aborting second batch.
 		assert_eq!(measurements.len(), BATCH_ROWS, "aspect {i} ({aspect_name}): got {} rows, expected {BATCH_ROWS} (the abort fired before the second batch committed)", measurements.len(),);
 
-		// Verify each row matches the planned first-batch data.
-		let planned = planned_batch(i, 0);
+		// Verify each row against the first-batch data the child wrote, which both sides
+		// build from the same helpers below.
 		// Sort the measurements by timestamp for deterministic comparison.
 		let mut sorted = measurements.into_iter().collect::<std::result::Result<Vec<_>, _>>()?;
 		sorted.sort_by_key(|m| m.timestamp());
