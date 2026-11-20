@@ -8603,3 +8603,35 @@ Filed as #794; the exception itself is #790 and the migration is #791.
 - **Separate, still-open availability point.**  The surviving 64-bit FNV-1a fingerprint
   (`weftdb/src/types/ingest.rs:162-180`) can produce a false `IdempotencyConflict`.
   Not addressed here.
+
+## 2026-11-20 — Legacy-seal idempotency: the payload key is inherited state, the new entry point adds call identity (#803) (landed as PR #817)
+
+`weftdb/src/types/legacy_seal.rs` has replayed an identical `(DatasetId, rows)` legacy ingest as
+one idempotent write since `343d626` (D-S19 #485), keyed `legacy:{dataset_id}:{payload_crc:08x}:{count}`,
+pinned by `seal_backed_aspect_round_trips_replays_and_widens` and
+`seal_backed_new_measurement_entry_points_reach_the_seal`. Issue #803 reported that as a defect: a
+benchmark re-run or backfill that reuses a `DatasetId` is absorbed instead of writing. Those two pins
+are protected inherited state, not something this slice overrides — at that surface the caller hands
+the store nothing but `(dataset_id, rows)`, so a blind client retry and an identical genuinely-new
+call are indistinguishable by construction, and protecting the retry from doubling rows is the safer
+half of that trade. What was missing is not the replay rule but any way to express **call identity**,
+so the fix adds it: `ingest_batch_with_gate(store, aspect_id, _dataset_id, idempotency_token: &str, rows, squash_target_rows)`
+keyed `legacy:{token}` — the token is required so a new caller cannot silently opt out of replay
+protection; the same token with the same payload replays the first receipt, the same token with a
+different payload is a loud `StoreError::IdempotencyConflict`, and distinct tokens always write, even
+for identical rows under one `DatasetId`. Both key styles share one body (`ingest_batch_under_key`),
+so the fragmentation gate and the overlap reconciliation of #813 run identically under either.
+
+Traded: without a token — through the thin `ingest_batch` wrapper that every legacy facade call site
+uses (`weftdb/src/types/database/inputs.rs:336`, `:445`, `:2454`) — an identical genuinely-new re-run
+is still absorbed. That is #803's residual gap, and closing it means routing a caller identity to this
+path: the server ledger's key (`weft-server/src/ingest.rs:717`) already exists but the sealed-batch
+path never uses it, which is #768's seal routing. #803 therefore stays open, narrowed to that. What
+would revive the original defect: minting a fresh `Uuid` inside `ingest_batch` instead of deriving the
+key from the payload.
+
+CI note while touching this file: `weftdb/src/lib.rs:2` carries
+`#![forbid(clippy::pedantic, clippy::nursery, clippy::all)]`, and `clippy::too_long_first_doc_paragraph`
+arrives through `nursery`, so a public item whose first doc paragraph runs past a short summary line
+fails `cargo clippy --workspace --all-targets --all-features` with exit 101. Keep first paragraphs to
+one line and put the rest in a second paragraph.
