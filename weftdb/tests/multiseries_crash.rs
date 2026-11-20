@@ -168,7 +168,7 @@ async fn a_multiseries_crash_at_sframe_written_is_recoverable() -> Result<()> {
 
 	// ── Spawn child ───────────────────────────────────────────────────────
 	let output = std::process::Command::new(std::env::current_exe()?)
-		.args(["multiseries_crash::child", "--exact", "--nocapture", "--test-threads=1"])
+		.args(["child", "--exact", "--nocapture", "--test-threads=1"])
 		.env(CHILD_ENV, &name)
 		.env("WEFT_DATA_DIR", data_dir)
 		.env("WEFT_LEGACY_DEFAULT_STORAGE", "segments")

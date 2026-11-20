@@ -8612,3 +8612,8 @@ each to match the current tier row counts. A historical sentence in the version-
 touching those sentences too. The honest way to satisfy it is to restate the present-tense
 count where the document makes one, and reword the past-tense sentences so a historical number
 is no longer stated as a current tier count ("108, with 45 of them in the Test tier").
+
+Two more pins the same cell had to satisfy, both invisible to a local `cargo test`:
+
+- **The `Test` tier has a written-out allowlist, not only a tier tag.** `the_tiers_are_the_explicit_choice_they_claim` (`weft-server/src/settings.rs:575-583`) rebuilds the set of `Tier::Test` names and asserts it equals an allowlist spelled out in the test itself — "a channel a test harness sets for the child it spawns, and nothing else may sit in it". Adding a harness variable therefore needs **both** the `VarSpec` and a name in that allowlist; a PR that adds only the spec passes locally and fails the `weft-server` lib suite in CI. The check is two-directional, so a name that moves tier must be edited in both places too.
+- **A re-executed child is addressed by its harness path, which for a crate-root test is just the function name.** The cell spawned its child with `--exact multiseries_crash::child`; that filter matches nothing (`running 0 tests`, exit status 0), so the parent's "the child aborted" assertion fired against a clean exit instead of a signal. The module-qualified spelling works only where the child lives in a `mod` (as in `weftdb/tests/db_tests.rs:1607` `database_new_crash::child`). Lesson: assert on the child having actually run — a filtered-out child looks exactly like a successful one.
