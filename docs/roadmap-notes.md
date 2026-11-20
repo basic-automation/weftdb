@@ -576,6 +576,17 @@ Around that, the read-path arc is done: streaming and batch point lookup (also a
       - **Research (2026-10-09) — a cheaper sketch index, if the sketch format is ever revised.**
       - **Positioning (2026-10-09) — exact percentiles are a differentiator against QuestDB.**
       - **NEXT — select on the mantissas when a partial is not merged.**
+- **DONE (2026-11-20) — Audit the other `weft-bench` workloads' generators for the same class of flattery (#396, PR #<n>).**
+  Generated corpus shapes for every generator were read from source and assessed against
+  the same flattery classes identified in #395 (2-decimal scale, regular timestamps,
+  FOR-friendly repetition, clean analytic signals).  The full write-up is at
+  `docs/research/bench-generator-audit.md`.  10 generators were audited (plus the
+  real-corpora entry points and size presets); 5 claims in `bench/claims.json` are
+  flagged **suspect**, 1 claim (`sketch-claim-corrected`) was already corrected by #398,
+  and the remaining 8 claims are `unaffected` because they run on real data or a different
+  code path.  **No claim was withdrawn in this PR** — the suspect verdicts await a
+  coordinator decision, and #397 (a representative generator or real-corpus defaults)
+  stays open.
 - **The seven slow `weft-orchestration` tests are bounded, and the three failures #402 recorded have no subject left (closed 2026-11-11).** Two entries sat here, and `4de2c691` ("the roadmap is a phased checklist; the prose moves to basicautomation.io") cut both mid-sentence, which is why they read as open work: the second, "Re-measured 2026-10-09 — still unbounded", was the tail of the bound-the-seven-tests item, and the first was the note that three failures were hiding behind the `SKIP_SLOW_TESTS` guard.
   - The bound exists. Seven `timed out after 1200s (#404)` guards now sit in the harnesses — `test_api` (`weft-orchestration/src/lib.rs:1772`), `test_pipeline_api` (`:1983`), `test_api_precise` (`:2166`), `test_pipeline_api_precise` (`:2348`), `test_batch_processing` (`:2467`), `test_specific_process_batch` (`:2537`), `test_pipeline_api_with_fake_db` (`:2732`) — at 3x the 357 s in which all seven finished for real on a runner, with push and pull-request runs skipping them so the nightly schedule is what exercises them (`CHANGELOG.md:266`, #404 and #646).
   - #402 is closed as completed (2026-11-10) and recorded here as **closed on erasure, not on a fix**: `test_api_precise`, `test_pipeline_api_with_fake_db` and `test_pipeline_api_precise` exist on `main` only as runner names in `weft-orchestration/src/lib.rs`, the `Invalid time range: start time must be before end time` failure has no fix behind it, and the close-out's own words were "none can be identified — every CI run where the slow weft-orchestration tests actually execute shows all of them passing". The real defect that was fixed is the dictionary one: schema creation now runs in an exclusive transaction before the concurrent one opens, in `weftdb/src/types/database/inputs.rs:1426-1440`, which also restores the three dictionary tables the inline DDL omitted. If those test names turn up again, reopen #402 against the names rather than this entry — that is where the evidence lives.

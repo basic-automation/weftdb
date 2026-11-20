@@ -8635,3 +8635,28 @@ CI note while touching this file: `weftdb/src/lib.rs:2` carries
 arrives through `nursery`, so a public item whose first doc paragraph runs past a short summary line
 fails `cargo clippy --workspace --all-targets --all-features` with exit 101. Keep first paragraphs to
 one line and put the rest in a second paragraph.
+
+## 2026-11-20 — An audit may flag a published claim but not withdraw it (#396) (landed as PR #<n>)
+
+**The question.**  Issue #396 asked for an audit of the remaining `weft-bench` generators for the same
+class of corpus-shape flattery that #395 and #398 found in the ingest and `sketch_p99` workloads.
+If the audit finds that a published figure rests on a flattering generator, should this PR silently
+re-run the bench and edit the claim?
+
+**The decision.**  No.  An audit PR that edits claims would rewrite published figures mid-PR without
+coordinator review.  The delegation is: audit + flag, coordinator decides withdrawals.  A suspect
+verdict in `docs/research/bench-generator-audit.md` names the claim and the shape problem but does
+not change, withdraw, or retract any number.  The flag is informative, not prescriptive — the
+coordinator reads it and decides.
+
+**What was rejected.**  (a) Silently re-running affected benches in this PR — that would change
+published figures as a side-effect of the audit, with no separate approval.  (b) Deleting suspect
+figures outright — even a correctly identified flattery does not imply the direction of the correction,
+and withdrawing without a replacement figure makes the README less useful.  (c) Changing generator
+defaults — that would invalidate every stored report that cites the old defaults (the bench output
+embeds the profile name and its parameter hash), and the audit has not determined the correct new
+default.
+
+**The residue.**  Five claims are flagged suspect; none is withdrawn.  The suspect-verdict set is
+unresolved — a coordinator may decide to retract, re-measure with a representative generator, or
+wait for #397.  Issue #397 (a representative storage generator or real-corpus defaults) stays open.
