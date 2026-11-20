@@ -243,7 +243,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
       - [ ] **Research (2026-10-09) — a cheaper sketch index, if the sketch format is ever revised.**
       - [ ] **Positioning (2026-10-09) — exact percentiles are a differentiator against QuestDB.**
       - [ ] **NEXT — select on the mantissas when a partial is not merged.** (#401)
-- [ ] **Adopt the TSM-Bench QUERY SPEC (not the repo) as Weft-Bench's external comparison workload.**
+- [x] **Adopt the TSM-Bench QUERY SPEC (not the repo) as Weft-Bench's external comparison workload.**
 - [ ] **Research (2026-10-09) — DuckDB has a native linear-interpolation arm**
 - [ ] **NEXT — (3c) materialized tiers, remaining**
 - [ ] **Positioning — WeftDB's `.weftpart` sidecar IS the "incremental materialized view", and mergeable DDSketch is its edge (this run's research)**

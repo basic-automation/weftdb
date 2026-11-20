@@ -8679,3 +8679,33 @@ section instead. The store-side parser is the single parse point (`row_expiry_po
 `weftdb/src/types/segment_store.rs`); `docs/config-schema.md` and the `settings.rs` `VarSpec`
 summary were rewritten to match, since both previously promised "there is no seconds-based
 conversion".
+
+## 2026-11-20 — Which paper defines the TSM-Bench query spec (#394)
+
+**Question.** The brief for this slice names "Garcia, Seltzer, VLDB 2015" as the TSM-Bench paper. Which paper is the canonical source for the seven query definitions?
+
+**Decision.** Adopt the Khelifati et al. PVLDB 2023 paper ("TSM-Bench: Benchmarking Time Series Database Systems for Monitoring Applications", PVLDB 16(11), doi:10.14778/3611479.3611532) as the canonical spec. The paper's §3.3 defines Q1–Q7 with canonical SQL. The Garcia/Seltzer 2015 PDF at vldb.org/pvldb/vol8/p2030-garcia.pdf is behind Cloudflare and could not be read; no Garcia/Seltzer reference appears in the PVLDB 2023 paper's bibliography. The codebase already cites the PVLDB 2023 paper (gap_fill.rs:5: "PVLDB 16(11)"). The brief's citation appears to be an error; this is documented in the spec doc as unresolved.
+
+**Rejected.** Using the Garcia/Seltzer 2015 paper as primary source — it cannot be read and the community uniformly cites the 2023 paper. Waiting for the 2015 paper to become accessible — the adoption does not depend on it.
+
+**Residue.** The Garcia/Seltzer 2015 paper may contain a different or earlier query specification. If it becomes accessible, re-check whether its definitions supersede or supplement the PVLDB 2023 spec. The implementation slice should read the PVLDB 2023 paper text (obtained) before coding each arm.
+
+## 2026-11-20 — TSM-Bench Q1–Q10 includes Q8–Q10 (#394)
+
+**Question.** The adoption brief refers to "ten query numbers, Q1–Q10." The PVLDB 2023 paper defines only Q1–Q7. What are Q8–Q10?
+
+**Decision.** No Q8–Q10 exist in the published TSM-Bench spec. The paper defines seven queries; the repository's queries.sql files for each system contain only q1–q7. Q8–Q10 are not adopted because no canonical definition exists. The spec doc states this explicitly in §1's "Queries we deliberately do not run" table.
+
+**Rejected.** Inventing Q8–Q10 definitions — the brief requires "do not invent query definitions."
+
+**Residue.** If the TSM-Bench technical report (referenced in the README at misc/TSM_Technical_Report.pdf, not read by this author) defines additional queries, they can be evaluated in a later slice. The current adoption covers the seven peer-reviewed queries.
+
+## 2026-11-20 — Stage ordering and scope (#394)
+
+**Question.** Should the staged adoption plan include a performance publication step, or stop at arm implementation?
+
+**Decision.** The adoption plan stops at the cross-engine comparison gate (Stage 5). Publishing a performance number (latency, throughput) is explicitly a non-goal for all stages — numbers belong in a separate bench/claims.json change under the claims policy. This keeps the adoption slices purely about harness infrastructure.
+
+**Rejected.** Publishing numbers as part of the adoption — they would skip the claims review process. Also rejected: making the adoption a single monolithic implementation slice — the staged plan allows incremental review and avoids the 45-minute timebox limit.
+
+**Residue.** The number-publishing policy (§3 of benchmark-policy.md) applies once numbers exist. The first published TSM-Bench number must go through the normal claims PR flow.

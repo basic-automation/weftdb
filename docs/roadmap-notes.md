@@ -762,3 +762,11 @@ The matching empty bold headers in this file ("START HERE (filed 2026-10-11 …)
 - Conclusion: nothing has changed for this repo. The non-Linux SIGKILL exclusion stands. Watch #9770 for a merge before the stale window closes again, and then for the first release that carries it.
 
 **Handoff for the next run.** Phase 12's open items are all held: ROB-14 (the `p787` and `p810` lanes, active 2026-11-17; cut 2 merged in #805), TTL-PURGE and TTL-UNIT (#810, the `p799` worktree), and SEAL-* (#811–#819). The rest are owner-gated. In Phase 13, the TAG-12 fan-out arm is held by #809. TAG-12's TSBS half (`single-groupby-1-1-1` and `lastpoint` over the whole TSBS file tagged by `hostname`) still needs a quiet host. On 2026-11-19 the host had a load average of 36 and 9 GB of 124 GB available, with a 59 GB `strata` process resident.
+
+**TSM-Bench query spec adoption (P394, 2026-11-20).** ROADMAP.md:246 ticked.
+`docs/research/tsm-bench-query-spec.md` published: Q1–Q7 canonical SQL extracted from the
+Khelifati et al. PVLDB 2023 paper; Garcia/Seltzer 2015 source unverifiable behind Cloudflare.
+Gap analysis: Q5 (`--gap-fill`) is the only existing arm that explicitly identifies itself as a
+TSM-Bench query; Q1 (`--range-fetch`) is the next closest; Q2/Q3/Q6/Q7 need new arms.
+Staged adoption plan with five stages (Q5 formalization → Q1 adaptation → Q4 stored-data path
+→ Q2/Q3/Q6/Q7 new arms → cross-engine gate). No cargo / no Rust files touched.
