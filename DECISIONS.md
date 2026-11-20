@@ -8733,3 +8733,21 @@ section instead. The store-side parser is the single parse point (`row_expiry_po
 `weftdb/src/types/segment_store.rs`); `docs/config-schema.md` and the `settings.rs` `VarSpec`
 summary were rewritten to match, since both previously promised "there is no seconds-based
 conversion".
+
+## 2026-11-20 — Baseline is a committed copy, not a released tag (FRE-18a, #838)
+
+**Question.** Why is the wire-compatibility baseline a committed file copy rather than a
+released tag?
+
+**Decision.** The baseline lives at `compat/openapi/baseline/weftdb.json`, a byte-identical
+copy of the committed spec as it was at the rc.1 freeze cut. The checker
+(`scripts/ci/check-openapi-breaking.py`) compares against this committed copy.
+
+**Rejected.** Using a released tag (`v0.1.0`, `v0.1.1`) as the baseline. Those tags contain no
+`compat/openapi/` directory at all, so a tag-based reference would silently resolve to nothing
+and the breaker would always pass — a gate that never fires.
+
+**Residue.** When a later release creates a tag that *does* carry the OpenAPI directory, the
+baseline could be moved to a tag reference. Until then, the committed copy is the only reliable
+anchor.
+

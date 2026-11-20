@@ -762,3 +762,11 @@ The matching empty bold headers in this file ("START HERE (filed 2026-10-11 …)
 - Conclusion: nothing has changed for this repo. The non-Linux SIGKILL exclusion stands. Watch #9770 for a merge before the stale window closes again, and then for the first release that carries it.
 
 **Handoff for the next run.** Phase 12's open items are all held: ROB-14 (the `p787` and `p810` lanes, active 2026-11-17; cut 2 merged in #805), TTL-PURGE and TTL-UNIT (#810, the `p799` worktree), and SEAL-* (#811–#819). The rest are owner-gated. In Phase 13, the TAG-12 fan-out arm is held by #809. TAG-12's TSBS half (`single-groupby-1-1-1` and `lastpoint` over the whole TSBS file tagged by `hostname`) still needs a quiet host. On 2026-11-19 the host had a load average of 36 and 9 GB of 124 GB available, with a 59 GB `strata` process resident.
+
+## 2026-11-20 — OpenAPI breaking-change check wired (FRE-18a, #838)
+
+The rc.1 wire-compatibility baseline was cut at `compat/openapi/baseline/weftdb.json`
+(a byte-identical copy of the committed spec at the freeze cut).
+`scripts/ci/check-openapi-breaking.py` compares the live committed spec against the
+baseline and classifies every difference against the six rule families in
+`docs/stability.md:27-40`. The check and its unit tests run in the `claims` CI job.

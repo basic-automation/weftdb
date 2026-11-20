@@ -147,6 +147,14 @@ jobs:
       - run: python3 -m unittest discover -s scripts/config -p 'test_*.py' -v
         env:
           PYTHONDONTWRITEBYTECODE: "1"
+      # OpenAPI breaking-change check against the freeze baseline (FRE-18a, #838).
+      - run: python3 scripts/ci/check-openapi-breaking.py
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+      # Unit tests for the OpenAPI breaking-change checker.
+      - run: python3 -m unittest discover -s scripts/ci -p 'test_check_openapi_breaking.py' -v
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
 
   # weft-xbench is its own workspace (it builds DuckDB from C++), so nothing else builds it on
   # every push. Its lock is seeded from the workspace's; this fails when a shared dependency

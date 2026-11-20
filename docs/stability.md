@@ -65,6 +65,10 @@ reinterpretations as announced in the changelog.
 **Basis:** [`compat/openapi/weftdb.json`](../compat/openapi/weftdb.json) and the drift
 test [`generated_spec_matches_committed_file`](../weft-server/src/openapi.rs), which
 the CI `test` job runs on every push and pull request (`cargo test --workspace`).
+The [breaking-change checker](../scripts/ci/check-openapi-breaking.py) compares the
+live spec against the rc.1 baseline
+([`compat/openapi/baseline/weftdb.json`](../compat/openapi/baseline/weftdb.json))
+on every push and pull request.
 
 ### `weftdb-client` (the Rust SDK, crate directory `weft-client/`)
 
