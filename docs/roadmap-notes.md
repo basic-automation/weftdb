@@ -217,6 +217,7 @@ The licensing decisions are made. Every WeftDB crate is `MIT OR Apache-2.0`, Jus
 
 - **7.2 WAL & crash consistency**
 - **7.3 Corruption detection**
+  *Closed 2026-11-20 (audit): every component named by the roadmap line is on main. D-S12 (2026-10-29, `DECISIONS.md:3570`) gave startup recovery, quarantine with a TTL (`weftdb/src/types/quarantine.rs`) and the fsck route (`weft-server/src/routes.rs:967`); ROB-8 (#265), ROB-9 (#315) and ROB-22 (#446 frame-fault policy verification, #720 suspect-frame policy and background-decode crash-loop breaker) are closed; restore into a chosen new root over HTTP landed 2026-11-14 (#213). The offline drill at `weft-server/src/restore.rs:65` is unchanged.*
 - **7.4 Whole-store backup manifest**
   *Closed 2026-11-05 (audit): whole-store manifest `weftdb-whole-store-backup/1` shipped in D-S16 (#483).*
 - **7.4 Documented RPO/RTO** against the measured snapshot cadence
