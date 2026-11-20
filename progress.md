@@ -26,3 +26,21 @@
 - **To open a PR:** `gh pr create --repo basic-automation/weftdb --base main --head p12/ingest-disconnect-4xx` with a body that says "CI is the first execution; this code was never compiled locally."
 - **To run CI:** push the branch; CI will compile and run the tests. Key test to watch: `ingest_body_read_past_the_total_deadline_is_408` (must stay green — it was not modified, only duplicated).
 - **Next command after this handoff:** `cargo fmt` to format the code, then commit and push.
+
+---
+
+# progress — bprec1/bigdecimal-inventory
+
+## Done
+
+- **`docs/research/bigdecimal-inventory.md`** — comprehensive inventory of every BigDecimal precision boundary in the workspace. Covers 12 crates, ~1,620 BigDecimal mentions. Each site labelled exact, lossy by construction, or lossy by policy. Serde feature differences documented.
+- **`docs/roadmap-notes.md`** — appended a dated line under the B-precision backlog entry (~line 454).
+- **`DECISIONS.md`** — appended a section documenting key classification decisions.
+- **PR not yet opened** — waiting for final verification of line numbers.
+
+## Not done
+
+- CI has not run (no cargo builds — host constraint).
+- PR not opened (will open after line-number verification).
+- `ROADMAP.md:283` left unticked (per brief: inventory half only).
+- No code changes (per brief: docs only).
