@@ -8636,7 +8636,7 @@ arrives through `nursery`, so a public item whose first doc paragraph runs past 
 fails `cargo clippy --workspace --all-targets --all-features` with exit 101. Keep first paragraphs to
 one line and put the rest in a second paragraph.
 
-## 2026-11-20 — What "links to a benchmark artifact" can mean when no figure has an artifact (#243) (state)
+## 2026-11-20 — What "links to a benchmark artifact" can mean when no figure has an artifact (#243) (landed as PR #832)
 
 **Context.** The roadmap line "Every performance claim in the README links to a benchmark artifact"
 requires each README figure to be backed by a traceable artifact. The README has no bare numeric
