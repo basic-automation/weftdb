@@ -22,6 +22,11 @@ difference against the six compatibility rule families documented in
   default, if that default changes the behaviour of a request that omitted it,
   is breaking.
 
+The checker does not yet classify:
+(1) a ``required`` array gaining an existing property on a nested object;
+(2) ``nullable`` changes inside ``allOf`` sub-schemas.
+These are known gaps, not silent passes.
+
 Usage:
     python3 scripts/ci/check-openapi-breaking.py [--baseline PATH] [--current PATH]
 
@@ -475,9 +480,20 @@ def _compare_operation(
                 "optional -> required"
             )
 
+        # Default added to existing parameter
+        base_schema = bp.get("schema", {})
+        curr_schema = cp.get("schema", {})
+        base_default = base_schema.get("default")
+        curr_default = curr_schema.get("default")
+        if base_default is None and curr_default is not None:
+            findings.append(
+                f"BREAKING added-default {loc}.parameters.{key}.schema: "
+                f"absent -> default={curr_default!r}"
+            )
+
         # Schema change
         _compare_schemas(
-            bp.get("schema", {}), cp.get("schema", {}),
+            base_schema, curr_schema,
             f"{loc}.parameters.{key}.schema",
             spec, baseline, findings,
         )

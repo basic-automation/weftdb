@@ -276,6 +276,38 @@ class RequiredToOptionalTest(unittest.TestCase):
             f"expected a required-optional finding, got {findings}",
         )
 
+    def test_optional_to_required_fails(self) -> None:
+        """Optional -> required is breaking."""
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "post": _make_op(
+                    request_body=_json_body(
+                        _obj_schema(
+                            {"name": {"type": "string"}}, []
+                        )
+                    ),
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "post": _make_op(
+                    request_body=_json_body(
+                        _obj_schema(
+                            {"name": {"type": "string"}}, ["name"]
+                        )
+                    ),
+                ),
+            },
+        })
+        base_norm = cob._normalise(base)
+        curr_norm = cob._normalise(curr)
+        findings = cob.compare(base_norm, curr_norm)
+        self.assertTrue(
+            any("BREAKING" in f and "optional-required" in f for f in findings),
+            f"expected an optional-required finding, got {findings}",
+        )
+
 
 class TypeChangeTest(unittest.TestCase):
     """Type constraint tightened or loosened (type change) is breaking."""
@@ -835,8 +867,8 @@ class FormatOrderPassesTest(unittest.TestCase):
 # Missing baseline
 # ===================================================================
 
-class MissingBaselineTest(unittest.TestCase):
-    """Missing baseline -> exit 2."""
+class BaselineFailuresTest(unittest.TestCase):
+    """Baseline integrity failures -> exit 2 (fail-closed)."""
 
     def test_missing_baseline_exits_2(self) -> None:
         """Calling main() with a non-existent baseline must exit 2."""
@@ -851,6 +883,73 @@ class MissingBaselineTest(unittest.TestCase):
             cob._load_json(nonexistent)
         self.assertEqual(cm.exception.code, 2)
         os.unlink(current_path)
+
+    def test_empty_paths_in_baseline_exits_2(self) -> None:
+        """An empty 'paths' dict in baseline must exit 2."""
+        import subprocess
+        import sys
+        with tempfile.NamedTemporaryFile(
+            suffix=".json", mode="w", delete=False,
+        ) as f:
+            json.dump({"openapi": "3.1.0", "info": {"version": "1"}, "paths": {}}, f)
+            baseline_path = f.name
+        with tempfile.NamedTemporaryFile(
+            suffix=".json", mode="w", delete=False,
+        ) as f:
+            json.dump({"openapi": "3.1.0", "info": {"version": "1"}, "paths": {"/x": {}}}, f)
+            current_path = f.name
+        cob_path = cob.__file__
+        assert cob_path is not None
+        try:
+            rc = subprocess.run(
+                [sys.executable, cob_path, "--baseline", baseline_path, "--current", current_path],
+                capture_output=True, timeout=10,
+            )
+            self.assertEqual(rc.returncode, 2,
+                             f"expected exit 2 for empty baseline paths, got {rc.returncode}: {rc.stderr.decode()}")
+        finally:
+            os.unlink(baseline_path)
+            os.unlink(current_path)
+
+    def test_unreadable_baseline_exits_2(self) -> None:
+        """An unreadable baseline file must exit 2."""
+        with tempfile.NamedTemporaryFile(
+            suffix=".json", mode="w", delete=False,
+        ) as f:
+            json.dump({"openapi": "3.1.0", "info": {"version": "1"}, "paths": {}}, f)
+            current_path = f.name
+        # Create a baseline file, then remove read permission.
+        baseline_path = current_path + ".unreadable"
+        try:
+            with open(baseline_path, "w") as f:
+                f.write('{"openapi": "3.1.0"}')
+            os.chmod(baseline_path, 0o000)
+            with self.assertRaises(SystemExit) as cm:
+                cob._load_json(baseline_path)
+            self.assertEqual(cm.exception.code, 2)
+        finally:
+            os.chmod(baseline_path, 0o644)
+            os.unlink(baseline_path)
+            os.unlink(current_path)
+
+    def test_truncated_json_exits_2(self) -> None:
+        """A truncated JSON file must exit 2."""
+        with tempfile.NamedTemporaryFile(
+            suffix=".json", mode="w", delete=False,
+        ) as f:
+            json.dump({"openapi": "3.1.0", "info": {"version": "1"}, "paths": {}}, f)
+            current_path = f.name
+        # Write truncated JSON to a temp file.
+        truncated_path = current_path + ".truncated"
+        try:
+            with open(truncated_path, "w") as f:
+                f.write('{"openapi": "3.1.0", ')
+            with self.assertRaises(SystemExit) as cm:
+                cob._load_json(truncated_path)
+            self.assertEqual(cm.exception.code, 2)
+        finally:
+            os.unlink(truncated_path)
+            os.unlink(current_path)
 
 
 # ===================================================================
@@ -914,6 +1013,47 @@ class AdditionalParamChangesTest(unittest.TestCase):
         self.assertTrue(
             any("BREAKING" in f and "removed-param" in f for f in findings),
             f"expected removed-param finding, got {findings}",
+        )
+
+    def test_added_default_to_existing_param_fails(self) -> None:
+        """Adding a default to an existing parameter is breaking."""
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    parameters=[
+                        {
+                            "in": "query",
+                            "name": "format",
+                            "required": False,
+                            "schema": {"type": "string"},
+                        }
+                    ],
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    parameters=[
+                        {
+                            "in": "query",
+                            "name": "format",
+                            "required": False,
+                            "schema": {
+                                "type": "string",
+                                "default": "json",
+                            },
+                        }
+                    ],
+                ),
+            },
+        })
+        base_norm = cob._normalise(base)
+        curr_norm = cob._normalise(curr)
+        findings = cob.compare(base_norm, curr_norm)
+        self.assertTrue(
+            any("BREAKING" in f and "added-default" in f for f in findings),
+            f"expected added-default finding, got {findings}",
         )
 
 

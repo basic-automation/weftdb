@@ -70,6 +70,11 @@ live spec against the rc.1 baseline
 ([`compat/openapi/baseline/weftdb.json`](../compat/openapi/baseline/weftdb.json))
 on every push and pull request.
 
+The checker does not yet classify:
+(1) a ``required`` array gaining an existing property on a nested object;
+(2) ``nullable`` changes inside ``allOf`` sub-schemas.
+These are known gaps, not silent passes.
+
 ### `weftdb-client` (the Rust SDK, crate directory `weft-client/`)
 
 **Status: stable (pre-1.0).** Every method matches one HTTP route. Breaking changes to
