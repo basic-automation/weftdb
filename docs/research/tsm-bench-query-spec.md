@@ -108,11 +108,11 @@ FILL(LINEAR);
 **What varies:** As Q1; the upsampling step is 5 seconds.
 
 **Weft-Bench shape:** The `--gap-fill` workload (`weft-bench/src/gap_fill.rs:4–18`) explicitly identifies itself as TSM-Bench Q5's shape: "reduce a series into grid-aligned buckets, then synthesize the empty ones … `SELECT … SAMPLE BY 5s FILL(LINEAR)`". It differs in:
-- **Bucket width:** WeftDB's grid only has unit widths (`s`/`m`/`h`/…), so Q5's literal 5-second buckets are expressed as `Resolution::Seconds` with stride-based approximation (see `gap_fill.rs:14–16`).
+- **Bucket width:** WeftDB's grid only has unit widths (`s`/`m`/`h`/…), so Q5's literal 5-second buckets are expressed as `Resolution::Seconds` with stride-based approximation (see `gap_fill.rs:18–19`).
 - **No WHERE time-range clause:** The `run_gap_fill` generator produces a synthetic corpus for the full generated span; no caller-specified `[t0 - range, t0)` window exists yet.
 - **No station/sensor filtering:** The gap-fill arm works on a single generated series.
 
-This is the **mature** arm — it has a correctness gate with accuracy scoring (`gap_fill.rs:12–13`, `:238`), and the codebase already calls it "TSM-Bench Q5's shape" (`gap_fill.rs:4`, `main.rs:2529`, `CHANGELOG.md:1948`).
+This is the **mature** arm — it has a correctness gate with accuracy scoring (`gap_fill.rs:12–13`, `:238`), and the codebase already calls it "TSM-Bench Q5's shape" (`gap_fill.rs:4`, `main.rs:2529`, `CHANGELOG.md:1958`).
 
 ---
 
