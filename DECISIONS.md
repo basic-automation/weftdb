@@ -8679,3 +8679,41 @@ section instead. The store-side parser is the single parse point (`row_expiry_po
 `weftdb/src/types/segment_store.rs`); `docs/config-schema.md` and the `settings.rs` `VarSpec`
 summary were rewritten to match, since both previously promised "there is no seconds-based
 conversion".
+
+## 2026-11-20 — A CI leg that dies in its own cache-save post step is a budget bug, not a code signal (#835)
+
+**Question.** Four docs-only pull requests (#830, #831, #832, #834) each ended their CI run with
+exactly one non-green check, `test (windows-latest)`, marked `cancelled` at exactly one hour — and
+`main` showed the same thing twice (runs 44761112603 at `1c32c44`, 44751023989 at `1de5435`). An
+agent that gates merges on "all checks pass" cannot merge anything, and a human who merges over it
+is making an unrecorded judgement about what the red means. Both outcomes are worse than the cost of
+the fix.
+
+**Decision.** Read the leg's step table before deciding what a cancelled leg means. On run
+44761112603, job 136373576261: `Build` (`cargo build --workspace --all-targets --locked`) succeeded
+15:17:02Z → 15:34:23Z, 17 min; `Test` (`cargo test --workspace --locked -- --test-threads=4`)
+succeeded 15:34:23Z → 16:15:43Z, 41 min; every `if: failure()` step was skipped; the only cancelled
+step was `Post Run Swatinem/rust-cache` at 16:15:43Z → 16:16:09Z, with the job killed at 16:16:09Z,
+exactly 60:00 after it started. Run 44751684242 finished the same leg in 51 min. So the work fits
+and the ceiling is landing on the tail — the cache save, and on a slower runner the last minutes of
+the test step. Raised `timeout-minutes` on the `test` job from 60 to 75
+(`.github/workflows/ci.yml:193`), the only line changed, and left the `features` job's 60
+(`.github/workflows/ci.yml:318`) alone because that job never came near the ceiling.
+
+**Rejected.** Narrowing the Windows leg to a subset of crates: the portability claim is that the
+workspace builds and its tests pass on Windows, and a quieter leg is a smaller claim wearing the same
+badge. Splitting build and test into two jobs with an artifact between them: that answers a
+cache-miss cost we never measured — the build was 12-17 min, which is not the problem. Leaving the
+number alone and re-running the leg: `gh run rerun --failed` produced attempt 2 on three pull
+requests and they went the same way; re-running a budget bug is a coin flip. Merging the four
+docs-only pull requests over the cancelled leg without opening the issue first: the override is
+defensible when the step table shows Build and Test both succeeded, but it is only defensible if
+somebody wrote that down — so the issue, the measurements, and this entry come before the merges.
+
+**Residue.** The nightly `schedule` legs do not set `SKIP_SLOW_TESTS`, so the full suite's Windows
+wall-clock is still unmeasured; if the schedule starts timing out, the honest answer is a separate
+budget for the scheduled leg, not a bigger number for every leg. The two TEMPORARY `if: failure()`
+debug steps in the same job (row-expiry, and the maintenance-budget one from #758) are still in the
+file, left alone because they belong to other slices' diagnoses — whoever's diagnosis they served
+should remove them. And the general rule this slice is really about: before treating a CI failure as
+a code signal, check whether the steps that would have caught the code actually ran.
