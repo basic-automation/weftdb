@@ -8722,7 +8722,7 @@ those items are actually available depends on machine state that the roadmap doe
 narrative (`:100`), making the ghcr.io package public (`:99`), the `parquet`/`arrow-buffer` upstream
 reports (`:101`), and D-S21's privileged power-loss validation (`:77`) — plus a quiet host window
 (and the T7 reference drive on 10 Gbps, `:112`) before the TSBS and calibration items can run.
-    ## 2026-11-20 — A roadmap line may not promise a leg the pin vocabulary forbids (#236) (landed as PR #833)
+## 2026-11-20 — A roadmap line may not promise a leg the pin vocabulary forbids (#236) (landed as PR #833)
 
 **Question.** `ROADMAP.md` line 166 (at the time) read "Upgrade/rollback procedure, exercised against the previous release". That bundles two claims. The upgrade half is real: CI job `compat` runs `LEG_RUNNERS["0.1.0"]["upgrade"]` — `weftdb/tests/compat_v010.rs::a_v010_store_migrates_forward_and_keeps_reading_its_own_values` — against the sole pinned release `v0.1.0` (commit `b9a8ee42`), whose `legs` field admits only `["upgrade"]`. The rollback half has no runner: `compat/releases.toml` has no `rollback` leg anywhere, `releases.LEGS == {"upgrade"}`, and `scripts/compat/test_leg_coverage.py` keeps rollback only in `SUBSTITUTE_RUNNERS` (a store-format-marker tamper stand-in) precisely because no runner may claim that leg. FRE-16 (2026-11-10) declared rollback-after-writes unsupported for 1.0, and the pin rule says a pin may declare only what CI truly executes.
 
