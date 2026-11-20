@@ -8636,7 +8636,7 @@ arrives through `nursery`, so a public item whose first doc paragraph runs past 
 fails `cargo clippy --workspace --all-targets --all-features` with exit 101. Keep first paragraphs to
 one line and put the rest in a second paragraph.
 
-## 2026-11-20 — A roadmap line may not promise a leg the pin vocabulary forbids (#236) (landed as PR #<n>)
+## 2026-11-20 — A roadmap line may not promise a leg the pin vocabulary forbids (#236) (landed as PR #833)
 
 **Question.** `ROADMAP.md` line 166 (at the time) read "Upgrade/rollback procedure, exercised against the previous release". That bundles two claims. The upgrade half is real: CI job `compat` runs `LEG_RUNNERS["0.1.0"]["upgrade"]` — `weftdb/tests/compat_v010.rs::a_v010_store_migrates_forward_and_keeps_reading_its_own_values` — against the sole pinned release `v0.1.0` (commit `b9a8ee42`), whose `legs` field admits only `["upgrade"]`. The rollback half has no runner: `compat/releases.toml` has no `rollback` leg anywhere, `releases.LEGS == {"upgrade"}`, and `scripts/compat/test_leg_coverage.py` keeps rollback only in `SUBSTITUTE_RUNNERS` (a store-format-marker tamper stand-in) precisely because no runner may claim that leg. FRE-16 (2026-11-10) declared rollback-after-writes unsupported for 1.0, and the pin rule says a pin may declare only what CI truly executes.
 
