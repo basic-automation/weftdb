@@ -918,7 +918,7 @@ mod tests {
 		// An aspect with a TTL whose wholly-expired frames are removed by one tick.
 		// A frame that straddles the cutoff is left alone.
 		let dir = TempDir::new().unwrap();
-		let store = SegmentStore::open_with_options(dir.path(), SegmentStoreOptions::default().with_expiry(RowExpiryPolicy::Ttl { ttl: 10 })).await.unwrap();
+		let store = SegmentStore::open_with_options(dir.path(), SegmentStoreOptions::default().with_expiry(RowExpiryPolicy::Ttl { ttl: 10, unit: weft_physical_type::timestamp::TimeUnit::Seconds })).await.unwrap();
 		store.declare("a", &schema()).await.unwrap();
 		// The cutoff at now=100s is 90. Frame [60..79] is wholly expired; frame [85..120] straddles.
 		store.seal("a", &schema(), &[60_i64, 70, 79], &[bd("1"), bd("2"), bd("3")]).await.unwrap();
@@ -963,7 +963,7 @@ mod tests {
 	#[tokio::test]
 	async fn the_expired_purge_tick_drops_the_stale_frame_under_the_wall_clock() {
 		let dir = TempDir::new().unwrap();
-		let store = SegmentStore::open_with_options(dir.path(), SegmentStoreOptions::default().with_expiry(RowExpiryPolicy::Ttl { ttl: 10 })).await.unwrap();
+		let store = SegmentStore::open_with_options(dir.path(), SegmentStoreOptions::default().with_expiry(RowExpiryPolicy::Ttl { ttl: 10, unit: weft_physical_type::timestamp::TimeUnit::Seconds })).await.unwrap();
 		store.declare("a", &schema()).await.unwrap();
 		store.seal("a", &schema(), &[60_i64, 70, 79], &[bd("1"), bd("2"), bd("3")]).await.unwrap();
 		// The aspect's unit is seconds, so the recent frame is written in seconds too: five to
