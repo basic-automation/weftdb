@@ -9,11 +9,11 @@ use std::str::FromStr;
 
 use bigdecimal::BigDecimal;
 use tempfile::TempDir;
-use weft_physical_type::{AspectSchema, PhysicalType, timestamp::TimeUnit};
+use weft_physical_type::{timestamp::TimeUnit, AspectSchema, PhysicalType};
 
 use super::{SegmentStore, SegmentStoreOptions};
 use crate::{
-	IngestBatch, TagSet, segment_store::row_expiry::{RowExpiryPolicy, expired_cutoff, is_row_expired}
+	segment_store::row_expiry::{expired_cutoff, is_row_expired, RowExpiryPolicy}, IngestBatch, TagSet
 };
 
 fn bd(s: &str) -> BigDecimal {

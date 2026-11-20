@@ -125,7 +125,11 @@ impl RowExpiryPolicy {
 					return i64::MIN;
 				};
 				let now_unit = aspect_unit.from_nanos(now_ns);
-				if now_unit < ttl_in_unit { i64::MIN } else { now_unit - ttl_in_unit }
+				if now_unit < ttl_in_unit {
+					i64::MIN
+				} else {
+					now_unit - ttl_in_unit
+				}
 			}
 		}
 	}
@@ -365,7 +369,7 @@ mod tests {
 
 		// now = 5_000_000_000 ns = 5000 ms
 		let now_ns = ns(5); // 5_000_000_000 ns = 5000 ms in from_nanos
-		// row_ts = 3999 ms → age = 1001 > 1000 → expired
+				    // row_ts = 3999 ms → age = 1001 > 1000 → expired
 		assert!(is_row_expired(&ms_policy, now_ns, 3999, &ms_unit), "millis unit: age 1001 > 1000 → expired");
 		// row_ts = 4000 ms → age = 1000 == 1000 → NOT expired
 		assert!(!is_row_expired(&ms_policy, now_ns, 4000, &ms_unit), "millis unit: age 1000 == 1000 → NOT expired");
