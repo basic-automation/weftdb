@@ -8571,9 +8571,11 @@ count at the settings layer only, which leaves the store's own `from_env` path s
 unit-blind. Silently keeping "bare = aspect units" was rejected because that is the bug.
 
 **Boundary and residue.** A row whose age equals the TTL is **not** expired (strict `>`). A
-TTL finer than the aspect's resolution saturates to 0 — every row aged at least one tick
-expires — rather than turning into "never expires"; that saturation is documented on the
-policy. Because the variable is `Experimental`, the settings-tier test list is unchanged and
+**positive** TTL finer than the aspect's resolution clamps to **one tick** — the newest tick's
+rows are kept — rather than saturating to 0, which would have expired every row aged at least one
+tick (a `500ms` TTL on a `Seconds` aspect would purge a series). An explicit `ttl == 0` still
+means "everything strictly before `now`", which is what `zero_ttl_expires_rows_strictly_before_now`
+pins; a blanket `.max(1)` would have broken that. Because the variable is `Experimental`, the settings-tier test list is unchanged and
 no deprecation window applies; `UPGRADING.md` carries a short "variables can change meaning"
 section instead. The store-side parser is the single parse point (`row_expiry_policy_from`,
 `weftdb/src/types/segment_store.rs`); `docs/config-schema.md` and the `settings.rs` `VarSpec`
