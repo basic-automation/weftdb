@@ -19,6 +19,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `capture_measurement`-side call sites in `inputs.rs` were removed — they moved into the
   bulk path.
 - **A refused maintenance plan has its own HTTP answer (#764).**- **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**- **`WEFT_MEMORY_BUDGET_BYTES` and the cgroup limit are now read and held (#788).**
+- **A fan-out benchmark arm — the cost of reading across many series (#809, TAG-12).**
+`weft-bench --fan-out` opens a real `SegmentStore`, ingests a seeded corpus of tagged series
+(1 000 rows each by default), and then reads every series at each rung of a series-count ladder
+(1, 10, 100, 1000), reporting wall time, rows read and series touched per rung. It is the
+multi-series read cost curve the TSBS tag-grouped queries that TAG-12 moved here need. It measures
+our own engine: the vendor racing rules in `docs/benchmark-policy.md` are not engaged by it.
 - **The reconcile daemon defers its passes when the memory budget has no headroom (#806,
 ROB-14 cut 3).** Each of the six tick functions in `weft-server/src/reconcile_daemon.rs`
 now asks `has_budget_for_pass` before it touches the store: with a limit set (the
@@ -32,6 +38,13 @@ whose footprint the probe cannot see is still bounded by the store's own
 The deferral costs nothing: the backlog is not dropped and the next tick retries. The
 compaction, expiry and purge daemons do not carry a budget yet, so ROB-14 stays open.
 - **`WEFT_MEMORY_BUDGET_BYTES` and the cgroup limit are now read and held (#788).**
+- **The reconcile daemon runs the expired-row purge every tick (#785).**
+After the existing sweeps, every daemon tick also calls `SegmentStore::purge_expired`
+on the store. When the policy is `NoExpiry` (the default) the call returns cheaply with
+no work; when a TTL is configured, the frames every row of which is past the cutoff are
+removed from the index and retired to the reaper. A frame that straddles the cutoff is
+left alone and counted. Failures follow the same WARN-per-aspect and breaker-skip idiom
+as the other sweeps.- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**- **A refused maintenance plan has its own HTTP answer (#764).**- **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**- **`WEFT_MEMORY_BUDGET_BYTES` and the cgroup limit are now read and held (#788).**
 Where the server could previously only bound a request's body bytes, it now knows the memory
 ceiling it runs under: `weft-server/src/memory_budget.rs` reads cgroup v2 `memory.max`, falls
 back to v1 `memory/memory.limit_in_bytes`, and treats `max`, a missing file and an unreadable
@@ -43,6 +56,7 @@ cannot leak the count. Nothing is refused in this cut: reading, exposing and acc
 first, so the refusal (503 `over_budget` with `details.kind` of `memory`) comes in cut 2 and the
 roadmap line stays open until then.
 - **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**- **A refused maintenance plan has its own HTTP answer (#764).**- **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**
+origin/main
 origin/main
   Store-wide maintenance sweeps — threshold reconcile, hot/cold reconcile, squash over threshold,
   squash to target rows, many-aspect squash — check a per-sweep deadline between components, groups,
@@ -132,6 +146,42 @@ origin/main
 
 ### Fixed
 
+- **The cargo-deny exception for `chrono` (RUSTSEC-2026-0543) now expires on its date, not in prose.** The action pin was bumped to `EmbarkStudios/cargo-deny-action` v2.1.2 (commit `70f81531115945ba6eb6b941ec9d39d063438eb9`), which runs cargo-deny 0.21.0, and the ignore entry carries `expiry = "2027-01-31"`: once that date passes the advisory is reported again with `advisory-ignore-expired` and CI goes red until the migration (#791) lands or the exception is re-dated. The old pin (cargo-deny 0.20.2) rejected the `expiry` key with `error[unexpected-keys]`, which is why the deadline had only been documentation. Closes #794.
+- **TTL purge no longer drops a doomed segment that shadows a surviving segment of the same series (#797).**
+  `purge_aspect_held` now builds a `survivors` map (straddling and wholly live segments)
+  before it considers doomed segments; any doomed segment whose timeline extent overlaps a
+  survivor of the same series is kept on disk with a `tracing::debug!` line and a count in
+  `shadowed_and_kept`. Previously a wholly expired segment whose rows superseded an older
+  segment whose extent it overlaps was dropped, re-exposing the superseded values to a plain
+  (non-expiry) read.
+- **TTL purge now chunks swap plans by `MAX_PLANS_PER_TXN` and reports partial progress instead of returning an error (#798).**
+  An aspect with more than 32 series was previously refused by `swap_plans`'s "at most 32
+  plans" guard. Now the plans are split into chunks of `MAX_PLANS_PER_TXN` and submitted in
+  separate swap transactions; a later chunk that fails does not undo the drops of earlier
+  chunks, and `completed` is set to `false` in the returned `AspectExpirySwept` so the caller
+  does not charge the breaker and the next sweep retries the remaining segments.
+- **Seal-backed aspects replace at shared timestamps, rows mode appends (#802).**
+  At a timestamp that two ingest calls share, a seal-backed aspect keeps only the newest
+  call's rows (duplicates inside one call are all kept). This is a behaviour change from
+  rows mode, where both rows are stored. The test
+  `seal_backed_new_measurement_entry_points_reach_the_seal` now asserts that the new value
+  is present and the old value is absent after a duplicate-timestamp write, for a single-row
+  write and for a batch write.
+- **A seal-backed aspect's row count now agrees with what a range read returns (#800).**
+  The count is answered from the segment rollup (`aspect_stats().total_rows`), which sums every
+  segment's rows, while a range read folds overlapping timestamp ranges newest-wins. After a
+  batch rewrote a timestamp that already existed, the two disagreed: the count still included
+  the superseded copy of that timestamp, and the read showed only the newer value. It needed a
+  batch whose range overlapped an existing segment's extent in the middle rather than touching
+  its edge, because a batch entirely above or below the existing extent produces non-overlapping
+  extents. `ingest_batch_with_gate` (`weftdb/src/types/legacy_seal.rs`) now calls
+  `SegmentStore::reconcile_overlaps` after the fragmentation gate, so an overlapping cluster is
+  folded at write time and the index stays overlap-free (it returns `Ok(0)` when nothing
+  overlaps). The gate on its own could not have done it: whether it folds at all is a function
+  of `total_rows / target_rows`, so a small aspect can be left fragmented.
+origin/main
+  of `total_rows / target_rows`, so a small aspect can be left fragmented.origin/main
+
 - **A seal-backed legacy aspect's bulk writes now reach the store it reads from (#232).**
   `capture_new_measurement` and `batch_capture_new_measurements`
   (`weftdb/src/types/database/inputs.rs`) wrote into the per-aspect rows-mode
@@ -161,6 +211,17 @@ origin/main
   byte is written, matching the protection the ingest and seal paths
   already had. Two new unit tests in `disk_guard_tests.rs` pin the
   refusal and the success case.
+
+- **`replace_measurements_in_range` and `capture_new_measurement_chunk` are now refused on seal-backed
+  aspects with a typed `Error::SealBackedRejected` (#801).** Both entry points wrote into the
+  per-aspect rows-mode `measurements.db` that no seal-backed read ever consults — the call returned
+  `Ok` while the data was silently unreachable. `replace_measurements_in_range`
+  (`weftdb/src/types/database/inputs.rs:2128`) checked its guard before the `legacy_metadata_write`
+  wrapper; `capture_new_measurement_chunk` (`:770`) checks at its entry. The same guard is added to
+  `Aspect::compress_with_progress` (`aspect.rs:1871`) and `Aspect::set_compression_config` (`aspect.rs:1805`).
+- **`aspect_storage_mode` now calls `ensure_storage_mode_column` before the SELECT, so a
+  pre-D-S19 database produces `Rows` without string-matching an SQLite error (#801, criterion 3).**
+  The former `Err(_) => Rows` catch-all is narrowed to genuinely absent rows or `NULL` values.
 
 ### Testing
 

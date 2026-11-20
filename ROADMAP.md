@@ -74,12 +74,6 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 
 ## Phase 12 — Close the pre-beta lanes (was W6, W8 and W9 open items)
 
-- [ ] START HERE (filed 2026-11-11 for the next run)
-- [ ] START HERE (rewritten 2026-11-11 for the next run)
-- [ ] START HERE (filed 2026-10-11 for the next run)
-- [ ] START HERE (filed 2026-10-09 for the next run)
-- [ ] (2026-10-08 list.) The 2026-10-08 run (PR `routine/dsp-2026-10-08`)
-- [ ] (2026-09-23 list; item 3 shipped 2026-10-08.) The 2026-09-23 run
 - [ ] Run D-S21's privileged power-loss validation (sudo: dm-log-writes or a QEMU hard reset) *(owner)*
 - [x] read lane: **X-READ** Read-time newer-wins merge across overlapping segments, per series
 - [x] maint lane: **ROB-20** Maintenance resource limits, k-way merge, re-split of oversized frames (byte budget #765 + disk-guard reserve #761 + per-op time budget #781; `merge_k_way` #772; output re-split #773. The time budget is honoured between swaps only, and one already-oversized segment is not auto re-split)
@@ -88,19 +82,19 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [x] **FRE-10a** Contract tests: probes, compute endpoints, metrics and roles
 - [ ] **ROB-14** Cgroup-aware memory budget with per-request reservations
 - [x] Restoring *into a chosen new root* over HTTP (7.3) (#213, 2026-11-14: `POST /api/v1/storage/restore/into?label=...&name=...` into `WEFT_RESTORE_BASE_DIR`; the offline drill at `weft-server/src/restore.rs` is unchanged)
-- [x] Store-side row-level TTL/expiry (prerequisite for the SOA-15 TTL lane) *(cut 1 shipped 2026-11-15 in #752: the policy, the read-path filter and a report-only sweep; cut 2 shipped 2026-11-16 in #775: `purge_expired` drops whole segments whose every row is expired, and the reaper unlinks them; cut 3, the environment switch, landed in #784 for issue #783: the `WEFT_ROW_TTL` env var, the settings entry and the config-schema docs; the daemon call site is open in #786)*
+- [x] Store-side row-level TTL/expiry (prerequisite for the SOA-15 TTL lane) *(cut 1 shipped 2026-11-15 in #752: the policy, the read-path filter and a report-only sweep; cut 2 shipped 2026-11-16 in #775: `purge_expired` drops whole segments whose every row is expired, and the reaper unlinks them; cut 3, the environment switch, landed in #784 for issue #783: the `WEFT_ROW_TTL` env var, the settings entry and the config-schema docs; cut 4, the daemon call site, shipped 2026-11-17 in #786 for issue #785: `reconcile_tick_purge_expired` in `weft-server/src/reconcile_daemon.rs` calls `SegmentStore::purge_expired` on the daemon's own tick and records the sweep, so expiry no longer waits for an operator call; with `NoExpiry` the tick is a recorded no-op)*
 - [x] Real-filesystem ENOSPC test for #656 on the injectable space source (#694 merged)
 - [x] **Measurement bulk ingest routed through the `.weftseg` seal** *(part 1 shipped 2026-11-16: the two legacy bulk writers that do not read the stored range first were routed through the seal store, and the aspect's own latest-timestamp read was fixed to consult it. #768 then made new legacy aspects seal-backed by default, with `WEFT_LEGACY_DEFAULT_STORAGE=rows` as the opt-out, so a fresh deployment writes sealed frames through every ingest entry point)*
 - [x] **CI**
 - [x] Packaging (1.0 minimum)
 - [ ] **Row-TTL purge defects** *(found 2026-11-17 by a read-only audit of #776; nothing on `main` calls `purge_expired` yet, so these gate the daemon call site in #785)*
-  - [ ] **TTL-PURGE** Dropping an expired segment must not bring back the values it superseded in a surviving overlapping segment (#797)
-  - [ ] **TTL-PURGE** An aspect with more than 32 series with expired segments can be purged, and partial drops are counted (#798)
+  - [x] **TTL-PURGE** Dropping an expired segment must not bring back the values it superseded in a surviving overlapping segment (#797, 2026-11-19: `purge_aspect_held` keeps a wholly-expired segment on disk when its `[min_ts, max_ts]` extent overlaps a surviving segment of the same series, so a plain read cannot revert to superseded values)
+  - [x] **TTL-PURGE** An aspect with more than 32 series with expired segments can be purged, and partial drops are counted (#798, 2026-11-19: the swap plans are applied in chunks that stay inside the store's per-transaction plan ceiling, and the sweep report counts the aspects and segments it actually dropped)
   - [ ] **TTL-UNIT** The row TTL carries a unit instead of being a bare number read in each aspect's own time unit (#799)
 - [ ] **Legacy seal routing defects** *(found 2026-11-17 by a read-only audit of #769, #770 and #780; these gate the seal-backed default in #768)*
-  - [ ] **SEAL-COUNT** The count of a seal-backed aspect agrees with what a range read returns after a batch rewrites a timestamp (#800)
-  - [ ] **SEAL-REPLACE** `replace_measurements_in_range` and `compress()` never write to the unread rows file of a seal-backed aspect (#801)
-  - [ ] **SEAL-DUP** The replace-not-append rule for duplicate timestamps is documented and pinned by a test (#802)
+  - [x] **SEAL-COUNT** The count of a seal-backed aspect agrees with what a range read returns after a batch rewrites a timestamp (#800, 2026-11-19: `ingest_batch_with_gate` now folds overlapping clusters with `SegmentStore::reconcile_overlaps` after every ingest, so the segment index stays overlap-free and the rollup count equals the read)
+  - [x] **SEAL-REPLACE** `replace_measurements_in_range` and `compress()` never write to the unread rows file of a seal-backed aspect (#801, 2026-11-19: the rows-mode-only entry points refuse up front with `Error::SealBackedRejected` when the aspect is seal-backed; `set_compression_config` and `capture_new_measurement_chunk` are covered by the same guard)
+  - [x] **SEAL-DUP** The replace-not-append rule for duplicate timestamps is documented and pinned by a test (#802)
   - [ ] **SEAL-IDEM** A reused `DatasetId` cannot lose a write or fail on a CRC-32 collision (#803)
 - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
 - [ ] Write or approve the honesty-page narrative *(owner)*
