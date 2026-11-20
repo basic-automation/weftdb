@@ -10,17 +10,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Changed
 
-- **The legacy seal adapter no longer derives the idempotency key from a CRC-32 of the payload (#803).**
-  `DatasetId` is a logical multi-write identity and is not the idempotency unit; a seal write is
-  idempotent only under a caller-supplied per-call token (UUIDv4 when `None`), otherwise each call
-  appends (matching rows-mode's documented "no idempotency key" contract).  The prior key shape
-  `legacy:{uuid}:{crc}:{n}` is never written and existing rows under that scheme stay inert.
-  `ingest_batch_with_gate` gained an `idempotency_token: Option<&str>` parameter.
-
-### Removed
-
-- **`payload_crc`** — the CRC-32 content hash that was part of the derived idempotency key.  It is
-  removed entirely; no call site feeds a content hash into `IngestBatch::key` (#803).
+- **Legacy seal ingest gained a caller-identity idempotency entry point (#803).**
+  `ingest_batch_with_gate(store, aspect_id, _dataset_id, idempotency_token: &str, rows, squash_target_rows)`
+  keys the seal write `legacy:{token}` — the token is required, so a new caller cannot silently opt out
+  of replay protection: the same token with the same payload replays the first receipt, the same token
+  with a different payload is a loud `StoreError::IdempotencyConflict`, and distinct tokens always
+  write, even for identical rows under one `DatasetId`. The payload-derived key
+  `legacy:{dataset_id}:{payload_crc:08x}:{count}` and its `payload_crc` are unchanged, and the thin
+  `ingest_batch` wrapper that every legacy facade call site uses still derives its key from them — so
+  an identical re-run through that wrapper is still absorbed, and #803 stays open pending the
+  server-ledger identity under #768.
 
 ### Added
 
