@@ -174,6 +174,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: python3 scripts/xbench/check-lock.py
+      # check-lock.py compares the packages the two locks share; it cannot see a dependency a
+      # workspace crate gained that weft-xbench's lock never recorded. Resolving with --locked can:
+      # a stale lock fails here on the push, not first in the nightly cross-engine smoke.
+      - run: cargo metadata --locked --format-version 1 --manifest-path weft-xbench/Cargo.toml > /dev/null
       - run: python3 -m unittest discover -s scripts/xbench -p 'test_*.py' -v
         env:
           PYTHONDONTWRITEBYTECODE: "1"
