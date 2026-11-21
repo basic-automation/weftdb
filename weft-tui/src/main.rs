@@ -18,6 +18,11 @@ use weft_tui::{
 
 #[tokio::main]
 async fn main() {
+	// Huge pages cost about 2 MB per open database on a THP=always host
+	// (`weftdb::opt_out_of_transparent_huge_pages`); a failure only leaves them on.
+	if let Err(error) = weftdb::opt_out_of_transparent_huge_pages() {
+		eprintln!("could not opt out of transparent huge pages: {error}");
+	}
 	// Create log file path
 	let log_path = std::env::var("WEFT_DATA_DIR").map_or_else(
 		|_| {

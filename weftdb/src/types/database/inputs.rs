@@ -1943,6 +1943,7 @@ impl Inputs for Database {
 				}
 			}
 			Self::commit_concurrent(&conn).await?;
+			self.cache.lock().await.invalidate_generation(&Self::unprocessed_events_cache_key(aspect_id)).await;
 			let log = format!("Inserted unprocessed event {event_id} for aspect {aspect_id}");
 			let _ = self.record_transaction(&log).await?;
 			Ok(tx_id)
@@ -1978,6 +1979,8 @@ impl Inputs for Database {
 			}
 
 			Self::commit_concurrent(&conn).await?;
+			self.cache.lock().await.invalidate_generation(&Self::unprocessed_events_cache_key(aspect_id)).await;
+			self.cache.lock().await.invalidate(&format!("unprocessed_event_{}_{}", aspect_id.as_uuid(), event_id.to_uuid())).await;
 			let log = format!("Removed unprocessed event {event_id} for aspect {aspect_id}");
 			let _ = self.record_transaction(&log).await?;
 			Ok(TxId::new())
@@ -2012,6 +2015,7 @@ impl Inputs for Database {
 			}
 
 			Self::commit_concurrent(&conn).await?;
+			self.cache.lock().await.invalidate_generation(&Self::unprocessed_events_cache_key(aspect_id)).await;
 			let log = format!("Cleared all unprocessed events for aspect {aspect_id}");
 			let _ = self.record_transaction(&log).await?;
 			Ok(TxId::new())
@@ -2035,6 +2039,7 @@ impl Inputs for Database {
 				}
 			}
 			Self::commit_concurrent(&conn).await?;
+			self.cache.lock().await.invalidate_generation(&Self::unprocessed_events_cache_key(aspect_id)).await;
 			let log = format!("Cleaned up unprocessed events older than {older_than} for aspect {aspect_id}");
 			let _ = self.record_transaction(&log).await?;
 			Ok(TxId::new())

@@ -693,11 +693,12 @@ fn remove_expired_signals(signals: &mut Signals, correlations: &[weftdb::Correla
 	let mut corrected: Vec<weftdb::Correlation> = Vec::new();
 	let mut slots: std::collections::HashMap<weftdb::CorrelationID, usize> = std::collections::HashMap::new();
 	let mut removed_count = 0;
+	let by_id: std::collections::HashMap<&weftdb::CorrelationID, &weftdb::Correlation> = correlations.iter().rev().map(|c| (c.id(), c)).collect();
 	for (correlation_id, manifestation_id, signal_type, resolution_time) in signals_to_remove {
 		let slot = if let Some(&slot) = slots.get(&correlation_id) {
 			slot
 		} else {
-			let Some(correlation) = correlations.iter().find(|c| *c.id() == correlation_id) else { continue };
+			let Some(&correlation) = by_id.get(&correlation_id) else { continue };
 			corrected.push(correlation.clone());
 			slots.insert(correlation_id, corrected.len() - 1);
 			corrected.len() - 1
@@ -715,18 +716,14 @@ fn collect_expired_signals(signals: &Signals, events: &[weftdb::Event], correlat
 	let mut expired_historical = 0usize;
 	let mut expired_forward = 0usize;
 
+	// First match wins, as the linear scans did.
+	let by_id: std::collections::HashMap<&weftdb::CorrelationID, &weftdb::Correlation> = correlations.iter().rev().map(|c| (c.id(), c)).collect();
+	let events_by_id: std::collections::HashMap<&weftdb::EventID, &weftdb::Event> = events.iter().rev().map(|e| (e.id(), e)).collect();
 	for signal in signals.values() {
-		let mut signal_event_id = None;
-		for correlation in correlations {
-			if correlation.id() == signal.correlation_id() {
-				signal_event_id = Some(correlation.event_id().clone());
-				break;
-			}
-		}
+		let (signal_event_id, average_distance) = by_id.get(signal.correlation_id()).map_or((None, None), |c| (Some(c.event_id().clone()), c.average_distance().cloned()));
 
 		if let Some(event_id) = signal_event_id {
-			if let Some(event) = events.iter().find(|e| *e.id() == event_id) {
-				let average_distance = correlations.iter().find(|c| c.id() == signal.correlation_id()).and_then(|c| c.average_distance().cloned());
+			if let Some(&event) = events_by_id.get(&event_id) {
 				if let Some((_, predicted_manifestation)) = event.manifestations().iter().find(|(_, m)| m.id() == signal.manifestation_id()) {
 					let prediction_point = match signal.signal_type() {
 						SignalType::PredictStart | SignalType::PredictMid => predicted_manifestation.midpoint(),

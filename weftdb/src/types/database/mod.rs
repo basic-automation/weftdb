@@ -33,6 +33,18 @@ static LAST_USED: LazyLock<std::sync::Mutex<HashMap<String, std::time::Instant>>
 /// unlinked empty log would orphan the commits that follow.
 static OPENED_ONCE: LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
+/// Metadata paths whose open-time [`Database::prune_metadata`] already ran in this process.
+/// The prune scans the whole queue and transaction log, and `existing()` is called per
+/// chunk of work, so running it on every open made reads grow with the queue. Once per
+/// path per process keeps the first open identical; [`Database::prune_unread_queues`]
+/// handles queues that age later. [`Database::close`] forgets the path.
+static PRUNED_ON_OPEN: LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Whether this open should run the prune: true the first time a path is seen.
+fn claim_open_prune(metadata_path: &str) -> bool {
+	PRUNED_ON_OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(metadata_path.to_string())
+}
+
 /// When the last idle sweep ran; sweeps are rate-limited to one per [`IDLE_SWEEP_EVERY`].
 static LAST_SWEEP: LazyLock<std::sync::Mutex<std::time::Instant>> = LazyLock::new(|| std::sync::Mutex::new(std::time::Instant::now()));
 const IDLE_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
@@ -180,6 +192,8 @@ pub async fn clear_connection_cache_by_name(name: &str) {
 	// true cold open and runs the sidecar sweep again.
 	OPENED_ONCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|path| !removed.contains(path));
 	LAST_USED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|path, _| !removed.contains(path));
+	// A restart prunes on open again.
+	PRUNED_ON_OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|path| !path.contains(name));
 }
 
 pub mod config;
@@ -747,8 +761,13 @@ impl DatabaseStructure for Database {
 		let database = Self { id: db_id, name: name.to_string(), metadata: metadata_turso_db, metadata_path: metadata_db_path.clone(), cache: Arc::new(Mutex::new(cache::DatabaseCache::new())), seal_store: Arc::new(Mutex::new(None)) };
 		// A store written before 0.3.3 can hold millions of rows that are now never written;
 		// pruning them is best effort and never blocks the open.
-		if let Err(e) = database.prune_metadata().await {
-			tracing::warn!("Pruning the metadata database failed; it is left as it was: {e}");
+		// Only on the first open of this file in the process: see [`PRUNED_ON_OPEN`].
+		if claim_open_prune(metadata_db_path) {
+			if let Err(e) = database.prune_metadata().await {
+				tracing::warn!("Pruning the metadata database failed; it is left as it was: {e}");
+				// Let the next open try again.
+				PRUNED_ON_OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(metadata_db_path.as_str());
+			}
 		}
 		Ok(database)
 	}
@@ -782,6 +801,7 @@ impl DatabaseStructure for Database {
 				conn_pool::unregister(&db, conn_pool::Role::Legacy);
 			}
 		}
+		PRUNED_ON_OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&db_path);
 
 		// Wait for database files to be actually released
 		self.wait_for_database_release().await?;
@@ -2266,5 +2286,39 @@ mod idle_close_tests {
 		assert_eq!(idle_close_from(Some("0")), None);
 		assert_eq!(idle_close_from(Some(" 60 ")), Some(Duration::from_secs(60)));
 		assert_eq!(idle_close_from(Some("soon")), Some(Duration::from_secs(300)));
+	}
+}
+
+#[cfg(test)]
+mod open_prune_tests {
+	use super::{claim_open_prune, Config, PRUNED_ON_OPEN};
+	use crate::{Database, DatabaseStructure};
+
+	fn claimed(path: &str) -> bool {
+		PRUNED_ON_OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(path)
+	}
+
+	#[test]
+	fn a_path_claims_the_open_prune_once() {
+		let path = "/nonexistent/open-prune-claim/metadata.db";
+		assert!(claim_open_prune(path));
+		assert!(!claim_open_prune(path));
+	}
+
+	#[tokio::test]
+	#[serial_test::serial]
+	async fn only_the_first_open_prunes_and_close_forgets_it() -> anyhow::Result<()> {
+		let name = format!("open_prune_{}", uuid::Uuid::new_v4().simple());
+		let db = Database::new(&name).await?;
+		let path = format!("{}/{name}/metadata.db", <Database as Config>::get_data_dir());
+		drop(Database::existing(&name).await?);
+		assert!(claimed(&path), "the first open did not prune");
+		// The second open finds the path claimed, so it skips the prune.
+		drop(Database::existing(&name).await?);
+		assert!(!claim_open_prune(&path));
+		db.close().await?;
+		drop(db);
+		assert!(!claimed(&path), "close kept the claim");
+		Ok(())
 	}
 }

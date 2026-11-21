@@ -30,6 +30,11 @@
 //! Caveat: weftdb's own wall-clock timers (idle close, queue pruning) still run in real
 //! time, so a compressed run sees fewer of them per virtual hour than fanctl does.
 
+/// The production allocator, as weft-server installs it, so the soak measures the RSS
+/// and CPU fanctl would see.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::{
 	collections::HashMap, path::{Path, PathBuf}, str::FromStr, sync::Arc, time::{Duration as StdDuration, Instant}
 };
@@ -375,6 +380,10 @@ fn temp(sensor: usize, t: i64) -> f64 {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+	// NOTHP=1: opt out of transparent huge pages, as weft-server does, to A/B what THP=always adds.
+	if std::env::var("NOTHP").is_ok() {
+		weftdb::opt_out_of_transparent_huge_pages()?;
+	}
 	let o = parse()?;
 	std::fs::create_dir_all(&o.dir)?;
 	anyhow::ensure!(std::fs::read_dir(&o.dir)?.next().is_none(), "{} is not empty", o.dir.display());

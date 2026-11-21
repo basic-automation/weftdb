@@ -1,5 +1,5 @@
 //! Memory per committed row, raw Turso vs `capture_measurement`:
-//! `cargo run --release --example capture_rss -- <empty dir> <raw|raw-noidx|weft> [rows]`.
+//! `cargo run --release --example capture_rss -- <empty dir> <raw|raw-noidx|conns|weft> [rows]`.
 //!
 //! `raw` commits one row per `BEGIN CONCURRENT` on a fresh connection to a WeftDB-configured
 //! MVCC file (as `begin_concurrent` does); `weft` captures into one seconds aspect.
@@ -12,6 +12,12 @@ use weftdb::{
 	Database, DatasetId, InputMeasurement,
 };
 
+/// Keep every opened database alive for the whole run, as WeftDB's handle cache does.
+fn held_dbs(db: turso::Database) {
+	static DBS: std::sync::Mutex<Vec<turso::Database>> = std::sync::Mutex::new(Vec::new());
+	DBS.lock().expect("not poisoned").push(db);
+}
+
 fn anon_mb() -> f64 {
 	let s = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
 	s.lines().find(|l| l.starts_with("Anonymous:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok()).unwrap_or(0.0) / 1024.0
@@ -19,8 +25,12 @@ fn anon_mb() -> f64 {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+	// NOTHP=1: opt out of transparent huge pages, as weft-server does, to A/B what THP=always adds.
+	if std::env::var("NOTHP").is_ok() {
+		weftdb::opt_out_of_transparent_huge_pages()?;
+	}
 	let mut args = std::env::args().skip(1);
-	let dir = args.next().ok_or_else(|| anyhow::anyhow!("usage: capture_rss <dir> <raw|raw-noidx|weft> [rows]"))?;
+	let dir = args.next().ok_or_else(|| anyhow::anyhow!("usage: capture_rss <dir> <raw|raw-noidx|conns|weft> [rows]"))?;
 	let mode = args.next().unwrap_or_else(|| "raw".into());
 	let rows: i64 = args.next().map_or(Ok(200_000), |r| r.parse())?;
 	std::fs::create_dir_all(&dir)?;
@@ -81,6 +91,41 @@ async fn main() -> anyhow::Result<()> {
 					println!("{},{a:.0},{:.0} B/row", i + 1, (a - base) * 1024.0 * 1024.0 / (i + 1) as f64);
 				}
 			}
+		}
+		// `conns`: open `rows` databases, run one transaction on each, and keep (KEEP=1) or drop
+		// its connection, optionally after `PRAGMA cache_size=CACHE` — what a pooled idle
+		// connection costs per file.
+		"conns" => {
+			let keep = std::env::var("KEEP").is_ok();
+			let cache = std::env::var("CACHE").ok();
+			let mut held = Vec::new();
+			for i in 0..rows {
+				let db = turso::Builder::new_local(&format!("{dir}/c{i}.db")).build().await?;
+				let conn = db.connect()?;
+				conn.execute("PRAGMA journal_mode=experimental_mvcc", ()).await.ok();
+				conn.execute("CREATE TABLE IF NOT EXISTS m (ts INTEGER)", ()).await?;
+				let conn = db.connect()?;
+				if let Some(c) = &cache { conn.execute(&format!("PRAGMA cache_size={c}"), ()).await?; }
+				match std::env::var("WORK").as_deref() {
+					Ok("none") => {}
+					Ok("read") => {
+						let mut r = conn.query("SELECT count(*) FROM m", ()).await?;
+						while r.next().await?.is_some() {}
+					}
+					_ => {
+						conn.execute("BEGIN CONCURRENT", ()).await?;
+						conn.execute("INSERT INTO m VALUES (?)", turso::params![i]).await?;
+						conn.execute("COMMIT", ()).await?;
+					}
+				}
+				if keep { held.push(conn); }
+				held_dbs(db);
+				if (i + 1) % step == 0 {
+					let a = anon_mb();
+					println!("{},{a:.0},{:.0} KB/db", i + 1, (a - base) * 1024.0 / (i + 1) as f64);
+				}
+			}
+			drop(held);
 		}
 		"weft" => {
 			let db = Database::new("capture_rss").await?;

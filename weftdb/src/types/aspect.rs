@@ -1478,7 +1478,7 @@ impl Aspect {
 
 	#[instrument]
 	async fn wireframe_correlations_tables_direct(conn: &Connection) -> Result<()> {
-		// Note: No PRIMARY KEY on TEXT columns or indexes to support MVCC
+		// Note: No PRIMARY KEY on TEXT columns to support MVCC; the lookup indexes are created below
 		// Main correlations table
 		conn.as_ref()
 			.execute(
@@ -1540,6 +1540,19 @@ impl Aspect {
 				turso::params![],
 			)
 			.await?;
+
+		// Every correlation read looks rows up by correlation id; without these each lookup
+		// scanned the whole table, once per correlation (fanctl soak stall). Not UNIQUE:
+		// nothing has kept a correlation id from being inserted twice.
+		for (name, sql) in [
+			("idx_correlations_id", "CREATE INDEX IF NOT EXISTS idx_correlations_id ON correlations(id)"),
+			("idx_correlation_error_rates_correlation", "CREATE INDEX IF NOT EXISTS idx_correlation_error_rates_correlation ON correlation_error_rates(correlation_id)"),
+			("idx_correlation_occurrences_correlation", "CREATE INDEX IF NOT EXISTS idx_correlation_occurrences_correlation ON correlation_occurrences(correlation_id, occurrence_index)"),
+		] {
+			if let Err(e) = conn.as_ref().execute(sql, turso::params![]).await {
+				tracing::warn!("Failed to create index {name}: {e}");
+			}
+		}
 
 		Ok(())
 	}

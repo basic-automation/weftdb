@@ -450,12 +450,12 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		tracing::info!(expected_points = expected_points, chunk_count = chunk_count, chunk_duration_ms = chunk_duration.num_milliseconds(), "[analyze_range] Chunked streaming setup");
 
 		// Clone self for use in async stream
-		let db_name = self.name().to_string();
+		let db_handle = self.clone();
 		let aspect_id = *aspect_id;
 
 		// Create streaming iterator that fetches and interpolates per chunk
 		let stream = futures::stream::unfold((start, None::<std::vec::IntoIter<Point>>, false), move |(current_chunk_start, mut current_iter, done)| {
-			let db_name = db_name.clone();
+			let db = db_handle.clone();
 			let aspect_id = aspect_id;
 			let end_time = end;
 			let resolution_val = resolution;
@@ -491,11 +491,6 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 				);
 
 				// Fetch measurements for this chunk (with overlap)
-				let db = match Self::existing(&db_name).await {
-					Ok(db) => db,
-					Err(e) => return Some((Err(e), (chunk_end, None, true))),
-				};
-
 				let measurements = match db.fetch_measurements_for_chunk(&aspect_id, fetch_start, fetch_end).await {
 					Ok(m) => m,
 					Err(e) => return Some((Err(e), (chunk_end, None, true))),
@@ -1045,98 +1040,16 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 	}
 
 	async fn get_correlations(&self, aspect_id: &AspectId) -> Result<Pin<Box<dyn Stream<Item = Result<Correlation>> + Send + 'static>>> {
-		// Page size for chunked loading
-		const PAGE_SIZE: i64 = 100;
-
-		// Get database connection info upfront for the streaming closure
 		let mut aspect = self.get_aspect(aspect_id).await?;
-		let initial_state: CorrelationStreamState = (0i64, Vec::<CorrelationID>::new(), aspect.correlations().await?, aspect.correlations_path(), self.cache.clone(), *aspect_id);
+		let db = aspect.correlations().await?;
+		let db_path = aspect.correlations_path();
 		drop(aspect);
+		let cache = self.cache.clone();
+		let aspect_id = *aspect_id;
 
-		// Use unfold to create a true streaming iterator that fetches in chunks
-		let stream = futures::stream::unfold(initial_state, move |(offset, mut current_ids, db, db_path, cache, aspect_id)| {
-			async move {
-				// If we have IDs in the current batch, pop one and fetch it
-				if let Some(correlation_id) = current_ids.pop() {
-					// Fetch the full correlation for this ID
-					match Self::fetch_correlation_by_id(&db, &db_path, &cache, &aspect_id, &correlation_id).await {
-						Ok(correlation) => Some((Ok(correlation), (offset, current_ids, db, db_path, cache, aspect_id))),
-						Err(e) => {
-							tracing::warn!("Failed to fetch correlation {correlation_id}: {e}");
-							// Continue with next ID
-							Some((Err(e), (offset, current_ids, db, db_path, cache, aspect_id)))
-						}
-					}
-				} else {
-					// Need to fetch next page of IDs
-					let conn: cache::Connection = match Self::begin_concurrent(&db, &db_path, Some(cache.clone())).await {
-						Ok(c) => c,
-						Err(e) => return Some((Err(e), (offset, current_ids, db, db_path, cache, aspect_id))),
-					};
-
-					let query_sql = "SELECT id FROM correlations LIMIT ? OFFSET ?";
-					let rows_result = conn.as_ref().query(query_sql, turso::params![PAGE_SIZE, offset]).await;
-
-					let mut rows = match rows_result {
-						Ok(r) => r,
-						Err(e) => {
-							let _ = Self::rollback_concurrent(&conn).await;
-							return Some((Err(Error::DatabaseError(format!("Failed to query correlations: {e}")).into()), (offset, current_ids, db, db_path, cache, aspect_id)));
-						}
-					};
-
-					// Collect IDs from this page
-					let mut new_ids = Vec::new();
-					loop {
-						match rows.next().await {
-							Ok(Some(row)) => {
-								if let Ok(id_val) = row.get_value(0) {
-									if let Some(id_str) = id_val.as_text() {
-										if let Ok(uuid) = Uuid::parse_str(id_str) {
-											new_ids.push(CorrelationID::from_uuid(uuid));
-										}
-									}
-								}
-							}
-							Ok(None) => break,
-							Err(e) => {
-								tracing::warn!("Error reading correlation ID row: {e}");
-								break;
-							}
-						}
-					}
-
-					drop(rows);
-					if let Err(e) = Self::commit_concurrent(&conn).await {
-						return Some((Err(e), (offset, current_ids, db, db_path, cache, aspect_id)));
-					}
-
-					if new_ids.is_empty() {
-						// No more data, end the stream
-						return None;
-					}
-
-					// Update offset for next page
-					let new_offset = offset + i64::try_from(new_ids.len()).unwrap_or(PAGE_SIZE);
-
-					// Reverse so we can pop from the end efficiently
-					new_ids.reverse();
-
-					// Pop first ID and fetch it
-					if let Some(correlation_id) = new_ids.pop() {
-						match Self::fetch_correlation_by_id(&db, &db_path, &cache, &aspect_id, &correlation_id).await {
-							Ok(correlation) => Some((Ok(correlation), (new_offset, new_ids, db, db_path, cache, aspect_id))),
-							Err(e) => {
-								tracing::warn!("Failed to fetch correlation {correlation_id}: {e}");
-								Some((Err(e), (new_offset, new_ids, db, db_path, cache, aspect_id)))
-							}
-						}
-					} else {
-						None
-					}
-				}
-			}
-		});
+		// One query per table, assembled in memory: paging ids with OFFSET and fetching each
+		// correlation by id scanned the tables once per correlation (fanctl soak stall).
+		let stream = futures::stream::once(async move { Self::load_all_correlations(&db, &db_path, &cache, &aspect_id).await.unwrap_or_else(|e| vec![Err(e)]) }).flat_map(futures::stream::iter);
 
 		Ok(Box::pin(stream))
 	}
@@ -1215,7 +1128,9 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 
 	async fn get_unprocessed_events(&self, aspect_id: &AspectId) -> Result<Pin<Box<dyn Stream<Item = Result<Event>> + Send + 'static>>> {
 		// Check cache first
-		let cache_key = format!("unprocessed_events_{}", aspect_id.as_uuid());
+		let cache_key = Self::unprocessed_events_cache_key(aspect_id);
+		// Taken before the read, so a write committed during it keeps this read uncached.
+		let generation = self.cache.lock().await.generation(&cache_key).await;
 		if let Some(cached_events) = self.cache.lock().await.get::<Vec<Event>>(&cache_key).await {
 			// Convert cached events to stream
 			let event_stream = futures::stream::iter(cached_events.into_iter().map(Ok));
@@ -1244,8 +1159,8 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 				tracing::warn!("Failed to parse unprocessed event with ID {event_id}");
 			}
 		}
-		// Cache the events
-		self.cache.lock().await.store(&cache_key, events.clone()).await;
+		// Cache the events unless a writer changed the table since `generation`.
+		self.cache.lock().await.store_if_generation(&cache_key, generation, events.clone()).await;
 
 		// Convert events to stream
 		let event_stream = futures::stream::iter(events.into_iter().map(Ok));
@@ -1396,9 +1311,13 @@ struct BracketWindows {
 	range: (DateTime<Utc>, DateTime<Utc>),
 }
 
-/// The state the correlation stream unfolds: the next offset, the ids fetched but not yet
-/// read, and what a fetch needs.
-type CorrelationStreamState = (i64, Vec<CorrelationID>, turso::Database, String, std::sync::Arc<tokio::sync::Mutex<cache::DatabaseCache>>, AspectId);
+/// Each correlation's error rates, or why one did not parse, keyed by the stored
+/// `correlation_id` text.
+type ErrorRatesByCorrelation = HashMap<String, std::result::Result<HashMap<SignalType, ErrorRate>, String>>;
+
+/// Each correlation's occurrences by `occurrence_index`, or why one did not parse, keyed by
+/// the stored `correlation_id` text.
+type OccurrencesByCorrelation = HashMap<String, std::result::Result<HashMap<usize, Occurrence>, String>>;
 
 impl Database {
 	/// Every batch row `rows` holds, parsed; a row that does not parse is logged and skipped.
@@ -1550,7 +1469,9 @@ impl Database {
 		Ok(measurements)
 	}
 
-	/// Fetch a correlation by ID without requiring &self (for use in streaming closures)
+	/// Fetch a correlation by ID without requiring &self: the per-id reference the bulk read
+	/// is checked against.
+	#[cfg(test)]
 	async fn fetch_correlation_by_id(db: &turso::Database, db_path: &str, cache: &std::sync::Arc<tokio::sync::Mutex<cache::DatabaseCache>>, aspect_id: &AspectId, correlation_id: &CorrelationID) -> Result<Correlation> {
 		// Check cache first
 		let cache_key = format!("correlation_{}_{}", aspect_id.as_uuid(), correlation_id.to_uuid());
@@ -1624,28 +1545,183 @@ impl Database {
 		Ok((id, dictionary_id, subject_id, aspect_id, pattern_id, event_id, average_distance))
 	}
 
+	/// Every correlation in `db`, in the order the old id paging returned them, each
+	/// assembled from one scan of `correlations`, `correlation_error_rates` and
+	/// `correlation_occurrences`. A correlation already in `cache` is served from it, and
+	/// one read here is cached, as [`fetch_correlation_by_id`](Self::fetch_correlation_by_id)
+	/// does.
+	async fn load_all_correlations(db: &turso::Database, db_path: &str, cache: &std::sync::Arc<tokio::sync::Mutex<cache::DatabaseCache>>, aspect_id: &AspectId) -> Result<Vec<Result<Correlation>>> {
+		let conn: cache::Connection = Self::begin_concurrent(db, db_path, Some(cache.clone())).await?;
+		let loaded = Self::scan_correlation_tables(&conn).await;
+		if loaded.is_err() {
+			let _ = Self::rollback_concurrent(&conn).await;
+		}
+		let (order, mut rows_by_id, mut error_rates, mut occurrences) = loaded?;
+		Self::commit_concurrent(&conn).await?;
+
+		// Index in `out` of each id already assembled, so a duplicate id reuses it.
+		let mut built: HashMap<String, usize> = HashMap::new();
+		let mut out: Vec<Result<Correlation>> = Vec::with_capacity(order.len());
+		for correlation_id in order {
+			let key = correlation_id.to_uuid().to_string();
+			let cache_key = format!("correlation_{}_{key}", aspect_id.as_uuid());
+			if let Some(cached) = cache.lock().await.get::<Correlation>(&cache_key).await {
+				out.push(Ok(cached));
+				continue;
+			}
+			if let Some(&slot) = built.get(&key) {
+				let again = match &out[slot] {
+					Ok(c) => Ok(Correlation::clone(c)),
+					Err(e) => Err(anyhow::anyhow!(e.to_string())),
+				};
+				out.push(again);
+				continue;
+			}
+			let result = match rows_by_id.remove(&key) {
+				None => Err(format!("Correlation with ID {correlation_id} not found")),
+				Some(Err(e)) => Err(e),
+				Some(Ok((id, dictionary_id, subject_id, aspect_id_parsed, pattern_id, event_id, average_distance))) => {
+					let id_key = id.to_uuid().to_string();
+					let error_rate = error_rates.remove(&id_key).unwrap_or_else(|| Ok(HashMap::new()));
+					let occurrences_by_index = occurrences.remove(&id_key).unwrap_or_else(|| Ok(HashMap::new()));
+					match (error_rate, occurrences_by_index) {
+						(Err(e), _) | (_, Err(e)) => Err(e),
+						(Ok(error_rate), Ok(by_index)) => {
+							let mut indexed: Vec<(usize, Occurrence)> = by_index.into_iter().collect();
+							indexed.sort_unstable_by_key(|(index, _)| *index);
+							let occurrences: Vec<Occurrence> = indexed.into_iter().map(|(_, occurrence)| occurrence).collect();
+							let correlation = Correlation::new(Some(id), crate::CorrelationKeys { dictionary_id, subject_id, aspect_id: aspect_id_parsed, pattern_id, event_id }, error_rate, occurrences, average_distance);
+							cache.lock().await.store(&cache_key, correlation.clone()).await;
+							Ok(correlation)
+						}
+					}
+				}
+			};
+			if let Err(e) = &result {
+				tracing::warn!("Failed to fetch correlation {correlation_id}: {e}");
+			}
+			built.insert(key, out.len());
+			out.push(result.map_err(|e| anyhow::anyhow!(e)));
+		}
+		Ok(out)
+	}
+
+	/// One scan of each correlation table: the correlation ids in table order, the first
+	/// row of each id (as `WHERE id = ?` returns it), and each id's error rates and
+	/// occurrences. The child tables are read in rowid order, the order a per-id lookup
+	/// returns them in, so a repeated signal type or occurrence index resolves the same way.
+	async fn scan_correlation_tables(conn: &cache::Connection) -> Result<(Vec<CorrelationID>, HashMap<String, std::result::Result<CorrelationRowData, String>>, ErrorRatesByCorrelation, OccurrencesByCorrelation)> {
+		let mut order = Vec::new();
+		let mut rows_by_id: HashMap<String, std::result::Result<CorrelationRowData, String>> = HashMap::new();
+		let mut rows = conn
+			.as_ref()
+			.query("SELECT id, dictionary_id, subject_id, aspect_id, pattern_id, event_id, average_distance_value, average_distance_units FROM correlations", turso::params![])
+			.await
+			.map_err(|e| Error::DatabaseError(format!("Failed to query correlations: {e}")))?;
+		loop {
+			let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation row: {e}")))? else { break };
+			let Some(id_text) = row.get_value(0).ok().and_then(|v| v.as_text().cloned()) else { continue };
+			let Ok(uuid) = Uuid::parse_str(&id_text) else { continue };
+			order.push(CorrelationID::from_uuid(uuid));
+			rows_by_id.entry(id_text).or_insert_with(|| Self::parse_correlation_row(&row).map_err(|e| e.to_string()));
+		}
+		drop(rows);
+
+		let mut error_rates: ErrorRatesByCorrelation = HashMap::new();
+		let mut rows = conn
+			.as_ref()
+			.query("SELECT correlation_id, signal_type, error_rate_value, error_rate_units FROM correlation_error_rates", turso::params![])
+			.await
+			.map_err(|e| Error::DatabaseError(format!("Failed to query correlation error rates: {e}")))?;
+		loop {
+			let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation error rate row: {e}")))? else { break };
+			let Some(correlation_id) = row.get_value(0).ok().and_then(|v| v.as_text().cloned()) else { continue };
+			let parsed = Self::parse_error_rate_row(&row);
+			let entry = error_rates.entry(correlation_id).or_insert_with(|| Ok(HashMap::new()));
+			if let Ok(map) = entry {
+				match parsed {
+					Ok((signal_type, rate)) => {
+						map.insert(signal_type, rate);
+					}
+					Err(e) => *entry = Err(e.to_string()),
+				}
+			}
+		}
+		drop(rows);
+
+		let mut occurrences: OccurrencesByCorrelation = HashMap::new();
+		let mut rows = conn
+			.as_ref()
+			.query("SELECT correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp FROM correlation_occurrences", turso::params![])
+			.await
+			.map_err(|e| Error::DatabaseError(format!("Failed to query correlation occurrences: {e}")))?;
+		loop {
+			let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation occurrence row: {e}")))? else { break };
+			let Some(correlation_id) = row.get_value(0).ok().and_then(|v| v.as_text().cloned()) else { continue };
+			let parsed = Self::parse_occurrence_row(&row);
+			let entry = occurrences.entry(correlation_id).or_insert_with(|| Ok(HashMap::new()));
+			if let Ok(map) = entry {
+				match parsed {
+					Ok((index, occurrence)) => {
+						map.insert(index, occurrence);
+					}
+					Err(e) => *entry = Err(e.to_string()),
+				}
+			}
+		}
+		drop(rows);
+
+		Ok((order, rows_by_id, error_rates, occurrences))
+	}
+
+	/// An error rate row: `correlation_id(0)`, `signal_type(1)`, `error_rate_value(2)`,
+	/// `error_rate_units(3)`.
+	fn parse_error_rate_row(row: &turso::Row) -> Result<(SignalType, ErrorRate)> {
+		let signal_type_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Error rate signal type is not text".to_string()))?.clone();
+		let error_rate_value: BigDecimal = {
+			let value_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Error rate value is not text".to_string()))?.clone();
+			BigDecimal::from_str(&value_str).map_err(|e| Error::DatabaseError(format!("Invalid error rate value format: {e}")))?
+		};
+		let error_rate_units_str = row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Error rate units is not text".to_string()))?.clone();
+
+		let units: Resolution = Resolution::from_str(&error_rate_units_str).map_err(|e| Error::DatabaseError(format!("Invalid error rate units format: {e}")))?;
+		let err_rate = ErrorRate::new(error_rate_value, units);
+
+		let signal_type = SignalType::from_str(&signal_type_str).map_err(|e| Error::DatabaseError(format!("Invalid error type format: {e}")))?;
+		Ok((signal_type, err_rate))
+	}
+
+	/// An occurrence row: `correlation_id(0)`, `occurrence_index(1)`, then the occurrence.
+	fn parse_occurrence_row(row: &turso::Row) -> Result<(usize, Occurrence)> {
+		let occ_index: usize = usize::try_from(*row.get_value(1)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Index is not integer".to_string()))?).map_err(|e| Error::DatabaseError(format!("Occurrence index out of range: {e}")))?;
+		let occ_aspect_id_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Aspect ID is not text".to_string()))?.clone();
+		let occ_resolution_str = row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Resolution is not text".to_string()))?.clone();
+		let occ_size: usize = usize::try_from(*row.get_value(4)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Size is not integer".to_string()))?).map_err(|e| Error::DatabaseError(format!("Occurrence size out of range: {e}")))?;
+		let occ_database_info_str = row.get_value(5)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Database Info is not text".to_string()))?.clone();
+		let occ_pattern_id_str = row.get_value(6)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Pattern ID is not text".to_string()))?.clone();
+		let occ_beginning_timestamp_millis: i64 = *row.get_value(7)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Beginning Timestamp is not integer".to_string()))?;
+		let occ_end_timestamp_millis: i64 = *row.get_value(8)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence End Timestamp is not integer".to_string()))?;
+		let occ_aspect_id = AspectId::from_str(&occ_aspect_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for occurrence Aspect ID: {e}")))?;
+		let occ_resolution = Resolution::from_str(&occ_resolution_str).map_err(|e| Error::DatabaseError(format!("Invalid resolution format: {e}")))?;
+		let occ_pattern_id = PatternID::from_uuid(Uuid::parse_str(&occ_pattern_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for occurrence Pattern ID: {e}")))?);
+		let occ_beginning_timestamp = DateTime::from_timestamp_millis(occ_beginning_timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid beginning timestamp".to_string()))?;
+		let occ_end_timestamp = DateTime::from_timestamp_millis(occ_end_timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid end timestamp".to_string()))?;
+		let occ_database_info: DatabaseInfo = serde_json::from_str(&occ_database_info_str).map_err(|e| Error::DatabaseError(format!("Failed to parse occurrence database info JSON: {e}")))?;
+		Ok((occ_index, Occurrence::new(occ_aspect_id, occ_resolution, occ_size, occ_database_info, occ_pattern_id, occ_beginning_timestamp, occ_end_timestamp)))
+	}
+
 	async fn load_correlation_error_rates(conn: &cache::Connection, correlation_id: &CorrelationID) -> Result<HashMap<SignalType, ErrorRate>> {
 		let error_rate_query_sql = r"
-	                                SELECT signal_type, error_rate_value, error_rate_units
+	                                SELECT correlation_id, signal_type, error_rate_value, error_rate_units
 	                                FROM correlation_error_rates
 	                                WHERE correlation_id = ?
 	                        ";
-		let mut error_rate_rows: turso::Rows = conn.as_ref().query(error_rate_query_sql, turso::params![correlation_id.to_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query correlation error rates: {e}")))?;
+		let mut rows: turso::Rows = conn.as_ref().query(error_rate_query_sql, turso::params![correlation_id.to_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query correlation error rates: {e}")))?;
 		let mut error_rate: HashMap<SignalType, ErrorRate> = HashMap::new();
-		while let Some(error_rate_row) = error_rate_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation error rate row: {e}")))? {
-			let signal_type_str = error_rate_row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Error rate signal type is not text".to_string()))?.clone();
-			let error_rate_value: BigDecimal = {
-				let value_str = error_rate_row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Error rate value is not text".to_string()))?.clone();
-				BigDecimal::from_str(&value_str).map_err(|e| Error::DatabaseError(format!("Invalid error rate value format: {e}")))?
-			};
-			let error_rate_units_str = error_rate_row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Error rate units is not text".to_string()))?.clone();
-
-			let units: Resolution = Resolution::from_str(&error_rate_units_str).map_err(|e| Error::DatabaseError(format!("Invalid error rate units format: {e}")))?;
-			let err_rate = ErrorRate::new(error_rate_value, units);
-
-			let signal_type = SignalType::from_str(&signal_type_str).map_err(|e| Error::DatabaseError(format!("Invalid error type format: {e}")))?;
-
-			error_rate.insert(signal_type, err_rate);
+		loop {
+			let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation error rate row: {e}")))? else { break };
+			let (signal_type, rate) = Self::parse_error_rate_row(&row)?;
+			error_rate.insert(signal_type, rate);
 		}
 		Ok(error_rate)
 	}
@@ -1656,40 +1732,17 @@ impl Database {
 	                                FROM correlation_occurrences
 	                                WHERE correlation_id = ?
 	                        ";
-		let mut occ_rows: turso::Rows = conn.as_ref().query(occurrences_query_sql, turso::params![correlation_id.to_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query correlation occurrences: {e}")))?;
-		let mut occurrences: Vec<Occurrence> = Vec::new();
-		// load occurrences in order of occurrence_index
+		let mut rows: turso::Rows = conn.as_ref().query(occurrences_query_sql, turso::params![correlation_id.to_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query correlation occurrences: {e}")))?;
+		// A later row with the same occurrence_index replaces an earlier one; then sort by index.
 		let mut occ_map: HashMap<usize, Occurrence> = HashMap::new();
 		loop {
-			let Some(occ_row) = occ_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation occurrence row: {e}")))? else {
-				break;
-			};
-			let occ_index: usize = usize::try_from(*occ_row.get_value(1)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Index is not integer".to_string()))?).map_err(|e| Error::DatabaseError(format!("Occurrence index out of range: {e}")))?;
-			let occ_aspect_id_str = occ_row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Aspect ID is not text".to_string()))?.clone();
-			let occ_resolution_str = occ_row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Resolution is not text".to_string()))?.clone();
-			let occ_size: usize = usize::try_from(*occ_row.get_value(4)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Size is not integer".to_string()))?).map_err(|e| Error::DatabaseError(format!("Occurrence size out of range: {e}")))?;
-			let occ_database_info_str = occ_row.get_value(5)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Database Info is not text".to_string()))?.clone();
-			let occ_pattern_id_str = occ_row.get_value(6)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Pattern ID is not text".to_string()))?.clone();
-			let occ_beginning_timestamp_millis: i64 = *occ_row.get_value(7)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Beginning Timestamp is not integer".to_string()))?;
-			let occ_end_timestamp_millis: i64 = *occ_row.get_value(8)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence End Timestamp is not integer".to_string()))?;
-			let occ_aspect_id = AspectId::from_str(&occ_aspect_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for occurrence Aspect ID: {e}")))?;
-			let occ_resolution = Resolution::from_str(&occ_resolution_str).map_err(|e| Error::DatabaseError(format!("Invalid resolution format: {e}")))?;
-			let occ_database_info: DatabaseInfo = serde_json::from_str(&occ_database_info_str).map_err(|e| Error::DatabaseError(format!("Failed to parse occurrence database info JSON: {e}")))?;
-			let occ_pattern_id = PatternID::from_uuid(Uuid::parse_str(&occ_pattern_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for occurrence Pattern ID: {e}")))?);
-			let occ_beginning_timestamp = DateTime::from_timestamp_millis(occ_beginning_timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid beginning timestamp".to_string()))?;
-			let occ_end_timestamp = DateTime::from_timestamp_millis(occ_end_timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid end timestamp".to_string()))?;
-			let occurrence = Occurrence::new(occ_aspect_id, occ_resolution, occ_size, occ_database_info, occ_pattern_id, occ_beginning_timestamp, occ_end_timestamp);
-			occ_map.insert(occ_index, occurrence);
+			let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation occurrence row: {e}")))? else { break };
+			let (index, occurrence) = Self::parse_occurrence_row(&row)?;
+			occ_map.insert(index, occurrence);
 		}
-		// Sort occurrences by index
-		let mut occ_indices: Vec<usize> = occ_map.keys().copied().collect();
-		occ_indices.sort_unstable();
-		for index in occ_indices {
-			if let Some(occurrence) = occ_map.get(&index) {
-				occurrences.push(occurrence.clone());
-			}
-		}
-		Ok(occurrences)
+		let mut indexed: Vec<(usize, Occurrence)> = occ_map.into_iter().collect();
+		indexed.sort_unstable_by_key(|(index, _)| *index);
+		Ok(indexed.into_iter().map(|(_, occurrence)| occurrence).collect())
 	}
 
 	/// Parse a measurement row without requiring &self (for use in streaming closures)
@@ -1765,6 +1818,12 @@ impl Database {
 
 	/// The key `get_dictionary_metadata` caches a dictionary's metadata under, which
 	/// `set_dictionary_metadata` invalidates. Dictionary names are per aspect, so it has both.
+	/// The cache key of an aspect's unprocessed event list. Every write to the unprocessed
+	/// events table invalidates it with `invalidate_generation`.
+	pub(crate) fn unprocessed_events_cache_key(aspect_id: &AspectId) -> String {
+		format!("unprocessed_events_{}", aspect_id.as_uuid())
+	}
+
 	pub(crate) fn dictionary_metadata_cache_key(aspect_id: &AspectId, dictionary_name: &str) -> String {
 		format!("dictionary_metadata_{}_{dictionary_name}", aspect_id.as_uuid())
 	}
@@ -2021,5 +2080,123 @@ mod tests {
 		assert_eq!(err.to_string(), "Database error: Invalid interpolation format: invalid bounds factor -1: must be finite and not negative");
 		assert!(Database::parse_stored_steps(&Value::Integer(-1), &text("Cubic")).is_err());
 		assert!(Database::parse_stored_steps(&Value::Integer(10), &Value::Null).is_err());
+	}
+
+	mod correlation_reads {
+		use futures::StreamExt;
+
+		use crate::{
+			cache, correlation::ErrorRate, database::traits::{AspectStructure, DatabaseStructure, Inputs, Outputs}, types::signal::Distance, Correlation, CorrelationID, CorrelationKeys, Database, DatabaseInfo, DictionaryId, Event, EventID, Occurrence, PatternID, SignalType, SubjectId
+		};
+
+		fn at(secs: i64) -> chrono::DateTime<chrono::Utc> {
+			chrono::DateTime::from_timestamp(secs, 0).expect("in range")
+		}
+
+		fn correlation(aspect_id: crate::AspectId, subject_id: SubjectId, n: i64) -> Correlation {
+			let pattern_id = PatternID::from_uuid(uuid::Uuid::new_v4());
+			let mut error_rate = std::collections::HashMap::new();
+			error_rate.insert(SignalType::PredictStart, ErrorRate::new(bigdecimal::BigDecimal::from(n), splimes::Resolution::Seconds));
+			if n % 2 == 0 {
+				error_rate.insert(SignalType::PredictEnd, ErrorRate::new(bigdecimal::BigDecimal::from(n * 3), splimes::Resolution::Milliseconds));
+			}
+			let occurrences = (0..n).map(|i| Occurrence::new(aspect_id, splimes::Resolution::Seconds, usize::try_from(i + 1).expect("small"), DatabaseInfo::new(format!("db{n}"), format!("/tmp/db{n}")), pattern_id, at(1000 * n + i), at(1000 * n + i + 5))).collect();
+			let average_distance = (n % 3 != 0).then(|| Distance::new(bigdecimal::BigDecimal::from(n), splimes::Resolution::Seconds));
+			Correlation::new(
+				Some(CorrelationID::from_uuid(uuid::Uuid::new_v4())),
+				CorrelationKeys { dictionary_id: DictionaryId::from_uuid(uuid::Uuid::new_v4()), subject_id, aspect_id, pattern_id, event_id: EventID::from_uuid(uuid::Uuid::new_v4()) },
+				error_rate,
+				occurrences,
+				average_distance,
+			)
+		}
+
+		/// The bulk read returns what the per-id read returns, in the table's order, and the
+		/// correlation tables are indexed by correlation id.
+		#[tokio::test]
+		#[serial_test::serial]
+		async fn the_bulk_read_matches_the_per_id_read() -> anyhow::Result<()> {
+			let name = format!("correlation_reads_{}", uuid::Uuid::new_v4().simple());
+			let db = Database::new(&name).await?;
+			let subject = db.observe_subject("s").await?;
+			let aspect_id = db.track_aspect(&subject.id(), "a", &splimes::Resolution::Seconds, None).await?.id();
+			let inserted: Vec<Correlation> = (1..=6).map(|n| correlation(aspect_id, subject.id(), n)).collect();
+			for c in &inserted {
+				db.insert_correlation(&aspect_id, c).await?;
+			}
+
+			let streamed: Vec<Correlation> = db.get_correlations(&aspect_id).await?.map(|r| r.expect("every correlation reads")).collect().await;
+			assert_eq!(streamed.iter().map(Correlation::id).collect::<Vec<_>>(), inserted.iter().map(Correlation::id).collect::<Vec<_>>(), "not in insertion (table) order");
+
+			let mut handle = db.get_aspect(&aspect_id).await?;
+			let corr_db = handle.correlations().await?;
+			let corr_path = handle.correlations_path();
+			drop(handle);
+			// Fresh caches, so both paths read the tables.
+			let bulk = Database::load_all_correlations(&corr_db, &corr_path, &std::sync::Arc::new(tokio::sync::Mutex::new(cache::DatabaseCache::new())), &aspect_id).await?;
+			assert_eq!(bulk.len(), inserted.len());
+			let per_id_cache = std::sync::Arc::new(tokio::sync::Mutex::new(cache::DatabaseCache::new()));
+			for (bulk, expected) in bulk.into_iter().zip(&inserted) {
+				let bulk = bulk?;
+				let per_id = Database::fetch_correlation_by_id(&corr_db, &corr_path, &per_id_cache, &aspect_id, expected.id()).await?;
+				assert_eq!(bulk, per_id, "the bulk read differs from the per-id read");
+				assert_eq!(&bulk, expected, "the read differs from what was inserted");
+			}
+
+			let conn = <Database as crate::database::traits::connection::Connection>::begin_concurrent(&corr_db, &corr_path, None).await?;
+			for (sql, index) in [
+				("EXPLAIN QUERY PLAN SELECT id FROM correlations WHERE id = '00000000-0000-0000-0000-000000000000'", "idx_correlations_id"),
+				("EXPLAIN QUERY PLAN SELECT signal_type FROM correlation_error_rates WHERE correlation_id = 'x'", "idx_correlation_error_rates_correlation"),
+				("EXPLAIN QUERY PLAN SELECT size FROM correlation_occurrences WHERE correlation_id = 'x'", "idx_correlation_occurrences_correlation"),
+			] {
+				let mut rows = conn.as_ref().query(sql, turso::params![]).await?;
+				let mut plan = String::new();
+				while let Some(row) = turso::Rows::next(&mut rows).await? {
+					for i in 0..row.column_count() {
+						if let Ok(turso::Value::Text(t)) = row.get_value(i) {
+							plan.push_str(&t);
+							plan.push(' ');
+						}
+					}
+				}
+				drop(rows);
+				assert!(plan.contains(index), "{sql} does not use {index}: {plan}");
+			}
+			<Database as crate::database::traits::connection::Connection>::commit_concurrent(&conn).await?;
+			drop(conn);
+			drop(corr_db);
+			db.close().await?;
+			drop(db);
+			Ok(())
+		}
+
+		/// An unprocessed event is listed as soon as it is written, and gone as soon as it
+		/// is removed, though the list was read (and cached) before.
+		#[tokio::test]
+		#[serial_test::serial]
+		async fn unprocessed_event_writes_show_at_once() -> anyhow::Result<()> {
+			let name = format!("unprocessed_events_{}", uuid::Uuid::new_v4().simple());
+			let db = Database::new(&name).await?;
+			let subject = db.observe_subject("s").await?;
+			let aspect_id = db.track_aspect(&subject.id(), "a", &splimes::Resolution::Seconds, None).await?.id();
+			let ids = |db: Database| async move { db.get_unprocessed_events(&aspect_id).await.expect("listed").map(|e| e.expect("event").id().clone()).collect::<Vec<_>>().await };
+
+			let first = Event::new(None, "first".to_string(), None, None);
+			db.insert_unprocessed_event(&aspect_id, &first).await?;
+			assert_eq!(ids(db.clone()).await, vec![first.id().clone()]);
+
+			let second = Event::new(None, "second".to_string(), None, None);
+			db.insert_unprocessed_event(&aspect_id, &second).await?;
+			assert_eq!(ids(db.clone()).await, vec![first.id().clone(), second.id().clone()], "the cached list hid the new event");
+
+			db.remove_unprocessed_event(&aspect_id, first.id()).await?;
+			assert_eq!(ids(db.clone()).await, vec![second.id().clone()], "the cached list kept the removed event");
+
+			db.clear_unprocessed_events(&aspect_id).await?;
+			assert!(ids(db.clone()).await.is_empty(), "the cached list survived the clear");
+			db.close().await?;
+			drop(db);
+			Ok(())
+		}
 	}
 }
