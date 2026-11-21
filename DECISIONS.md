@@ -8978,3 +8978,21 @@ attention" where the code already documents its trade-off.
 
 **Needs human.** None: this is a read-only inventory with no code changes and no merge conflict
 risk.
+
+## 2026-11-21 — What TSBS's tag-grouped queries mean in `weft-xbench`, and what answers them first (TAG-12, #341)
+
+**Ambiguous.** The TAG-12 line names "TSBS tag-grouped query suite" and lists `single-groupby-*`, `double-groupby-*`, `lastpoint` and `high-cpu-*`. TSBS's README describes `single-groupby` as a MAX "every 5 mins", while the SQL TSBS generates buckets by one minute; and the line does not say how an engine's answer is judged.
+
+**Chosen.**
+
+- **TSBS's generated queries are the definition, not its README.** `single-groupby-M-H-T` is the MAX of the first `M` of TSBS's `cpuMetrics` over `H` named hosts per **one-minute** bucket in a half-open `[start, end)` window. Every generator read agrees: TimescaleDB `time_bucket('60 seconds', time)`, ClickHouse `toStartOfMinute`, InfluxDB `group by time(1m)`, QuestDB `SAMPLE BY 1m`. The README mismatch is [timescale/tsbs#214](https://github.com/timescale/tsbs/issues/214), open since 2022. Only the six variants TSBS registers (`1-1-1`, `1-1-12`, `1-8-1`, `5-1-1`, `5-1-12`, `5-8-1`) are named.
+- **An in-process reference judges every engine.** `tsbs::TsbsCpu` answers each query from the parsed file. TSBS picks hosts and windows from its own seed, so the caller passes the ones a generated query names, and the reference and the engine answer the same question. There is no ground truth beyond this, as with the `tsbs` interpolation datasets (2026-10-31).
+- **The fields stay TSBS's integers.** `load_cpu` refuses a float, unsigned, boolean or string field instead of converting it, so the reference is exact by construction and WeftDB stores the values as `ScaledI64` at scale 0 with no lossy step.
+- **WeftDB answers first, untimed.** `TsbsWeft` stores one aspect per metric and one series per `hostname` and answers from `downsample_range_of` (MAX per minute) and whole-series reads (`lastpoint`). A timed phase, the report and other engines come after the answers are pinned equal.
+
+**Rejected.**
+
+- The README's five-minute buckets: no engine TSBS benchmarks would run that query.
+- Timing first and checking later: a fast wrong answer is the failure this harness exists to catch.
+- Running TSBS's Go query generator in CI for the reference: the reference is twenty lines of Rust over data the tests already build, and the nightly does not carry a Go toolchain (2026-10-31).
+
