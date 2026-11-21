@@ -743,8 +743,10 @@ mod tests {
 	#[test]
 	fn an_indeterminate_row_is_rendered_as_non_deterministic_not_a_failure() {
 		let mut indet = result("ds1", "weftdb-memory", Phase::Interpolate, &FAST, true);
-		indet.correctness.as_mut().map(|c| c.indeterminate = true);
-		indet.correctness.as_mut().map(|c| c.passed = false);
+		if let Some(c) = indet.correctness.as_mut() {
+			c.indeterminate = true;
+			c.passed = false;
+		}
 		let regular_fail = result("ds2", "duckdb-double", Phase::Interpolate, &FAST, false);
 		let r = report(vec![indet, regular_fail]);
 		let md = to_markdown(&blocks(&r));
