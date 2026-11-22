@@ -825,3 +825,14 @@ and a parenthetical claiming nothing on `main` calls `purge_expired`. Both halve
 daemon loop (`:552`), pinned by `purge_expired_drops_wholly_expired_frames_and_leaves_straddling_ones`
 (`:917`). The line is now `[x]` and its parenthetical names those PRs and that call site.
 `ROADMAP.md:94` (Legacy seal routing defects) stays open because SEAL-IDEM (#803) is unticked.
+
+## 2026-11-22 — Python test wiring guard (#853, CI-GATES)
+
+`ROADMAP.md` keeps no line for CI hygiene, so this note exists because the defect class does.
+`ci.yml` discovers Python tests through narrow `-p` patterns (`:143`, `:155`), so a `test_*.py`
+added to `scripts/ci` is invisible to CI until a step names it: the guard now proves every
+`test_*.py` under `scripts/` and `tools/` is named directly or matched by a `unittest discover`
+directory/pattern pair, and runs in the `claims` job. It was written against issue #853 after a
+worker for this slice imported two unmerged files from PR #845's branch, which is how the gap
+became visible: a missing step and a duplicated file look identical from a diff of one branch.
+`OK: 13 test script(s) wired by 13 workflow(s)` against `main`.
