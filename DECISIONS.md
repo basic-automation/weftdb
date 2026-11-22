@@ -9028,6 +9028,57 @@ tests, or CI, and no other line was ticked.
 
 **Needs human.** None.
 
+## 2026-11-22 — Splitting an unsatisfiable acceptance clause instead of forcing a fix (#849, #803)
+
+`ROADMAP.md:98` (SEAL-IDEM, issue #803, reopened) asks for one thing in three clauses: a reused
+`DatasetId` must not lose an A-B-A write, must not fail on a CRC-32 collision, and its landed
+replay/widen tests must keep passing. An oracle consult (run `25a7fe27-86be-4eff-b554-a9b7fc9d4011`)
+concluded those are **mutually unsatisfiable** in the library: clause 1 needs *call* identity, and
+call identity is exactly what the pinned identical-content tests forbid the legacy facades from
+inventing.
+
+What was ambiguous, and what I chose:
+
+- **Do not force one PR.** Split the line. The collision clause is cheap, non-breaking and
+  self-contained — the ledger key digests the payload with a 32-bit CRC
+  (`weftdb/src/types/legacy_seal.rs:163-171`, key at `:178`), which is ~50 % collision odds by
+  ~77,000 distinct writes. That became **issue #849**: widen the digest to a 128-bit SHA-256 prefix
+  (`sha2` is already a workspace dependency at `Cargo.toml:67`, locked in `Cargo.lock:4305`, just not
+  yet used by `weftdb`). The caller-identity clause stays open on #803 and is deferred past 1.0,
+  because the sealed storage path that does not use legacy keys at all is already the default
+  (#768, landed as PR #777 on 2026-11-17), which makes the residual opt-in.
+- **The key is on-disk state, and that is survivable.** `ingest_ledger` persists the literal key
+  column (`weftdb/src/types/segment_index.rs:1102`, `LedgerEntry { key: text(1), … }` at `:1125`),
+  but the lookup is `(aspect, key)`, so changing the derivation needs no migration and no layout
+  bump: pre-change rows simply stop matching and orphan. The behavioural cost is that a blind retry
+  from an older client re-writes instead of replaying — on an append-only store that is the safer
+  direction, and it is a documented consequence rather than a silent one.
+- **Keep `payload_crc` public and do not deprecate it.** There is no public-API snapshot gate in this
+  repo (`grep -rn 'public surface' docs/stability.md .github/workflows/ci.yml` finds only the
+  roadmap-table row), and `#[deprecated]` on a function still referenced by a unit test in the same
+  file (`:512`) risks `-D warnings` in the `clippy` job, which cannot be checked locally here. A doc
+  note is enough. Hash choice: SHA-256 truncated to 128 bits over `blake3`, because `blake3` is not a
+  dependency anywhere in the workspace and one more vendored crate for 16 bytes of digest is not worth
+  it.
+- **Leave `#803` open** rather than closing it "as narrowed", which is what the consult recommended.
+  It was reopened by the routine loop and the caller-identity half has no other tracker; closing it
+  while the collision fix is still unmerged would lose the trail. It carries a comment pointing at
+  #849 and at this section instead.
+- **Leave `ROADMAP.md:98` unticked** and rewrite its prose. The audit (see
+  `roadmap-claim-findings.md`) found three more lines whose prose asserts a gate that has already
+  shipped — `:94` ("these gate the seal-backed default in #768", which landed 2026-11-17), `:127`
+  (the fan-out arm landed as PR #809 on 2026-11-19, though no ladder run or claim entry exists, so it
+  stays open on that ground alone) and `:163` (the OpenAPI breaking-change check shipped as PR #839 on
+  2026-11-20). Each now says what shipped and what is left, rather than asserting a dependency that no
+  longer exists.
+
+Lesson for anyone briefing off a roadmap line: **the prose is a claim, not a constraint.** #797/#798/#799
+were closed by PRs #810/#822 while `:90` still said "nothing on `main` calls `purge_expired`", and
+`:98` still said the remaining half "depends on #768" eleven days after #768 landed. Re-read the code
+and the PR state before turning a roadmap sentence into a work order.
+
+Needs human. None.
+
 ## 2026-11-22 — A gate that nothing invokes is not a gate (#853)
 
 **Context.** CI-GATES (#853). Every Python gate in this repo runs only because a
