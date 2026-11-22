@@ -445,6 +445,13 @@ origin/main
   `trend_analysis` survives only as a commented-out call. The `ROADMAP.md` verification line
   stays unchecked: a negative answer completes the audit, not the wiring. Defects filed as
   #862 and #863.
+- **ILP/Influx interop audited end to end (#359).** New research document
+  `docs/research/ilp-interop-audit.md` answers what interop exists today and what the roadmap's
+  "connector crate" line still needs: the parser crate, four HTTP ILP endpoints and `write_ilp` in
+  both SDKs are present and reachable, while an ILP writer, an InfluxDB client dependency, a
+  connector trait, UDP ingress and an ILP round-trip suite are absent. Follow-up slices filed as
+  #866, #867, #868 and #869; the connector trait (#358) is the prerequisite and is filed but
+  unassigned. No behaviour change, and the `ROADMAP.md` line stays unchecked.
 
 ## [0.3.7] - 2026-11-12
 
