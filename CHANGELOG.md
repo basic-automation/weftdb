@@ -8,6 +8,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **ILP writer for `LineRecord` and `FieldValue` (#866).**
+  `LineRecord` now implements `Display` and exposes `to_ilp()` to serialise
+  parsed records back into InfluxDB Line Protocol form. `FieldValue` also
+  implements `Display`. Escaping mirrors the parser exactly, not the Influx
+  published spec.
+
 ### Changed
 
 - **`url` is 2.5.9, not 2.5.8 (#857).** RustSec advisory RUSTSEC-2026-0592
