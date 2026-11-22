@@ -10,6 +10,25 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Changed
 
+- **`url` is 2.5.9, not 2.5.8 (#857).** RustSec advisory RUSTSEC-2026-0592
+  (`denial-of-service`) reports that `Url::origin()` handled a `blob:` URL by re-parsing its path as
+  another URL and calling itself whatever the inner scheme was, with no depth limit: 10,000 `blob:`
+  prefixes (50,020 bytes) parse fine, and calling `origin()` on the result overflowed a default 2 MiB
+  thread stack. A stack overflow aborts the process and `catch_unwind()` does not catch it, and
+  `url::quirks::origin()` routes through the same function. 2.5.9 follows the URL Standard and takes
+  the inner origin only for `http`, `https` and `file`. The dependency is transitive only —
+  `cargo tree --locked -i url` puts `url v2.5.8` under `reqwest v0.13.5` (reached from `weft-server`
+  through `opentelemetry-http`/`opentelemetry-otlp v0.33.0` and directly from `weftdb-client`), plus
+  `tower-http v0.6.11` under `reqwest` — and no manifest in the workspace declares `url`. WeftDB's own
+  code calls neither `Url::origin()` nor `url::quirks::origin()` (zero hits across `weftdb`,
+  `weft-server`, `weft-client`, `weft-bench`, `weft-tui`, `weft-line-protocol`), so this is the
+  supply-chain gate doing its job, not a live WeftDB crash path. The lockfile moves two entries:
+  `url 2.5.8 -> 2.5.9` and `form_urlencoded 1.2.2 -> 1.2.3`, the one requirement 2.5.9 tightens, both
+  checksums matching crates.io; `THIRD-PARTY-LICENSES.md` regenerates to those two version lines.
+  `cargo deny check advisories` is CI's gate under the pinned 0.21.0; a local 0.20.2 run against a
+  copy of `deny.toml` with its `expiry` key stripped (0.20.2 cannot parse that key — the pre-#794
+  state recorded in the file) reports `advisories ok` on the bumped lockfile.
+
 - **Legacy seal ingest gained a caller-identity idempotency entry point (#803).**
   `ingest_batch_with_gate(store, aspect_id, _dataset_id, idempotency_token: &str, rows, squash_target_rows)`
   keys the seal write `legacy:{token}` — the token is required, so a new caller cannot silently opt out
