@@ -161,3 +161,16 @@ Branch `ci-gates/test-wiring`, based on `d901e90`. Issue #853.
   `UNWIRED:` paths and the real-repo test passes.
 - `.github/workflows/ci.yml` parses with `yaml.safe_load`; 17 jobs; `claims` steps
   contain the two new `run:` commands.
+# progress — ROADMAP-TRUTH-3 (truth3/roadmap-lines, base c3379fc)
+
+## Done
+
+- `ROADMAP.md:94`, `:98`, `:119` rewritten in place; every box left in its prior state
+- `DECISIONS.md`: "A stale roadmap line is a defect in its own right" with the #803 clause
+  mapping (collision half satisfied by #849/PR #850, lost-write half held to after 1.0)
+- `docs/roadmap-notes.md`: dated note for the same pass
+- Committed with `git commit -s`, pushed, PR open against #855
+
+## Not run
+
+- Nothing compiled: the change touches three markdown files and no Rust. CI is the gate.

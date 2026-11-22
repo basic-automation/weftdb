@@ -1,9 +1,12 @@
-"""Tests for check-test-wiring.py (CI-GATES, #853).
+"""Tests for check-test-wiring.py (CI-GATES, #853; hardening, #859).
 
 Every test writes a fixture YAML workflow into a ``tempfile.TemporaryDirectory``
 and runs ``_run_check`` against a set of stub test files created in the same
 temporary tree.  The last test (``test_real_repo_passes``) runs the guard
 against the actual repository tree — that is the regression that matters.
+
+The two ``…_not_wired`` / ``blanket`` cases below are the #859 regressions:
+both pass the guard before the hardening, and fail it after.
 """
 
 import importlib.util as _util
@@ -102,6 +105,53 @@ class CheckTestWiringTest(unittest.TestCase):
             )
             rc = cwt._run_check(root, wf_dir)
             self.assertEqual(rc, 1)
+
+    def test_basename_copy_is_not_wired(self) -> None:
+        """#859: a step that runs ``scripts/x/test_a.py`` must not credit a
+        different file that merely shares its basename.
+
+        ``scripts/bench/test_a.py`` is a separate test nobody invited, so the
+        guard must report it unwired (exit 1).  Before #859 the guard also
+        recorded the bare basename and this case passed (exit 0).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wf_dir = _make_tree(
+                tmp,
+                ["scripts/x/test_a.py", "scripts/bench/test_a.py"],
+                [{"run": "python3 scripts/x/test_a.py"}],
+            )
+            rc = cwt._run_check(root, wf_dir)
+            self.assertEqual(rc, 1)
+
+    def test_blanket_discover_is_refused(self) -> None:
+        """#859: ``discover -s .`` would cover every policed file, so it is
+        reported as a blanket rule and does not wire anything (exit 1).
+
+        Before #859 a single ``-s .`` step in any workflow credited every
+        ``test_*.py`` under ``scripts/`` and ``tools/``, which made the whole
+        guard vacuous.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wf_dir = _make_tree(
+                tmp,
+                ["scripts/x/test_a.py", "tools/y/test_b.py"],
+                [{"run": "python3 -m unittest discover -s . -p 'test_*.py' -v"}],
+            )
+            rc = cwt._run_check(root, wf_dir)
+            self.assertEqual(rc, 1)
+
+    def test_bounded_discover_root_still_wires(self) -> None:
+        """#859 keeps the allowed case: a discover rooted at a bounded
+        directory (``tools``, not the repository root) still covers its test
+        files (exit 0)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, wf_dir = _make_tree(
+                tmp,
+                ["tools/y/nested/test_b.py"],
+                [{"run": "python3 -m unittest discover -s tools -p 'test_*.py' -v"}],
+            )
+            rc = cwt._run_check(root, wf_dir)
+            self.assertEqual(rc, 0)
 
     def test_real_repo_passes(self) -> None:
         """Run the guard against the actual repository tree.  This is the
