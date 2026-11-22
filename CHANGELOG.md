@@ -8,6 +8,15 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Documentation
+
+- **REST facade audit (#360).** Audited what the WeftDB HTTP API (the REST facade) still does not
+  expose from the `weftdb` library. Produced `docs/research/rest-facade-audit.md` with a route
+  inventory, grouped by scope, and a gap analysis. Four real gaps filed as separate issues (#878
+  row TTL expiry, #879 manual segment split, #880 metadata repair and rollup backfill, #881 series
+  resolution and tag lookup). No behaviour change; `ROADMAP.md:194` line left unchecked per the
+  audit contract.
+
 ### Changed
 
 - **`url` is 2.5.9, not 2.5.8 (#857).** RustSec advisory RUSTSEC-2026-0592

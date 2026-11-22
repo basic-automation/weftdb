@@ -191,7 +191,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 
 - [ ] **B-conn** Vendor-neutral connector trait + registry
 - [ ] **B-ilp** ILP/Influx interop connector crate
-- [ ] **B-rest** REST facade remainder
+- [ ] **B-rest** REST facade remainder (audit: `docs/research/rest-facade-audit.md` — four real gaps filed as #878–#881; the `interpolate_range_f64` optimization is deliberately library-only; Phase 22 line left unchecked per the audit contract)
 - [ ] **B-resilience** Write retry, size-tiered write selector, interpolation window extension
 - [ ] **B-conncache** Complete the cached-connection migration
 - [ ] Grafana → Prometheus remote write/read (if monitoring) → R/Arrow workflows
