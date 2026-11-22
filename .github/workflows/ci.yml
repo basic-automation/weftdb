@@ -98,6 +98,7 @@ jobs:
         shell: bash
         env:
           RUSTFLAGS: ""
+          CARGO_TERM_COLOR: never
         run: |
           set -uo pipefail
           expected=$(cargo metadata --no-deps --format-version 1 | jq '[.packages[] | select(.source == null)] | length')
@@ -164,6 +165,19 @@ jobs:
             echo "compat/openapi/baseline/weftdb.json moved without updating compat/openapi/baseline/weftdb.json.sha256" >&2
             exit 1
           fi
+      # Every test script under scripts/ and tools/ must be invoked by a
+      # workflow step (CI-GATES, #853).  A gate that nothing invokes is not
+      # a gate: scripts/ci is discovered by narrow -p patterns, so a test
+      # file added there is invisible to CI unless a step names it.
+      - run: python3 scripts/ci/check-test-wiring.py
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+      # Unit tests for the wiring guard (explicit step, not discover:
+      # scripts/ci discovery is deliberately narrow, and a discover line
+      # would contradict the point of the guard).
+      - run: python3 scripts/ci/test_check_test_wiring.py
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
       # The control check's own unit tests run here too, not only in the release
       # workflow: an unexercised gate is an unenforced gate (FRE-18c, P2).
       - run: python3 scripts/ci/test_check_baseline_control.py

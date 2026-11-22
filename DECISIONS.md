@@ -9078,6 +9078,51 @@ were closed by PRs #810/#822 while `:90` still said "nothing on `main` calls `pu
 and the PR state before turning a roadmap sentence into a work order.
 
 Needs human. None.
+
+## 2026-11-22 — A gate that nothing invokes is not a gate (#853)
+
+**Context.** CI-GATES (#853). Every Python gate in this repo runs only because a
+workflow step names it, and nothing asserts that the step exists.
+`scripts/ci` is the directory where CI discovers tests with narrow patterns
+(`-p 'test_check_serial_order.py'`, `-p 'test_check_openapi_breaking.py'`), so a
+test file added there is invisible to CI unless some step names it. The concrete
+instance was found while working #843: its `scripts/ci/test_check_baseline_control.py`
+has a workflow step only on that issue's own branch (PR #845), and nothing on
+`main` would ever have invoked it had this guard existed.
+
+**Question.** How should the guard detect whether a test file is wired?
+
+**Chosen: parse every `.github/workflows/*.yml` with `yaml.safe_load`, walk
+jobs/steps, and recognise two shapes.** Direct: the run text contains
+`python3 <path>` where `<path>` resolves to the file. Discovery: the run
+matches `python3 -m unittest discover -s <dir> -p <pattern>`, and the file's
+directory is under `<dir>` and its name matches `<pattern>` via `fnmatch`.
+
+**Rejected: grep for `test_check_baseline_control.py`.** Grepping would find a
+file mentioned in a comment even if it had no run step, producing false
+negatives. A YAML parse is also future-proof if the workflow format changes
+how run steps are structured.
+
+**Rejected: running the wiring guard via a `unittest discover` line.** The
+`discover` lines in `scripts/ci` are deliberately narrow — they name the exact
+test file that targets a specific guard. A discover line for `test_check_test_wiring.py`
+would use the same narrow pattern the guard exists to police, contradicting
+the point. An explicit `run:` step is the honest signal.
+
+**Rejected: adding a new job.** The `claims` job already runs every Python
+gate and its tests; adding a new job would increase CI minutes, require an
+additional `actions/checkout`, and scatter the gates across the workflow. All
+gates and their tests live in `claims` with `run:` steps only (action-pinning
+rejects unpinned `uses:`).
+
+**Correction made while finishing the slice.** The worker's draft of this
+section said the #843 test file exists on `main` and wired it in this change. It
+does not: that file and its checker live only on the unmerged branch for #843,
+and the copies the worker made out of that other worktree have been removed from
+this branch — the brief's own premise was wrong, which is worth recording next to
+the guard that exists to catch exactly that class of drift. `check-test-wiring.py`
+reports `OK: 13 test script(s) wired by 13 workflow(s)` against `main`, and #845
+brings its own step for its own test.
 ## 2026-11-22 — The legacy ledger key is a payload digest, so its width is a data-integrity parameter (#849)
 
 **Context.** The legacy seal path keys its ingest ledger by a payload digest. Until this change the
@@ -9141,6 +9186,62 @@ inner scheme is not `http`/`https`/`file` now yields an opaque origin instead of
 used to report. Nothing in this workspace builds a `blob:` URL, so it is inert in WeftDB's own code,
 but the change lands inside `reqwest`'s use of `url`, which this bump does not attempt to audit — the
 client and server test suites are what exercise that path.
+## 2026-11-22 — A verification line is answered, not ticked (B-analysis, #362)
+
+**Question.** `ROADMAP.md:317` reads "**B-analysis** Verify the per-point analysis model is
+wired end-to-end", and issue #362 is its generated stub with no acceptance detail. Two things
+were ambiguous: what completes a *verify* line, and whether a negative answer entitles it to a
+tick.
+
+**Chosen.** Run the audit, rewrite the line's prose with the verdict, and leave the box
+unchecked. File the discovered defects as their own issues (#862, #863) and close #362 as the
+audit itself. Findings doc: `docs/research/per-point-analysis-wiring.md`.
+
+**Rationale.** A tick on "verify X is wired" is read downstream as "verified: wired". The line
+describes a state of the world, not the act of asking. This is the same rule the ROADMAP-TRUTH
+slices applied to stale ticks — a roadmap edit rewrites prose, and only an issue that actually
+delivers the state gets the tick. Answering the question *and* opening the defects it found
+keeps the queue honest: nobody has to re-derive the audit to know what remains.
+
+**What the audit rests on.** Call-site and definition sweeps (`rg --glob '!target'` over
+`**/*.rs`), plus per-crate dependency scan. No build was run — the RAM constraint on this host
+forbids local cargo — so this is structural evidence, not behavioural: nothing here shows
+`analyze_point` returning a wrong value, only that no product path calls it.
+
+- No producer on a product path: `Batch::process()` (`weftdb/src/types/batches/batch.rs:447`)
+  is called only from `weft-orchestration/src/lib.rs:795`, its
+  `debug_batch_test.rs:62`, and `weftdb/tests/db_tests.rs:1133,1177,1230`;
+  `BatchCollection::process_batches()` (`weftdb/src/types/batches/mod.rs:176`) has zero call
+  sites.
+- Not persisted, and reads clear it: `BatchedMeasurement::new` fixes `analysis: None`
+  (`weftdb/src/types/batches/batched_measurements/mod.rs:22-24`) and both read-side
+  constructors use it (`weftdb/src/types/batches/mod.rs:82,138`). The sole reader,
+  `weft-orchestration/src/lib.rs:872,887` (`measurement.analysis()?.relative()`), therefore
+  sees `Some` only inside the pass that computed it.
+- No surface: no "analysis" token anywhere under `weft-server/src`; `analyze_point`/
+  `analyze_range` (`weftdb/src/types/database/traits/outputs.rs:39,41`) are called only from
+  `weftdb` tests and `weftdb/benches/new_api_benchmarks.rs:118,140`.
+  `weft-orchestration` is depended on by `weft-bench` only (`weft-bench/Cargo.toml:36`).
+- Dead half: no `trend_analysis` definition exists; only the commented-out call at
+  `weftdb/src/types/batches/batch.rs:303-304`, whose stated reason ("the expensive O(n²)
+  trend_analysis") is unverified.
+
+**Rejected.** (a) Ticking the line with a "not wired" annotation — that is how a roadmap starts
+asserting things it found false. (b) Adding an HTTP route for `analyze_point`/`analyze_range`
+in this slice: it is a public-surface change while the surface freeze (#238) is open, and it
+would expose an `Analysis` payload that is `None` on every read — a route that returns nothing.
+(c) Deleting the `trend` half: removing `trend`/`trend()`/`get_trend()`/`get_slope()`/
+`set_trend()` (`analysis.rs:17-33`) is a breaking public-API change needing the same owner
+sign-off as adding surface, and the only rationale for its absence is a comment. (d) Wiring
+`process()` into a product path here: it first needs the persist-or-recompute decision, which
+touches the segment layout and `layout_version`.
+
+**Lean recorded, not implemented.** Recompute rather than persist — the relative values are a
+pure function of the points in one batch, so recomputation costs a pass and adds no format
+change, while persisting adds columns that can go stale.
+
+**Needs human.** Whether the `trend` half survives at all, and whether the product ever wants
+an analysis surface over HTTP. Both are recorded on #862 and #863 rather than decided here.
 ## 2026-11-22 — A doc comment that says a shipped feature is absent is its own defect (#860, TAG-12 residual)
 
 **Ambiguity.** `weft-bench/src/fan_out.rs` opened with "On `main` `git grep -l fan-out` matches only
