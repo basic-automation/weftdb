@@ -453,6 +453,11 @@ origin/main
   connector trait, UDP ingress and an ILP round-trip suite are absent. Follow-up slices filed as
   #866, #867, #868 and #869; the connector trait (#358) is the prerequisite and is filed but
   unassigned. No behaviour change, and the `ROADMAP.md` line stays unchecked.
+- Cached-connection audit (#369, PR #870, `docs/research/cached-connection-audit.md`): what
+  connection caching Weft already has, which call sites bypass it and why, and the correctness
+  couplings a new cache must respect (handle `Drop` flushes, MVCC enabled once per file). Filed
+  #871, #872 and #873; the roadmap line stays unchecked because the remaining work is either in
+  the owner's lane or changes public surface.
 
 ## [0.3.7] - 2026-11-12
 
