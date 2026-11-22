@@ -28,6 +28,24 @@ All original deliverables for issue #838 (FRE-18a) are implemented, committed, p
 
 ---
 
+## Handoff — FRE-18c (this run)
+
+- **All code changes are Python + docs + CI yml only.** No Rust touched.
+- **Fixes #843:** requestBody.required deltas (P0), combinator descent (P1), non-tautological baseline control (P1), docs corrected (P2).
+- **PR**: https://github.com/basic-automation/weftdb/pull/845
+- **CI run**: https://github.com/basic-automation/weftdb/actions/runs/44988826200
+- **Local verification**: `python3 -m unittest discover -s scripts/ci -p 'test_*.py'` → 85 tests, all pass; `check-action-pinning.py` → OK; all probes exit 1.
+- **No staged files**, working tree clean.
+- **Key files changed**:
+  - `scripts/ci/check-openapi-breaking.py` — combinator descent + requestBody.required delta detection
+  - `scripts/ci/test_check_openapi_breaking.py` — 8 new tests (47 total)
+  - `scripts/ci/check-baseline-control.py` — new (baseline control via gh api)
+  - `scripts/ci/test_check_baseline_control.py` — new (4 tests)
+  - `.github/workflows/ci.yml` — wired baseline control into claims job
+  - `docs/stability.md` — corrected gap list
+  - `DECISIONS.md`, `docs/roadmap-notes.md` — updated
+- **Remaining**: monitor CI run; no expected failures.
+
 # progress — bprec1/bigdecimal-inventory
 
 ## Done
