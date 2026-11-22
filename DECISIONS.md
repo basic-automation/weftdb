@@ -9242,3 +9242,31 @@ change, while persisting adds columns that can go stale.
 
 **Needs human.** Whether the `trend` half survives at all, and whether the product ever wants
 an analysis surface over HTTP. Both are recorded on #862 and #863 rather than decided here.
+
+## 2026-11-22 — A worker's progress log reached `main`, and the fix is to ignore the class (#876)
+
+**Ambiguity.** `progress.md` sat at the repository root on `main`: a 163-line run log for issue
+#838, with a Done checklist and acceptance notes, written by an agent and merged along with the code
+it described. The question was whether such a file is documentation to keep, documentation to move
+under `docs/`, or scratch to delete. It is also the second scaffolding leak of this kind — the
+`.gitignore` scratch section already carries a `## Worker handoff notes are scratch, not repo
+content` entry for `.handoff-*.md`, which means the repo had already decided the class once.
+
+**Choice.** Delete the file and widen the ignore rule to the class: `progress.md` and `.briefs/`
+join the scratch section. Nothing references the file (`rg -n 'progress\.md' .github scripts docs
+tools` returns nothing), so deleting loses no information that anything depends on; the content
+itself describes work that is recorded properly in `ROADMAP.md`, `DECISIONS.md` and the issue
+tracker, which is where a reader looks for it.
+
+**Why not move it under `docs/`.** A run log is a statement about one agent's session, not about the
+system. Its claims were true at the moment the agent wrote them and are unverifiable afterwards, so
+placing it in `docs/` would add a document that invites trust it has not earned. The same reasoning
+already removed `DETAILED_CHANGES.txt` and `.handoff-*.md` from the tree.
+
+**Deferred deliberately: a CI guard.** The complete fix is a check that no scaffolding filename
+(`progress.md`, `.briefs/**`, `.handoff-*.md`) is tracked — the ignore rule only stops *this*
+checkout from re-adding one. That guard belongs beside the Python test-wiring guard in
+`scripts/ci/`, and the hardening branch for it (`ci-gates/wiring-basename`, #859) is unmerged and
+edits `scripts/ci/` and `.github/workflows/ci.yml`. Landing a second guard in that directory at the
+same time manufactures a conflict for no benefit, so the guard waits for #859 to merge. Recorded
+here rather than only in a commit message because it is a decision to leave known work undone.

@@ -49,3 +49,8 @@ weft-audit.jsonl
 
 # Worker handoff notes are scratch, not repo content.
 .handoff-*.md
+
+# The same class, other names: a worker's progress log and its brief reached main
+# the way the handoff notes did (#876). Ignore the class, not the instance.
+progress.md
+.briefs/

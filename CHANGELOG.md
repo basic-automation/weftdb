@@ -40,6 +40,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   an identical re-run through that wrapper is still absorbed, and #803 stays open pending the
   server-ledger identity under #768.
 
+- **A worker's progress log was tracked at `progress.md` (#876).** It was a run log for issue
+  #838: a Done checklist written by an agent into its worktree, committed, and merged. Nothing in
+  `.github/`, `scripts/`, `docs/` or `tools/` references it and no document links to it, so it read
+  as project documentation while being none. It is removed, and `.gitignore` now covers the class
+  (`progress.md`, `.briefs/`) beside the `.handoff-*.md` entry that already existed.
+
 ### Fixed
 
 - **The legacy ingest-ledger key now digests its payload with 128 bits instead
