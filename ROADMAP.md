@@ -316,7 +316,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] **B-sim** Full variability-metric matrix, fixed-point dedup, occurrence-distance constraint
 - [ ] **B-analysis** Verify the per-point analysis model is wired end-to-end — audited 2026-11-22: **not wired** (no producer on any product path, never persisted and every read resets it to `None`, no server surface, and the `trend` half has no producer); defects filed as #862/#863, findings in `docs/research/per-point-analysis-wiring.md`
 - [ ] **B-snapshot** Pipeline state-snapshot audit trail
-- [ ] **B-object** Schemaless object/annotation store beside numeric aspects
+- [ ] **B-object** Schemaless object/annotation store beside numeric aspects (audit 2026-11-22: docs/research/object-store-audit.md — **does not exist**; freeze blocks it; defer to post-1.0; box stays open by design)
 
 ## Phase 29 — SQL surface
 

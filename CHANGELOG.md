@@ -8,6 +8,10 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Documentation
+
+- **B-object audit** — `docs/research/object-store-audit.md` confirms no schemaless object/annotation store exists; every PhysicalType is numeric, the segment frame has no non-numeric column model, and the public-surface freeze blocks new routes. Deferred to post-1.0. Phase label reconciled from the stale "Phase 4" (issue body) to Phase 28 (the live ROADMAP.md position). (#363)
+
 ### Changed
 
 - **`url` is 2.5.9, not 2.5.8 (#857).** RustSec advisory RUSTSEC-2026-0592
