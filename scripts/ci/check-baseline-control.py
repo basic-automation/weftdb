@@ -67,6 +67,12 @@ def _fetch_base_digest(repo: str, ref: str, path: str) -> str:
     Returns the sha256 hex string found in the response's ``content``
     field (base64-decoded, first whitespace token).
     """
+    # If the path is absolute (e.g. from a default path built from
+    # __file__ in CI), strip the GITHUB_WORKSPACE prefix so the URL
+    # is repo-relative.
+    workspace = os.environ.get("GITHUB_WORKSPACE", "")
+    if workspace and path.startswith(workspace + "/"):
+        path = path[len(workspace) + 1:]
     api_url = f"repos/{repo}/contents/{path.lstrip('/')}?ref={ref}"
     result = subprocess.run(
         ["gh", "api", api_url, "--jq", ".content"],
@@ -117,7 +123,10 @@ def main_with_args(
     else:
         r = repo or os.environ.get("GITHUB_REPOSITORY", "")
         br = base_ref or os.environ.get("GITHUB_BASE_REF", "")
-        if not r or not br:
+        if not br:
+            print("no base ref: baseline control not applicable")
+            return 0
+        if not r:
             print(
                 "ERROR: --repo and --base-ref are required when "
                 "--base-digest is not provided (or set GITHUB_REPOSITORY "

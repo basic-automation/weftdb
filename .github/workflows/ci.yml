@@ -167,7 +167,7 @@ jobs:
       # Non-tautological baseline control: compare the committed digest against
       # the base branch's copy (FRE-18c, P1).  Uses gh api to fetch the base
       # branch's digest file -- no extra checkout or fetch-depth needed.
-      - run: python3 scripts/ci/check-baseline-control.py
+      - run: python3 scripts/ci/check-baseline-control.py --digest-file compat/openapi/baseline/weftdb.json.sha256
         env:
           PYTHONDONTWRITEBYTECODE: "1"
 

@@ -82,3 +82,24 @@ All original deliverables for issue #838 (FRE-18a) are implemented, committed, p
 - **Do not merge** — left for reviewer.
 - `ROADMAP.md:150` unticked (this is one clause of FRE-18, not the freeze cut).
 - CI workflow will trigger automatically on push.
+
+# progress — FRE-18c-fix
+
+## Checkpoint (2026-11-22, ~35 min into 45-min run)
+
+**Changes made:**
+- P0-1: `_fetch_base_digest` now strips `GITHUB_WORKSPACE` prefix from absolute paths before building the API URL.
+- P0-2: `main_with_args` now prints notice and exits 0 when `GITHUB_BASE_REF` is empty.
+- CI: `claims` job step passes `--digest-file compat/openapi/baseline/weftdb.json.sha256` for a repo-relative path.
+- P2: 5 new tests (URL construction for relative/absolute paths, no-base-ref exits 0, 404 exits 2, bad base64 exits 2).
+
+**Verification:**
+- 90/90 tests pass (was 85, 5 new).
+- `check-openapi-breaking.py` exit 0.
+- `check-action-pinning.py` exit 0.
+- `--repo basic-automation/weftdb --base-ref main` → exit 2 (expected: no token, 404 — per brief).
+- Empty env → exit 0 with "no base ref: baseline control not applicable".
+
+**Commit ready:** `git commit -s` with message `[FRE-18C] Fix the baseline control path and the no-base-ref exit, and cover both (#843)`.
+**Push:** `git push origin HEAD`.
+**Not done:** `ROADMAP.md:163` stays unchecked per brief. No merge, no PR body edit.
