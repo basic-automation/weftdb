@@ -21,6 +21,20 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   an identical re-run through that wrapper is still absorbed, and #803 stays open pending the
   server-ledger identity under #768.
 
+### Fixed
+
+- **The legacy ingest-ledger key now digests its payload with 128 bits instead
+  of a 32-bit CRC (#849).**
+  The key format changed from
+  `legacy:{dataset_id}:{payload_crc:08x}:{n}` to
+  `legacy:{dataset_id}:{payload_digest (32 hex)}:{n}`. The ledger is an
+  `(aspect, key)` lookup, so rows written under the old key stop matching and
+  are orphaned (no corruption, no layout bump, no migration needed). A blind
+  retry from a pre-change client re-writes instead of replaying, which on an
+  append-only store is the safer direction. The CRC-32 function `payload_crc`
+  is kept public and behaviourally unchanged; the new `payload_digest` is a
+  128-bit SHA-256 prefix over the same canonical bytes.
+
 ### Added
 
 - **Multi-series crash cell (TAG-12, issue #341).** A new fault-injection test

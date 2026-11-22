@@ -828,3 +828,13 @@ and a parenthetical claiming nothing on `main` calls `purge_expired`. Both halve
 daemon loop (`:552`), pinned by `purge_expired_drops_wholly_expired_frames_and_leaves_straddling_ones`
 (`:917`). The line is now `[x]` and its parenthetical names those PRs and that call site.
 `ROADMAP.md:94` (Legacy seal routing defects) stays open because SEAL-IDEM (#803) is unticked.
+
+## 2026-11-22 — Legacy ledger key digest widened from CRC-32 to 128 bits (#849, SEAL-HASH1) to 128-bit SHA-256 prefix (#849)
+
+The key format changed from `legacy:{dataset_id}:{payload_crc:08x}:{n}` to
+`legacy:{dataset_id}:{payload_digest (32 hex)}:{n}`. The change is migration-free because the lookup
+is `(aspect, key)`; rows written under the old key are orphaned (no corruption, no layout bump).
+A blind retry from a pre-change client re-writes instead of replaying, which on an append-only
+store is the safer direction. `payload_crc` kept public and behaviourally unchanged.
+`payload_digest` is a SHA-256 prefix truncated to 128 bits. SHA-2 was already a workspace
+dependency (`sha2 = "0.10.9"`), used by `weft-bench`, `weft-client`, `weft-server`, `weft-xbench`.
