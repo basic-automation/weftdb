@@ -6,14 +6,23 @@ Ensure every ``test_*.py`` under ``scripts/`` and ``tools/`` is invoked
 by at least one workflow step.  Steps are recognised in two forms:
 
 1. direct: the run text contains ``python3 <path>`` where ``<path>`` is
-   the exact repo-relative path of the test file.
+   the exact repo-relative path of the test file.  A bare basename is
+   **not** accepted: crediting ``scripts/bench/test_guard.py`` because a
+   step runs ``scripts/ci/test_guard.py`` would let an uninvited test
+   pass the guard (#859).
 2. discovery: the run text matches
    ``python3 -m unittest discover -s <dir> -p <pattern>``; a file is
    covered if its parent directory is a descendant of ``<dir>`` and its
    name matches ``<pattern>`` via ``fnmatch``.
 
+A discovery rooted at the repository root (``-s .``, ``-s ""``, ``-s ..``)
+would credit every policed file, named or not, so it is reported on a
+``BLANKET-DISCOVER: ...`` line and does **not** count as coverage: one
+line in any workflow must not be able to make the guard vacuous.
+
 Files not covered by any step are printed on ``UNWIRED: <path> ...``
-lines; the script exits 1 if any unwired file exists, 0 otherwise.
+lines; the script exits 1 if any unwired file or blanket discovery rule
+exists, 0 otherwise.
 
 Usage::
 
@@ -70,9 +79,12 @@ def _parse_wiring_steps(wf_paths: list[str]) -> list[dict]:
     """Return a list of wiring clues: each dict has keys
     ``"direct"`` (list of paths) and ``"discover"`` (list of
     ``(dir, pattern)`` tuples)."""
-    direct: set[str] = set()
-    discover: list[tuple[str, str]] = []
+    direct_all: set[str] = set()
+    discover_all: list[tuple[str, str]] = []
+    blanket: list[tuple[str, str]] = []
     for wf_path in wf_paths:
+        direct: set[str] = set()
+        discover: list[tuple[str, str]] = []
         with open(wf_path, encoding="utf-8") as f:
             try:
                 data = yaml.safe_load(f)
@@ -101,7 +113,33 @@ def _parse_wiring_steps(wf_paths: list[str]) -> list[dict]:
                 if not isinstance(run, str):
                     continue
                 _parse_run_text(run, direct, discover)
-    return [{"direct": sorted(direct), "discover": sorted(discover)}]
+        wf_name = os.path.basename(wf_path)
+        for discover_dir, pattern in discover:
+            if _is_blanket_root(discover_dir):
+                blanket.append((wf_name, discover_dir))
+            else:
+                discover_all.append((discover_dir, pattern))
+        direct_all.update(direct)
+    return [
+        {
+            "direct": sorted(direct_all),
+            "discover": sorted(discover_all),
+            "blanket": sorted(blanket),
+        }
+    ]
+
+
+def _is_blanket_root(discover_dir: str) -> bool:
+    """Return True if a ``unittest discover -s <dir>`` root is the repository
+    root or above it.
+
+    Such a root covers every directory the guard polices, so it would credit
+    test files nobody invited.  A bounded root (``scripts``, ``scripts/ci``,
+    ``tools``) is still allowed: choosing a whole directory is a deliberate,
+    reviewable invitation.
+    """
+    norm = os.path.normpath(discover_dir) if discover_dir else ""
+    return norm in ("", ".", "..") or norm.startswith("../")
 
 
 def _parse_run_text(
@@ -141,12 +179,10 @@ def _parse_run_text(
             # Accept only .py files (test_*.py or any .py that could be
             # a test guard).
             if candidate.endswith(".py"):
-                # Strip any leading ./ or ../ for normalisation.
-                normed = os.path.normpath(candidate)
-                direct.add(normed)
-                # Also add the bare basename, since a step may be run
-                # from the repo root.
-                direct.add(os.path.basename(candidate))
+                # Strip any leading ./ or ../ for normalisation.  Only the
+                # normalised repo-relative path is recorded: a bare basename
+                # would credit a same-named test in any other directory.
+                direct.add(os.path.normpath(candidate))
 
 
 def _is_wired(
@@ -155,10 +191,8 @@ def _is_wired(
     discover: list[tuple[str, str]],
 ) -> bool:
     """Return True if *test_path* is covered by any wiring clue."""
-    # Direct match: exact repo-relative path, or bare basename.
+    # Direct match: the exact repo-relative path only.
     if test_path in direct:
-        return True
-    if os.path.basename(test_path) in direct:
         return True
 
     # Discovery match.
@@ -196,9 +230,11 @@ def _run_check(root: str, workflows_dir: str) -> int:
     wiring = _parse_wiring_steps(wf_paths)
     direct: set[str] = set()
     discover: list[tuple[str, str]] = []
+    blanket: list[tuple[str, str]] = []
     for w in wiring:
         direct.update(w["direct"])
         discover.extend(w["discover"])
+        blanket.extend(w["blanket"])
 
     unwired: list[str] = []
     for tf in test_files:
@@ -207,15 +243,26 @@ def _run_check(root: str, workflows_dir: str) -> int:
 
     wf_count = len(wf_paths)
     total = len(test_files)
-    if unwired:
+    if blanket or unwired:
+        for wf_name, discover_dir in blanket:
+            print(
+                f'BLANKET-DISCOVER: {wf_name} uses "discover -s'
+                f' {discover_dir}", which would credit every test file'
+                " under scripts/ and tools/ without naming any of them;"
+                " narrow the discover directory or invite the files"
+                " explicitly",
+            )
         for u in unwired:
             print(
                 f"UNWIRED: {u} (no direct invocation and no discover rule"
                 f" covers it)",
             )
+        blanket_note = (
+            f" and {len(blanket)} blanket discover rule(s)" if blanket else ""
+        )
         print(
             f"FAILED: {len(unwired)} of {total} test script(s) unwired"
-            f" across {wf_count} workflow(s)",
+            f" across {wf_count} workflow(s){blanket_note}",
             file=sys.stderr,
         )
         return 1
