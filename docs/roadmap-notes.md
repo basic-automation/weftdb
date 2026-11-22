@@ -841,7 +841,7 @@ split: the CRC-32 collision half is issue #849, the caller-identity half deferre
 and `:163` (the OpenAPI breaking-change checker shipped as PR #839 on 2026-11-20; what is left of
 FRE-18 is the rc.1 freeze cut and the layout-2 baseline fixtures). `:83` (ROB-14) and `:137`
 (Quotas and limits) are also stale but belong to the owner, so they are reported and left alone.
-## 2026-11-22 — Legacy ledger key digest widened from CRC-32 to 128 bits (#849, SEAL-HASH1) to 128-bit SHA-256 prefix (#849)
+## 2026-11-22 — Legacy ledger key digest widened from CRC-32 to a 128-bit SHA-256 prefix (#849, SEAL-HASH1)
 
 The key format changed from `legacy:{dataset_id}:{payload_crc:08x}:{n}` to
 `legacy:{dataset_id}:{payload_digest (32 hex)}:{n}`. The change is migration-free because the lookup
@@ -850,3 +850,17 @@ A blind retry from a pre-change client re-writes instead of replaying, which on 
 store is the safer direction. `payload_crc` kept public and behaviourally unchanged.
 `payload_digest` is a SHA-256 prefix truncated to 128 bits. SHA-2 was already a workspace
 dependency (`sha2 = "0.10.9"`), used by `weft-bench`, `weft-client`, `weft-server`, `weft-xbench`.
+
+## 2026-11-22 — The fan-out arm's doc comment said the arm did not exist (#860, TAG-12 residual, L127)
+
+`weft-bench/src/fan_out.rs` opened by asserting that on `main` fan-out appears only in prose documents and
+that "there is **no measurement**". PR #809 (issue #807, TAG-12 cut A) landed the arm, so the sentence
+described a tree that no longer exists. The doc now states that the arm is runnable (`--fan-out`; knobs in
+`FanOutParams`: `seed`, `series_steps` default 1/10/100/1000, `rows_per_series` 1000, `read_window_ns`
+1000 seconds) and that **no published number exists**: `bench/claims.json` has no `fan_out` entry, and
+publishing one goes through `docs/benchmark-policy.md` plus `scripts/ci/check-baseline-control.py`.
+
+**L127 and L124 stay unchecked.** A doc correction is not a measurement: the ladder run still needs the T7
+reference drive (L120, `*(owner)*`) and a baseline-control-compliant claims entry. Repaired en route: the
+malformed heading at L844 of this file, a wrapped heading from the SEAL-HASH1 slice that had folded onto
+one line.

@@ -9092,3 +9092,37 @@ lookup is `(aspect, key)`; the consequence is orphaned old rows + replay-lost-ac
 store is the safer direction). `payload_crc` is kept public and behaviourally unchanged rather than
 removed or deprecated. The A-B-A half of #803 (caller-identity-based idempotency for the legacy
 facades) is deliberately not attempted here.
+
+## 2026-11-22 — A doc comment that says a shipped feature is absent is its own defect (#860, TAG-12 residual)
+
+**Ambiguity.** `weft-bench/src/fan_out.rs` opened with "On `main` `git grep -l fan-out` matches only
+`DECISIONS.md`, `ROADMAP.md` and `docs/roadmap-notes.md` — there is **no measurement**", written before
+PR #809 landed the arm. The false half and the true half sit in one sentence, so the cheap move was to
+delete the sentence and the tidy move was to fold the fix into the next benchmark PR. Neither is right:
+deleting loses the true half, and folding makes a measurement diff harder to review while the falsehood
+keeps propagating in the meantime.
+
+**Choice.** Rewrote the module doc so both facts are stated separately and dated: the arm exists and is
+runnable (`--fan-out`; `run_fan_out_workload` at `weft-bench/src/main.rs:539`, flag parsed at `:1779`,
+dispatched at `:164`), and **no ladder number has ever been published** — `git grep -c fan_out
+bench/claims.json` matches nothing, so publishing one goes through `docs/benchmark-policy.md` and
+`scripts/ci/check-baseline-control.py`. Shipped as a docs-only slice.
+
+**Rationale.** A doc comment is a claim about the tree, and a false one makes the next agent's premise
+wrong — the same failure mode as a stale roadmap line (#851, #855), reached from the other direction:
+those roadmap lines had fallen behind the code, and this doc comment had fallen behind it too. Keeping the
+honest half explicit matters as much as removing the false half: the accurate statement is not "fan-out is
+missing" but "runnable and unmeasured", and that difference is what stops someone quoting a number that
+does not exist.
+
+**A related artifact found while appending.** `docs/roadmap-notes.md:844` on `main` carries a malformed
+heading: "## 2026-11-22 — Legacy ledger key digest widened from CRC-32 to 128 bits (#849, SEAL-HASH1) to
+128-bit SHA-256 prefix (#849)". It is the remains of a wrapped heading from the SEAL-HASH1 slice whose
+continuation was appended as a separate line and folded back into the heading. Repaired here by cutting
+the trailing fragment. Lesson for every future append-at-end slice: if a markdown heading must wrap, wrap
+it as prose **below** the heading, never as a continuation of it — a concatenated heredoc has no soft wrap.
+
+**Not done.** No `ROADMAP.md` L127/L124 tick (a doc fix is not a measurement); no ladder run (needs the T7
+reference drive at L120, marked `*(owner)*`, and a local `cargo run`, which this host does not do); no
+`bench/claims.json` entry; no `weft-xbench` change (the nightly routine loop's lane, open PR #842); no
+`CHANGELOG.md` entry (nothing user-visible changed).

@@ -128,3 +128,11 @@ Branch `bprec2/inventory-citations`, based on `ecb0744`.
 - All counts corrected per `grep -c` output from `origin/main`
 - Per-label site count updated to 51 / 89 / 20
 - Committed, pushed, PR open
+
+## 2026-11-22 — TAG-12 DOC (#860): fan-out module doc corrected
+
+- `weft-bench/src/fan_out.rs` module doc no longer claims fan-out is absent; it now says the arm is runnable and unmeasured
+- `bench/claims.json` fan-out entries on `origin/main`: 0, verified with `git grep -c fan_out bench/claims.json`
+- Repaired the malformed `docs/roadmap-notes.md:844` heading left by the SEAL-HASH1 slice
+- `ROADMAP.md` untouched: L127 and L124 stay open until a ladder run is published as a claims entry
+- Committed, pushed, PR open
