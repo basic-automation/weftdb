@@ -394,6 +394,16 @@ origin/main
   number of points, the pool never exceeds its cap, and the device allocator does not grow without
   bound.  (#725)
 
+### Documentation
+
+- **ILP/Influx interop audited end to end (#359).** New research document
+  `docs/research/ilp-interop-audit.md` answers what interop exists today and what the roadmap's
+  "connector crate" line still needs: the parser crate, four HTTP ILP endpoints and `write_ilp` in
+  both SDKs are present and reachable, while an ILP writer, an InfluxDB client dependency, a
+  connector trait, UDP ingress and an ILP round-trip suite are absent. Follow-up slices filed as
+  #866, #867, #868 and #869; the connector trait (#358) is the prerequisite and is filed but
+  unassigned. No behaviour change, and the `ROADMAP.md` line stays unchecked.
+
 ## [0.3.7] - 2026-11-12
 
 ### Fixed

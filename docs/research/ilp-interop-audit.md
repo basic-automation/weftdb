@@ -1,6 +1,6 @@
 # ILP/Influx interop audit: what exists and what is missing
 
-**Research for roadmap item [Phase 22 — Connectors and ingest interop — B-ilp: ILP/Influx interop connector crate](#359).**
+**Research for roadmap item **B-ilp: ILP/Influx interop connector crate** (`ROADMAP.md:193`, Phase 22 — Connectors and ingest interop), issue #359.**
 
 **Author:** slice B-ILP-AUDIT  
 **Date:** 2026-11-22  
@@ -10,7 +10,7 @@
 
 ## 1. Verdict (one sentence)
 
-> WeftDB has a **mature, self-owned ILP parser**, four live HTTP endpoints that accept ILP bodies, and Rust + Python SDK methods that send them — but it has **no InfluxDB client, no ILP serializer, no connector trait, no UDP ingress, and no dedicated ILP documentation or examples**, so the roadmap item "ILP/Influx interop connector crate" is **3/10 done**: the parser exists, everything that would make it a *connector crate* (vendor client, write path to a running InfluxDB, ILP output, ILP→Weft schema mapping trait) is absent.
+> WeftDB has a **mature, self-owned ILP parser**, four live HTTP endpoints that accept ILP bodies, and Rust + Python SDK methods that send them — but it has **no InfluxDB client, no ILP serializer, no connector trait, no UDP ingress, and no dedicated ILP documentation or examples**, so the roadmap item "ILP/Influx interop connector crate" is **partly done, and the part that is done is the part already in core**: the parser and its inbound ingest surface exist, while everything that would make it a *connector crate* (vendor client, write path to a running InfluxDB, ILP output, ILP→Weft schema mapping trait) is absent.
 
 | Component | Status | Evidence |
 |-----------|--------|----------|
@@ -24,7 +24,7 @@
 | Measurement→dataset mapping | **Partial** | `measurement=` query param filters records, but no `DatasetId`/tenant abstraction bound to ILP |
 | Precision/time-unit mapping | **Present** | `TimestampPrecision` (ns/µs/ms/s) → `TimeUnit` (Nanos/Micros/Millis/Seconds) with `epoch_in_unit` rescaling |
 | InfluxDB client (write out) | **Absent** | No `influxdb`, `influxdb2`, or any InfluxDB client crate in `Cargo.lock` |
-| Connector trait / registry | **Absent** | Phase 22 `B-conn` is unfiled; no connector trait exists |
+| Connector trait / registry | **Absent** | Filed as #358 ("B-conn", unassigned); no connector trait exists in-tree |
 | UDP ingress | **Absent** | Not mentioned in `docs/roadmap-notes.md`, no UDP listener code |
 | TLS/auth | **Present** (server-side) | Server has TLS + basic auth; ILP endpoints inherit it |
 | Error/backpressure | **Present** | Structured `ApiError`, body caps, disk guard, `Idempotency-Key`, two-phase ingest |
@@ -46,8 +46,8 @@
 | `weft-line-protocol/Cargo.toml:12` | `keywords = ["influxdb", "line-protocol", "parser"]` | Categorisation |
 | `weft-line-protocol/src/lib.rs:289` | `pub fn parse(input: &str) -> Result<Vec<LineRecord>, ParseError>` | Full document parser |
 | `weft-line-protocol/src/lib.rs:332` | `pub fn parse_points(...) -> Result<Vec<Point>, ParseError>` | Single-series projection |
-| `weft-line-protocol/src/lib.rs:78` | `pub enum TimestampPrecision` | Precision type: Nanoseconds/Micros/Millis/Seconds |
-| `weft-line-protocol/src/lib.rs:371` | `fn parse_line(line: &str) -> Result<LineRecord, String>` | Single-line parser |
+| `weft-line-protocol/src/lib.rs:51` | `pub enum TimestampPrecision` | Precision type: Nanoseconds/Micros/Millis/Seconds |
+| `weft-line-protocol/src/lib.rs:370` | `fn parse_line(line: &str) -> Result<LineRecord, String>` | Single-line parser |
 | `weft-line-protocol/src/lib.rs:389` | `fn parse_measurement_and_tags(...)` | Tag/measurement split |
 | `weft-line-protocol/src/lib.rs:408` | `fn parse_fields(...)` | Field-set parser |
 | `weft-line-protocol/src/lib.rs:426` | `fn parse_field_value(...)` | Typed field value parser |
@@ -143,11 +143,11 @@ project_ilp_series (ingest.rs:1190)
   ↓ record.to_point(field, precision)  →  Option<splimes::Point>
   ↓ record.series_key()  →  (measurement, sorted_tags)
   ↓
-weftdb::TagSet::from_pairs(tags)  (ingest.rs:1230)
+weftdb::TagSet::from_pairs(tags)  (ingest.rs:1215)
   ↓
-epoch_in_unit(point.timestamp, schema.timestamp_unit)  (ingest.rs:1301)
+epoch_in_unit(point.timestamp, schema.timestamp_unit)  (ingest.rs:1296)
   ↓
-weft_physical_type::check_decimal_domain(&point.value)  (ingest.rs:1307)
+weft_physical_type::check_decimal_domain(&point.value)  (ingest.rs:1301)
   ↓
 IngestBatch { key, timestamps, values, rows_per_page, groups }
   ↓
@@ -161,7 +161,7 @@ commit_ingest (ingest.rs:785)
 | `weftdb::AspectId` | `weftdb/src/types/aspect.rs:19` | Unique aspect identifier (UUID) |
 | `weftdb::DatasetId` | `weftdb/src/types/dataset.rs:10` | Unique dataset identifier (UUID) |
 | `weft_physical_type::TimeUnit` | `weft-physical-type/src/timestamp.rs:72` | Stored epoch unit: Seconds/Millis/Micros/Nanos |
-| `weft_line_protocol::TimestampPrecision` | `weft-line-protocol/src/lib.rs:78` | Wire timestamp precision: ns/µs/ms/s |
+| `weft_line_protocol::TimestampPrecision` | `weft-line-protocol/src/lib.rs:51` | Wire timestamp precision: ns/µs/ms/s |
 | `weft_line_protocol::LineRecord` | `weft-line-protocol/src/lib.rs:143` | Parsed ILP record: measurement, tags, fields, timestamp |
 | `weft_line_protocol::FieldValue` | `weft-line-protocol/src/lib.rs:105` | Typed field: Float/Integer/Unsigned/Bool/Str |
 | `weftdb::IngestBatch` | `weftdb/src/types/ingest.rs:94` | Sealed batch: key, timestamps, values, groups |
@@ -203,7 +203,7 @@ There is no function anywhere in the repo that produces ILP text. The parser (`w
 
 ### 5.3 Precision and time-unit mapping — ✅ Present
 
-`TimestampPrecision` (lib.rs:78) and `TimeUnit` (`weft-physical-type/src/timestamp.rs:72`) both define the same four units (ns/µs/ms/s). `epoch_in_unit` (ingest.rs:1301) resizes from absolute `DateTime<Utc>` to the aspect's declared epoch unit. The mapping is lossy in the coarse direction (ns→seconds truncates) but correct.
+`TimestampPrecision` (lib.rs:51) and `TimeUnit` (`weft-physical-type/src/timestamp.rs:72`) both define the same four units (ns/µs/ms/s). `epoch_in_unit` (ingest.rs:1296) resizes from absolute `DateTime<Utc>` to the aspect's declared epoch unit. The mapping is lossy in the coarse direction (ns→seconds truncates) but correct.
 
 ### 5.4 Tag → aspect/series mapping — ✅ Present
 
@@ -249,7 +249,7 @@ Phase 22 — Connectors and ingest interop
   - [ ] **B-ilp** ILP/Influx interop connector crate           (ROADMAP.md:193)
 ```
 
-The roadmap places **B-ilp** in Phase 22, alongside **B-conn** (the connector trait). The ordering implies B-conn comes first, because B-ilp is a *connector crate* that would implement that trait. Neither is checked.
+The roadmap places **B-ilp** in Phase 22, alongside **B-conn** (the connector trait). The ordering implies B-conn comes first, because B-ilp is a *connector crate* that would implement that trait. Neither is checked, and #358 is filed but unassigned, so B-ilp currently has no owner for its prerequisite.
 
 ### 6.2 docs/roadmap-notes.md
 
@@ -264,7 +264,7 @@ The notes call B-ilp **partial** — matching this audit's finding. B-conn is **
 
 | Source | Quote | Constraint |
 |--------|-------|------------|
-| `CONTRIBUTING.md:62` | `weft-line-protocol parses ILP but has no InfluxDB client` | Crate design is format-agostic |
+| `CONTRIBUTING.md:62` | `weft-line-protocol parses ILP but has no InfluxDB client` | Crate design is format-agnostic |
 | `weft-line-protocol/Cargo.toml:11` | `"Vendor-neutral InfluxDB Line Protocol (ILP) parser: text in, neutral records / splimes points out. No client, no network, no vendor dependency."` | The parser crate is explicitly not a connector |
 | `DECISIONS.md:2165` | `"historian connectors and SLA support are paid"` | Connectors other than open-source ones (Prometheus, ILP) are commercial-tier |
 | `weft-line-protocol/src/lib.rs:10-15` | Doc comment: "a concrete InfluxDB connector … would live in its own crate outside the core" | A connector crate is expected to be a *new* crate, not an addition to an existing one |
@@ -307,8 +307,8 @@ This is a **structural audit** (grep, read, classify). Every claim above is back
 
 ## 9. Follow-ups (candidate issues, not created)
 
-- `#<TBD>`: **Design the vendor-neutral connector trait (B-conn)**. Prerequisite for B-ilp; the trait defines `write_series`, `query`, `ping` and any discovery/health-check methods. Blocks B-ilp. Evidence: `ROADMAP.md:192`, `roadmap-notes.md:447`.
-- `#<TBD>`: **Add ILP serializer to `weft-line-protocol`** (`impl Display for LineRecord` or `fn serialize`). Small cost (~50 LoC), needed if a connector writes ILP to InfluxDB. Evidence: no serialize function exists in `weft-line-protocol/src/lib.rs`.
-- `#<TBD>`: **Write `weft-influxdb-connector` crate** implementing B-conn trait for InfluxDB HTTP API. New crate outside core workspace. Evidence: `ROADMAP.md:193`, design constraint at `weft-line-protocol/src/lib.rs:10-15`.
-- `#<TBD>`: **Dedicated ILP round-trip test suite** exercising multi-measurement payloads, all field types, precision edge cases, ambiguous series rejection. Evidence: only partial coverage in compat and live tests.
-- `#<TBD>`: **ILP documentation and examples** — standalone `examples/ilp-ingest/` with Rust and Python examples, and a "send ILP to WeftDB" guide. Evidence: no `examples/` directory and no dedicated ILP user guide.
+- #358 (filed, unassigned): **Design the vendor-neutral connector trait (B-conn)**. Prerequisite for B-ilp; the trait defines `write_series`, `query`, `ping` and any discovery/health-check methods. Blocks B-ilp. Evidence: `ROADMAP.md:192`, `roadmap-notes.md:447`.
+- #866: **Add ILP serializer to `weft-line-protocol`** (`impl Display for LineRecord` or `fn serialize`). Small cost (~50 LoC), needed if a connector writes ILP to InfluxDB. Evidence: no serialize function exists in `weft-line-protocol/src/lib.rs`.
+- #867: **Write the InfluxDB connector crate (outside core)** implementing B-conn trait for InfluxDB HTTP API. New crate outside core workspace. Evidence: `ROADMAP.md:193`, design constraint at `weft-line-protocol/src/lib.rs:10-15`.
+- #868: **Dedicated ILP round-trip test suite** exercising multi-measurement payloads, all field types, precision edge cases, ambiguous series rejection. Evidence: only partial coverage in compat and live tests.
+- #869: **ILP documentation and examples** — standalone `examples/ilp-ingest/` with Rust and Python examples, and a "send ILP to WeftDB" guide. Evidence: no `examples/` directory and no dedicated ILP user guide.
