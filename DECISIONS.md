@@ -9007,3 +9007,48 @@ its SEAL-IDEM sub-item (`:98`, issue #803) is still `[ ]`. Nothing in this chang
 tests, or CI, and no other line was ticked.
 
 **Needs human.** None.
+
+## 2026-11-22 — A gate that nothing invokes is not a gate (#853)
+
+**Context.** CI-GATES (#853). Every Python gate in this repo runs only because a
+workflow step names it, and nothing asserts that the step exists.
+`scripts/ci` is the directory where CI discovers tests with narrow patterns
+(`-p 'test_check_serial_order.py'`, `-p 'test_check_openapi_breaking.py'`), so a
+test file added there is invisible to CI unless some step names it. The concrete
+instance was found while working #843: its `scripts/ci/test_check_baseline_control.py`
+has a workflow step only on that issue's own branch (PR #845), and nothing on
+`main` would ever have invoked it had this guard existed.
+
+**Question.** How should the guard detect whether a test file is wired?
+
+**Chosen: parse every `.github/workflows/*.yml` with `yaml.safe_load`, walk
+jobs/steps, and recognise two shapes.** Direct: the run text contains
+`python3 <path>` where `<path>` resolves to the file. Discovery: the run
+matches `python3 -m unittest discover -s <dir> -p <pattern>`, and the file's
+directory is under `<dir>` and its name matches `<pattern>` via `fnmatch`.
+
+**Rejected: grep for `test_check_baseline_control.py`.** Grepping would find a
+file mentioned in a comment even if it had no run step, producing false
+negatives. A YAML parse is also future-proof if the workflow format changes
+how run steps are structured.
+
+**Rejected: running the wiring guard via a `unittest discover` line.** The
+`discover` lines in `scripts/ci` are deliberately narrow — they name the exact
+test file that targets a specific guard. A discover line for `test_check_test_wiring.py`
+would use the same narrow pattern the guard exists to police, contradicting
+the point. An explicit `run:` step is the honest signal.
+
+**Rejected: adding a new job.** The `claims` job already runs every Python
+gate and its tests; adding a new job would increase CI minutes, require an
+additional `actions/checkout`, and scatter the gates across the workflow. All
+gates and their tests live in `claims` with `run:` steps only (action-pinning
+rejects unpinned `uses:`).
+
+**Correction made while finishing the slice.** The worker's draft of this
+section said the #843 test file exists on `main` and wired it in this change. It
+does not: that file and its checker live only on the unmerged branch for #843,
+and the copies the worker made out of that other worktree have been removed from
+this branch — the brief's own premise was wrong, which is worth recording next to
+the guard that exists to catch exactly that class of drift. `check-test-wiring.py`
+reports `OK: 13 test script(s) wired by 13 workflow(s)` against `main`, and #845
+brings its own step for its own test.
