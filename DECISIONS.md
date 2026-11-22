@@ -8999,3 +8999,31 @@ risk.
 ### Top-level documents (`security`/`securitySchemes`/`servers`/`info`/`tags`/`externalDocs`)
 
 **Chosen: declared out of scope for the 1.0 surface freeze.** These are global metadata that do not affect the wire-format of individual routes. A change to `info.description` or `tags` is editorial, not breaking. Adding a new server URL in `servers` is additive. The non-telephone rule applies: no client inspects these at runtime. Documented in `docs/stability.md` as a known gap.
+## 2026-11-21 — Ticking a roadmap line means rewriting its claim, not just its box (#846)
+
+`ROADMAP.md:90` ("Row-TTL purge defects") was unchecked while all three of its sub-items
+(`:91-93`, issues #797, #798, #799) were already ticked, and its parenthetical said
+"nothing on `main` calls `purge_expired` yet, so these gate the daemon call site in #785".
+Both halves of that claim are false on `main`, so the line was not simply waiting for a
+tick: it was asserting something readers would act on.
+
+**Verified on `origin/main` (`ecb0744`) before editing.** #797 and #798 closed 2026-11-19 by
+squash PR **#810**; #799 closed 2026-11-20 by squash PR **#822** (`1de54350a`); the gate they
+blocked shipped as PR **#786** ("[TTL-CUT4] Run the expired-row purge in the reconcile daemon"),
+merged 2026-11-19T22:19:23Z as `5572e6f`, closing issue #785. The call site is
+`reconcile_tick_purge_expired` at `weft-server/src/reconcile_daemon.rs:409`, which calls
+`store.purge_expired(now)` at `:412` and is driven from the daemon loop at `:552`. A
+regression test (`purge_expired_drops_wholly_expired_frames_and_leaves_straddling_ones`,
+`:917`) pins it.
+
+**Choice.** Tick the line and **rewrite the parenthetical in place** to name the two PRs that
+closed the three defects and the PR that wired the daemon sweep, keeping the audit date and
+the issue numbers so the history stays traceable. The alternative — ticking and leaving the
+sentence, or deleting the parenthetical — either keeps a false claim or discards the
+provenance that tells a reader why the line exists at all.
+
+**Left open deliberately.** `ROADMAP.md:94` ("Legacy seal routing defects") stays unchecked:
+its SEAL-IDEM sub-item (`:98`, issue #803) is still `[ ]`. Nothing in this change touches code,
+tests, or CI, and no other line was ticked.
+
+**Needs human.** None.

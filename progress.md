@@ -103,3 +103,15 @@ All original deliverables for issue #838 (FRE-18a) are implemented, committed, p
 **Commit ready:** `git commit -s` with message `[FRE-18C] Fix the baseline control path and the no-base-ref exit, and cover both (#843)`.
 **Push:** `git push origin HEAD`.
 **Not done:** `ROADMAP.md:163` stays unchecked per brief. No merge, no PR body edit.
+---
+
+# progress — B-PRECISION-2 (bprec2/inventory-citations, base ecb0744)
+Branch `bprec2/inventory-citations`, based on `ecb0744`.
+
+## Done
+
+- All four confirmed citation defects fixed
+- Every remaining TOKEN_OFF_WINDOW resolved (harness now reports 0)
+- All counts corrected per `grep -c` output from `origin/main`
+- Per-label site count updated to 51 / 89 / 20
+- Committed, pushed, PR open
