@@ -64,3 +64,16 @@ All original deliverables for issue #838 (FRE-18a) are implemented, committed, p
 - **Do not merge** — left for reviewer.
 - `ROADMAP.md:150` unticked (this is one clause of FRE-18, not the freeze cut).
 - CI workflow will trigger automatically on push.
+
+---
+
+# progress — B-PRECISION-2 (bprec2/inventory-citations, base ecb0744)
+Branch `bprec2/inventory-citations`, based on `ecb0744`.
+
+## Done
+
+- All four confirmed citation defects fixed
+- Every remaining TOKEN_OFF_WINDOW resolved (harness now reports 0)
+- All counts corrected per `grep -c` output from `origin/main`
+- Per-label site count updated to 51 / 89 / 20
+- Committed, pushed, PR open
