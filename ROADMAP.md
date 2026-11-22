@@ -190,7 +190,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 ## Phase 22 — Connectors and ingest interop
 
 - [ ] **B-conn** Vendor-neutral connector trait + registry
-- [ ] **B-ilp** ILP/Influx interop connector crate
+- [ ] **B-ilp** ILP/Influx interop connector crate — audited 2026-11-22 (#359, `docs/research/ilp-interop-audit.md`): inbound interop is real (own parser crate, four HTTP ILP endpoints, `write_ilp` in both SDKs, precision mapping), outbound is absent (no InfluxDB client in `Cargo.lock`, no ILP writer, no connector trait, no UDP); prerequisite #358 (B-conn trait) is filed and unassigned, follow-ups #866 writer / #867 connector crate / #868 round-trip suite / #869 docs + examples.
 - [ ] **B-rest** REST facade remainder
 - [ ] **B-resilience** Write retry, size-tiered write selector, interpolation window extension
 - [ ] **B-conncache** Complete the cached-connection migration
