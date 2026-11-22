@@ -8,6 +8,10 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Documentation
+
+- **B-poll / B-retry / B-register audit (#361).** `docs/research/client-poll-retry-register-audit.md` published: all three backlog items are either already present (retry-for-503) or not needed (polling daemon, source registration). No behaviour changed. Phase label reconciled to Phase&nbsp;23.
+
 ### Changed
 
 - **`url` is 2.5.9, not 2.5.8 (#857).** RustSec advisory RUSTSEC-2026-0592

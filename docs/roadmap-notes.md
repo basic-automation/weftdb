@@ -459,7 +459,7 @@ The interpolation item (B-interp, Phase 5) is done.
     whose protocol is not ILP at all), and which repository and tier a vendor connector lives in,
     since `DECISIONS.md:2165` places historian connectors in the paid tier.
 - **B-rest** *(Phase 2 · partial)*
-- **B-poll / B-retry / B-register** *(Phase 7 · absent)*
+- **B-poll / B-retry / B-register** *(Phase 23 · absent — see docs/research/client-poll-retry-register-audit.md; all three are not needed or already present)*
 - **B-analysis** *(Phase 4/9 · verify)*
   - 2026-11-22: wiring audit produced (`docs/research/per-point-analysis-wiring.md`) — **not wired** end-to-end: no producer on any product path (`Batch::process()` is called only from `weft-orchestration` and two `weftdb` tests; `process_batches()` has zero call sites), never persisted and every read path resets it (`BatchedMeasurement::new` fixes `analysis: None`), no `weft-server` surface, and the `trend` half has no producer. Defects filed as #862/#863; the `ROADMAP.md` line stays unchecked (#362)
 - **B-object** *(Phase 4 · absent)*
