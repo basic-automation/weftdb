@@ -64,3 +64,19 @@ All original deliverables for issue #838 (FRE-18a) are implemented, committed, p
 - **Do not merge** — left for reviewer.
 - `ROADMAP.md:150` unticked (this is one clause of FRE-18, not the freeze cut).
 - CI workflow will trigger automatically on push.
+
+---
+
+## SEAL-HASH1
+
+**Changed files:**
+- `weftdb/Cargo.toml` — added `sha2 = { workspace = true }`
+- `weftdb/src/types/legacy_seal.rs` — added `canonical_payload_bytes` helper, `payload_digest` (128-bit SHA-256 prefix), updated `payload_crc` to delegate through the helper, changed `idempotency_key` to use 32-hex-char digest, updated unit test
+- `weftdb/tests/legacy_seal_tests.rs` — added `crc32_colliding_pair` helper, `crc32_collides_on_distinct_payloads_and_the_new_digest_does_not`, `crc32_colliding_payloads_are_not_treated_as_duplicates`
+- `CHANGELOG.md`, `DECISIONS.md`, `docs/roadmap-notes.md`, `progress.md` — documentation
+
+**Ran:** `grep` consistency checks, `git diff` review. No cargo build (host RAM constraint).
+
+**Not run:** cannot compile, run tests, format, or lint.
+
+**Commit:** pending `git add` + `git commit -s` + `git push` + `gh pr create`.

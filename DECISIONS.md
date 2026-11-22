@@ -8978,3 +8978,18 @@ attention" where the code already documents its trade-off.
 
 **Needs human.** None: this is a read-only inventory with no code changes and no merge conflict
 risk.
+
+## 2026-11-22 — The legacy ledger key is a payload digest, so its width is a data-integrity parameter (#849)
+
+**Context.** The legacy seal path keys its ingest ledger by a payload digest. Until this change the
+digest was CRC-32, which at ~77k distinct writes has ~50 % collision odds; two distinct batches
+with colliding digests are silently deduplicated. The change widens the key derivation to a 128-bit
+SHA-256 prefix (`payload_digest`) over the same canonical bytes.
+
+**Decision.** The key is on-disk state (`ingest_ledger.key`,
+`weftdb/src/types/segment_index.rs:1102`). Changing the derivation is migration-free because the
+lookup is `(aspect, key)`; the consequence is orphaned old rows + replay-lost-across-versions
+(a blind retry from a pre-change client re-writes instead of replaying, which on an append-only
+store is the safer direction). `payload_crc` is kept public and behaviourally unchanged rather than
+removed or deprecated. The A-B-A half of #803 (caller-identity-based idempotency for the legacy
+facades) is deliberately not attempted here.

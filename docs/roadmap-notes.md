@@ -813,3 +813,13 @@ Gap analysis: Q5 (`--gap-fill`) is the only existing arm that explicitly identif
 TSM-Bench query; Q1 (`--range-fetch`) is the next closest; Q2/Q3/Q6/Q7 need new arms.
 Staged adoption plan with five stages (Q5 formalization → Q1 adaptation → Q4 stored-data path
 → Q2/Q3/Q6/Q7 new arms → cross-engine gate). No cargo / no Rust files touched.
+
+## SEAL-HASH1 (2026-11-22): The legacy ledger key digest widened from CRC-32 to 128-bit SHA-256 prefix (#849)
+
+The key format changed from `legacy:{dataset_id}:{payload_crc:08x}:{n}` to
+`legacy:{dataset_id}:{payload_digest (32 hex)}:{n}`. The change is migration-free because the lookup
+is `(aspect, key)`; rows written under the old key are orphaned (no corruption, no layout bump).
+A blind retry from a pre-change client re-writes instead of replaying, which on an append-only
+store is the safer direction. `payload_crc` kept public and behaviourally unchanged.
+`payload_digest` is a SHA-256 prefix truncated to 128 bits. SHA-2 was already a workspace
+dependency (`sha2 = "0.10.9"`), used by `weft-bench`, `weft-client`, `weft-server`, `weft-xbench`.

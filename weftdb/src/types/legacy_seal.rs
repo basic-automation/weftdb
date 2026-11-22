@@ -58,6 +58,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use bigdecimal::BigDecimal;
 use uuid::Uuid;
+use sha2::{Digest, Sha256};
 use weft_physical_type::{crc32, widen_value_encoding, AspectSchema, PhysicalType, TimeUnit};
 
 use crate::{AspectId, DatasetId, IngestBatch, Measurement, MeasurementId, SegmentStore, TxId};
@@ -157,25 +158,51 @@ pub fn aspect_key(aspect_id: &AspectId) -> String {
 	aspect_id.as_uuid().to_string()
 }
 
-/// The CRC-32 of a batch's canonical rows: each row as its timestamp in
-/// milliseconds (little-endian) followed by its value's plain string. This
-/// is the `payload_crc` of the derived idempotency key.
+/// The canonical bytes of a batch's rows: each row as its timestamp in
+/// milliseconds (little-endian) followed by its value's plain string.
+/// Used by both [`payload_crc`] and [`payload_digest`] so the two digests
+/// are derived from identical input.
 #[must_use]
-pub fn payload_crc(rows: &[(i64, BigDecimal)]) -> u32 {
+pub fn canonical_payload_bytes(rows: &[(i64, BigDecimal)]) -> Vec<u8> {
 	let mut bytes = Vec::with_capacity(rows.len() * 24);
 	for (timestamp, value) in rows {
 		bytes.extend_from_slice(&timestamp.to_le_bytes());
 		bytes.extend_from_slice(value.to_plain_string().as_bytes());
 		bytes.push(0);
 	}
-	crc32(&bytes)
+	bytes
+}
+
+/// The CRC-32 of a batch's canonical rows. The ledger key no longer uses
+/// this value because 32 bits collide at benchmark-relevant row counts
+/// (~50 % odds by 77k distinct writes); see [`payload_digest`] for the
+/// replacement.
+#[must_use]
+pub fn payload_crc(rows: &[(i64, BigDecimal)]) -> u32 {
+	crc32(&canonical_payload_bytes(rows))
+}
+
+/// A 128-bit (SHA-256 prefix) digest over the canonical bytes of a batch's
+/// rows, used in the derived idempotency key. Wider than [`payload_crc`] to
+/// avoid silent collisions: the chance of an accidental collision across
+/// distinct payloads is approximately 2⁻¹²⁸ per pair.
+#[must_use]
+pub fn payload_digest(rows: &[(i64, BigDecimal)]) -> [u8; 16] {
+	let mut hasher = Sha256::new();
+	hasher.update(canonical_payload_bytes(rows));
+	let full: [u8; 32] = hasher.finalize().into();
+	full[..16].try_into().expect("sha256 output is 32 bytes")
 }
 
 /// The derived idempotency key of one legacy ingest call (design §8, S19):
-/// `legacy:{dataset_id}:{payload_crc:08x}:{n}`, `n` the row count.
+/// `legacy:{dataset_id}:{payload_digest:32 hex}:{n}`, `n` the row count.
+/// The digest was widened from CRC-32 to a 128-bit SHA-256 prefix in
+/// [#849] because CRC-32 collisions silently dropped distinct batches.
 #[must_use]
 pub fn idempotency_key(dataset_id: &DatasetId, rows: &[(i64, BigDecimal)]) -> String {
-	format!("legacy:{}:{:08x}:{}", dataset_id.as_uuid(), payload_crc(rows), rows.len())
+	let digest = payload_digest(rows);
+	let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+	format!("legacy:{}:{hex}:{}", dataset_id.as_uuid(), rows.len())
 }
 
 /// The seal-store idempotency key of an identity-aware call: `legacy:{token}`.
@@ -509,7 +536,9 @@ mod tests {
 		let dataset = DatasetId::from_uuid(Uuid::nil());
 		let rows = vec![(1_000, bd("1.5")), (2_000, bd("-2"))];
 		let key = idempotency_key(&dataset, &rows);
-		assert_eq!(key, format!("legacy:{}:{:08x}:2", Uuid::nil(), payload_crc(&rows)));
+		let digest = payload_digest(&rows);
+		let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+		assert_eq!(key, format!("legacy:{}:{hex}:2", Uuid::nil()));
 		assert_ne!(key, idempotency_key(&dataset, &[(1_000, bd("1.5"))]), "a different batch derives a different key");
 		assert_eq!(synthetic_tx_id(&key, 0), synthetic_tx_id(&key, 0), "a retry derives the same TxIds");
 		assert_ne!(synthetic_tx_id(&key, 0), synthetic_tx_id(&key, 1));
