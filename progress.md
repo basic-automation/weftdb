@@ -80,3 +80,13 @@ All original deliverables for issue #838 (FRE-18a) are implemented, committed, p
 **Not run:** cannot compile, run tests, format, or lint.
 
 **Commit:** pending `git add` + `git commit -s` + `git push` + `gh pr create`.
+# progress — B-PRECISION-2 (bprec2/inventory-citations, base ecb0744)
+Branch `bprec2/inventory-citations`, based on `ecb0744`.
+
+## Done
+
+- All four confirmed citation defects fixed
+- Every remaining TOKEN_OFF_WINDOW resolved (harness now reports 0)
+- All counts corrected per `grep -c` output from `origin/main`
+- Per-label site count updated to 51 / 89 / 20
+- Committed, pushed, PR open
