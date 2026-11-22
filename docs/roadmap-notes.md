@@ -449,6 +449,7 @@ The interpolation item (B-interp, Phase 5) is done.
 - **B-rest** *(Phase 2 · partial)*
 - **B-poll / B-retry / B-register** *(Phase 7 · absent)*
 - **B-analysis** *(Phase 4/9 · verify)*
+  - 2026-11-22: wiring audit produced (`docs/research/per-point-analysis-wiring.md`) — **not wired** end-to-end: no producer on any product path (`Batch::process()` is called only from `weft-orchestration` and two `weftdb` tests; `process_batches()` has zero call sites), never persisted and every read path resets it (`BatchedMeasurement::new` fixes `analysis: None`), no `weft-server` surface, and the `trend` half has no producer. Defects filed as #862/#863; the `ROADMAP.md` line stays unchecked (#362)
 - **B-object** *(Phase 4 · absent)*
 - **B-windows** *(Phase 9 · absent/partial)*
 - **B-dedup** *(Phase 7 · partial)*
@@ -841,6 +842,17 @@ split: the CRC-32 collision half is issue #849, the caller-identity half deferre
 and `:163` (the OpenAPI breaking-change checker shipped as PR #839 on 2026-11-20; what is left of
 FRE-18 is the rc.1 freeze cut and the layout-2 baseline fixtures). `:83` (ROB-14) and `:137`
 (Quotas and limits) are also stale but belong to the owner, so they are reported and left alone.
+
+## 2026-11-22 — Python test wiring guard (#853, CI-GATES)
+
+`ROADMAP.md` keeps no line for CI hygiene, so this note exists because the defect class does.
+`ci.yml` discovers Python tests through narrow `-p` patterns (`:143`, `:155`), so a `test_*.py`
+added to `scripts/ci` is invisible to CI until a step names it: the guard now proves every
+`test_*.py` under `scripts/` and `tools/` is named directly or matched by a `unittest discover`
+directory/pattern pair, and runs in the `claims` job. It was written against issue #853 after a
+worker for this slice imported two unmerged files from PR #845's branch, which is how the gap
+became visible: a missing step and a duplicated file look identical from a diff of one branch.
+`OK: 13 test script(s) wired by 13 workflow(s)` against `main`.
 ## 2026-11-22 — Legacy ledger key digest widened from CRC-32 to 128 bits (#849, SEAL-HASH1) to 128-bit SHA-256 prefix (#849)
 
 The key format changed from `legacy:{dataset_id}:{payload_crc:08x}:{n}` to
