@@ -459,7 +459,7 @@ The interpolation item (B-interp, Phase 5) is done.
     whose protocol is not ILP at all), and which repository and tier a vendor connector lives in,
     since `DECISIONS.md:2165` places historian connectors in the paid tier.
 - **B-rest** *(Phase 2 · partial)*
-- **B-poll / B-retry / B-register** *(Phase 7 · absent)*
+- **B-poll / B-retry / B-register** *(Phase 23 · absent — see docs/research/client-poll-retry-register-audit.md; all three are not needed or already present)*
 - **B-analysis** *(Phase 4/9 · verify)*
   - 2026-11-22: wiring audit produced (`docs/research/per-point-analysis-wiring.md`) — **not wired** end-to-end: no producer on any product path (`Batch::process()` is called only from `weft-orchestration` and two `weftdb` tests; `process_batches()` has zero call sites), never persisted and every read path resets it (`BatchedMeasurement::new` fixes `analysis: None`), no `weft-server` surface, and the `trend` half has no producer. Defects filed as #862/#863; the `ROADMAP.md` line stays unchecked (#362)
 - **B-object** *(Phase 28 · absent)*
@@ -471,6 +471,7 @@ The interpolation item (B-interp, Phase 5) is done.
   - 2026-11-20: BigDecimal precision-boundary inventory produced (`docs/research/bigdecimal-inventory.md`) (#840)
 - **B-resilience** *(Phase 4/7 · partial)*
 - **B-conncache** *(Phase 4/7 · partial)*
+  - 2026-11-22: cached-connection audit produced (`docs/research/cached-connection-audit.md`, PR #870, issue #369). Two cache layers are in place — the process-wide `CONNECTION_DATABASES` map (`weftdb/src/types/database/mod.rs:24`) with `close_idle_databases` (`mod.rs:122`), and the per-`Database` aspect cache (`mod.rs:143`). Remaining, filed as #871 (read-only cache for `rows_mode` opens, which must never share the MVCC-enabling cache), #872 (the idle sweep exists but is not called from the server loop) and #873 (no per-path `Database` singleton). Not taken by the loop: #871/#872 overlap the owner's `p12/fanctl-correlation-growth` lane, and #873 is a public-surface change while #238 is open.
 - **B-msgpack** *(Phase 6 · absent)*
 - **B-snapshot** *(Phase 3/9 · absent)*
 

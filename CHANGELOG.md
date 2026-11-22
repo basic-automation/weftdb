@@ -10,6 +10,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Documentation
 
+- **B-poll / B-retry / B-register audit (#361).** `docs/research/client-poll-retry-register-audit.md` published: all three backlog items are either already present (retry-for-503) or not needed (polling daemon, source registration). No behaviour changed. Phase label reconciled to Phase&nbsp;23.
 - **B-object audit** — `docs/research/object-store-audit.md` confirms no schemaless object/annotation store exists; every PhysicalType is numeric, the segment frame has no non-numeric column model, and the public-surface freeze blocks new routes. Deferred to post-1.0. Phase label reconciled from the stale "Phase 4" (issue body) to Phase 28 (the live ROADMAP.md position). (#363)
 
 ### Changed
@@ -43,6 +44,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `ingest_batch` wrapper that every legacy facade call site uses still derives its key from them — so
   an identical re-run through that wrapper is still absorbed, and #803 stays open pending the
   server-ledger identity under #768.
+
+- **A worker's progress log was tracked at `progress.md` (#876).** It was a run log for issue
+  #838: a Done checklist written by an agent into its worktree, committed, and merged. Nothing in
+  `.github/`, `scripts/`, `docs/` or `tools/` references it and no document links to it, so it read
+  as project documentation while being none. It is removed, and `.gitignore` now covers the class
+  (`progress.md`, `.briefs/`) beside the `.handoff-*.md` entry that already existed.
 
 ### Fixed
 
@@ -447,6 +454,11 @@ origin/main
   connector trait, UDP ingress and an ILP round-trip suite are absent. Follow-up slices filed as
   #866, #867, #868 and #869; the connector trait (#358) is the prerequisite and is filed but
   unassigned. No behaviour change, and the `ROADMAP.md` line stays unchecked.
+- Cached-connection audit (#369, PR #870, `docs/research/cached-connection-audit.md`): what
+  connection caching Weft already has, which call sites bypass it and why, and the correctness
+  couplings a new cache must respect (handle `Drop` flushes, MVCC enabled once per file). Filed
+  #871, #872 and #873; the roadmap line stays unchecked because the remaining work is either in
+  the owner's lane or changes public surface.
 
 ## [0.3.7] - 2026-11-12
 

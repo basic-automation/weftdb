@@ -9304,6 +9304,108 @@ open and makes the work inside it look unclaimed. Flag it on the PR *and* on the
 the same turn, because the routine loop reads one and other agents read the other. This item is "Needs human"
 in the sense that only the routine loop (or a human) may act on it.
 
+## 2026-11-22 — B-poll, B-retry, B-register: what the backlog line means, and what is actually missing (#361)
+
+**Ambiguity.** The three names have no definition anywhere in the repository — no `DECISIONS.md`
+entry, no research doc, no predecessor commit, no separate issue, and no PR. The only source is
+the single `ROADMAP.md` line: "Scheduled polling daemon, at-least-once retry buffer, runtime source
+registration". The names are placeholder labels for a single envisioned background-loop client.
+
+**Phase label discrepancy.** The ROADMAP.md line lives under Phase 23 (§7.1 Online ingest), but
+`docs/roadmap-notes.md` and issue #361's title both said "Phase 7" — a carry-over from the
+predecessor roadmap's internal numbering. Fixed to Phase 23 in both places.
+
+**Chosen: no follow-ups. The line's prose is annotated with the verdict, and no checkbox is ticked.**
+
+- **B-poll — NOT NEEDED.** WeftDB is a push/pull store, not an event broker. Query results are
+  synchronous. A scheduled polling daemon would be application-specific logic, not SDK behaviour.
+  Same choice as sibling SDKs (Rust, Python).
+- **B-retry — ALREADY PRESENT.** The client retries `503 overloaded` GETs with `Retry-After`
+  respect. Writes are correctly left to the caller with idempotency keys. What exists is
+  sufficient; an exponential-backoff-with-jitter polish is a ~5-line change for a PR that
+  touches this code for another reason, not a separate issue.
+- **B-register — NOT NEEDED.** WeftDB does not poll external sources. Runtime source registration
+  is a feature of metrics-scraping systems and data-aggregation gateways, not a passive-accept
+  store. Users who want to poll an external source and push results into WeftDB write their own
+  loop; the SDK provides all the routes.
+
+**Rationale.** The roadmap line from the predecessor described a feature that was never
+specified and that does not match the product's architecture. No code is missing; the line
+is an accurate record of a feature that was never needed. Filing follow-ups for "not needed"
+findings would be editorial noise. The audit doc (`docs/research/client-poll-retry-register-audit.md`)
+records the evidence.
+## 2026-11-22 — The cached-connection audit answers its roadmap line without ticking it (#369)
+
+**Question.** "Complete the cached-connection migration" (`ROADMAP.md`) presumes a migration that
+the code does not describe. What is the state, and does an audit let the line be ticked?
+
+**Chosen.** No. The audit (PR #870, `docs/research/cached-connection-audit.md`) records what exists
+and files what remains (#871, #872, #873); the line stays unchecked and its text carries the
+verdict.
+
+**Rationale.** Same rule already used for the other verification lines: an audit answers, it does
+not implement. Ticking would tell the next reader that the migration is finished, when the gap the
+roadmap names — the sites that still open their own handles — is still open.
+
+**What the audit rests on.** The vocabulary of the roadmap line does not match the code: there is no
+`ConnectionPool`, no `CachedConnection`, no `bb8`/`r2d2`. There are two caches, a process-wide
+`CONNECTION_DATABASES` map keyed by path and a per-`Database` aspect cache, plus an idle sweep that
+the server loop never calls. Those facts, not a guess about intent, are what the follow-up issues
+were written from.
+
+**Rejected.** Routing the SegmentStore's four control-plane handles through the shared cache — the
+store is a singleton per root, opens each file exactly once and holds it by value, so routing adds no
+deduplication and fights idle-close. Recorded as rejected in the audit rather than filed.
+
+**Lanes.** #871 and #872 overlap the owner's `p12/fanctl-correlation-growth` connection-reuse work
+(`docs/roadmap-notes.md:767`), which has no roadmap line "to avoid claiming it". They are filed so
+the gap is visible on the board, and the audit and the issues both say the lane must be checked
+before anyone starts. The loop did not claim either.
+
+**Needs human.** #873 needs the public-surface decision (an `Arc<Database>` or a `&Database` facade)
+while the #238 freeze is open.
+## 2026-11-22 — A worker's progress log reached `main`, and the fix is to ignore the class (#876)
+
+**Ambiguity.** `progress.md` sat at the repository root on `main`: a 163-line run log for issue
+#838, with a Done checklist and acceptance notes, written by an agent and merged along with the code
+it described. The question was whether such a file is documentation to keep, documentation to move
+under `docs/`, or scratch to delete. It is also the second scaffolding leak of this kind — the
+`.gitignore` scratch section already carries a `## Worker handoff notes are scratch, not repo
+content` entry for `.handoff-*.md`, which means the repo had already decided the class once.
+
+**Choice.** Delete the file and widen the ignore rule to the class: `progress.md` and `.briefs/`
+join the scratch section. Nothing references the file (`rg -n 'progress\.md' .github scripts docs
+tools` returns nothing), so deleting loses no information that anything depends on; the content
+itself describes work that is recorded properly in `ROADMAP.md`, `DECISIONS.md` and the issue
+tracker, which is where a reader looks for it.
+
+**Why not move it under `docs/`.** A run log is a statement about one agent's session, not about the
+system. Its claims were true at the moment the agent wrote them and are unverifiable afterwards, so
+placing it in `docs/` would add a document that invites trust it has not earned. The same reasoning
+already removed `DETAILED_CHANGES.txt` and `.handoff-*.md` from the tree.
+
+**The CI guard, and why it did not wait.** The complete fix is a check that no scaffolding filename
+is tracked, because an ignore rule only stops *this* checkout from re-adding one: `git add -f` and an
+already-tracked path both defeat it, and `progress.md` was already tracked when it was merged. The
+issue filed for that check (#885) said it should wait for the wiring-guard hardening branch
+(`ci-gates/wiring-basename`, #859), since both touch `scripts/ci/` and add a step to
+`.github/workflows/ci.yml`. While implementing it the wait looked wrong. The hazard #859 guards is a
+blanket `unittest discover` root — a workflow line that silently opts future files in. The steps this
+guard adds invoke two scripts by exact path, so they stay legal under #859's stricter rules whichever
+order they merge in; the residual cost is one possible `ci.yml` conflict on a branch that has to
+rebase anyway. The cost of waiting was not a conflict but a window: every agent that pushes to this
+repo meanwhile can land another `progress.md`, and the guard is what closes the window. Recorded
+because both the issue text and this section's first draft said the opposite.
+
+**What the guard enforces, and what it deliberately does not.** It enforces filename rules —
+`progress.md`, `progress-*.md`, `HANDOFF.md`, `.handoff-*.md` at any depth, and any path with a
+`.briefs` component. It does not enforce the heading rule, though the heading detector
+(`HANDOFF_HEADING`) is kept in the file so the rule stays expressible and can be wired into a
+pre-commit hook. The reason is concrete: `DECISIONS.md` on `main` quotes a `## Handoff` heading while
+describing this very incident, so a CI rule on headings would fail honest write-ups of the practice
+the rule exists to stop. A gate that fails legitimate prose gets routed around by a blanket exemption
+nobody re-reads, so the heading rule stays a review rule and the filename rule — which has no
+legitimate counter-use — is the one CI enforces.
 ## 2026-11-22 — B-object is absent; the freeze blocks it; defer to post-1.0 (#363)
 
 **Context.** Issue #363 "B-object (Phase 4 · absent)" from the predecessor backlog asks whether
