@@ -813,3 +813,15 @@ Gap analysis: Q5 (`--gap-fill`) is the only existing arm that explicitly identif
 TSM-Bench query; Q1 (`--range-fetch`) is the next closest; Q2/Q3/Q6/Q7 need new arms.
 Staged adoption plan with five stages (Q5 formalization → Q1 adaptation → Q4 stored-data path
 → Q2/Q3/Q6/Q7 new arms → cross-engine gate). No cargo / no Rust files touched.
+
+## 2026-11-21 — Row-TTL purge defects line ticked (#846)
+
+`ROADMAP.md:90` was unchecked with all three sub-items (`#797`, `#798`, `#799`) already ticked
+and a parenthetical claiming nothing on `main` calls `purge_expired`. Both halves were stale:
+#797 and #798 closed through PR #810 (2026-11-19), #799 through PR #822 (`1de54350a`,
+2026-11-20), and the daemon gate they blocked landed as PR #786 (`5572e6f`, merged
+2026-11-19T22:19:23Z, issue #785). `reconcile_tick_purge_expired`
+(`weft-server/src/reconcile_daemon.rs:409`) calls `store.purge_expired(now)` (`:412`) from the
+daemon loop (`:552`), pinned by `purge_expired_drops_wholly_expired_frames_and_leaves_straddling_ones`
+(`:917`). The line is now `[x]` and its parenthetical names those PRs and that call site.
+`ROADMAP.md:94` (Legacy seal routing defects) stays open because SEAL-IDEM (#803) is unticked.
