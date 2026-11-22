@@ -446,6 +446,18 @@ The interpolation item (B-interp, Phase 5) is done.
 - **B-tags** *(Phase 2/4 · done: TAG-5..TAG-11)*
 - **B-conn** *(Phase 2/7 · absent)*
 - **B-ilp** *(Phase 2 · partial)*
+  - 2026-11-22: audited end to end (PR #865, `docs/research/ilp-interop-audit.md`). Present: the
+    `weft-line-protocol` parser crate (`parse` at `src/lib.rs:289`, `parse_points` at `:332`),
+    `POST /api/v1/storage/{aspect}/ilp` (`weft-server/src/routes.rs:947`), the interpolate and
+    downsample ILP routes (`:891-894`, `:900-903`), `write_ilp` in both the Rust and the Python
+    SDKs, and `TimestampPrecision` to `TimeUnit` rescaling (`weft-server/src/ingest.rs:1296`).
+    Absent: an ILP writer, any InfluxDB client dependency, a connector trait, UDP ingress, and an
+    ILP round-trip suite. The line stays unchecked, because an audit answers what exists and does
+    not implement the missing half. Follow-ups #866 (writer), #867 (connector crate), #868
+    (round-trip suite), #869 (docs and examples); prerequisite #358 (connector trait) is filed but
+    unassigned. Two owner decisions gate #867: which InfluxDB API to target (v1, v2, or InfluxDB 3,
+    whose protocol is not ILP at all), and which repository and tier a vendor connector lives in,
+    since `DECISIONS.md:2165` places historian connectors in the paid tier.
 - **B-rest** *(Phase 2 · partial)*
 - **B-poll / B-retry / B-register** *(Phase 7 · absent)*
 - **B-analysis** *(Phase 4/9 · verify)*
@@ -863,6 +875,17 @@ A blind retry from a pre-change client re-writes instead of replaying, which on 
 store is the safer direction. `payload_crc` kept public and behaviourally unchanged.
 `payload_digest` is a SHA-256 prefix truncated to 128 bits. SHA-2 was already a workspace
 dependency (`sha2 = "0.10.9"`), used by `weft-bench`, `weft-client`, `weft-server`, `weft-xbench`.
+## 2026-11-22 — Roadmap truth pass 3: three lines corrected, none ticked (#855, ROADMAP-TRUTH-3)
+
+`ROADMAP.md:94` now says these defects *gated* the seal-backed default that #768 landed as
+PR #777 on 2026-11-17, and that the group is closed except SEAL-IDEM. `:98` records the
+#803 split: the collision half closed by #849 / PR #850 (squash `c3379fc`, 128-bit
+`payload_digest` replacing CRC-32 in `legacy:{dataset_id}:{payload_digest}:{count}`), the
+lost-write half open behind an after-1.0 API decision about a caller token in
+`weftdb/src/types/database/inputs.rs:336,445,2454`. `:119` no longer claims "shipped" and
+"[ ]" at once: EVI-16 (#277) and EVI-17 (#319) are closed and `HONESTY.md` is on main, so
+only the owner narrative is outstanding and the box stays unchecked for that reason.
+No box moved in this change.
 
 ## 2026-11-22 — The fan-out arm's doc comment said the arm did not exist (#860, TAG-12 residual, L127)
 
