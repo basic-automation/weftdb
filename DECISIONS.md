@@ -9141,3 +9141,34 @@ inner scheme is not `http`/`https`/`file` now yields an opaque origin instead of
 used to report. Nothing in this workspace builds a `blob:` URL, so it is inert in WeftDB's own code,
 but the change lands inside `reqwest`'s use of `url`, which this bump does not attempt to audit — the
 client and server test suites are what exercise that path.
+
+## 2026-11-22 — The cached-connection audit answers its roadmap line without ticking it (#369)
+
+**Question.** "Complete the cached-connection migration" (`ROADMAP.md`) presumes a migration that
+the code does not describe. What is the state, and does an audit let the line be ticked?
+
+**Chosen.** No. The audit (PR #870, `docs/research/cached-connection-audit.md`) records what exists
+and files what remains (#871, #872, #873); the line stays unchecked and its text carries the
+verdict.
+
+**Rationale.** Same rule already used for the other verification lines: an audit answers, it does
+not implement. Ticking would tell the next reader that the migration is finished, when the gap the
+roadmap names — the sites that still open their own handles — is still open.
+
+**What the audit rests on.** The vocabulary of the roadmap line does not match the code: there is no
+`ConnectionPool`, no `CachedConnection`, no `bb8`/`r2d2`. There are two caches, a process-wide
+`CONNECTION_DATABASES` map keyed by path and a per-`Database` aspect cache, plus an idle sweep that
+the server loop never calls. Those facts, not a guess about intent, are what the follow-up issues
+were written from.
+
+**Rejected.** Routing the SegmentStore's four control-plane handles through the shared cache — the
+store is a singleton per root, opens each file exactly once and holds it by value, so routing adds no
+deduplication and fights idle-close. Recorded as rejected in the audit rather than filed.
+
+**Lanes.** #871 and #872 overlap the owner's `p12/fanctl-correlation-growth` connection-reuse work
+(`docs/roadmap-notes.md:767`), which has no roadmap line "to avoid claiming it". They are filed so
+the gap is visible on the board, and the audit and the issues both say the lane must be checked
+before anyone starts. The loop did not claim either.
+
+**Needs human.** #873 needs the public-surface decision (an `Arc<Database>` or a `&Database` facade)
+while the #238 freeze is open.

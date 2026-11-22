@@ -193,7 +193,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] **B-ilp** ILP/Influx interop connector crate
 - [ ] **B-rest** REST facade remainder
 - [ ] **B-resilience** Write retry, size-tiered write selector, interpolation window extension
-- [ ] **B-conncache** Complete the cached-connection migration
+- [ ] **B-conncache** Complete the cached-connection migration — audited 2026-11-22 (PR #870, `docs/research/cached-connection-audit.md`): the process-wide `CONNECTION_DATABASES` cache and its idle sweep exist and already cover the sub-aspect databases; what is left is a read-only cache for rows-mode opens (#871), calling `close_idle_databases` from the server loop (#872), and a per-path `Database` singleton (#873). Left unchecked on purpose — #871/#872 sit in the owner's `p12/fanctl-correlation-growth` connection-reuse lane (`docs/roadmap-notes.md:767`) and #873 changes public surface while the #238 freeze is open
 - [ ] Grafana → Prometheus remote write/read (if monitoring) → R/Arrow workflows
   - [ ] **Prometheus remote write/read**: a remote-write series is a metric plus a label set
 - [ ] Lean on production MVCC concurrent writes for concurrent ingest + catalog updates under load

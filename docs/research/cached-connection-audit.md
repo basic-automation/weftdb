@@ -264,7 +264,7 @@ What is **done**:
 
 What **remains open**:
 
-1. **`rows_mode.rs` reader opens.**  Each call to `rows_mode::open()` (`rows_mode.rs:720`)
+1. **`rows_mode.rs` reader opens.** Filed as #871.  Each call to `rows_mode::open()` (`rows_mode.rs:720`)
    opens a fresh Turso connection to a legacy database.  Every `import-into` run and each
    discover-skip creates at least one such open.  These cannot go through
    `CONNECTION_DATABASES` as-is because the reader leg opens the database without MVCC
@@ -272,20 +272,20 @@ What **remains open**:
    could be built, but it would be a separate cache — never `CONNECTION_DATABASES` which
    sets MVCC on first open.
 
-2. **Multiple `Database` struct instances for the same physical database.**  Each
+2. **Multiple `Database` struct instances for the same physical database.** Filed as #873.  Each
    `Database` struct has its own `DatabaseCache` and its own `metadata` handle (the
    top-level Turso database for catalog/subjects).  Two `Database` handles to the same
    path do deduplicate in `CONNECTION_DATABASES` for the sub-aspect files, but
    `DATABASES` (`mod.rs:21`, the `HashMap<DatabaseId, DatabaseInfo>`) is a separate
    map.  There is currently no named database singleton at the application level.
 
-3. **SegmentStore was never intended to share its handles.**  The store is a singleton per
+3. **SegmentStore was never intended to share its handles.** No issue was filed for this: the sequencing table rejects the work.  The store is a singleton per
    root (Locks enforce exclusivity).  The four control-plane databases of one store are
    opened exactly once and live for the store's lifetime.  Making them pass through
    `CONNECTION_DATABASES` would be harmless but not useful — no deduplication, same
    lifecycle.
 
-4. **No idle-timeout on SegmentStore handles.**  The store's four databases are always
+4. **No idle-timeout on SegmentStore handles.** No issue was filed: this is a per-root cost already bounded by the one-store-per-process rule.  The store's four databases are always
    open while the store lives.  If the number of SegmentStore roots grows (currently one
    process opens exactly one store, through `open_from_env`), each root adds four
    databases that cannot be closed while the store lives.  This is not a cache problem
@@ -297,11 +297,17 @@ What **remains open**:
 
 | Priority | Change | Effort | Risk |
 |----------|--------|--------|------|
-| P1 | Build a `READ_ONLY_CONNECTION_CACHE` for rows-mode opens | Small (<50 lines) | Low — `rows_mode::open` always creates a fresh `turso::Database` then `.connect()`. The `connect()` is the only allocation after the handle. A simple `HashMap<String, Weak<turso::Connection>>` with per-path LRU eviction would avoid re-probing the same legacy file on repeated import attempts. |
-| P2 | Seed `close_idle_databases` into the server's background tick | Small (config + call) | Low — the function exists and is tested; it is just not called from the main server loop. |
-| P3 | Consolidate `Database` struct into a process-wide singleton per path | Medium | Medium — the `Database` is seeded from `database/mod.rs` and most call sites use `database: Database` references that would need a `&Database` facade or an `Arc<Database>`. |
+| P1 | Build a `READ_ONLY_CONNECTION_CACHE` for rows-mode opens (#871) | Small (<50 lines) | Low — `rows_mode::open` always creates a fresh `turso::Database` then `.connect()`. The `connect()` is the only allocation after the handle. A simple `HashMap<String, Weak<turso::Connection>>` with per-path LRU eviction would avoid re-probing the same legacy file on repeated import attempts. |
+| P2 | Seed `close_idle_databases` into the server's background tick (#872) | Small (config + call) | Low — the function exists and is tested; it is just not called from the main server loop. |
+| P3 | Consolidate `Database` struct into a process-wide singleton per path (#873) | Medium | Medium — the `Database` is seeded from `database/mod.rs` and most call sites use `database: Database` references that would need a `&Database` facade or an `Arc<Database>`. |
 | — | Move SegmentStore control-plane opens through `CONNECTION_DATABASES` | Not recommended | Costs complexity, adds no deduplication, and would prevent idle-close of those handles while the store lives. |
 
+
+Do not start P1 or P2 without checking the lane first: `docs/roadmap-notes.md:767` records that
+the owner's `p12/fanctl-correlation-growth` lane is already working on "per-row memory probe,
+connection reuse", and the notes deliberately added no roadmap line for the RSS question "to
+avoid claiming it". #872 in particular is that lane's work in the shape the roadmap would
+describe; it is filed so the gap is on the board, not so this loop can take it.
 ---
 
 ## Method note
@@ -312,11 +318,3 @@ were verified against `origin/main` at that commit by grepping the worktree file
 directly.  Every `path:line` pair was opened and read — none is copied from a previous
 report.  The analysis records structure (which functions call which, which cache paths
 exist, which open paths bypass them), not dynamic behaviour.
-
-## Handoff
-
-Everything up to here is the audit.  What follows is the bridge to the next task (PR
-creation):
-
-- [ ] Commit the file to branch `b-conncache/audit`
-- [ ] Push and open a PR with body-file pointing at this document

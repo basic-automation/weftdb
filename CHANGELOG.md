@@ -413,6 +413,14 @@ origin/main
   number of points, the pool never exceeds its cap, and the device allocator does not grow without
   bound.  (#725)
 
+### Documentation
+
+- Cached-connection audit (#369, PR #870, `docs/research/cached-connection-audit.md`): what
+  connection caching Weft already has, which call sites bypass it and why, and the correctness
+  couplings a new cache must respect (handle `Drop` flushes, MVCC enabled once per file). Filed
+  #871, #872 and #873; the roadmap line stays unchecked because the remaining work is either in
+  the owner's lane or changes public surface.
+
 ## [0.3.7] - 2026-11-12
 
 ### Fixed
