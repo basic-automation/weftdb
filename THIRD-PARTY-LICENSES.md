@@ -6656,7 +6656,7 @@ Used by:
     https://github.com/rust-lang/cc-rs
   * fnv 1.0.7
     https://github.com/servo/rust-fnv
-  * form_urlencoded 1.2.2
+  * form_urlencoded 1.2.3
     https://github.com/servo/rust-url
   * glob 0.3.4
     https://github.com/rust-lang/glob
@@ -6786,7 +6786,7 @@ Used by:
     https://github.com/unicode-rs/unicode-width
   * unicode-width 0.2.2
     https://github.com/unicode-rs/unicode-width
-  * url 2.5.8
+  * url 2.5.9
     https://github.com/servo/rust-url
   * uuid 1.27.0
     https://github.com/uuid-rs/uuid

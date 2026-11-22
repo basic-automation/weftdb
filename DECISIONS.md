@@ -9093,6 +9093,54 @@ store is the safer direction). `payload_crc` is kept public and behaviourally un
 removed or deprecated. The A-B-A half of #803 (caller-identity-based idempotency for the legacy
 facades) is deliberately not attempted here.
 
+## 2026-11-22 — A dependency advisory gets bumped, not ignored (#857, RUSTSEC-2026-0592)
+
+**Context.** `cargo-deny` went red on `main` at `527eae56` through no code change: RustSec published
+RUSTSEC-2026-0592 (`url` `Url::origin()` recursion on nested `blob:` URLs) on 2026-11-20 and the
+advisory database simply caught up. The ambiguity was which of the two levers `deny.toml` offers to
+use. Ignoring is cheap and needs no rebuild — and this machine cannot afford a rebuild: every Rust
+job in CI passes `--locked`, so a lockfile change has to be exact, and installing cargo-deny 0.21.0
+locally is a compile, which is exactly what the no-local-build policy avoids.
+
+**Decision.** Bump it: `cargo update -p url --precise 2.5.9`, and regenerate `THIRD-PARTY-LICENSES.md`
+as part of the same commit. No `deny.toml` ignore.
+
+**Rationale.**
+1. `deny.toml` states the rule in its own comment — every advisory fails the check, and an ignore is
+   for accepting one deliberately, with a reason and a date — and it sets
+   `unused-ignored-advisory = "deny"`. An ignore for an advisory that has a patched release would
+   therefore turn into a second failure the moment the bump landed anyway. The chrono ignore survives
+   on those terms because RustSec says there is no safe upgrade and arrow 60.1.0 pins `chrono ^0.4.40`.
+2. Reachability argued the severity down but not the fix: our crates call neither `Url::origin()` nor
+   `url::quirks::origin()` (zero hits), yet the crate sits in the shipped graph under `reqwest` via
+   `opentelemetry-otlp` in `weft-server` and directly in `weftdb-client`. "We do not call it today" is
+   not a property any gate can keep checking, so it is not a reason to carry an exception.
+3. `cargo update`, not a hand-edit of `Cargo.lock`: 2.5.9 also tightens `form_urlencoded` to `^1.2.3`,
+   and a hand-written lock is exactly what `--locked` punishes when the resolver would have produced
+   something else. The command printed two updates and "141 unchanged dependencies behind latest",
+   and that is the whole diff.
+4. The license bundle is derived state. `THIRD-PARTY-LICENSES.md` names crate versions, and the
+   `third-party licenses` job regenerates it with the pinned `cargo-about 0.9.2` and compares, so
+   leaving it stale would move the failure from `cargo-deny` to a different gate. `cargo-about 0.9.2`
+   was already installed here, which is why regenerating cost no build.
+
+**What was explicitly not done.**
+- No new `deny.toml` ignore, and no change to the chrono exception or its `expiry = "2027-01-31"`.
+- No other dependency moved, upgraded or refreshed — the 141 packages behind the latest stay where
+  they are, because an unrelated bump inside a security fix turns a two-line review into an audit.
+- No local `cargo build`, `check` or `test`: CI's `--locked` jobs are the resolver proof. Metadata-only
+  commands (`cargo update`, `cargo tree`, `cargo fetch`, `cargo-about generate`) were run inside the
+  usual `systemd-run --scope -p MemoryMax=6G -p TasksMax=512 nice -n 19` fence.
+- cargo-deny was not installed at CI's 0.21.0. The local 0.20.2 refuses to read the real `deny.toml`
+  (`failed to deserialize config`, on the `expiry` key), so the local run used a copy with that key
+  stripped. That proves the advisory is gone (`advisories ok`); it does not prove the real config
+  parses — only CI's pinned version does that.
+
+**Known limitation.** 2.5.9 changes behaviour as well as fixing the overflow: a `blob:` URL whose
+inner scheme is not `http`/`https`/`file` now yields an opaque origin instead of the tuple origin it
+used to report. Nothing in this workspace builds a `blob:` URL, so it is inert in WeftDB's own code,
+but the change lands inside `reqwest`'s use of `url`, which this bump does not attempt to audit — the
+client and server test suites are what exercise that path.
 ## 2026-11-22 — A doc comment that says a shipped feature is absent is its own defect (#860, TAG-12 residual)
 
 **Ambiguity.** `weft-bench/src/fan_out.rs` opened with "On `main` `git grep -l fan-out` matches only
