@@ -423,6 +423,20 @@ origin/main
   number of points, the pool never exceeds its cap, and the device allocator does not grow without
   bound.  (#725)
 
+### Documentation
+
+- **The per-point analysis model was audited, and it is not wired end-to-end (#362).**
+  `docs/research/per-point-analysis-wiring.md` records four breaks, each with call-site
+  evidence: `Batch::process()` runs only inside `weft-orchestration`'s pipeline and two
+  `weftdb` tests, and `BatchCollection::process_batches()` has no callers at all;
+  `BatchedMeasurement::new` fixes `analysis: None` and both read-side batch constructors build
+  measurements only through it, so nothing an earlier pass computed survives a re-read;
+  `weft-server` contains no "analysis" token and `analyze_point`/`analyze_range` have no
+  caller outside `weftdb`; and the `trend` half of `Analysis` has no producer —
+  `trend_analysis` survives only as a commented-out call. The `ROADMAP.md` verification line
+  stays unchecked: a negative answer completes the audit, not the wiring. Defects filed as
+  #862 and #863.
+
 ## [0.3.7] - 2026-11-12
 
 ### Fixed
