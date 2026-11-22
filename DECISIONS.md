@@ -9364,3 +9364,45 @@ before anyone starts. The loop did not claim either.
 
 **Needs human.** #873 needs the public-surface decision (an `Arc<Database>` or a `&Database` facade)
 while the #238 freeze is open.
+## 2026-11-22 — A worker's progress log reached `main`, and the fix is to ignore the class (#876)
+
+**Ambiguity.** `progress.md` sat at the repository root on `main`: a 163-line run log for issue
+#838, with a Done checklist and acceptance notes, written by an agent and merged along with the code
+it described. The question was whether such a file is documentation to keep, documentation to move
+under `docs/`, or scratch to delete. It is also the second scaffolding leak of this kind — the
+`.gitignore` scratch section already carries a `## Worker handoff notes are scratch, not repo
+content` entry for `.handoff-*.md`, which means the repo had already decided the class once.
+
+**Choice.** Delete the file and widen the ignore rule to the class: `progress.md` and `.briefs/`
+join the scratch section. Nothing references the file (`rg -n 'progress\.md' .github scripts docs
+tools` returns nothing), so deleting loses no information that anything depends on; the content
+itself describes work that is recorded properly in `ROADMAP.md`, `DECISIONS.md` and the issue
+tracker, which is where a reader looks for it.
+
+**Why not move it under `docs/`.** A run log is a statement about one agent's session, not about the
+system. Its claims were true at the moment the agent wrote them and are unverifiable afterwards, so
+placing it in `docs/` would add a document that invites trust it has not earned. The same reasoning
+already removed `DETAILED_CHANGES.txt` and `.handoff-*.md` from the tree.
+
+**The CI guard, and why it did not wait.** The complete fix is a check that no scaffolding filename
+is tracked, because an ignore rule only stops *this* checkout from re-adding one: `git add -f` and an
+already-tracked path both defeat it, and `progress.md` was already tracked when it was merged. The
+issue filed for that check (#885) said it should wait for the wiring-guard hardening branch
+(`ci-gates/wiring-basename`, #859), since both touch `scripts/ci/` and add a step to
+`.github/workflows/ci.yml`. While implementing it the wait looked wrong. The hazard #859 guards is a
+blanket `unittest discover` root — a workflow line that silently opts future files in. The steps this
+guard adds invoke two scripts by exact path, so they stay legal under #859's stricter rules whichever
+order they merge in; the residual cost is one possible `ci.yml` conflict on a branch that has to
+rebase anyway. The cost of waiting was not a conflict but a window: every agent that pushes to this
+repo meanwhile can land another `progress.md`, and the guard is what closes the window. Recorded
+because both the issue text and this section's first draft said the opposite.
+
+**What the guard enforces, and what it deliberately does not.** It enforces filename rules —
+`progress.md`, `progress-*.md`, `HANDOFF.md`, `.handoff-*.md` at any depth, and any path with a
+`.briefs` component. It does not enforce the heading rule, though the heading detector
+(`HANDOFF_HEADING`) is kept in the file so the rule stays expressible and can be wired into a
+pre-commit hook. The reason is concrete: `DECISIONS.md` on `main` quotes a `## Handoff` heading while
+describing this very incident, so a CI rule on headings would fail honest write-ups of the practice
+the rule exists to stop. A gate that fails legitimate prose gets routed around by a blanket exemption
+nobody re-reads, so the heading rule stays a review rule and the filename rule — which has no
+legitimate counter-use — is the one CI enforces.
