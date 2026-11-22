@@ -164,6 +164,12 @@ jobs:
             echo "compat/openapi/baseline/weftdb.json moved without updating compat/openapi/baseline/weftdb.json.sha256" >&2
             exit 1
           fi
+      # Non-tautological baseline control: compare the committed digest against
+      # the base branch's copy (FRE-18c, P1).  Uses gh api to fetch the base
+      # branch's digest file -- no extra checkout or fetch-depth needed.
+      - run: python3 scripts/ci/check-baseline-control.py
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
 
   # weft-xbench is its own workspace (it builds DuckDB from C++), so nothing else builds it on
   # every push. Its lock is seeded from the workspace's; this fails when a shared dependency

@@ -867,6 +867,197 @@ class FormatOrderPassesTest(unittest.TestCase):
 # Missing baseline
 # ===================================================================
 
+
+# ===================================================================
+# Combinator (allOf / oneOf / anyOf) member-content changes (FRE-18c)
+# ===================================================================
+
+class CombinatorTest(unittest.TestCase):
+    """Schema changes inside allOf / oneOf / anyOf members are detected."""
+
+    def test_allOf_nullable_change_fails(self) -> None:
+        """nullable flip inside allOf member is detected."""
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body({
+                            "allOf": [
+                                {"type": "object", "nullable": True},
+                            ]
+                        }),
+                    },
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body({
+                            "allOf": [
+                                {"type": "object"},
+                            ]
+                        }),
+                    },
+                ),
+            },
+        })
+        base_norm = cob._normalise(base)
+        curr_norm = cob._normalise(curr)
+        findings = cob.compare(base_norm, curr_norm)
+        self.assertTrue(
+            any("BREAKING" in f and "nullable" in f for f in findings),
+            f"expected nullable finding in allOf, got {findings}",
+        )
+
+    def test_allOf_nullable_change_3_1_spelling_fails(self) -> None:
+        """3.1 nullable spelling inside allOf member is detected."""
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body({
+                            "allOf": [
+                                {"type": ["object", "null"]},
+                            ]
+                        }),
+                    },
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body({
+                            "allOf": [
+                                {"type": "object"},
+                            ]
+                        }),
+                    },
+                ),
+            },
+        })
+        base_norm = cob._normalise(base)
+        curr_norm = cob._normalise(curr)
+        findings = cob.compare(base_norm, curr_norm)
+        self.assertTrue(
+            any("BREAKING" in f and "nullable" in f for f in findings),
+            f"expected nullable finding in allOf (3.1), got {findings}",
+        )
+
+    def test_oneOf_nullable_change_fails(self) -> None:
+        """nullable flip inside oneOf member is detected."""
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body({
+                            "oneOf": [
+                                {"type": "object", "nullable": True},
+                                {"type": "string"},
+                            ]
+                        }),
+                    },
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body({
+                            "oneOf": [
+                                {"type": "object"},
+                                {"type": "string"},
+                            ]
+                        }),
+                    },
+                ),
+            },
+        })
+        base_norm = cob._normalise(base)
+        curr_norm = cob._normalise(curr)
+        findings = cob.compare(base_norm, curr_norm)
+        self.assertTrue(
+            any("BREAKING" in f and "nullable" in f for f in findings),
+            f"expected nullable finding in oneOf, got {findings}",
+        )
+
+    def test_anyOf_nullable_change_fails(self) -> None:
+        """nullable flip inside anyOf member is detected."""
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body({
+                            "anyOf": [
+                                {"type": "object", "nullable": True},
+                            ]
+                        }),
+                    },
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body({
+                            "anyOf": [
+                                {"type": "object"},
+                            ]
+                        }),
+                    },
+                ),
+            },
+        })
+        base_norm = cob._normalise(base)
+        curr_norm = cob._normalise(curr)
+        findings = cob.compare(base_norm, curr_norm)
+        self.assertTrue(
+            any("BREAKING" in f and "nullable" in f for f in findings),
+            f"expected nullable finding in anyOf, got {findings}",
+        )
+
+    def test_allOf_member_add_type_change_fails(self) -> None:
+        """A type change inside allOf member is detected."""
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body({
+                            "allOf": [
+                                {"type": "integer"},
+                            ]
+                        }),
+                    },
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "get": _make_op(
+                    responses={
+                        "200": _json_body({
+                            "allOf": [
+                                {"type": "string"},
+                            ]
+                        }),
+                    },
+                ),
+            },
+        })
+        base_norm = cob._normalise(base)
+        curr_norm = cob._normalise(curr)
+        findings = cob.compare(base_norm, curr_norm)
+        self.assertTrue(
+            any("BREAKING" in f and "type-change" in f for f in findings),
+            f"expected type-change finding in allOf, got {findings}",
+        )
+
+
 class BaselineFailuresTest(unittest.TestCase):
     """Baseline integrity failures -> exit 2 (fail-closed)."""
 
@@ -1227,7 +1418,132 @@ class RequestBodyChangesTest(unittest.TestCase):
         self.assertTrue(
             any("BREAKING" in f and "removed-requestBody" in f for f in findings),
             f"expected removed-requestBody finding, got {findings}",
+        )    
+    # ------------------------------------------------------------------
+    # RequestBody.required deltas (FRE-18c, P0)
+    # ------------------------------------------------------------------
+
+    def test_requestBody_required_false_to_true_fails(self) -> None:
+        """required: false -> true on an existing requestBody is breaking."""
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "post": _make_op(
+                    request_body={
+                        "required": False,
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "object"},
+                            }
+                        },
+                    },
+                    responses={"200": _json_body({"type": "string"})},
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "post": _make_op(
+                    request_body={
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "object"},
+                            }
+                        },
+                    },
+                    responses={"200": _json_body({"type": "string"})},
+                ),
+            },
+        })
+        base_norm = cob._normalise(base)
+        curr_norm = cob._normalise(curr)
+        findings = cob.compare(base_norm, curr_norm)
+        self.assertTrue(
+            any("BREAKING" in f and "optional-required-requestBody" in f for f in findings),
+            f"expected optional-required-requestBody finding, got {findings}",
         )
+
+    def test_requestBody_required_true_to_false_fails(self) -> None:
+        """required: true -> false on an existing requestBody is breaking."""
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "post": _make_op(
+                    request_body={
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "object"},
+                            }
+                        },
+                    },
+                    responses={"200": _json_body({"type": "string"})},
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "post": _make_op(
+                    request_body={
+                        "required": False,
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "object"},
+                            }
+                        },
+                    },
+                    responses={"200": _json_body({"type": "string"})},
+                ),
+            },
+        })
+        base_norm = cob._normalise(base)
+        curr_norm = cob._normalise(curr)
+        findings = cob.compare(base_norm, curr_norm)
+        self.assertTrue(
+            any("BREAKING" in f and "required-optional-requestBody" in f for f in findings),
+            f"expected required-optional-requestBody finding, got {findings}",
+        )
+
+    def test_requestBody_required_absent_equals_false_to_true_fails(self) -> None:
+        """required absent (defaults to false) -> true is breaking."""
+        base = _make_spec(paths={
+            "/api/v1/test": {
+                "post": _make_op(
+                    request_body={
+                        # no required key -- defaults to false
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "object"},
+                            }
+                        },
+                    },
+                    responses={"200": _json_body({"type": "string"})},
+                ),
+            },
+        })
+        curr = _make_spec(paths={
+            "/api/v1/test": {
+                "post": _make_op(
+                    request_body={
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "object"},
+                            }
+                        },
+                    },
+                    responses={"200": _json_body({"type": "string"})},
+                ),
+            },
+        })
+        base_norm = cob._normalise(base)
+        curr_norm = cob._normalise(curr)
+        findings = cob.compare(base_norm, curr_norm)
+        self.assertTrue(
+            any("BREAKING" in f and "optional-required-requestBody" in f for f in findings),
+            f"expected optional-required-requestBody finding, got {findings}",
+        )
+
+
 
 
 if __name__ == "__main__":
