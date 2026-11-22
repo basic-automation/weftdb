@@ -128,3 +128,17 @@ Branch `bprec2/inventory-citations`, based on `ecb0744`.
 - All counts corrected per `grep -c` output from `origin/main`
 - Per-label site count updated to 51 / 89 / 20
 - Committed, pushed, PR open
+
+# progress — ROADMAP-TRUTH-3 (truth3/roadmap-lines, base c3379fc)
+
+## Done
+
+- `ROADMAP.md:94`, `:98`, `:119` rewritten in place; every box left in its prior state
+- `DECISIONS.md`: "A stale roadmap line is a defect in its own right" with the #803 clause
+  mapping (collision half satisfied by #849/PR #850, lost-write half held to after 1.0)
+- `docs/roadmap-notes.md`: dated note for the same pass
+- Committed with `git commit -s`, pushed, PR open against #855
+
+## Not run
+
+- Nothing compiled: the change touches three markdown files and no Rust. CI is the gate.
