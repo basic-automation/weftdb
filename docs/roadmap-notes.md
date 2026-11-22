@@ -470,6 +470,7 @@ The interpolation item (B-interp, Phase 5) is done.
   - 2026-11-20: BigDecimal precision-boundary inventory produced (`docs/research/bigdecimal-inventory.md`) (#840)
 - **B-resilience** *(Phase 4/7 · partial)*
 - **B-conncache** *(Phase 4/7 · partial)*
+  - 2026-11-22: cached-connection audit produced (`docs/research/cached-connection-audit.md`, PR #870, issue #369). Two cache layers are in place — the process-wide `CONNECTION_DATABASES` map (`weftdb/src/types/database/mod.rs:24`) with `close_idle_databases` (`mod.rs:122`), and the per-`Database` aspect cache (`mod.rs:143`). Remaining, filed as #871 (read-only cache for `rows_mode` opens, which must never share the MVCC-enabling cache), #872 (the idle sweep exists but is not called from the server loop) and #873 (no per-path `Database` singleton). Not taken by the loop: #871/#872 overlap the owner's `p12/fanctl-correlation-growth` lane, and #873 is a public-surface change while #238 is open.
 - **B-msgpack** *(Phase 6 · absent)*
 - **B-snapshot** *(Phase 3/9 · absent)*
 
