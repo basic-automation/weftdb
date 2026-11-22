@@ -22,10 +22,14 @@ difference against the six compatibility rule families documented in
   default, if that default changes the behaviour of a request that omitted it,
   is breaking.
 
-The checker does not yet classify:
-(1) a ``required`` array gaining an existing property on a nested object;
-(2) ``nullable`` changes inside ``allOf`` sub-schemas.
-These are known gaps, not silent passes.
+Known gaps (declared in ``docs/stability.md``):
+- Top-level documents ``security`` / ``securitySchemes`` / ``servers`` / ``info`` /
+  ``tags`` / ``externalDocs`` are out of scope (not compared).
+- ``required`` array changes on nested objects that are already caught as property-level
+  optional/required deltas are not restated here (the docstring is not a gap list).
+
+Combinator member content (``allOf`` / ``oneOf`` / ``anyOf``) **is** now compared
+(FRE-18c).
 
 Usage:
     python3 scripts/ci/check-openapi-breaking.py [--baseline PATH] [--current PATH]
@@ -336,6 +340,28 @@ def _compare_schemas(
                 f"{base_val!r} -> {curr_val!r}"
             )
 
+    # --- Combinators (allOf / oneOf / anyOf) ---
+    for kw in ("allOf", "oneOf", "anyOf"):
+        base_members = base_schema.get(kw, [])
+        curr_members = curr_schema.get(kw, [])
+        if not isinstance(base_members, list) or not isinstance(curr_members, list):
+            continue
+        n = max(len(base_members), len(curr_members))
+        for i in range(n):
+            sp = f"{path_hint}.{kw}[{i}]"
+            if i >= len(base_members):
+                continue  # added member – not compared
+            if i >= len(curr_members):
+                findings.append(
+                    f"BREAKING removed-{kw}-member {sp}: present -> absent"
+                )
+                continue
+            base_m = base_members[i] if isinstance(base_members[i], dict) else {}
+            curr_m = curr_members[i] if isinstance(curr_members[i], dict) else {}
+            _compare_schemas(
+                base_m, curr_m, sp, spec, baseline, findings,
+            )
+
     # --- Properties ---
     base_props = base_schema.get("properties", {})
     curr_props = curr_schema.get("properties", {})
@@ -536,6 +562,24 @@ def _compare_request_body(
             "present -> absent"
         )
         return
+    # --- Requiredness delta on existing requestBody ---
+    # OpenAPI 3.x: ``required`` defaults to ``false`` when absent.
+    was_required = base_rb.get("required", False)
+    is_required = curr_rb.get("required", False)
+    if was_required and not is_required:
+        # Making a required request body optional is wire-relaxing, but a
+        # client that was forced to send data before could now stop doing
+        # so; this is the same class as ``required-optional`` on a field
+        # (docs/stability.md:35 calls it breaking), so we flag it.
+        findings.append(
+            f"BREAKING required-optional-requestBody {path_hint}: "
+            "required -> optional"
+        )
+    elif not was_required and is_required:
+        findings.append(
+            f"BREAKING optional-required-requestBody {path_hint}: "
+            "optional -> required"
+        )
     _compare_content(
         base_rb, curr_rb, f"{path_hint}.requestBody",
         spec, baseline, findings,
