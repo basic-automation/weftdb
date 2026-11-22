@@ -178,6 +178,16 @@ jobs:
       - run: python3 scripts/ci/test_check_test_wiring.py
         env:
           PYTHONDONTWRITEBYTECODE: "1"
+      # No agent scaffolding may be tracked: a run log or handoff note committed
+      # as documentation reads like a claim about the product (#876 removed the
+      # first one that reached main). Pattern list lives in the checker (#885).
+      - run: python3 scripts/ci/check-tracked-scaffolding.py
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+      # Unit tests for the scaffolding guard (explicit step, same reason).
+      - run: python3 scripts/ci/test_check_tracked_scaffolding.py
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
       # The control check's own unit tests run here too, not only in the release
       # workflow: an unexercised gate is an unenforced gate (FRE-18c, P2).
       - run: python3 scripts/ci/test_check_baseline_control.py

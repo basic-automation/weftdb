@@ -9263,10 +9263,25 @@ system. Its claims were true at the moment the agent wrote them and are unverifi
 placing it in `docs/` would add a document that invites trust it has not earned. The same reasoning
 already removed `DETAILED_CHANGES.txt` and `.handoff-*.md` from the tree.
 
-**Deferred deliberately: a CI guard.** The complete fix is a check that no scaffolding filename
-(`progress.md`, `.briefs/**`, `.handoff-*.md`) is tracked — the ignore rule only stops *this*
-checkout from re-adding one. That guard belongs beside the Python test-wiring guard in
-`scripts/ci/`, and the hardening branch for it (`ci-gates/wiring-basename`, #859) is unmerged and
-edits `scripts/ci/` and `.github/workflows/ci.yml`. Landing a second guard in that directory at the
-same time manufactures a conflict for no benefit, so the guard waits for #859 to merge. Recorded
-here rather than only in a commit message because it is a decision to leave known work undone.
+**The CI guard, and why it did not wait.** The complete fix is a check that no scaffolding filename
+is tracked, because an ignore rule only stops *this* checkout from re-adding one: `git add -f` and an
+already-tracked path both defeat it, and `progress.md` was already tracked when it was merged. The
+issue filed for that check (#885) said it should wait for the wiring-guard hardening branch
+(`ci-gates/wiring-basename`, #859), since both touch `scripts/ci/` and add a step to
+`.github/workflows/ci.yml`. While implementing it the wait looked wrong. The hazard #859 guards is a
+blanket `unittest discover` root — a workflow line that silently opts future files in. The steps this
+guard adds invoke two scripts by exact path, so they stay legal under #859's stricter rules whichever
+order they merge in; the residual cost is one possible `ci.yml` conflict on a branch that has to
+rebase anyway. The cost of waiting was not a conflict but a window: every agent that pushes to this
+repo meanwhile can land another `progress.md`, and the guard is what closes the window. Recorded
+because both the issue text and this section's first draft said the opposite.
+
+**What the guard enforces, and what it deliberately does not.** It enforces filename rules —
+`progress.md`, `progress-*.md`, `HANDOFF.md`, `.handoff-*.md` at any depth, and any path with a
+`.briefs` component. It does not enforce the heading rule, though the heading detector
+(`HANDOFF_HEADING`) is kept in the file so the rule stays expressible and can be wired into a
+pre-commit hook. The reason is concrete: `DECISIONS.md` on `main` quotes a `## Handoff` heading while
+describing this very incident, so a CI rule on headings would fail honest write-ups of the practice
+the rule exists to stop. A gate that fails legitimate prose gets routed around by a blanket exemption
+nobody re-reads, so the heading rule stays a review rule and the filename rule — which has no
+legitimate counter-use — is the one CI enforces.

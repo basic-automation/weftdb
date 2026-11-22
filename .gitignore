@@ -51,6 +51,9 @@ weft-audit.jsonl
 .handoff-*.md
 
 # The same class, other names: a worker's progress log and its brief reached main
-# the way the handoff notes did (#876). Ignore the class, not the instance.
+# the way the handoff notes did (#876). Ignore the class, not the instance. The CI
+# guard (#885) polices this list, so keep the two in step.
 progress.md
+progress-*.md
+HANDOFF.md
 .briefs/
