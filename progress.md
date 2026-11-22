@@ -174,10 +174,3 @@ Branch `ci-gates/test-wiring`, based on `d901e90`. Issue #853.
 ## Not run
 
 - Nothing compiled: the change touches three markdown files and no Rust. CI is the gate.
-## 2026-11-22 — TAG-12 DOC (#860): fan-out module doc corrected
-
-- `weft-bench/src/fan_out.rs` module doc no longer claims fan-out is absent; it now says the arm is runnable and unmeasured
-- `bench/claims.json` fan-out entries on `origin/main`: 0, verified with `git grep -c fan_out bench/claims.json`
-- Repaired the malformed `docs/roadmap-notes.md:844` heading left by the SEAL-HASH1 slice
-- `ROADMAP.md` untouched: L127 and L124 stay open until a ladder run is published as a claims entry
-- Committed, pushed, PR open
