@@ -228,3 +228,11 @@
 2. **Line 90 (Row-TTL purge defects)** — Stale prose about "nothing calls purge_expired" since daemon call site (#786) landed on main.
 3. **Line 94 (Legacy seal routing defects)** — All sub-items are done; #768 closed; the line should be checked or the prose updated.
 4. **Line 137 (7.6 Quotas/limits)** — ROB-14 code and ROB-24 evidence exist on main; unchecked state may confuse readers.
+## Action taken (2026-11-22)
+
+- `:90` Row-TTL: ticked with its parenthetical rewritten — issue #846, PR #848.
+- `:94`/`:98` SEAL: prose rewritten, both left `[ ]`. The CRC-32 collision half of `:98` is now issue #849 (digest widened to 128 bits); the caller-identity half stays open on #803 and is deferred past 1.0, with the reasoning in `DECISIONS.md`.
+- `:127` fan-out: prose rewritten, left `[ ]` — the arm landed (PR #809), the measurement did not.
+- `:163` FRE-18: prose rewritten, left `[ ]` — the OpenAPI checker shipped (PR #839); the freeze cut and layout-2 fixtures remain.
+- `:83` (ROB-14) and `:137` (Quotas and limits): reported to the owner on issue #125, not edited here.
+- `:290` needs the papers to verify (benchmark-claims provenance) — left as UNVERIFIABLE-LOCALLY.

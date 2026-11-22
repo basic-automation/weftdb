@@ -813,3 +813,16 @@ Gap analysis: Q5 (`--gap-fill`) is the only existing arm that explicitly identif
 TSM-Bench query; Q1 (`--range-fetch`) is the next closest; Q2/Q3/Q6/Q7 need new arms.
 Staged adoption plan with five stages (Q5 formalization → Q1 adaptation → Q4 stored-data path
 → Q2/Q3/Q6/Q7 new arms → cross-engine gate). No cargo / no Rust files touched.
+
+## 2026-11-22 — Four roadmap lines asserted gates that had already shipped (#849, #803)
+
+A read-only audit of every unchecked `ROADMAP.md` line's prose against `origin/main` at `ecb0744`
+(`roadmap-claim-findings.md`) found seven stale claims. Four lines are rewritten here rather than
+ticked, because the work they describe is partly done and partly genuinely open: `:94` (the seal
+routing defects *gated* the default in #768, which landed as PR #777 on 2026-11-17), `:98` (SEAL-IDEM
+split: the CRC-32 collision half is issue #849, the caller-identity half deferred past 1.0), `:127`
+(the fan-out arm landed as PR #809 — `weft-bench/src/fan_out.rs`, CLI wiring at
+`weft-bench/src/main.rs:539` — but there is no ladder run, no `bench/claims.json` entry and no report),
+and `:163` (the OpenAPI breaking-change checker shipped as PR #839 on 2026-11-20; what is left of
+FRE-18 is the rc.1 freeze cut and the layout-2 baseline fixtures). `:83` (ROB-14) and `:137`
+(Quotas and limits) are also stale but belong to the owner, so they are reported and left alone.
