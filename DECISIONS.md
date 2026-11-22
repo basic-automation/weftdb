@@ -9304,6 +9304,36 @@ open and makes the work inside it look unclaimed. Flag it on the PR *and* on the
 the same turn, because the routine loop reads one and other agents read the other. This item is "Needs human"
 in the sense that only the routine loop (or a human) may act on it.
 
+## 2026-11-22 — B-poll, B-retry, B-register: what the backlog line means, and what is actually missing (#361)
+
+**Ambiguity.** The three names have no definition anywhere in the repository — no `DECISIONS.md`
+entry, no research doc, no predecessor commit, no separate issue, and no PR. The only source is
+the single `ROADMAP.md` line: "Scheduled polling daemon, at-least-once retry buffer, runtime source
+registration". The names are placeholder labels for a single envisioned background-loop client.
+
+**Phase label discrepancy.** The ROADMAP.md line lives under Phase 23 (§7.1 Online ingest), but
+`docs/roadmap-notes.md` and issue #361's title both said "Phase 7" — a carry-over from the
+predecessor roadmap's internal numbering. Fixed to Phase 23 in both places.
+
+**Chosen: no follow-ups. The line's prose is annotated with the verdict, and no checkbox is ticked.**
+
+- **B-poll — NOT NEEDED.** WeftDB is a push/pull store, not an event broker. Query results are
+  synchronous. A scheduled polling daemon would be application-specific logic, not SDK behaviour.
+  Same choice as sibling SDKs (Rust, Python).
+- **B-retry — ALREADY PRESENT.** The client retries `503 overloaded` GETs with `Retry-After`
+  respect. Writes are correctly left to the caller with idempotency keys. What exists is
+  sufficient; an exponential-backoff-with-jitter polish is a ~5-line change for a PR that
+  touches this code for another reason, not a separate issue.
+- **B-register — NOT NEEDED.** WeftDB does not poll external sources. Runtime source registration
+  is a feature of metrics-scraping systems and data-aggregation gateways, not a passive-accept
+  store. Users who want to poll an external source and push results into WeftDB write their own
+  loop; the SDK provides all the routes.
+
+**Rationale.** The roadmap line from the predecessor described a feature that was never
+specified and that does not match the product's architecture. No code is missing; the line
+is an accurate record of a feature that was never needed. Filing follow-ups for "not needed"
+findings would be editorial noise. The audit doc (`docs/research/client-poll-retry-register-audit.md`)
+records the evidence.
 ## 2026-11-22 — ILP writer lives in `weft-line-protocol`, not a connector crate (#866)
 
 **The item asked: add an ILP writer so `LineRecord` can produce wire form, not only parse it.**
