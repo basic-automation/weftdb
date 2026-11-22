@@ -164,12 +164,20 @@ jobs:
             echo "compat/openapi/baseline/weftdb.json moved without updating compat/openapi/baseline/weftdb.json.sha256" >&2
             exit 1
           fi
+      # The control check's own unit tests run here too, not only in the release
+      # workflow: an unexercised gate is an unenforced gate (FRE-18c, P2).
+      - run: python3 scripts/ci/test_check_baseline_control.py
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
       # Non-tautological baseline control: compare the committed digest against
       # the base branch's copy (FRE-18c, P1).  Uses gh api to fetch the base
-      # branch's digest file -- no extra checkout or fetch-depth needed.
+      # branch's digest file -- no extra checkout or fetch-depth needed.  The
+      # Actions runner's `gh` refuses to authenticate unless GH_TOKEN is set in
+      # the step environment, which surfaced as `gh api failed (exit 4)`.
       - run: python3 scripts/ci/check-baseline-control.py --digest-file compat/openapi/baseline/weftdb.json.sha256
         env:
           PYTHONDONTWRITEBYTECODE: "1"
+          GH_TOKEN: ${{ github.token }}
 
   # weft-xbench is its own workspace (it builds DuckDB from C++), so nothing else builds it on
   # every push. Its lock is seeded from the workspace's; this fails when a shared dependency
