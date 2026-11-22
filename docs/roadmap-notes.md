@@ -459,6 +459,7 @@ The interpolation item (B-interp, Phase 5) is done.
     whose protocol is not ILP at all), and which repository and tier a vendor connector lives in,
     since `DECISIONS.md:2165` places historian connectors in the paid tier.
 - **B-rest** *(Phase 2 · partial)*
+- **B-poll / B-retry / B-register** *(Phase 23 · absent — see docs/research/client-poll-retry-register-audit.md; all three are not needed or already present)*
   - 2026-11-22: REST facade audit produced (`docs/research/rest-facade-audit.md`) — **four gaps remain**: row TTL expiry (#878), manual segment split (#879), metadata repair and rollup backfill (#880), series resolution and tag lookup (#881). The `interpolate_range_f64` optimization is deliberately library-only (already documented); `changes_since`/`ack_changes` overlap with B-conncache (#871). `ROADMAP.md` line stays unchecked (#360).
 - **B-poll / B-retry / B-register** *(Phase 7 · absent)*
 - **B-analysis** *(Phase 4/9 · verify)*
