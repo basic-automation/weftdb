@@ -8,6 +8,11 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Documentation
+
+- **CHRONO-INV, #791:** Inventory of `chrono` v0.4 dependency across the workspace — 9
+  consuming crates, 272 call sites, migration feasibility assessment.
+  See `docs/research/chrono-inventory.md`.
 ### Changed
 
 - **`url` is 2.5.9, not 2.5.8 (#857).** RustSec advisory RUSTSEC-2026-0592
