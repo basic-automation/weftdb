@@ -9334,6 +9334,36 @@ specified and that does not match the product's architecture. No code is missing
 is an accurate record of a feature that was never needed. Filing follow-ups for "not needed"
 findings would be editorial noise. The audit doc (`docs/research/client-poll-retry-register-audit.md`)
 records the evidence.
+## 2026-11-22 — The cached-connection audit answers its roadmap line without ticking it (#369)
+
+**Question.** "Complete the cached-connection migration" (`ROADMAP.md`) presumes a migration that
+the code does not describe. What is the state, and does an audit let the line be ticked?
+
+**Chosen.** No. The audit (PR #870, `docs/research/cached-connection-audit.md`) records what exists
+and files what remains (#871, #872, #873); the line stays unchecked and its text carries the
+verdict.
+
+**Rationale.** Same rule already used for the other verification lines: an audit answers, it does
+not implement. Ticking would tell the next reader that the migration is finished, when the gap the
+roadmap names — the sites that still open their own handles — is still open.
+
+**What the audit rests on.** The vocabulary of the roadmap line does not match the code: there is no
+`ConnectionPool`, no `CachedConnection`, no `bb8`/`r2d2`. There are two caches, a process-wide
+`CONNECTION_DATABASES` map keyed by path and a per-`Database` aspect cache, plus an idle sweep that
+the server loop never calls. Those facts, not a guess about intent, are what the follow-up issues
+were written from.
+
+**Rejected.** Routing the SegmentStore's four control-plane handles through the shared cache — the
+store is a singleton per root, opens each file exactly once and holds it by value, so routing adds no
+deduplication and fights idle-close. Recorded as rejected in the audit rather than filed.
+
+**Lanes.** #871 and #872 overlap the owner's `p12/fanctl-correlation-growth` connection-reuse work
+(`docs/roadmap-notes.md:767`), which has no roadmap line "to avoid claiming it". They are filed so
+the gap is visible on the board, and the audit and the issues both say the lane must be checked
+before anyone starts. The loop did not claim either.
+
+**Needs human.** #873 needs the public-surface decision (an `Arc<Database>` or a `&Database` facade)
+while the #238 freeze is open.
 ## 2026-11-22 — What "REST facade remainder" means, and what is actually missing (#360)
 
 **Question.** `ROADMAP.md:194` reads `- [ ] **B-rest** REST facade remainder` under Phase 22 — Connectors and ingest interop. `docs/roadmap-notes.md:449` lists it as `- **B-rest** *(Phase 2 · partial)*`. Neither says what "remainder" means. Two readings are possible: (a) gaps in WeftDB's own HTTP API ("the REST facade" per `weft-server/src/storage.rs:427), or (b) a vendor-compatible `/query`+`/write` shim implied by the Phase 22 connector context.
