@@ -8979,6 +8979,26 @@ attention" where the code already documents its trade-off.
 **Needs human.** None: this is a read-only inventory with no code changes and no merge conflict
 risk.
 
+
+## 2026-11-21 — FRE-18c: OpenAPI breaking-change gate fixes (ISSUE #843)
+
+**Context.** Issue #843 identified silent classes the OpenAPI breaking-change checker did not classify: `requestBody.required` deltas on existing bodies, combinator (`allOf`/`oneOf`/`anyOf`) member content, a tautological baseline control, and a declared-gap list wrong in both directions.
+
+### `requestBody.required` severity: `true -> false` is BREAKING
+
+**Chosen: both directions are BREAKING, including `required: true -> false`.** Making a required body optional is wire-relaxing, but a client that was forced to send the body before could now stop doing so — this is the same class as `required-optional` on a field (docs/stability.md calls it breaking for parameters and properties), so we flag it with `BREAKING required-optional-requestBody`. This is conservative: it would be a false positive only if the server still required the body despite the spec change, which is a server bug, not a classification error.
+
+### Baseline control mechanism
+
+**Chosen: `gh api repos/{owner}/{repo}/contents/{path}?ref={base_ref}` inside a `run:` block.** The `claims` job's `actions/checkout` has no `fetch-depth`, so `git diff origin/main` cannot work. An extra checkout of `${{ github.base_ref }}` would work but doubles the checkout time for every push/PR and introduces a second checkout step whose SHA must be pinned. The `gh api` approach fetches only the digest file (~100 bytes) with the `gh` binary already installed on GitHub-hosted runners, adding negligible time and no new dependencies.
+
+**Rejected: `git diff origin/main`** — the job's checkout is depth-1 (no `fetch-depth`), so `origin/main` is unavailable.
+
+**Rejected: second `actions/checkout` of base branch** — doubles checkout time, and the step's `uses:` must be SHA-pinned; the overhead is disproportionate for a single ~100-byte digest comparison.
+
+### Top-level documents (`security`/`securitySchemes`/`servers`/`info`/`tags`/`externalDocs`)
+
+**Chosen: declared out of scope for the 1.0 surface freeze.** These are global metadata that do not affect the wire-format of individual routes. A change to `info.description` or `tags` is editorial, not breaking. Adding a new server URL in `servers` is additive. The non-telephone rule applies: no client inspects these at runtime. Documented in `docs/stability.md` as a known gap.
 ## 2026-11-21 — Ticking a roadmap line means rewriting its claim, not just its box (#846)
 
 `ROADMAP.md:90` ("Row-TTL purge defects") was unchecked while all three of its sub-items
@@ -9058,3 +9078,17 @@ were closed by PRs #810/#822 while `:90` still said "nothing on `main` calls `pu
 and the PR state before turning a roadmap sentence into a work order.
 
 Needs human. None.
+## 2026-11-22 — The legacy ledger key is a payload digest, so its width is a data-integrity parameter (#849)
+
+**Context.** The legacy seal path keys its ingest ledger by a payload digest. Until this change the
+digest was CRC-32, which at ~77k distinct writes has ~50 % collision odds; two distinct batches
+with colliding digests are silently deduplicated. The change widens the key derivation to a 128-bit
+SHA-256 prefix (`payload_digest`) over the same canonical bytes.
+
+**Decision.** The key is on-disk state (`ingest_ledger.key`,
+`weftdb/src/types/segment_index.rs:1102`). Changing the derivation is migration-free because the
+lookup is `(aspect, key)`; the consequence is orphaned old rows + replay-lost-across-versions
+(a blind retry from a pre-change client re-writes instead of replaying, which on an append-only
+store is the safer direction). `payload_crc` is kept public and behaviourally unchanged rather than
+removed or deprecated. The A-B-A half of #803 (caller-identity-based idempotency for the legacy
+facades) is deliberately not attempted here.

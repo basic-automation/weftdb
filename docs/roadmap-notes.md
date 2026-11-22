@@ -813,6 +813,9 @@ Gap analysis: Q5 (`--gap-fill`) is the only existing arm that explicitly identif
 TSM-Bench query; Q1 (`--range-fetch`) is the next closest; Q2/Q3/Q6/Q7 need new arms.
 Staged adoption plan with five stages (Q5 formalization → Q1 adaptation → Q4 stored-data path
 → Q2/Q3/Q6/Q7 new arms → cross-engine gate). No cargo / no Rust files touched.
+## FRE-18c (2026-11-21) — OpenAPI gate fixes
+
+Issue #843: fixed requestBody.required deltas (P0), combinator descent for allOf/oneOf/anyOf (P1), non-tautological baseline control via gh api (P1), corrected declared gaps in docs/stability.md, declared top-level docs out of scope (P2). All changes are Python + docs + CI yml only; no Rust touched. PR #?? opened but not merged.
 
 ## 2026-11-21 — Row-TTL purge defects line ticked (#846)
 
@@ -838,3 +841,12 @@ split: the CRC-32 collision half is issue #849, the caller-identity half deferre
 and `:163` (the OpenAPI breaking-change checker shipped as PR #839 on 2026-11-20; what is left of
 FRE-18 is the rc.1 freeze cut and the layout-2 baseline fixtures). `:83` (ROB-14) and `:137`
 (Quotas and limits) are also stale but belong to the owner, so they are reported and left alone.
+## 2026-11-22 — Legacy ledger key digest widened from CRC-32 to 128 bits (#849, SEAL-HASH1) to 128-bit SHA-256 prefix (#849)
+
+The key format changed from `legacy:{dataset_id}:{payload_crc:08x}:{n}` to
+`legacy:{dataset_id}:{payload_digest (32 hex)}:{n}`. The change is migration-free because the lookup
+is `(aspect, key)`; rows written under the old key are orphaned (no corruption, no layout bump).
+A blind retry from a pre-change client re-writes instead of replaying, which on an append-only
+store is the safer direction. `payload_crc` kept public and behaviourally unchanged.
+`payload_digest` is a SHA-256 prefix truncated to 128 bits. SHA-2 was already a workspace
+dependency (`sha2 = "0.10.9"`), used by `weft-bench`, `weft-client`, `weft-server`, `weft-xbench`.

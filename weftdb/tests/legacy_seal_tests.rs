@@ -23,7 +23,7 @@ use futures::StreamExt;
 use serial_test::serial;
 use tempfile::TempDir;
 use uuid::Uuid;
-use weftdb::legacy_seal::{aspect_key, ingest_batch_with_gate, read_measurements, read_rows};
+use weftdb::legacy_seal::{aspect_key, ingest_batch_with_gate, payload_crc, payload_digest, read_measurements, read_rows};
 
 /// The fragmentation gate at a small target converges repeated ingests of the same aspect.
 ///
@@ -803,6 +803,82 @@ async fn gate_dataset_id_is_not_part_of_the_idempotency_key() -> Result<()> {
 	assert_ne!(tx1, tx2, "the key cannot be built from (dataset id, rows)");
 	let read_back = read_rows(&store, &aspect_id, None, None).await?;
 	assert_eq!(read_back.len(), 1, "the second call landed and collapsed onto the same timestamp");
+
+	drop(store);
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}
+
+/// One batch's worth of `(timestamp, value)` pairs, as the ledger keys see them.
+///
+/// Named because `(Vec<(i64, BigDecimal)>, Vec<(i64, BigDecimal)>)` is `clippy::type_complexity`.
+type PayloadRows = Vec<(i64, BigDecimal)>;
+
+/// Find a pair of distinct single-row payloads whose CRC-32 values collide,
+/// and prove that their 128-bit digest values differ.
+///
+/// Deterministic enumeration of 10⁶ payloads indexed by `payload_crc`;
+/// birthday expectation at this sample size is ~116 collisions (32-bit space),
+/// so finding none is a failure of the assumption.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn crc32_colliding_pair() -> (PayloadRows, PayloadRows) {
+	use std::{collections::HashMap, str::FromStr};
+	let mut seen: HashMap<u32, PayloadRows> = HashMap::new();
+	let mut pair: Option<(PayloadRows, PayloadRows)> = None;
+	for ts in 0..1_000_000_i64 {
+		let value = BigDecimal::from_str(&format!("{ts}.5")).expect("decimal");
+		let rows = vec![(ts, value)];
+		let crc = payload_crc(&rows);
+		if let Some(prev) = seen.get(&crc) {
+			pair = Some((prev.clone(), rows));
+			break;
+		}
+		seen.insert(crc, rows);
+	}
+	let (a, b) = pair.expect("expected a CRC-32 collision in 1e6 single-row payloads");
+	assert_ne!(a, b, "the colliding pair must be two distinct payloads");
+	assert_eq!(payload_crc(&a), payload_crc(&b), "the pair must collide under CRC-32");
+	assert_ne!(payload_digest(&a), payload_digest(&b), "the pair must NOT collide under the 128-bit digest");
+	(a, b)
+}
+
+/// CRC-32 collides on distinct payloads; the new 128-bit digest does not.
+#[test]
+fn crc32_collides_on_distinct_payloads_and_the_new_digest_does_not() {
+	let (_a, _b) = crc32_colliding_pair();
+	// The pair was found and the digest assertion passed inside the helper.
+	// No further assertions needed: the helper panics on failure.
+}
+
+/// CRC-32-colliding payloads are **not** treated as duplicates under the new digest:
+/// both batches persist, the second is not an `IdempotencyConflict`, and the final
+/// row count equals the sum.
+///
+/// This is the reproduction test: it fails on `origin/main` (where the CRC collision
+/// makes the second write vanish) and passes after the 128-bit digest is introduced.
+#[serial]
+#[tokio::test]
+async fn crc32_colliding_payloads_are_not_treated_as_duplicates() -> Result<()> {
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let (_dir, db) = setup().await?;
+	let subject = db.observe_subject("s").await?;
+	let aspect_id = db.track_aspect(&subject.id(), "crc32_collide", &splimes::Resolution::Milliseconds, None).await?.id();
+	let dataset = DatasetId::new();
+	let store = db.seal_store().await?;
+
+	let (first, second) = crc32_colliding_pair();
+	let total_rows = first.len() + second.len();
+	// Ingest the first batch under a call-supplied token.
+	let tx1 = ingest_batch_with_gate(&store, &aspect_id, &dataset, "crc32-collide-a", &first, 4).await?;
+	assert_eq!(tx1.len(), first.len(), "first batch produced a TxId per row");
+
+	// Ingest the second batch under a different token.
+	let tx2 = ingest_batch_with_gate(&store, &aspect_id, &dataset, "crc32-collide-b", &second, 4).await?;
+	assert_eq!(tx2.len(), second.len(), "second batch produced a TxId per row — not a duplicate");
+	assert_ne!(tx1, tx2, "the two batches produced different TxIds");
+
+	let read_back = read_rows(&store, &aspect_id, None, None).await?;
+	assert_eq!(read_back.len(), total_rows, "both batches persisted: {total_rows} rows, got {}", read_back.len());
 
 	drop(store);
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");

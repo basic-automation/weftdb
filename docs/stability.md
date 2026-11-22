@@ -89,10 +89,14 @@ live spec against the rc.1 baseline
 ([`compat/openapi/baseline/weftdb.json`](../compat/openapi/baseline/weftdb.json))
 on every push and pull request.
 
-The checker does not yet classify:
-(1) a ``required`` array gaining an existing property on a nested object;
-(2) ``nullable`` changes inside ``allOf`` sub-schemas.
-These are known gaps, not silent passes.
+The checker does not yet classify the following OpenAPI top-level documents:
+``security`` / ``securitySchemes`` / ``servers`` / ``info`` / ``tags`` /
+``externalDocs`` — these are defined globally and not compared between the
+baseline and the live spec (declared out of scope for the 1.0 surface freeze).
+Combinator member content (``allOf`` / ``oneOf`` / ``anyOf``) **is** now
+compared (FRE-18c).
+
+For changes the checker *does* handle, see the rule families above.
 
 ### `weftdb-client` (the Rust SDK, crate directory `weft-client/`)
 
