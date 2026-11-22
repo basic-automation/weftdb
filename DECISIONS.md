@@ -9092,3 +9092,60 @@ lookup is `(aspect, key)`; the consequence is orphaned old rows + replay-lost-ac
 store is the safer direction). `payload_crc` is kept public and behaviourally unchanged rather than
 removed or deprecated. The A-B-A half of #803 (caller-identity-based idempotency for the legacy
 facades) is deliberately not attempted here.
+
+## 2026-11-22 — A verification line is answered, not ticked (B-analysis, #362)
+
+**Question.** `ROADMAP.md:317` reads "**B-analysis** Verify the per-point analysis model is
+wired end-to-end", and issue #362 is its generated stub with no acceptance detail. Two things
+were ambiguous: what completes a *verify* line, and whether a negative answer entitles it to a
+tick.
+
+**Chosen.** Run the audit, rewrite the line's prose with the verdict, and leave the box
+unchecked. File the discovered defects as their own issues (#862, #863) and close #362 as the
+audit itself. Findings doc: `docs/research/per-point-analysis-wiring.md`.
+
+**Rationale.** A tick on "verify X is wired" is read downstream as "verified: wired". The line
+describes a state of the world, not the act of asking. This is the same rule the ROADMAP-TRUTH
+slices applied to stale ticks — a roadmap edit rewrites prose, and only an issue that actually
+delivers the state gets the tick. Answering the question *and* opening the defects it found
+keeps the queue honest: nobody has to re-derive the audit to know what remains.
+
+**What the audit rests on.** Call-site and definition sweeps (`rg --glob '!target'` over
+`**/*.rs`), plus per-crate dependency scan. No build was run — the RAM constraint on this host
+forbids local cargo — so this is structural evidence, not behavioural: nothing here shows
+`analyze_point` returning a wrong value, only that no product path calls it.
+
+- No producer on a product path: `Batch::process()` (`weftdb/src/types/batches/batch.rs:447`)
+  is called only from `weft-orchestration/src/lib.rs:795`, its
+  `debug_batch_test.rs:62`, and `weftdb/tests/db_tests.rs:1133,1177,1230`;
+  `BatchCollection::process_batches()` (`weftdb/src/types/batches/mod.rs:176`) has zero call
+  sites.
+- Not persisted, and reads clear it: `BatchedMeasurement::new` fixes `analysis: None`
+  (`weftdb/src/types/batches/batched_measurements/mod.rs:22-24`) and both read-side
+  constructors use it (`weftdb/src/types/batches/mod.rs:82,138`). The sole reader,
+  `weft-orchestration/src/lib.rs:872,887` (`measurement.analysis()?.relative()`), therefore
+  sees `Some` only inside the pass that computed it.
+- No surface: no "analysis" token anywhere under `weft-server/src`; `analyze_point`/
+  `analyze_range` (`weftdb/src/types/database/traits/outputs.rs:39,41`) are called only from
+  `weftdb` tests and `weftdb/benches/new_api_benchmarks.rs:118,140`.
+  `weft-orchestration` is depended on by `weft-bench` only (`weft-bench/Cargo.toml:36`).
+- Dead half: no `trend_analysis` definition exists; only the commented-out call at
+  `weftdb/src/types/batches/batch.rs:303-304`, whose stated reason ("the expensive O(n²)
+  trend_analysis") is unverified.
+
+**Rejected.** (a) Ticking the line with a "not wired" annotation — that is how a roadmap starts
+asserting things it found false. (b) Adding an HTTP route for `analyze_point`/`analyze_range`
+in this slice: it is a public-surface change while the surface freeze (#238) is open, and it
+would expose an `Analysis` payload that is `None` on every read — a route that returns nothing.
+(c) Deleting the `trend` half: removing `trend`/`trend()`/`get_trend()`/`get_slope()`/
+`set_trend()` (`analysis.rs:17-33`) is a breaking public-API change needing the same owner
+sign-off as adding surface, and the only rationale for its absence is a comment. (d) Wiring
+`process()` into a product path here: it first needs the persist-or-recompute decision, which
+touches the segment layout and `layout_version`.
+
+**Lean recorded, not implemented.** Recompute rather than persist — the relative values are a
+pure function of the points in one batch, so recomputation costs a pass and adds no format
+change, while persisting adds columns that can go stale.
+
+**Needs human.** Whether the `trend` half survives at all, and whether the product ever wants
+an analysis surface over HTTP. Both are recorded on #862 and #863 rather than decided here.
