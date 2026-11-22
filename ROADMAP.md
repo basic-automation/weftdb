@@ -191,9 +191,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 
 - [ ] **B-conn** Vendor-neutral connector trait + registry
 - [ ] **B-ilp** ILP/Influx interop connector crate — audited 2026-11-22 (#359, `docs/research/ilp-interop-audit.md`): inbound interop is real (own parser crate, four HTTP ILP endpoints, `write_ilp` in both SDKs, precision mapping), outbound is absent (no InfluxDB client in `Cargo.lock`, no ILP writer, no connector trait, no UDP); prerequisite #358 (B-conn trait) is filed and unassigned, follow-ups #866 writer / #867 connector crate / #868 round-trip suite / #869 docs + examples.
-- [ ] **B-rest** REST facade remainder
-- [ ] **B-ilp** ILP/Influx interop connector crate
-- [ ] **B-rest** REST facade remainder (audit: `docs/research/rest-facade-audit.md` — four real gaps filed as #878–#881; the `interpolate_range_f64` optimization is deliberately library-only; Phase 22 line left unchecked per the audit contract)
+- [ ] **B-rest** REST facade remainder — audited 2026-11-22 (#360, `docs/research/rest-facade-audit.md`): the facade covers 74 routes across 10 scopes, and the library work it still does not expose is filed as #878 row-TTL expire / #879 manual segment split / #880 metadata repair + rollup backfill / #881 series resolution + tag lookup; the `interpolate_range_f64` optimization is deliberately library-only.
 - [ ] **B-resilience** Write retry, size-tiered write selector, interpolation window extension
 - [ ] **B-conncache** Complete the cached-connection migration
 - [ ] Grafana → Prometheus remote write/read (if monitoring) → R/Arrow workflows

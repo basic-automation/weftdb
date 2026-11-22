@@ -36,7 +36,7 @@ The route registry (`weft-server/src/routes.rs:656-665`) calls 11 registration f
 
 ## What the facade covers
 
-All routes are stable (`RouteSpec::stable`) unless noted. 72 routes total (inventory below). Scopes listed follow the frozen 8-scope table (`weft-server/src/routes.rs:1008`).
+All routes are stable (`RouteSpec::stable`) unless noted. 74 routes total (inventory below). Scopes listed follow the frozen scope list (`pub enum Scope` at `weft-server/src/routes.rs:82`, `Scope::ALL` at `:995`).
 
 ### Probe (routes.rs:805-808)
 `GET /health`, `GET /healthz`, `GET /ready`, `GET /readyz`
