@@ -809,6 +809,11 @@ async fn gate_dataset_id_is_not_part_of_the_idempotency_key() -> Result<()> {
 	Ok(())
 }
 
+/// One batch's worth of `(timestamp, value)` pairs, as the ledger keys see them.
+///
+/// Named because `(Vec<(i64, BigDecimal)>, Vec<(i64, BigDecimal)>)` is `clippy::type_complexity`.
+type PayloadRows = Vec<(i64, BigDecimal)>;
+
 /// Find a pair of distinct single-row payloads whose CRC-32 values collide,
 /// and prove that their 128-bit digest values differ.
 ///
@@ -816,13 +821,12 @@ async fn gate_dataset_id_is_not_part_of_the_idempotency_key() -> Result<()> {
 /// birthday expectation at this sample size is ~116 collisions (32-bit space),
 /// so finding none is a failure of the assumption.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn crc32_colliding_pair() -> (Vec<(i64, BigDecimal)>, Vec<(i64, BigDecimal)>) {
+fn crc32_colliding_pair() -> (PayloadRows, PayloadRows) {
 	use std::{collections::HashMap, str::FromStr};
-	let mut seen: HashMap<u32, Vec<(i64, BigDecimal)>> = HashMap::new();
-	let mut pair: Option<(Vec<(i64, BigDecimal)>, Vec<(i64, BigDecimal)>)> = None;
-	for i in 0..1_000_000 {
-		let ts = i64::try_from(i).expect("i fits i64");
-		let value = BigDecimal::from_str(&format!("{i}.5")).expect("decimal");
+	let mut seen: HashMap<u32, PayloadRows> = HashMap::new();
+	let mut pair: Option<(PayloadRows, PayloadRows)> = None;
+	for ts in 0..1_000_000_i64 {
+		let value = BigDecimal::from_str(&format!("{ts}.5")).expect("decimal");
 		let rows = vec![(ts, value)];
 		let crc = payload_crc(&rows);
 		if let Some(prev) = seen.get(&crc) {
