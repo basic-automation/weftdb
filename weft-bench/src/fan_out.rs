@@ -8,10 +8,10 @@
 //! The arm opens a real [`weftdb::SegmentStore`], ingests a seeded multi-series corpus,
 //! then reads every series at each rung of a series-count ladder (default 1, 10, 100,
 //! 1000 series; 1000 rows per series; a 1000-second read window) and records wall time,
-//! rows read and series touched. Publishing a rung number goes through
-//! `docs/benchmark-policy.md` and the baseline-control gate in
-//! `scripts/ci/check-baseline-control.py` — until such an entry exists, quote nothing
-//! from this arm.
+//! rows read and series touched. Publishing a rung number means a figure in
+//! `docs/reference.md` vouched by an entry in the `bench/claims.json` registry, which
+//! `tools/check_claims.py` lints in CI under §3 of `docs/benchmark-policy.md` — until such
+//! an entry exists, quote nothing from this arm.
 //!
 //! **This is a cost curve for our own engine, not a race against another vendor.**
 //! The racing rules of `docs/benchmark-policy.md` are not engaged.

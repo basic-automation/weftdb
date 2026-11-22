@@ -858,9 +858,10 @@ that "there is **no measurement**". PR #809 (issue #807, TAG-12 cut A) landed th
 described a tree that no longer exists. The doc now states that the arm is runnable (`--fan-out`; knobs in
 `FanOutParams`: `seed`, `series_steps` default 1/10/100/1000, `rows_per_series` 1000, `read_window_ns`
 1000 seconds) and that **no published number exists**: `bench/claims.json` has no `fan_out` entry, and
-publishing one goes through `docs/benchmark-policy.md` plus `scripts/ci/check-baseline-control.py`.
+a published number would need a figure in `docs/reference.md` backed by a `bench/claims.json` entry that
+`tools/check_claims.py` checks in CI.
 
 **L127 and L124 stay unchecked.** A doc correction is not a measurement: the ladder run still needs the T7
-reference drive (L120, `*(owner)*`) and a baseline-control-compliant claims entry. Repaired en route: the
+reference drive (L120, `*(owner)*`) and a claims entry that satisfies §3 of `docs/benchmark-policy.md`. Repaired en route: the
 malformed heading at L844 of this file, a wrapped heading from the SEAL-HASH1 slice that had folded onto
 one line.

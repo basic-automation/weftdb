@@ -9104,9 +9104,9 @@ keeps propagating in the meantime.
 
 **Choice.** Rewrote the module doc so both facts are stated separately and dated: the arm exists and is
 runnable (`--fan-out`; `run_fan_out_workload` at `weft-bench/src/main.rs:539`, flag parsed at `:1779`,
-dispatched at `:164`), and **no ladder number has ever been published** — `git grep -c fan_out
-bench/claims.json` matches nothing, so publishing one goes through `docs/benchmark-policy.md` and
-`scripts/ci/check-baseline-control.py`. Shipped as a docs-only slice.
+dispatched at `:164`), and **no ladder number has ever been published** — `bench/claims.json` has no
+`fan_out` entry, so publishing one means a figure in `docs/reference.md` vouched by a registry entry that
+`tools/check_claims.py` lints in CI. Shipped as a docs-only slice.
 
 **Rationale.** A doc comment is a claim about the tree, and a false one makes the next agent's premise
 wrong — the same failure mode as a stale roadmap line (#851, #855), reached from the other direction:
@@ -9121,6 +9121,19 @@ heading: "## 2026-11-22 — Legacy ledger key digest widened from CRC-32 to 128 
 continuation was appended as a separate line and folded back into the heading. Repaired here by cutting
 the trailing fragment. Lesson for every future append-at-end slice: if a markdown heading must wrap, wrap
 it as prose **below** the heading, never as a continuation of it — a concatenated heredoc has no soft wrap.
+
+**Erratum, same slice.** My first cut of the replacement text said a published number "goes through
+`docs/benchmark-policy.md` and the baseline-control gate in `scripts/ci/check-baseline-control.py`" — wrong
+in precisely the way this slice exists to remove. That script compares the committed **OpenAPI** baseline
+digest against the base-ref copy (`--baseline compat/openapi/baseline/weftdb.json --digest-file
+compat/openapi/baseline/weftdb.json.sha256`), which is the FRE-18c contract gate and has nothing to do with
+benchmark figures; §3 of `docs/benchmark-policy.md` is a policy statement ("Every published number is ours,
+and reproducible"), not a publishing pipeline. The actual flow is a figure in `docs/reference.md` backed by a
+`bench/claims.json` entry (`schema: 1`; `id`, `figures`, `source`, `command`, `dataset`, `measured`,
+`reproducible_from_clone`, `artifact`) that `tools/check_claims.py` checks against the readme in CI. Caught
+by grepping the mechanism before anyone reviewed the PR. The lesson generalises to every citation this repo
+adds: name a gate only after reading what it gates, and re-read your own new sentence with the same scepticism
+the issue tells you to apply to the old one.
 
 **Not done.** No `ROADMAP.md` L127/L124 tick (a doc fix is not a measurement); no ladder run (needs the T7
 reference drive at L120, marked `*(owner)*`, and a local `cargo run`, which this host does not do); no
