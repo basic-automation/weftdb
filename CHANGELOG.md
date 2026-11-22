@@ -75,6 +75,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `capture_measurement`-side call sites in `inputs.rs` were removed — they moved into the
   bulk path.
 - **A refused maintenance plan has its own HTTP answer (#764).**- **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**- **`WEFT_MEMORY_BUDGET_BYTES` and the cgroup limit are now read and held (#788).**
+- **A wiring guard for Python test scripts under `scripts/` and `tools/` (#853, CI-GATES).**
+  `scripts/ci/check-test-wiring.py` parses every `.github/workflows/*.yml`
+  workflow with YAML rather than grep, enumerates every `test_*.py` under
+  `scripts/` and `tools/`, and fails if any of them is invoked by no workflow
+  step — neither a direct `python3 <path>` nor a `unittest discover -s <dir>
+  -p <pattern>` whose pattern matches it. A gate nothing invokes is not a gate:
+  `scripts/ci` is discovered only through narrow `-p` patterns naming specific
+  files, so a test file added to that directory is invisible to CI until a step
+  names it. The guard runs in the `claims` job, with an explicit step for its
+  own tests.
 - **A fan-out benchmark arm — the cost of reading across many series (#809, TAG-12).**
 `weft-bench --fan-out` opens a real `SegmentStore`, ingests a seeded corpus of tagged series
 (1 000 rows each by default), and then reads every series at each rung of a series-count ladder
