@@ -25,6 +25,11 @@
 | `weft-tui` | 1 | 2 |
 | `weft-xbench` | 6 | 26 |
 
+**"Mentions" = the sum of `git grep -c BigDecimal <crate>/src/` line counts per file** (a line with
+two occurrences counts once). "Files" = files under `<crate>/src/` with at least one such line.
+Both columns were recounted against `origin/main` on 2026-11-21; the earlier table carried two drifts
+(`weft-physical-type` 350 and `weft-bench` 201) that the recount corrected.
+
 ---
 
 ## Findings by crate
