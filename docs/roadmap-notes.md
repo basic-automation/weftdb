@@ -862,3 +862,14 @@ A blind retry from a pre-change client re-writes instead of replaying, which on 
 store is the safer direction. `payload_crc` kept public and behaviourally unchanged.
 `payload_digest` is a SHA-256 prefix truncated to 128 bits. SHA-2 was already a workspace
 dependency (`sha2 = "0.10.9"`), used by `weft-bench`, `weft-client`, `weft-server`, `weft-xbench`.
+## 2026-11-22 — Roadmap truth pass 3: three lines corrected, none ticked (#855, ROADMAP-TRUTH-3)
+
+`ROADMAP.md:94` now says these defects *gated* the seal-backed default that #768 landed as
+PR #777 on 2026-11-17, and that the group is closed except SEAL-IDEM. `:98` records the
+#803 split: the collision half closed by #849 / PR #850 (squash `c3379fc`, 128-bit
+`payload_digest` replacing CRC-32 in `legacy:{dataset_id}:{payload_digest}:{count}`), the
+lost-write half open behind an after-1.0 API decision about a caller token in
+`weftdb/src/types/database/inputs.rs:336,445,2454`. `:119` no longer claims "shipped" and
+"[ ]" at once: EVI-16 (#277) and EVI-17 (#319) are closed and `HONESTY.md` is on main, so
+only the owner narrative is outstanding and the box stays unchecked for that reason.
+No box moved in this change.

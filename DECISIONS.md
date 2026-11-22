@@ -9242,3 +9242,64 @@ change, while persisting adds columns that can go stale.
 
 **Needs human.** Whether the `trend` half survives at all, and whether the product ever wants
 an analysis surface over HTTP. Both are recorded on #862 and #863 rather than decided here.
+## 2026-11-22 — A stale roadmap line is a defect in its own right (#855)
+
+**Context.** ROADMAP-TRUTH-3 (#855). Two loops work the same `ROADMAP.md`, so a line that
+asserts a superseded fact is an invitation for the other loop to re-do finished work.
+Three unchecked lines had drifted: `:94` said the legacy seal routing defects "gate the
+seal-backed default in #768" (#768 landed as PR #777 on 2026-11-17); `:98` (SEAL-IDEM)
+still named the ledger key `legacy:{dataset_id}:{payload_crc}:{count}` and still said the
+remaining half "depends on #768"; `:119` read
+`- [ ] Ship honesty pages / **Honesty pages shipped** (EVI-16, EVI-17 and the owner
+narrative)`, which asserts the work is finished and unfinished in one line.
+
+**Chosen: rewrite the prose in place and tick nothing.** A box is ticked only when its
+issue closes with evidence. None of these three is complete: `:94` is open solely because
+of SEAL-IDEM, `:98` is open, and `:119`'s remainder is the owner narrative, which belongs
+to the project owner. Rewriting prose is not progress and must never look like it.
+
+**The #803 clause mapping, written down so nobody re-opens what is closed.**
+"The key no longer relies on a 32-bit checksum alone" is **satisfied**: PR #850 (squash
+`c3379fc`, issue #849 closed 2026-11-22T09:04:26Z) derives the key from a 128-bit
+SHA-256 prefix, `payload_digest` in `weftdb/src/types/legacy_seal.rs`. "An A-B-A sequence
+under one `DatasetId` ends with the last written value readable" is **not satisfied** and
+is deliberately not attempted: only *call* identity separates the second A from the first,
+and threading a token into the three legacy facade bodies
+(`weftdb/src/types/database/inputs.rs:336,445,2454`) is a breaking public-API change. The
+ruling on record holds it until after 1.0. Exposure is confined to the weft-tui CSV import
+path (`weft-tui/src/app.rs:2167` one `DatasetId::new()` for a whole import, `:2185`
+chunked `batch_capture_measurements`); the HTTP server never reaches `ingest_batch`
+(`weft-server/tests/seal_idem_http_replay.rs:22-34` calls `SegmentStore::ingest` with the
+resolved `Idempotency-Key`).
+
+**Needs human.** Both remaining halves of this line are owner-side: the honesty owner
+narrative (`ROADMAP.md:119`), and the post-1.0 decision on whether the legacy facades take
+a caller token.
+
+## 2026-11-22 — A routine PR that cannot merge is a roadmap blocker; the loop flags it instead of fixing it (#842)
+
+**Situation.** `ROADMAP.md` L128 (TSBS tag-grouped query suite in `weft-xbench`) is still `- [ ]` on `main`
+`527eae5`, yet PR #842 contains the work that would close it: two `[x]` sub-items for
+`weft-xbench/src/tsbs.rs` (`load_cpu`, `TsbsCpu`, `TsbsQuery`) and `weft-xbench/src/weft.rs` (`TsbsWeft`).
+`gh api pulls/842` reports `mergeable=false mergeable_state=dirty`, base `ecb0744`, head `39edd3a`, and
+`git merge-tree --write-tree origin/main pr/842` exits 1: the content conflicts are only the append-at-end
+files (`DECISIONS.md`, `docs/roadmap-notes.md`) where both sides added sections at the end;
+`.github/workflows/ci.yml` and `CHANGELOG.md` auto-merge, and `weft-xbench/Cargo.lock` conflicts with nothing
+because `Cargo.toml` carries `exclude = ['weft-xbench']` so the root lock bump in #858 never reaches that crate.
+
+**Choice.** Post the full diagnosis on the PR (#842 comment `7078366233`) and record it here, and change
+nothing on the PR: no rebase, no conflict resolution, no review, no merge, no close.
+
+**Rationale.** Two constraints collide and both are load-bearing. First, `weft-xbench` and every `routine/*`
+branch belong to the nightly routine loop; the rule against touching its branches or PRs exists because that
+loop edits the same checkout and resolves its own conflicts — my rebase of its branch would be overwritten by
+its next run, and could silently discard its append-at-end sections. Second, leaving the blocker *unrecorded*
+is worse than leaving it unfixed: a roadmap line that looks merely "unclaimed" invites another loop to
+re-implement TSBS in the crate it is not allowed to touch. So the deliverable is the evidence, not the merge:
+the PR's staleness, the exact conflict surface, what a rebase would have to do, and the fact that #858's
+`cargo-deny` fix is inherited by any rebase onto a post-#858 `main`.
+
+**Consequence to keep in mind.** A PR that sits DIRTY for days does not just wait — it keeps the roadmap line
+open and makes the work inside it look unclaimed. Flag it on the PR *and* on the coordination issue (#125) in
+the same turn, because the routine loop reads one and other agents read the other. This item is "Needs human"
+in the sense that only the routine loop (or a human) may act on it.
