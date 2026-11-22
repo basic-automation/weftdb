@@ -129,6 +129,38 @@ Branch `bprec2/inventory-citations`, based on `ecb0744`.
 - Per-label site count updated to 51 / 89 / 20
 - Committed, pushed, PR open
 
+---
+
+# progress — CI-GATES (ci-gates/test-wiring, base d901e90)
+Branch `ci-gates/test-wiring`, based on `d901e90`. Issue #853.
+
+## Done (implementation: worker; finishing and corrections: coordinator)
+
+- `scripts/ci/check-test-wiring.py` added: YAML-parses every workflow, enumerates
+  `test_*.py` under `scripts/` and `tools/`, fails on any file no step invokes
+  (direct `python3 <path>` or `unittest discover -s <dir> -p <pattern>` + fnmatch).
+- `scripts/ci/test_check_test_wiring.py` added: fixture-driven tests plus a
+  real-repo regression run.
+- Two explicit `run:` steps added to the `claims` job in `.github/workflows/ci.yml`
+  (guard + its tests); no `uses:` added, so action-pinning stays satisfied.
+- `CHANGELOG.md`, `DECISIONS.md` updated.
+
+## Corrections applied after the worker stopped
+
+- Removed `scripts/ci/check-baseline-control.py` and
+  `scripts/ci/test_check_baseline_control.py` from this branch: both were copies of
+  files that exist only on the unmerged `fre18c/openapi-gate-fixes` branch (PR #845).
+  The brief wrongly stated they were on `main`. This branch now touches no #845 file.
+- Removed the ci.yml step that invoked `test_check_baseline_control.py`; reworded the
+  guard's comment and the DECISIONS/CHANGELOG claims to the verified facts.
+
+## Verification (local, python only — no cargo on this host)
+
+- `python3 scripts/ci/check-test-wiring.py` → `OK: 13 test script(s) wired by 13 workflow(s)`, rc 0.
+- `python3 scripts/ci/test_check_test_wiring.py` → fixtures exercise both wired and
+  `UNWIRED:` paths and the real-repo test passes.
+- `.github/workflows/ci.yml` parses with `yaml.safe_load`; 17 jobs; `claims` steps
+  contain the two new `run:` commands.
 # progress — ROADMAP-TRUTH-3 (truth3/roadmap-lines, base c3379fc)
 
 ## Done
