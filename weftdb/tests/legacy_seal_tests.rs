@@ -817,8 +817,7 @@ async fn gate_dataset_id_is_not_part_of_the_idempotency_key() -> Result<()> {
 /// so finding none is a failure of the assumption.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn crc32_colliding_pair() -> (Vec<(i64, BigDecimal)>, Vec<(i64, BigDecimal)>) {
-	use std::collections::HashMap;
-	use std::str::FromStr;
+	use std::{collections::HashMap, str::FromStr};
 	let mut seen: HashMap<u32, Vec<(i64, BigDecimal)>> = HashMap::new();
 	let mut pair: Option<(Vec<(i64, BigDecimal)>, Vec<(i64, BigDecimal)>)> = None;
 	for i in 0..1_000_000 {
