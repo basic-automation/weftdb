@@ -13,9 +13,9 @@
 | Crate | Files | BigDecimal mentions |
 |---|---|---|
 | `weftdb` | 50 | 561 |
-| `weft-physical-type` | 8 | 350 |
+| `weft-physical-type` | 8 | 483 |
 | `weft-reduce` | 6 | 164 |
-| `weft-bench` | 24 | 201 |
+| `weft-bench` | 24 | 203 |
 | `weft-server` | 13 | 115 |
 | `weft-client` | 2 | 15 |
 | `weft-arrow` | 1 | 53 |
@@ -31,16 +31,16 @@
 
 ---
 
-### 1. `weft-physical-type` (350 mentions, 8 files)
+### 1. `weft-physical-type` (483 mentions, 8 files)
 
 #### 1.1 Boundaries into `BigDecimal`
 
 | Site | Code | Label |
 |---|---|---|
-| `src/lib.rs:462` `decimal_from_f64(value)` — shortest round-trip `{:e}` | `let decimal = BigDecimal::new(mantissa.into(), fraction_digits - exponent);` | **exact** (round-trip, not binary expansion) |
+| `src/lib.rs:490-508` `decimal_from_shortest_text` — shortest round-trip `{:e}` (called by `decimal_from_f64` at `:462`) | `let decimal = BigDecimal::new(mantissa.into(), fraction_digits - exponent);` | **exact** (round-trip, not binary expansion) |
 | `src/lib.rs:479` `decimal_from_f32(value)` — same for `f32` | `decimal_from_shortest_text(&format!("{value:e}"))` | **exact** (round-trip, not binary expansion) |
 | `src/lib.rs:511` `decimal_from_shortest_text` — negative-scale clamp | `if decimal.fractional_digit_count() < 0 { decimal.with_scale(0) } else { decimal }` | **lossy by policy** (clamps negative-scale decimals to scale 0) |
-| `src/lib.rs:449` `parse_decimal(text)` — `BigDecimal::from_str` | `let value = BigDecimal::from_str(text).map_err(...)?;` | **exact** (string parse preserves decimal text) |
+| `src/lib.rs:438-439` `parse_decimal(text)` — `BigDecimal::from_str` | `let value = BigDecimal::from_str(text).map_err(...)?;` | **exact** (string parse preserves decimal text) |
 | `src/lib.rs:693` `PhysicalValue::to_logical` F64 | `BigDecimal::from_f64(*f).unwrap_or_default()` | **lossy by construction** (exact binary expansion of `f64`) |
 | `src/lib.rs:694` `PhysicalValue::to_logical` F32 | `BigDecimal::from_f32(*f).unwrap_or_default()` | **lossy by construction** (exact binary expansion of `f32`) |
 | `src/lib.rs:696` `PhysicalValue::to_logical` ScaledI64/ScaledI128 | `BigDecimal::new(BigInt::from(*mantissa), i64::from(*scale))` | **exact** (integer + declared scale) |
@@ -57,8 +57,8 @@
 | `src/lib.rs:629` `ScaledI64` encode — `round(0)` then `to_i64()` | `let shifted = (value * pow10(scale)).round(0);` then `mantissa = shifted.to_i64().ok_or(EncodeError::Overflow)?;` | **lossy by policy** (scale truncation + `round` chooses how to round) |
 | `src/lib.rs:636` `ScaledI128` encode — same pattern | same as above but `to_i128()` | **lossy by policy** (same scale truncation + round) |
 | `src/lib.rs:645` `Decimal128` encode — `fit_i128` digit-shedding | `let (mantissa, scale) = fit_i128(bigint, scale);` | **lossy by policy** (round_div_10 per digit; exactness reported via `measure`) |
-| `src/lib.rs:661` `BigDecimalText` encode — `to_plain_string` | `let pv = PhysicalValue::BigDecimalText(value.to_plain_string());` | **exact** (always lossless) |
-| `src/lib.rs:537` `fit_i128` inner — `round_div_10` (half away from zero) | `(n + bias) / BigInt::from(10)` | **lossy by policy** (one digit of precision shed per call) |
+| `src/lib.rs:650` `BigDecimalText` encode — `to_plain_string` | `let pv = PhysicalValue::BigDecimalText(value.to_plain_string());` | **exact** (always lossless) |
+| `src/lib.rs:524-526` `fit_i128` inner — `round_div_10` (half away from zero); call site at `:537` | `(n + bias) / BigInt::from(10)` | **lossy by policy** (one digit of precision shed per call) |
 
 #### 1.3 Scale, rounding & comparison decisions
 
@@ -67,7 +67,7 @@
 | `src/lib.rs:511` `with_scale(0)` in `decimal_from_shortest_text` | `decimal.with_scale(0)` | **lossy by policy** (negative-scale → scale 0, discarding zeros) |
 | `src/lib.rs:553` `measure` — `diff.abs().normalized()` | `Exactness::Lossy { abs_error: diff.abs().normalized() }` | **exact** (error bounding, not storage or API boundary) |
 | `src/lib.rs:636` `round(0)` in ScaledI64/ScaledI128 | `.round(0)` | **lossy by policy** (scale choice rounds silently) |
-| `src/lib.rs:601` `column.rs` — normalized for exponent extraction | `let (_mantissa, exponent) = v.normalized().as_bigint_and_exponent();` | **exact** |
+| `src/column.rs:601` — normalized for exponent extraction | `let (_mantissa, exponent) = v.normalized().as_bigint_and_exponent();` | **exact** |
 
 ---
 
@@ -77,7 +77,7 @@
 
 | Site | Code | Label |
 |---|---|---|
-| `src/fill.rs:200` — linear interpolation `v0 + (v1-v0) * offset / span` | `let value = v0 + (v1 - v0) * BigDecimal::from(offset) / BigDecimal::from(span);` | **lossy by policy** (division uses `bigdecimal`'s default division precision; quotient may not terminate) |
+| `src/fill.rs:200` — linear interpolation `v0 + (v1-v0) * offset / span` | `let value = v0 + (v1 - v0) * BigDecimal::from(offset) / BigDecimal::from(span);` | **lossy by policy** (division uses `BigDecimal`'s default division precision; quotient may not terminate) |
 | `src/scaled.rs:281` `avg_of_sum` — `sum / count` | `i128::try_from(&digits).map_or_else(|_| sum / &BigDecimal::from(count), \|int\| avg_like_bigdecimal(int, scale, count))` | **lossy by policy** (division may round; integer fast path is exact when integer division yields no remainder) |
 | `src/scaled.rs:140` `avg_like_bigdecimal` — fast path for integer avg | `BigDecimal::new(sum, scale) / BigDecimal::from(count)` | **lossy by policy** (division rounding at default precision) |
 | `src/scaled.rs:1028` — test `with_scale(4)` | `p.value.with_scale(4)` | **lossy by policy** (test, not runtime) |
@@ -87,7 +87,7 @@
 | Site | Code | Label |
 |---|---|---|
 | `src/sketch.rs:57` `decimal_to_f64` — fast path `scaled_to_f64`, fallback `to_f64` | `digits.to_i64().and_then(\|m\| scaled_to_f64(m, scale)).or_else(\|\| v.to_f64())` | **lossy by construction** (returns `f64`) |
-| `src/sketch.rs:70-76` `scaled_to_f64` — exact division for small mantissas | `let m = mantissa.to_f64()?;` then `m / 10_f64.powi(scale)` | **lossy by construction** (mantissa converted to `f64` then scaled) |
+| `src/sketch.rs:70-76` `scaled_to_f64` — exact division for small mantissas | `let m = mantissa.to_f64()?;` then `Some(m / power)` (via `EXACT_POWERS_OF_TEN` lookup) | **lossy by construction** (mantissa converted to `f64` then scaled) |
 | `src/sketch.rs:55` `decimal_to_f64` doc: "bit-identical to BigDecimal's to_f64" | `pub fn decimal_to_f64(v: &BigDecimal) -> Option<f64>` | **lossy by construction** (API boundary to `f64`) |
 | `src/uniform.rs:223` — sketch `add(decimal_to_f64(v))` | `self.add(decimal_to_f64(v).ok_or(SketchError::ValueRange)?)` | **lossy by construction** (decimal → f64 → sketch) |
 | `src/sketch.rs:358` — same for DdSketch | `self.add(decimal_to_f64(v).ok_or(SketchError::ValueRange)?)` | **lossy by construction** (decimal → f64 → sketch) |
@@ -214,7 +214,7 @@ This means `BigDecimal` serde uses the default representation: a JSON number (e.
 
 | Site | Code | Label |
 |---|---|---|
-| `src/downsample.rs:331` `widen_json_value` — shortest round-trip `{:e}` | `BigDecimal::new(mantissa.into(), fraction_digits - exponent)` then `with_scale(0)` clamp | **exact** (round-trip decimal, same as `decimal_from_f64`) |
+| `src/downsample.rs:331` `widen_json_value` — shortest round-trip `{:e}` | `BigDecimal::new(mantissa.into(), fraction_digits - exponent)` then `with_scale(0)` clamp | **exact** (round-trip decimal; same construction as physical-type's variant) |
 | `src/downsample.rs:336` `json_point_value` — wraps `widen_json_value` | `widen_json_value(value).ok_or_else(...)` | **exact** |
 
 #### 4.2 Boundaries out of `BigDecimal`
@@ -265,7 +265,7 @@ The ILP parser constructs `FieldValue::Float` from the line-protocol wire bytes 
 
 ---
 
-### 7. `weft-bench` (201 mentions, 24 files)
+### 7. `weft-bench` (203 mentions, 24 files)
 
 #### 7.1 Boundaries out of `BigDecimal`
 
@@ -285,7 +285,7 @@ The ILP parser constructs `FieldValue::Float` from the line-protocol wire bytes 
 | `src/range_fetch.rs:272` — same | `v.to_f64().is_some_and(f64::is_finite)` | **lossy by construction** |
 | `src/forward_fill_adapter.rs:115` — `to_f64()` | `(value.to_f64().expect("finite") - want).abs() < 1e-9` | **lossy by construction** |
 | `src/profile.rs:579` — `to_f64()` | `let value = p.value.to_f64().expect("finite value");` | **lossy by construction** |
-| `src/conformance.rs:294` — standalone `to_f64` helper | `pub fn to_f64(d: &BigDecimal) -> f64 { d.to_f64().unwrap_or(0.0) }` | **lossy by construction** |
+| `src/conformance.rs:294` — standalone `to_f64` helper | `pub fn to_f64(d: &BigDecimal) -> f64 { d.to_string().parse().expect("a decimal parses as f64") }` | **lossy by construction** |
 | `src/conformance.rs:312` — `BigDecimal::try_from(to_f64(&p.value))` | `BigDecimal::try_from(to_f64(&p.value)).expect("finite")` | **lossy by construction** (round-trip f64 → BigDecimal → f64) |
 | `src/schema.rs:213` — digest `normalized().to_string()` | `v.normalized().to_string()` | **exact** |
 | `src/lib.rs:225` — digest via `normalized()` | `p.value.normalized()` | **exact** |
@@ -310,9 +310,9 @@ The ILP parser constructs `FieldValue::Float` from the line-protocol wire bytes 
 
 | Site | Code | Label |
 |---|---|---|
-| `src/types.rs:40` — `StoredValue` impl for `BigDecimal` | uses `to_string()` for serialization (writer) | **exact** |
+| `src/types.rs:40` — `StoredValue` impl for `BigDecimal` | `self.to_plain_string()` via `to_decimal_text` (writer) | **exact** |
 | `src/types.rs:53` — reader: `BigDecimal::from_str` | `let parsed = BigDecimal::from_str(self.trim()).map_err(...)?;` | **exact** |
-| `src/types.rs:91` — `decimal_from_text` custom deserializer | `let parsed: BigDecimal = s.parse().map_err(serde::de::Error::custom)?;` | **exact** |
+| `src/types.rs:91` — `decimal_from_text` custom deserializer | `BigDecimal::from_str(&text).map_err(...)` (inline in `map` closure) | **exact** |
 
 All serialization/deserialization goes through text, so no binary precision loss at client boundaries.
 
@@ -391,15 +391,15 @@ The sidecar (persisted partial reduction) uses postcard and travels through `wef
 
 ---
 
-## Per-label site count
+## Per-label site count (rows in tables above)
 
 | Label | Count |
 |---|---|
-| **exact** | ~80+ sites (from_str, to_plain_string, BigDecimal::new from integers, normalized extraction) |
-| **lossy by construction** | ~110+ sites (to_f64, from_f64, from_f32, f64→BigDecimal→f64 round trips) |
-| **lossy by policy** | ~25 sites (with_scale, round(0), round(2), fit_i128 digit-shedding, division precision) |
+| **exact** | 51 (from_str, to_plain_string, BigDecimal::new from integers, normalized extraction) |
+| **lossy by construction** | 89 (to_f64, from_f64, from_f32, f64→BigDecimal→f64 round trips) |
+| **lossy by policy** | 20 (with_scale, round(0), round(2), fit_i128 digit-shedding, division precision) |
 
-Note: counts are approximate because many test files repeat the same pattern; the key precision-bearing sites are all listed above.
+Note: these count only the labelled rows in the tables above, one row per distinct site. Test-file rows that repeat the same pattern are listed once; the key precision-bearing sites are all included.
 
 ---
 
