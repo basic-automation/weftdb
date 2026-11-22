@@ -8979,6 +8979,26 @@ attention" where the code already documents its trade-off.
 **Needs human.** None: this is a read-only inventory with no code changes and no merge conflict
 risk.
 
+
+## 2026-11-21 — FRE-18c: OpenAPI breaking-change gate fixes (ISSUE #843)
+
+**Context.** Issue #843 identified silent classes the OpenAPI breaking-change checker did not classify: `requestBody.required` deltas on existing bodies, combinator (`allOf`/`oneOf`/`anyOf`) member content, a tautological baseline control, and a declared-gap list wrong in both directions.
+
+### `requestBody.required` severity: `true -> false` is BREAKING
+
+**Chosen: both directions are BREAKING, including `required: true -> false`.** Making a required body optional is wire-relaxing, but a client that was forced to send the body before could now stop doing so — this is the same class as `required-optional` on a field (docs/stability.md calls it breaking for parameters and properties), so we flag it with `BREAKING required-optional-requestBody`. This is conservative: it would be a false positive only if the server still required the body despite the spec change, which is a server bug, not a classification error.
+
+### Baseline control mechanism
+
+**Chosen: `gh api repos/{owner}/{repo}/contents/{path}?ref={base_ref}` inside a `run:` block.** The `claims` job's `actions/checkout` has no `fetch-depth`, so `git diff origin/main` cannot work. An extra checkout of `${{ github.base_ref }}` would work but doubles the checkout time for every push/PR and introduces a second checkout step whose SHA must be pinned. The `gh api` approach fetches only the digest file (~100 bytes) with the `gh` binary already installed on GitHub-hosted runners, adding negligible time and no new dependencies.
+
+**Rejected: `git diff origin/main`** — the job's checkout is depth-1 (no `fetch-depth`), so `origin/main` is unavailable.
+
+**Rejected: second `actions/checkout` of base branch** — doubles checkout time, and the step's `uses:` must be SHA-pinned; the overhead is disproportionate for a single ~100-byte digest comparison.
+
+### Top-level documents (`security`/`securitySchemes`/`servers`/`info`/`tags`/`externalDocs`)
+
+**Chosen: declared out of scope for the 1.0 surface freeze.** These are global metadata that do not affect the wire-format of individual routes. A change to `info.description` or `tags` is editorial, not breaking. Adding a new server URL in `servers` is additive. The non-telephone rule applies: no client inspects these at runtime. Documented in `docs/stability.md` as a known gap.
 ## 2026-11-21 — Ticking a roadmap line means rewriting its claim, not just its box (#846)
 
 `ROADMAP.md:90` ("Row-TTL purge defects") was unchecked while all three of its sub-items

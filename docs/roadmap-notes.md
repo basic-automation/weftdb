@@ -813,6 +813,9 @@ Gap analysis: Q5 (`--gap-fill`) is the only existing arm that explicitly identif
 TSM-Bench query; Q1 (`--range-fetch`) is the next closest; Q2/Q3/Q6/Q7 need new arms.
 Staged adoption plan with five stages (Q5 formalization → Q1 adaptation → Q4 stored-data path
 → Q2/Q3/Q6/Q7 new arms → cross-engine gate). No cargo / no Rust files touched.
+## FRE-18c (2026-11-21) — OpenAPI gate fixes
+
+Issue #843: fixed requestBody.required deltas (P0), combinator descent for allOf/oneOf/anyOf (P1), non-tautological baseline control via gh api (P1), corrected declared gaps in docs/stability.md, declared top-level docs out of scope (P2). All changes are Python + docs + CI yml only; no Rust touched. PR #?? opened but not merged.
 
 ## 2026-11-21 — Row-TTL purge defects line ticked (#846)
 
