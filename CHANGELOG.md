@@ -75,6 +75,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `capture_measurement`-side call sites in `inputs.rs` were removed — they moved into the
   bulk path.
 - **A refused maintenance plan has its own HTTP answer (#764).**- **`SegmentStore::purge_expired` removes the frames a TTL has made useless (#775).**- **A maintenance sweep stops at its wall-clock budget (`WEFT_MAINTENANCE_MAX_OP_SECONDS`, #758).**- **`WEFT_MEMORY_BUDGET_BYTES` and the cgroup limit are now read and held (#788).**
+- **A wiring guard for Python test scripts under `scripts/` and `tools/` (#853, CI-GATES).**
+  `scripts/ci/check-test-wiring.py` parses every `.github/workflows/*.yml`
+  workflow with YAML rather than grep, enumerates every `test_*.py` under
+  `scripts/` and `tools/`, and fails if any of them is invoked by no workflow
+  step — neither a direct `python3 <path>` nor a `unittest discover -s <dir>
+  -p <pattern>` whose pattern matches it. A gate nothing invokes is not a gate:
+  `scripts/ci` is discovered only through narrow `-p` patterns naming specific
+  files, so a test file added to that directory is invisible to CI until a step
+  names it. The guard runs in the `claims` job, with an explicit step for its
+  own tests.
 - **A fan-out benchmark arm — the cost of reading across many series (#809, TAG-12).**
 `weft-bench --fan-out` opens a real `SegmentStore`, ingests a seeded corpus of tagged series
 (1 000 rows each by default), and then reads every series at each rung of a series-count ladder
@@ -415,6 +425,17 @@ origin/main
 
 ### Documentation
 
+- **The per-point analysis model was audited, and it is not wired end-to-end (#362).**
+  `docs/research/per-point-analysis-wiring.md` records four breaks, each with call-site
+  evidence: `Batch::process()` runs only inside `weft-orchestration`'s pipeline and two
+  `weftdb` tests, and `BatchCollection::process_batches()` has no callers at all;
+  `BatchedMeasurement::new` fixes `analysis: None` and both read-side batch constructors build
+  measurements only through it, so nothing an earlier pass computed survives a re-read;
+  `weft-server` contains no "analysis" token and `analyze_point`/`analyze_range` have no
+  caller outside `weftdb`; and the `trend` half of `Analysis` has no producer —
+  `trend_analysis` survives only as a commented-out call. The `ROADMAP.md` verification line
+  stays unchecked: a negative answer completes the audit, not the wiring. Defects filed as
+  #862 and #863.
 - Cached-connection audit (#369, PR #870, `docs/research/cached-connection-audit.md`): what
   connection caching Weft already has, which call sites bypass it and why, and the correctness
   couplings a new cache must respect (handle `Drop` flushes, MVCC enabled once per file). Filed
