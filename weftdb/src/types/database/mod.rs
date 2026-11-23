@@ -412,7 +412,7 @@ impl DatabaseStructure for Database {
 	/// Get or create a Turso database with proper MVCC configuration and connection pooling.
 	/// Returns (database, `was_new`): `was_new` is true on a cold open of a file that is new or
 	/// whose DDL has not committed in this process. Callers that run DDL when `was_new` must
-	/// call [`Self::mark_wireframed`] after it commits.
+	/// call `Database::mark_wireframed` after it commits.
 	async fn get_or_create_turso_database(db_path: &str) -> Result<(turso::Database, bool)> {
 		// Use a critical section to prevent race conditions during database creation
 		let mut cache = CONNECTION_DATABASES.lock().await;
