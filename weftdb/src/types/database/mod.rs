@@ -83,13 +83,32 @@ fn first_open_of(path: &str) -> bool {
 }
 
 /// Drop cached handles idle for longer than `after`, except `metadata.db` files, which
-/// every `Database` handle holds for its whole life anyway. Dropping a handle is safe
-/// while clones are still in use: Turso keeps the file open until the last clone drops,
-/// and a reopen in the meantime gets that same live database back. Returns how many
-/// handles were dropped.
+/// every `Database` handle holds for its whole life anyway, and files whose pool handed out
+/// a connection within `after`. Dropping a handle is safe while clones are still in use:
+/// Turso keeps the file open until the last clone drops, and a reopen in the meantime gets
+/// that same live database back (its registry is keyed by inode), under a new pool. The
+/// old clones lose their pool, so `Database::get_*_db` re-resolves a cached clone that
+/// [`conn_pool::is_pooled`] rejects. Returns how many handles were dropped.
+///
+/// This frees only the shared cache entry and the file's pool (its idle connection and
+/// page cache). A clone still held elsewhere, such as an unexpired or never-reread entry in
+/// a handle's `DatabaseCache` (which expires entries lazily, on a read of the same key),
+/// keeps the core database, its fd and its MVCC state alive, so most of an idle file's
+/// memory is released only once every such clone is gone.
 fn sweep_idle(cache: &mut HashMap<String, turso::Database>, after: std::time::Duration, now: std::time::Instant) -> usize {
 	let mut last_used = LAST_USED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-	let idle: Vec<String> = cache.keys().filter(|path| !path.ends_with("metadata.db")).filter(|path| last_used.get(*path).is_none_or(|t| now.saturating_duration_since(*t) >= after)).cloned().collect();
+	let idle: Vec<String> = cache
+		.iter()
+		.filter(|(path, _)| !path.ends_with("metadata.db"))
+		.filter(|(path, _)| last_used.get(*path).is_none_or(|t| now.saturating_duration_since(*t) >= after))
+		// `LAST_USED` only sees lookups through this cache; most work runs on clones held
+		// elsewhere (the per-handle `DatabaseCache`, aspects, pipelines). Every transaction
+		// checks a connection out of the pool, so a recent checkout means the file is busy.
+		// Sweeping a busy file closed nothing (the clones keep it open) and only threw its
+		// pool away, so each later transaction opened a fresh cold connection.
+		.filter(|(_, db)| !conn_pool::used_within(db, conn_pool::Role::Legacy, after, now))
+		.map(|(path, _)| path.clone())
+		.collect();
 	for path in &idle {
 		if let Some(db) = cache.remove(path) {
 			conn_pool::unregister(&db, conn_pool::Role::Legacy);
@@ -1399,7 +1418,7 @@ impl DatabaseStructure for Database {
 		let cache_key = format!("measurements_db_{aspect_id}");
 
 		// Try cache first
-		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await.filter(|db| conn_pool::is_pooled(db, conn_pool::Role::Legacy)) {
 			return Ok(db);
 		}
 
@@ -1427,7 +1446,7 @@ impl DatabaseStructure for Database {
 
 	async fn get_unprocessed_batches_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
 		let cache_key = format!("unprocessed_batches_db_{aspect_id}");
-		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await.filter(|db| conn_pool::is_pooled(db, conn_pool::Role::Legacy)) {
 			return Ok(db);
 		}
 		let mut aspect = self.get_aspect(aspect_id).await?;
@@ -1450,7 +1469,7 @@ impl DatabaseStructure for Database {
 
 	async fn get_processed_batches_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
 		let cache_key = format!("processed_batches_db_{aspect_id}");
-		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await.filter(|db| conn_pool::is_pooled(db, conn_pool::Role::Legacy)) {
 			return Ok(db);
 		}
 		let mut aspect = self.get_aspect(aspect_id).await?;
@@ -1473,7 +1492,7 @@ impl DatabaseStructure for Database {
 
 	async fn get_patterns_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
 		let cache_key = format!("patterns_db_{aspect_id}");
-		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await.filter(|db| conn_pool::is_pooled(db, conn_pool::Role::Legacy)) {
 			return Ok(db);
 		}
 		let mut aspect = self.get_aspect(aspect_id).await?;
@@ -1497,7 +1516,7 @@ impl DatabaseStructure for Database {
 
 	async fn get_events_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
 		let cache_key = format!("events_db_{aspect_id}");
-		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await.filter(|db| conn_pool::is_pooled(db, conn_pool::Role::Legacy)) {
 			return Ok(db);
 		}
 		let mut aspect = self.get_aspect(aspect_id).await?;
@@ -1520,7 +1539,7 @@ impl DatabaseStructure for Database {
 
 	async fn get_unprocessed_events_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
 		let cache_key = format!("unprocessed_events_db_{aspect_id}");
-		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await.filter(|db| conn_pool::is_pooled(db, conn_pool::Role::Legacy)) {
 			return Ok(db);
 		}
 		let mut aspect = self.get_aspect(aspect_id).await?;
@@ -1543,7 +1562,7 @@ impl DatabaseStructure for Database {
 
 	async fn get_processed_events_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
 		let cache_key = format!("processed_events_db_{aspect_id}");
-		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await.filter(|db| conn_pool::is_pooled(db, conn_pool::Role::Legacy)) {
 			return Ok(db);
 		}
 		let mut aspect = self.get_aspect(aspect_id).await?;
@@ -1566,7 +1585,7 @@ impl DatabaseStructure for Database {
 
 	async fn get_correlations_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
 		let cache_key = format!("correlations_db_{aspect_id}");
-		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await.filter(|db| conn_pool::is_pooled(db, conn_pool::Role::Legacy)) {
 			return Ok(db);
 		}
 		let mut aspect = self.get_aspect(aspect_id).await?;
@@ -1589,7 +1608,7 @@ impl DatabaseStructure for Database {
 
 	async fn get_dictionary_db(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<turso::Database> {
 		let cache_key = format!("dictionary_db_{aspect_id}_{dictionary_name}");
-		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await.filter(|db| conn_pool::is_pooled(db, conn_pool::Role::Legacy)) {
 			return Ok(db);
 		}
 		let mut aspect = self.get_aspect(aspect_id).await?;
@@ -2287,6 +2306,90 @@ mod idle_close_tests {
 		assert_eq!(idle_close_from(Some("0")), None);
 		assert_eq!(idle_close_from(Some(" 60 ")), Some(Duration::from_secs(60)));
 		assert_eq!(idle_close_from(Some("soon")), Some(Duration::from_secs(300)));
+	}
+
+	use super::{conn_pool, sweep_idle, CONNECTION_DATABASES};
+	use crate::{database::traits::Connection as _, Database, DatabaseStructure};
+
+	/// Sweep only `path`'s cache entry, so tests running beside this one keep theirs.
+	async fn sweep_one(path: &str, after: Duration) -> bool {
+		let mut cache = CONNECTION_DATABASES.lock().await;
+		let mut mine: std::collections::HashMap<String, turso::Database> = cache.remove(path).into_iter().map(|db| (path.to_string(), db)).collect();
+		let swept = sweep_idle(&mut mine, after, std::time::Instant::now()) == 1;
+		cache.extend(mine);
+		swept
+	}
+
+	async fn insert(db: &turso::Database, x: i64) -> anyhow::Result<()> {
+		let conn = Database::begin_concurrent(db, "idle", None).await?;
+		conn.as_ref().execute("INSERT INTO t VALUES (?1)", turso::params![x]).await?;
+		Database::commit_concurrent(&conn).await?;
+		Ok(())
+	}
+
+	async fn count(db: &turso::Database) -> anyhow::Result<i64> {
+		let conn = db.connect()?;
+		let mut rows = conn.query("SELECT COUNT(*) FROM t", ()).await?;
+		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("no row"))?;
+		Ok(row.get::<i64>(0)?)
+	}
+
+	async fn open_with_table(path: &str) -> anyhow::Result<turso::Database> {
+		let (db, _) = Database::get_or_create_turso_database(path).await?;
+		let conn = Database::begin_immediate(&db).await?;
+		conn.as_ref().execute("CREATE TABLE IF NOT EXISTS t (x INTEGER)", ()).await?;
+		Database::commit_immediate(&conn).await?;
+		Ok(db)
+	}
+
+	/// A file used only through a clone (never through the handle cache, as `DatabaseCache`
+	/// clones are) is busy, and the sweep must leave it and its pool alone. It used to be
+	/// swept on the first pass, and every later transaction opened a cold connection.
+	#[tokio::test]
+	async fn a_file_used_through_a_clone_is_not_swept() -> anyhow::Result<()> {
+		let dir = tempfile::tempdir()?;
+		let path = dir.path().join("busy.db").to_string_lossy().to_string();
+		let clone = open_with_table(&path).await?;
+		tokio::time::sleep(Duration::from_millis(300)).await;
+		for x in 0..20 {
+			insert(&clone, x).await?;
+		}
+		assert!(!sweep_one(&path, Duration::from_millis(200)).await, "a busy file was swept");
+		assert!(conn_pool::is_pooled(&clone, conn_pool::Role::Legacy), "the busy file lost its pool");
+		assert_eq!(conn_pool::idle_count(&clone, conn_pool::Role::Legacy), Some(1), "transactions did not share one connection");
+
+		tokio::time::sleep(Duration::from_millis(300)).await;
+		assert!(sweep_one(&path, Duration::from_millis(200)).await, "a genuinely idle file was kept");
+		assert!(!conn_pool::is_pooled(&clone, conn_pool::Role::Legacy));
+		super::clear_connection_cache_by_name(&path).await;
+		Ok(())
+	}
+
+	/// Reopening a swept file while an old clone is alive gives the same live database (no
+	/// second instance) with a working pool, and transactions on it reuse one connection.
+	#[tokio::test]
+	async fn a_reopen_after_a_sweep_shares_the_live_database_and_pools_again() -> anyhow::Result<()> {
+		let dir = tempfile::tempdir()?;
+		let path = dir.path().join("reopen.db").to_string_lossy().to_string();
+		let old = open_with_table(&path).await?;
+		insert(&old, 1).await?;
+		tokio::time::sleep(Duration::from_millis(300)).await;
+		assert!(sweep_one(&path, Duration::from_millis(200)).await);
+
+		let (new, _) = Database::get_or_create_turso_database(&path).await?;
+		assert!(conn_pool::is_pooled(&new, conn_pool::Role::Legacy), "the reopen is not pooled");
+		assert!(!conn_pool::is_pooled(&old, conn_pool::Role::Legacy), "the stale clone should be rejected and re-resolved");
+		for x in 2..52 {
+			insert(&new, x).await?;
+		}
+		assert_eq!(conn_pool::idle_count(&new, conn_pool::Role::Legacy), Some(1), "50 transactions after the reopen did not reuse one connection");
+		// One instance: a commit through either handle is visible through the other at once.
+		insert(&old, 100).await?;
+		assert_eq!(count(&new).await?, 52);
+		assert_eq!(count(&old).await?, 52);
+		drop(old);
+		super::clear_connection_cache_by_name(&path).await;
+		Ok(())
 	}
 }
 

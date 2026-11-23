@@ -37,6 +37,30 @@ pub struct Pool {
 	idle: Mutex<Vec<turso::Connection>>,
 	/// Cleared by [`unregister`]; a returned connection then goes away instead.
 	open: std::sync::atomic::AtomicBool,
+	/// When a connection was last checked out, in milliseconds since [`EPOCH`]. The idle
+	/// sweep reads it: every transaction checks out, so a file used through any clone of its
+	/// handle (not only through the handle cache) counts as in use.
+	last_checkout: std::sync::atomic::AtomicU64,
+}
+
+static EPOCH: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+
+fn stamp(at: std::time::Instant) -> u64 {
+	u64::try_from(at.saturating_duration_since(*EPOCH).as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Whether `db`'s `role` pool handed out a connection less than `within` before `now`.
+/// An unpooled database answers false.
+pub fn used_within(db: &turso::Database, role: Role, within: std::time::Duration, now: std::time::Instant) -> bool {
+	let last = POOLS.lock().unwrap_or_else(PoisonError::into_inner).get(&(identity(db), role)).map(|(_, pool)| pool.last_checkout.load(std::sync::atomic::Ordering::Relaxed));
+	last.is_some_and(|last| stamp(now).saturating_sub(last) < u64::try_from(within.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Whether `db` currently has a `role` pool. A clone kept past an idle sweep of its file
+/// has none; callers holding such clones re-resolve the handle instead of using it, since
+/// every transaction on it would open (and leak) a fresh connection with a cold page cache.
+pub fn is_pooled(db: &turso::Database, role: Role) -> bool {
+	POOLS.lock().unwrap_or_else(PoisonError::into_inner).contains_key(&(identity(db), role))
 }
 
 impl Pool {
@@ -87,7 +111,7 @@ const fn identity(db: &turso::Database) -> usize {
 /// [`unregister`], so the identity cannot be reused while the pool exists.
 pub fn register(db: &turso::Database, role: Role) {
 	let mut pools = POOLS.lock().unwrap_or_else(PoisonError::into_inner);
-	let entry = pools.entry((identity(db), role)).or_insert_with(|| (0, Arc::new(Pool { idle: Mutex::new(Vec::new()), open: std::sync::atomic::AtomicBool::new(true) })));
+	let entry = pools.entry((identity(db), role)).or_insert_with(|| (0, Arc::new(Pool { idle: Mutex::new(Vec::new()), open: std::sync::atomic::AtomicBool::new(true), last_checkout: std::sync::atomic::AtomicU64::new(stamp(std::time::Instant::now())) })));
 	entry.0 += 1;
 	drop(pools);
 }
@@ -119,6 +143,7 @@ pub fn unregister(db: &turso::Database, role: Role) {
 pub fn checkout(db: &turso::Database, role: Role) -> turso::Result<(turso::Connection, Option<Arc<Pool>>)> {
 	let pool = POOLS.lock().unwrap_or_else(PoisonError::into_inner).get(&(identity(db), role)).map(|(_, pool)| pool.clone());
 	let Some(pool) = pool else { return Ok((db.connect()?, None)) };
+	pool.last_checkout.store(stamp(std::time::Instant::now()), std::sync::atomic::Ordering::Relaxed);
 	let idle = pool.idle.lock().unwrap_or_else(PoisonError::into_inner).pop();
 	let conn = match idle {
 		Some(conn) => conn,
