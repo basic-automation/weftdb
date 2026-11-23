@@ -9424,6 +9424,35 @@ legitimate counter-use — is the one CI enforces.
 - Timing first and checking later: a fast wrong answer is the failure this harness exists to catch.
 - Running TSBS's Go query generator in CI for the reference: the reference is twenty lines of Rust over data the tests already build, and the nightly does not carry a Go toolchain (2026-10-31).
 
+## 2026-11-22 — B-object is absent; the freeze blocks it; defer to post-1.0 (#363)
+
+**Context.** Issue #363 "B-object (Phase 4 · absent)" from the predecessor backlog asks whether
+WeftDB has a schemaless object/annotation store beside numeric aspects. The audit
+(`docs/research/object-store-audit.md`) confirms:
+
+- **Nothing covers it.** Every `PhysicalType` variant (`weft-physical-type/src/lib.rs:161-200`)
+  is numeric (F64, F32, ScaledI64, ScaledI128, Decimal128, BigDecimalText).
+  `BigDecimalText` is an exactness escape hatch for decimal values, not a type escape hatch:
+  `parse_decimal` (`weft-physical-type/src/lib.rs:438`) rejects non-decimal text.
+- **No string/JSON/blob route path.** Every ingest point value is lifted through
+  `parse_decimal` to `BigDecimal` (`weft-server/src/ingest.rs:960,1042`). The segment frame
+  format has no non-numeric column model.
+- **The freeze blocks adding one.** Issue #238 ("Public surface declared and frozen", Phase 18
+  — Release candidate) prohibits new routes and JSON schema changes. B-object needs at minimum
+  a write route and a read route.
+- **Phase label reconciled.** Issue body says "Phase 4"; `ROADMAP.md:319` puts it under Phase 28
+  (Analytics premium); `docs/roadmap-notes.md` had "Phase 4 · absent". Corrected to Phase 28.
+
+**Chosen: defer to post-1.0, file no follow-ups, keep the box unchecked.**
+
+No implementation issues filed: creating fictionally actionable backlog items during the freeze
+would be speculative. The audit doc records the gap and recommends the post-1.0 re-evaluation
+scope a complete feature umbrella.
+
+**Needs human.** Whether the project wants object storage at all post-1.0, and whether it
+should be a new crate (`weft-object`) or a widened weft-physical-type. The audit doc recommends
+the crate path.
+
 ## 2026-11-23 — How the TSBS query phase draws, warms and times its queries (TAG-12, #341)
 
 **Ambiguous.** The TAG-12 sub-item asks for "a timed `weft-xbench` TSBS-query phase with the reference gate in the report". It does not say which hosts and windows a timed rep asks for, whether reps repeat one question or ask new ones, what counts as warm-up, how much of the TSBS file the phase reads, or what `combine` does with the result.
