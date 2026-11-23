@@ -2050,6 +2050,7 @@ mod tests {
 		#[tokio::test]
 		#[serial_test::serial]
 		async fn the_bulk_read_matches_the_per_id_read() -> anyhow::Result<()> {
+			crate::types::database::config::use_temp_data_dir();
 			let name = format!("correlation_reads_{}", uuid::Uuid::new_v4().simple());
 			let db = Database::new(&name).await?;
 			let subject = db.observe_subject("s").await?;
@@ -2106,6 +2107,7 @@ mod tests {
 		#[tokio::test]
 		#[serial_test::serial]
 		async fn get_correlations_does_not_parse_occurrence_json() -> anyhow::Result<()> {
+			crate::types::database::config::use_temp_data_dir();
 			let name = format!("correlation_no_occurrences_{}", uuid::Uuid::new_v4().simple());
 			let db = Database::new(&name).await?;
 			let subject = db.observe_subject("s").await?;
@@ -2159,6 +2161,7 @@ mod tests {
 		#[tokio::test]
 		#[serial_test::serial]
 		async fn unprocessed_event_writes_show_at_once() -> anyhow::Result<()> {
+			crate::types::database::config::use_temp_data_dir();
 			let name = format!("unprocessed_events_{}", uuid::Uuid::new_v4().simple());
 			let db = Database::new(&name).await?;
 			let subject = db.observe_subject("s").await?;

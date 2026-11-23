@@ -2438,6 +2438,7 @@ mod open_prune_tests {
 	#[tokio::test]
 	#[serial_test::serial]
 	async fn only_the_first_open_prunes_and_close_forgets_it() -> anyhow::Result<()> {
+		crate::types::database::config::use_temp_data_dir();
 		let name = format!("open_prune_{}", uuid::Uuid::new_v4().simple());
 		let db = Database::new(&name).await?;
 		let path = format!("{}/{name}/metadata.db", <Database as Config>::get_data_dir());
