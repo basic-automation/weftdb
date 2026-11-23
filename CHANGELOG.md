@@ -10,6 +10,9 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Documentation
 
+- **CHRONO-INV, #791:** Inventory of `chrono` v0.4 dependency across the workspace — 9
+  consuming crates, 272 call sites, migration feasibility assessment.
+  See `docs/research/chrono-inventory.md`.
 - **B-poll / B-retry / B-register audit (#361).** `docs/research/client-poll-retry-register-audit.md` published: all three backlog items are either already present (retry-for-503) or not needed (polling daemon, source registration). No behaviour changed. Phase label reconciled to Phase&nbsp;23.
 - **REST facade audit (#360).** Audited what the WeftDB HTTP API (the REST facade) still does not
   expose from the `weftdb` library. Produced `docs/research/rest-facade-audit.md` with a route

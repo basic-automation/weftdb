@@ -6661,6 +6661,34 @@ needs `soak-baseline/` to be re-cut deliberately, not silently by a green check.
 (`scripts/annotate-soak-drift.py`) still emits `::warning::` and exits 0, which #688 does not ask to change;
 a refusal is the absence of a measurement, drift is a measurement that moved.
 
+## 2026-11-22 — `chrono` v0.4 inventory and migration path (#791)
+
+**Decision:** commission `docs/research/chrono-inventory.md` as the single source of truth for the
+workspace's `chrono` dependency surface, to be referenced by follow-up issues Phases A–D.
+
+**Chosen: document and file follow-ups, do not migrate now.** The dependency is stable (`0.4`, 9
+consuming crates, ~272 call sites) and the workspace's `serde = "0.4"` workspace entry is
+well-pinned. Migration would be 10–20 engineer-days across three phases, beginning after a
+dedicated newtype layer in `weft-physical-type`. The published crate boundaries (`weftdb`,
+`weft-client`) mean any replacement of `DateTime<Utc>` in public signatures is a semver-breaking
+change that must wait for the next major version.
+
+**Chosen: four phases, each its own issue.** Phase A (clock reads → `SystemTime`) is safe for
+today; Phase B (Duration newtype in `weft-physical-type`) needs no public API change; Phase C
+(Instant newtype in published signatures) is semver-breaking; Phase D purges the workspace
+dependency. Each phase is independently revertible and testable.
+
+**Chosen: leave the `compat` fixture crate on chrono.** It produces fixed binary test fixtures
+for an old format and must not drift.
+
+**Chosen: advisory codelines / architectural markers only.** The ROADMAP.md is not annotated
+because no line names `chrono` by name today (verified via `git grep -in chrono ROADMAP.md`).
+Two lines (`ROADMAP.md:374`, `docs/roadmap-notes.md:446`) contain a date stamp
+(`MEASURED 2026-10-08`) but reference backup costs, not chrono — not annotated.
+
+**Cost, stated plainly:** no code changed, no dependency removed. Every follow-up issue must be
+scoped to avoid scope creep: each phase addresses exactly one chrono feature-group and must not
+add features to the in-repo types beyond what chrono provided.
 ## 2026-11-11 — FRE-9b: the OpenAPI document becomes the contract candidate (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the 1.0 plan (§6 W11) says only that "FRE-9b's annotations land
