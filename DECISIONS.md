@@ -9389,6 +9389,25 @@ before anyone starts. The loop did not claim either.
 
 **Needs human.** #873 needs the public-surface decision (an `Arc<Database>` or a `&Database` facade)
 while the #238 freeze is open.
+## 2026-11-22 — What "REST facade remainder" means, and what is actually missing (#360)
+
+**Question.** `ROADMAP.md:194` reads `- [ ] **B-rest** REST facade remainder` under Phase 22 — Connectors and ingest interop. `docs/roadmap-notes.md:449` lists it as `- **B-rest** *(Phase 2 · partial)*`. Neither says what "remainder" means. Two readings are possible: (a) gaps in WeftDB's own HTTP API ("the REST facade" per `weft-server/src/storage.rs:427), or (b) a vendor-compatible `/query`+`/write` shim implied by the Phase 22 connector context.
+
+**Chosen.** Treat (a) as the primary reading, document (b) as an alternative reading in the same doc with the evidence that the codebase does not use "facade" for that sense. Under either reading, the set of missing endpoints differs only by the InfluxDB query protocol and Prometheus remote write/read — the latter is already an explicit sub-bullet on the same roadmap line.
+
+**What the audit found.** 72 routes across 10 scopes. The `weftdb` library exposes ~90+ public methods through `SegmentStore`; every storage read, write, declare and backup path has a corresponding route. Four real gaps were identified:
+
+- **Row TTL expiry** (`expiry_sweep`, `purge_expired` in `weftdb/src/types/segment_store/maint.rs:22,82`): no endpoint calls them (#878).
+- **Manual segment split** (`split_segment` in `maint.rs:983`): called only internally by the overlap reconciler (#879).
+- **Metadata repair and rollup backfill** (`rebuild_aspect_metadata`, `rebuild_all_metadata`, `backfill_missing_rollups` in `maint.rs:2231,2250,2277`): no endpoint (#880).
+- **Series resolution and tag lookup** (`resolve_series`, `series_tags` in `weftdb/src/types/segment_store/read.rs:681,712`): library-only after TAG-10 landed per-series read variants (#881).
+
+**Not gaps.** `changes_since`/`ack_changes` overlap with B-conncache (#871–#873). `declare_with_upsert_keys` is a minor library variant. `interpolate_range_f64` is a precision trade-off already documented. `reap`/`mark_clean_shutdown`/`subscribe_poison` are deliberate daemon-only lifecycle.
+
+**What the doc rests on.** Every citation is from a fresh `rg`/`grep` at `5294136a7` (origin/main). Route inventory from `weft-server/src/routes.rs:805-975`; OpenAPI path list from `compat/openapi/weftdb.json`; library API from `weftdb/src/types/segment_store/`.
+
+**Alternative reading considered and rejected as primary.** The vendor-compatible shim reading would add InfluxDB v1 `/query` and Prometheus remote write/read as gaps. Prometheus remote write/read is already an explicit roadmap sub-item (`ROADMAP.md:198`); InfluxDB `/query` is not supported and no codebase evidence suggests it was intended. The `REST facade` term in the codebase (`weft-server/src/storage.rs:427`) refers to WeftDB's own HTTP API, not a shim.
+
 ## 2026-11-22 — A worker's progress log reached `main`, and the fix is to ignore the class (#876)
 
 **Ambiguity.** `progress.md` sat at the repository root on `main`: a 163-line run log for issue
