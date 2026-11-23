@@ -129,6 +129,9 @@ The phase also cleared the remaining loose ends. The stale README status was fix
     - [x] Every host's ten `cpu` fields loaded, and the six `single-groupby-*` variants and `lastpoint` answered in process as the reference (2026-11-21, `routine/weftdb-2026-11-21`: `weft-xbench/src/tsbs.rs` `load_cpu`, `TsbsCpu`, `TsbsQuery`; one-minute buckets as TSBS's generated SQL has them, not the README's "every 5 mins")
     - [x] WeftDB answers the same seven queries from a store tagged by `hostname`, equal to the reference (2026-11-21, `routine/weftdb-2026-11-21`: `weft-xbench/src/weft.rs` `TsbsWeft`; a test over 10 hosts × 720 readings, and an inclusive-end mutant fails it. Not timed; `lastpoint` reads each series whole)
     - [ ] A timed `weft-xbench` TSBS-query phase with the reference gate in the report, over the full TSBS file on a quiet host
+      - [x] The phase and its gate: `--tsbs-queries` times `--reps` seeded instances of each of the seven queries over the whole file, gates every answer against the reference, and reports them as schema v9's `tsbs_queries` (2026-11-23, `routine/weftdb-2026-11-23`: `weft_xbench::run_tsbs_queries`, `TsbsCpu::instances`; a mutated-reference test fails the gate on every instance; a debug run over `/mnt/weftbench/tsbs/cpu-only.lp` passes all seven on a busy host, timings unpublished)
+      - [ ] A release-build run over the full file on a quiet host, published as a report artifact
+    - [ ] A per-series latest-row read in `SegmentStore`, so `lastpoint` stops reading every series whole (TSBS's TimescaleDB `lastpoint` is a `LATERAL … ORDER BY time DESC LIMIT 1` per host); benchmark it against today's full-range read first
     - [ ] The other engines' TSBS SQL (TSBS's own per-engine generators), each checked against the reference
     - [ ] `double-groupby-*`, `high-cpu-*`, `cpu-max-all-*` and `groupby-orderby-limit`
   - [ ] Tagged fixtures and freeze docs

@@ -9406,6 +9406,7 @@ describing this very incident, so a CI rule on headings would fail honest write-
 the rule exists to stop. A gate that fails legitimate prose gets routed around by a blanket exemption
 nobody re-reads, so the heading rule stays a review rule and the filename rule — which has no
 legitimate counter-use — is the one CI enforces.
+
 ## 2026-11-21 — What TSBS's tag-grouped queries mean in `weft-xbench`, and what answers them first (TAG-12, #341)
 
 **Ambiguous.** The TAG-12 line names "TSBS tag-grouped query suite" and lists `single-groupby-*`, `double-groupby-*`, `lastpoint` and `high-cpu-*`. TSBS's README describes `single-groupby` as a MAX "every 5 mins", while the SQL TSBS generates buckets by one minute; and the line does not say how an engine's answer is judged.
@@ -9423,3 +9424,19 @@ legitimate counter-use — is the one CI enforces.
 - Timing first and checking later: a fast wrong answer is the failure this harness exists to catch.
 - Running TSBS's Go query generator in CI for the reference: the reference is twenty lines of Rust over data the tests already build, and the nightly does not carry a Go toolchain (2026-10-31).
 
+## 2026-11-23 — How the TSBS query phase draws, warms and times its queries (TAG-12, #341)
+
+**Ambiguous.** The TAG-12 sub-item asks for "a timed `weft-xbench` TSBS-query phase with the reference gate in the report". It does not say which hosts and windows a timed rep asks for, whether reps repeat one question or ask new ones, what counts as warm-up, how much of the TSBS file the phase reads, or what `combine` does with the result.
+
+**Chosen.**
+
+- **Instances are drawn as `tsbs_generate_queries` draws them, from our own seed.** Hosts are a uniformly random subset of distinct hosts (`getRandomHosts` → `GetRandomSubsetPerm` in `cmd/tsbs_generate_queries/uses/devops/common.go`), and the window's start is uniform in `[first, end − window)` at nanosecond granularity, `end = start + window` (`TimeInterval.RandWindow` in `internal/utils/time_interval.go`). The seed is `weft-xbench`'s `--seed`, one stream per query type, so the instances are reproducible but are not the same instances a TSBS query file with the same seed would hold (Go's `math/rand` stream is not reproduced).
+- **Each timed rep answers a different instance**, as `tsbs_run_queries` runs a file of generated queries once each. With its defaults (`--burn-in 0`, `--workers 1`, `--prewarm-queries false`, `pkg/query/benchmarker.go`) TSBS times every query once. The phase answers one extra instance untimed first, as a burn-in of one, so the first timed rep does not alone pay whatever the store defers to its first read after a load. That reason is a precaution, not a measured effect.
+- **The gate runs outside the timed span**, on every instance, and a query type passes only when every instance equals the reference. A failure fails the run (`all_correct`), and the report flags it as any other gate failure does.
+- **The phase reads the whole `--tsbs` file**, whatever `--scales` says. TSBS draws its windows over the generator's whole interval, and the tiny scale's hour has no 12-hour window in it.
+- **`combine` refuses reports that carry TSBS query results** rather than pooling them. Carrying run 1's results alone would present one run as the pool, and pooling needs the same instance draw in every run, which has not been designed.
+- **Report schema v9**: `tsbs_queries` is a new top-level list, not a new `Phase` of `ArmResult`. An `ArmResult` is shaped around one dataset's grid (input points, missingness, accuracy against ground truth), none of which a TSBS query has.
+
+**Rejected.** Reusing one instance for every rep (it would time a cache, not TSBS's workload); TSBS's `--prewarm-queries` cold/warm pair (no cold hook is wired to this phase yet); timing the reference (it is the gate, not an engine).
+
+**Not decided here.** `lastpoint` reads every series' whole range, because `SegmentStore` has no per-series latest-row read (`read.rs` exposes range, point and downsample reads; `aspect_stats` has an aspect-wide time range only). TSBS's TimescaleDB `lastpoint` is a `LATERAL … ORDER BY time DESC LIMIT 1` per tag set. Whether WeftDB gets a latest-row read is an engine change and needs a benchmark behind it, so it is a ROADMAP sub-item, not part of this phase.

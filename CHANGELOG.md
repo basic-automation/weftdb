@@ -75,6 +75,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   generated SQL does for every engine, not every five minutes as TSBS's README says
   ([timescale/tsbs#214](https://github.com/timescale/tsbs/issues/214)). Nothing is timed yet, and no
   other engine runs these queries.
+- **`weft-xbench --tsbs FILE --tsbs-queries` times WeftDB's answers to TSBS's tag-grouped queries
+  (TAG-12, #341).** The phase loads the whole file into a store tagged by `hostname` and, for each of
+  the six `single-groupby-*` variants and `lastpoint`, answers `--reps` seeded instances. Each instance
+  picks distinct random hosts and a random window, drawn the way `tsbs_generate_queries` draws them.
+  One untimed burn-in instance comes first. Every answer is checked against the in-memory reference
+  outside the timed span. A mismatch fails the run's gate, as a failed interpolation result does. The
+  report schema is v9: a new top-level `tsbs_queries` list, rendered as a "TSBS queries" table that
+  compares no engines. `weft-xbench combine` refuses reports that carry it instead of pooling them.
 - **Multi-series crash cell (TAG-12, issue #341).** A new fault-injection test
   (`multiseries_crash`) writes interleaved frames across 8 series, then aborts the process
   with SIGABRT part-way through a second batch on one of them. The parent reopens the
@@ -244,7 +252,8 @@ origin/main
 
 - **The nightly cross-engine smoke builds again.** `weft-xbench/Cargo.lock` never recorded the
   `tempfile` dependency `weft-bench` gained, so `cargo build --locked` for `weft-xbench` failed on every
-  scheduled `xbench-smoke` run from at least 2026-11-17. The lock now has it, and CI's `xbench-lock` job
+  scheduled `xbench-smoke` run from at least 2026-11-17 (through 2026-11-22). `weftdb`'s `sha2`
+  dependency, added by #849, was missing from it too. The lock now has both, and CI's `xbench-lock` job
   also resolves `weft-xbench` with `cargo metadata --locked`, so a stale lock fails on the push.
 - **The cargo-deny exception for `chrono` (RUSTSEC-2026-0543) now expires on its date, not in prose.** The action pin was bumped to `EmbarkStudios/cargo-deny-action` v2.1.2 (commit `70f81531115945ba6eb6b941ec9d39d063438eb9`), which runs cargo-deny 0.21.0, and the ignore entry carries `expiry = "2027-01-31"`: once that date passes the advisory is reported again with `advisory-ignore-expired` and CI goes red until the migration (#791) lands or the exception is re-dated. The old pin (cargo-deny 0.20.2) rejected the `expiry` key with `error[unexpected-keys]`, which is why the deadline had only been documentation. Closes #794.
 - **TTL purge no longer drops a doomed segment that shadows a surviving segment of the same series (#797).**
