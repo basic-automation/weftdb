@@ -459,10 +459,11 @@ The interpolation item (B-interp, Phase 5) is done.
     whose protocol is not ILP at all), and which repository and tier a vendor connector lives in,
     since `DECISIONS.md:2165` places historian connectors in the paid tier.
 - **B-rest** *(Phase 2 · partial)*
-- **B-poll / B-retry / B-register** *(Phase 7 · absent)*
+- **B-poll / B-retry / B-register** *(Phase 23 · absent — see docs/research/client-poll-retry-register-audit.md; all three are not needed or already present)*
 - **B-analysis** *(Phase 4/9 · verify)*
   - 2026-11-22: wiring audit produced (`docs/research/per-point-analysis-wiring.md`) — **not wired** end-to-end: no producer on any product path (`Batch::process()` is called only from `weft-orchestration` and two `weftdb` tests; `process_batches()` has zero call sites), never persisted and every read path resets it (`BatchedMeasurement::new` fixes `analysis: None`), no `weft-server` surface, and the `trend` half has no producer. Defects filed as #862/#863; the `ROADMAP.md` line stays unchecked (#362)
-- **B-object** *(Phase 4 · absent)*
+- **B-object** *(Phase 28 · absent)*
+  - 2026-11-22: object-store audit produced (`docs/research/object-store-audit.md`) — **does not exist** anywhere in the codebase; every PhysicalType variant is numeric, every ingest path parses BigDecimal, the segment frame has no non-numeric column model, and the HTTP surface has no object/annotation route. The freeze (#238, Phase 18) blocks adding routes. Defer to post-1.0; the ROADMAP.md line stays unchecked (#363). Label corrected from Phase 4 to Phase 28 to match the live ROADMAP.md position.
 - **B-windows** *(Phase 9 · absent/partial)*
 - **B-dedup** *(Phase 7 · partial)*
 - **B-sim** *(Phase 9 · partial)*
@@ -470,6 +471,7 @@ The interpolation item (B-interp, Phase 5) is done.
   - 2026-11-20: BigDecimal precision-boundary inventory produced (`docs/research/bigdecimal-inventory.md`) (#840)
 - **B-resilience** *(Phase 4/7 · partial)*
 - **B-conncache** *(Phase 4/7 · partial)*
+  - 2026-11-22: cached-connection audit produced (`docs/research/cached-connection-audit.md`, PR #870, issue #369). Two cache layers are in place — the process-wide `CONNECTION_DATABASES` map (`weftdb/src/types/database/mod.rs:24`) with `close_idle_databases` (`mod.rs:122`), and the per-`Database` aspect cache (`mod.rs:143`). Remaining, filed as #871 (read-only cache for `rows_mode` opens, which must never share the MVCC-enabling cache), #872 (the idle sweep exists but is not called from the server loop) and #873 (no per-path `Database` singleton). Not taken by the loop: #871/#872 overlap the owner's `p12/fanctl-correlation-growth` lane, and #873 is a public-surface change while #238 is open.
 - **B-msgpack** *(Phase 6 · absent)*
 - **B-snapshot** *(Phase 3/9 · absent)*
 
@@ -885,3 +887,38 @@ lost-write half open behind an after-1.0 API decision about a caller token in
 "[ ]" at once: EVI-16 (#277) and EVI-17 (#319) are closed and `HONESTY.md` is on main, so
 only the owner narrative is outstanding and the box stays unchecked for that reason.
 No box moved in this change.
+
+## Routine 2026-11-21 — xbench lock, TSBS reference queries, Turso #9770
+
+**Fixed: the nightly cross-engine smoke was red on `main`.** Every scheduled `xbench-smoke.yml` run from 2026-11-17 to 2026-11-20 failed in about 90 s at `cargo build --locked --manifest-path weft-xbench/Cargo.toml`: `weft-xbench/Cargo.lock` never recorded `tempfile`, which `weft-bench` depends on. `scripts/xbench/check-lock.py` compares only the packages the two locks share, so the per-push `xbench-lock` job stayed green. The lock gained the one line, and that job now also runs `cargo metadata --locked` against `weft-xbench` (exit 101 on main's lock, 0 on the fixed one). `cargo clippy --all-targets` for `weft-xbench` was also failing on main, on an `Option::map` with a unit closure in a `render.rs` test, and that is fixed too.
+
+**TAG-12, the TSBS half: answers before timings.** `weft-xbench/src/tsbs.rs` reads every host's ten `cpu` fields (`load_cpu`) and answers the six `single-groupby-*` variants and `lastpoint` in process (`TsbsCpu`, `TsbsQuery`). `weft-xbench/src/weft.rs` `TsbsWeft` stores the same data tagged by `hostname` and answers both query types from the store, and a test pins its answers equal to the reference over 10 hosts × 720 readings. Nothing is timed and no number exists. See DECISIONS 2026-11-21 for why the buckets are one minute.
+
+**Research.**
+- TSBS (repo head `c08b6b9`, 2026-11-17). Read: `cmd/tsbs_generate_queries/main.go`, which registers the six `single-groupby` variants; `uses/devops/common.go` (`cpuMetrics`, in order); and the `GroupByTime`/`LastPointPerHost` generators in `databases/{timescaledb,clickhouse,influx,questdb}/devops.go`. All four bucket `single-groupby` by one minute (`time_bucket('60 seconds')`, `toStartOfMinute`, `group by time(1m)`, `SAMPLE BY 1m`). `lastpoint` is the last row per host in every one: QuestDB `latest by hostname`, InfluxDB `group by "hostname" order by time desc limit 1`. The README's "every 5 mins" is [timescale/tsbs#214](https://github.com/timescale/tsbs/issues/214) (open since 2022-11-23, no comments). Sources: https://github.com/timescale/tsbs/blob/master/cmd/tsbs_generate_queries/databases/timescaledb/devops.go, https://github.com/timescale/tsbs/blob/master/cmd/tsbs_generate_queries/main.go, https://github.com/timescale/tsbs/issues/214.
+- Turso: [tursodatabase/turso#9770](https://github.com/tursodatabase/turso/pull/9770) ("complete an interrupted TRUNCATE checkpoint when the log is empty") **merged 2026-11-19**, and [#7480](https://github.com/tursodatabase/turso/issues/7480) is **closed**. The fix is in `v0.9.0-pre.6` (2026-11-20; the compare API reports the tag 110 commits ahead of the merge commit), but **not** in the new stable [`v0.8.4`](https://github.com/tursodatabase/turso/releases/tag/v0.8.4) (2026-11-20). That tag diverged from `main` before the merge, and its 36 commits carry two other MVCC logical-log fixes ("keep late commits in the logical log on passive-flag TRUNCATE", "publish upgraded logical-log header only after its write succeeds") but not #9770. This workspace pins `turso` 0.8.1. So the non-Linux SIGKILL exclusion in the crash matrix stands until a stable release with #9770 ships, or until the owner chooses to move to 0.9.x. A 0.8.1 → 0.8.4 bump is the owner's decision; the two logical-log fixes above are the case for it.
+
+**Next (tomorrow).**
+1. A timed TSBS-query phase in `weft-xbench` (`--tsbs-queries`?): load the file into `TsbsWeft`, time each query over generated hosts and windows, and gate each answer against `TsbsCpu`. This needs the report schema to carry a per-query result, so it is about one run. Publish timings only from a quiet host.
+2. `lastpoint` on WeftDB reads each series whole. A latest-row read (one segment, the last row) is the fast path, and it is worth checking whether `SegmentStore` already has one before adding one.
+3. Phase 12's **Row-TTL purge defects** parent has all three sub-items ticked and #785's daemon call site shipped (#786). It can be ticked by whoever next edits Phase 12; this run did not touch Phase 12.
+
+
+## Routine 2026-11-23 — timed TSBS query phase, xbench lock still stale on main
+
+**Stacked on #842.** `routine/weftdb-2026-11-21` (PR #842) is still open, and today's slice builds on its `TsbsCpu`/`TsbsWeft`, so this branch merges it. Merge #842 first; this PR's diff then shrinks to its own commits.
+
+**TAG-12: `weft-xbench --tsbs FILE --tsbs-queries`.** The phase loads the whole file into a `TsbsWeft` store (one aspect per metric, one series per `hostname`). For each of the six `single-groupby-*` variants and `lastpoint`, it draws `--reps + 1` seeded instances, answers the first untimed and times the rest. Each timed answer is compared with `TsbsCpu` outside the timed span. Results go into report schema v9's top-level `tsbs_queries` and a "TSBS queries" table that compares no engines. The choices (instance draw, burn-in of one, whole file, `combine` refusing) are in `DECISIONS.md` 2026-11-23.
+
+**Runtime check (2026-11-23, not a benchmark).** A debug build was run as `weft-xbench --scales tiny --reps 5 --load-reps 1 --tsbs /mnt/weftbench/tsbs/cpu-only.lp --tsbs-queries`, with `TMPDIR` in the run's scratch dir. It loaded the whole reference file: 10 hosts and 604,810 readings. All seven query types passed their gate on all 5 instances, with 0 mismatches. The 12-hour variants returned about 720 one-minute rows per instance, and `lastpoint` returned 10 rows per instance. The run exited 0 and wrote a v9 `xbench.json` plus `report.md`/`report.html`, and its temporary stores were removed. The evidence is in `/mnt/deepmem/Development/weftdb-routine/runs/20261123-025729/` (`xbench-tsbs.log`, `xbench-tsbs/`). The host's load average was 10–17 with about 16 GB available, and the build was unoptimised, so **no timing from this run is quoted anywhere**. The one directional observation is that `lastpoint` was by far the slowest query in that run. That is consistent with it reading every series whole, and item 2 below exists to measure it properly.
+
+**Also found: the nightly cross-engine smoke is still red on `main`.** `gh run list --workflow xbench-smoke.yml` shows the scheduled runs failing on 2026-11-19, -20, -21 and -22. #842 adds the missing `tempfile` line and a `cargo metadata --locked` check. A second stale entry came in after #842 was opened: `weftdb` gained `sha2` in #849 (`c3379fc`), and `weft-xbench/Cargo.lock` never recorded it. This branch's lock has both. Merging #842 alone would still leave `cargo build --locked` for `weft-xbench` failing on the `sha2` line.
+
+**Research.**
+- TSBS (`master`, read 2026-11-23). [`internal/utils/time_interval.go`](https://github.com/timescale/tsbs/blob/master/internal/utils/time_interval.go): `RandWindow` draws a start uniform in `[start, end − window)` at nanosecond granularity, sets `end = start + window`, and refuses a window not shorter than the interval. [`cmd/tsbs_generate_queries/uses/devops/common.go`](https://github.com/timescale/tsbs/blob/master/cmd/tsbs_generate_queries/uses/devops/common.go): `getRandomHosts` takes a random subset of distinct hosts with `GetRandomSubsetPerm` and refuses more hosts than `--scale`. [`pkg/query/benchmarker.go`](https://github.com/timescale/tsbs/blob/master/pkg/query/benchmarker.go): `tsbs_run_queries` defaults to `--burn-in 0`, `--workers 1` and `--prewarm-queries false`, so each generated query runs once. With `--prewarm-queries` each query runs twice in a row and the second run is reported as "warm". [`cmd/tsbs_generate_queries/databases/timescaledb/devops.go`](https://github.com/timescale/tsbs/blob/master/cmd/tsbs_generate_queries/databases/timescaledb/devops.go): `LastPointPerHost` is a `LATERAL (… ORDER BY time DESC LIMIT 1)` per tag set when tags are in their own table, otherwise `SELECT DISTINCT ON (hostname) * FROM cpu ORDER BY hostname, time DESC`. That is a latest-row read, which `SegmentStore` does not have.
+- Turso releases (`gh api repos/tursodatabase/turso/releases`): nothing new since the 2026-11-21 notes. The latest are still `v0.8.4` (stable, 2026-11-20) and `v0.9.0-pre.6` (2026-11-20). The 2026-11-21 conclusion stands: the #7480 fix is only in the 0.9 pre-releases.
+
+**Next (tomorrow).**
+1. Run `--tsbs-queries` in a release build over `/mnt/weftbench/tsbs/cpu-only.lp` on a quiet host (`--reps 100` or more), and publish it as a report artifact. Only then can a TSBS timing be quoted.
+2. A per-series latest-row read in `SegmentStore` for `lastpoint`. First measure today's full-range `lastpoint` against a prototype that reads only the series' last segment.
+3. The other engines' TSBS SQL (TimescaleDB first, since the generator SQL is already read), each checked against `TsbsCpu`.
