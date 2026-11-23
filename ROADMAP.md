@@ -126,6 +126,11 @@ The phase also cleared the remaining loose ends. The stale README status was fix
   - [x] Tagged `kill-compaction` and `corrupt-segment` cells (2026-11-17, `routine/weftdb-2026-11-17`: `kill-compaction-tagged` (every series exact after a SIGKILLed compaction, `fsck` clean, rerun exact) and `corrupt-segment-tagged` (served rows are their own series' values, losses are quarantined, at most one series loses rows); each fails a wrong-series mutant through the CLI. The matrix is six cells, and its CI runtime with the three tagged cells is not yet measured)
   - [ ] Fan-out benchmark (one tagged write or read across many series) *(2026-11-22: the arm itself landed — `weft-bench/src/fan_out.rs` behind `--fan-out`, wired at `weft-bench/src/main.rs:539`, PR #809 merged 2026-11-19 — but there is no ladder run, no `bench/claims.json` entry and no report, and the arm's module doc still says "there is no measurement"; a ladder run belongs on the reference drive at the line above, so this stays open)*
   - [ ] TSBS tag-grouped query suite in `weft-xbench` (`--tsbs` reads only `host_0` today; `single-groupby-*`, `double-groupby-*`, `lastpoint`, `high-cpu-*` group by `hostname`)
+    - [x] Every host's ten `cpu` fields loaded, and the six `single-groupby-*` variants and `lastpoint` answered in process as the reference (2026-11-21, `routine/weftdb-2026-11-21`: `weft-xbench/src/tsbs.rs` `load_cpu`, `TsbsCpu`, `TsbsQuery`; one-minute buckets as TSBS's generated SQL has them, not the README's "every 5 mins")
+    - [x] WeftDB answers the same seven queries from a store tagged by `hostname`, equal to the reference (2026-11-21, `routine/weftdb-2026-11-21`: `weft-xbench/src/weft.rs` `TsbsWeft`; a test over 10 hosts × 720 readings, and an inclusive-end mutant fails it. Not timed; `lastpoint` reads each series whole)
+    - [ ] A timed `weft-xbench` TSBS-query phase with the reference gate in the report, over the full TSBS file on a quiet host
+    - [ ] The other engines' TSBS SQL (TSBS's own per-engine generators), each checked against the reference
+    - [ ] `double-groupby-*`, `high-cpu-*`, `cpu-max-all-*` and `groupby-orderby-limit`
   - [ ] Tagged fixtures and freeze docs
 - [x] **ROB-24** Limits and overload evidence; frozen configuration documentation
 - [x] **SOA-15** part 2: TTL lane

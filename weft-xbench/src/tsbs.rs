@@ -7,13 +7,19 @@
 //! keeps one host's field as a series, which the harness then runs through the same load,
 //! interpolation and downsample phases as every other dataset.
 //!
-//! It is TSBS *data*, not TSBS's query suite: those queries group many series by tags, which
-//! WeftDB stores once tagged ingest (TAG-11) lands, and TAG-12 owns them.
+//! [`load`] keeps one host's field. [`load_cpu`] keeps every host's ten `usage_*` fields, and
+//! [`TsbsCpu`] answers TSBS's tag-grouped devops queries over them ([`TsbsQuery`]), as the
+//! reference every engine's answer to the same query is checked against (TAG-12, #341). The
+//! answers follow the SQL TSBS generates for `TimescaleDB`
+//! (`cmd/tsbs_generate_queries/databases/timescaledb/devops.go`), not the README's prose: a
+//! `single-groupby` buckets by **one minute**, which the README calls "every 5 mins".
 
-use std::{collections::BTreeSet, io::BufRead, path::Path};
+use std::{
+	collections::{BTreeMap, BTreeSet}, io::BufRead, path::Path
+};
 
 use splimes::Point;
-use weft_line_protocol::{SeriesKey, TimestampPrecision};
+use weft_line_protocol::{FieldValue, SeriesKey, TimestampPrecision};
 
 /// The measurement TSBS's `cpu-only` use case writes.
 pub const MEASUREMENT: &str = "cpu";
@@ -99,6 +105,199 @@ pub fn load_from_reader(reader: impl BufRead, host: &str, field: &str, span_secs
 	Ok(TsbsSeries { host: host.to_string(), field: field.to_string(), points, hosts: hosts.len() })
 }
 
+/// The ten `cpu` fields TSBS writes, in the order its query generator takes the first `N` of
+/// (`cpuMetrics` in `cmd/tsbs_generate_queries/uses/devops/common.go`).
+pub const CPU_METRICS: [&str; 10] = ["usage_user", "usage_system", "usage_idle", "usage_nice", "usage_iowait", "usage_irq", "usage_softirq", "usage_steal", "usage_guest", "usage_guest_nice"];
+
+/// Nanoseconds in the one-minute bucket a `single-groupby` groups by.
+const MINUTE_NS: i64 = 60_000_000_000;
+
+/// One `cpu` line: its instant and its ten fields in [`CPU_METRICS`] order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CpuReading {
+	/// The line's timestamp, in nanoseconds since the Unix epoch.
+	pub ts_ns: i64,
+	/// The ten `usage_*` fields, in [`CPU_METRICS`] order.
+	pub values: [i64; 10],
+}
+
+/// Every host's `cpu` readings from a TSBS `cpu-only` file, keyed by the `hostname` tag.
+///
+/// The fields are kept as the integers TSBS writes (`58i`): a float, unsigned, boolean or string
+/// field is refused, not converted, so a reference answer is exact by construction.
+#[derive(Debug, Clone, Default)]
+pub struct TsbsCpu {
+	/// Each host's readings, in time order. A `BTreeMap`, so hosts iterate in byte order of their
+	/// names (`host_10` before `host_2`), which is what `ORDER BY hostname` gives under the C
+	/// collation.
+	pub hosts: BTreeMap<String, Vec<CpuReading>>,
+}
+
+/// The TSBS devops queries [`TsbsCpu`] answers, named as `tsbs_generate_queries --query-type`
+/// names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TsbsQuery {
+	/// `single-groupby-<metrics>-<hosts>-<hours>`: the MAX of the first `metrics` CPU fields over
+	/// `hosts` hosts, per one-minute bucket, over `hours` hours.
+	SingleGroupby {
+		/// How many of [`CPU_METRICS`], from the first.
+		metrics: usize,
+		/// How many hosts the query names.
+		hosts: usize,
+		/// The window, in hours.
+		hours: u32,
+	},
+	/// `lastpoint`: the latest reading of every host.
+	Lastpoint,
+}
+
+/// One row of a `single-groupby` answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MinuteMax {
+	/// The bucket's start, in nanoseconds since the Unix epoch, a multiple of one minute.
+	pub minute_ns: i64,
+	/// The MAX of each asked-for metric over the bucket's rows of the named hosts.
+	pub max: Vec<i64>,
+}
+
+impl TsbsQuery {
+	/// The query types TSBS defines that this module answers, for `single-groupby` only the
+	/// variants TSBS's own generator registers (`1-1-1`, `1-1-12`, `1-8-1`, `5-1-1`, `5-1-12`,
+	/// `5-8-1`), then `lastpoint`.
+	pub const ALL: [Self; 7] = [Self::SingleGroupby { metrics: 1, hosts: 1, hours: 1 }, Self::SingleGroupby { metrics: 1, hosts: 1, hours: 12 }, Self::SingleGroupby { metrics: 1, hosts: 8, hours: 1 }, Self::SingleGroupby { metrics: 5, hosts: 1, hours: 1 }, Self::SingleGroupby { metrics: 5, hosts: 1, hours: 12 }, Self::SingleGroupby { metrics: 5, hosts: 8, hours: 1 }, Self::Lastpoint];
+
+	/// The `--query-type` name.
+	#[must_use]
+	pub fn name(self) -> String {
+		match self {
+			Self::SingleGroupby { metrics, hosts, hours } => format!("single-groupby-{metrics}-{hosts}-{hours}"),
+			Self::Lastpoint => "lastpoint".to_string(),
+		}
+	}
+
+	/// Parse a `--query-type` name.
+	///
+	/// # Errors
+	///
+	/// A name that is not in [`Self::ALL`].
+	pub fn parse(name: &str) -> anyhow::Result<Self> {
+		Self::ALL.into_iter().find(|q| q.name() == name).ok_or_else(|| anyhow::anyhow!("unknown or unsupported TSBS query type {name:?}; supported: {}", Self::ALL.map(Self::name).join(", ")))
+	}
+}
+
+impl TsbsCpu {
+	/// How many readings across all hosts.
+	#[must_use]
+	pub fn len(&self) -> usize {
+		self.hosts.values().map(Vec::len).sum()
+	}
+
+	/// Whether no host has a reading.
+	#[must_use]
+	pub fn is_empty(&self) -> bool {
+		self.hosts.values().all(Vec::is_empty)
+	}
+
+	/// `single-groupby`'s answer: for each one-minute bucket in `[start_ns, end_ns)` that holds a
+	/// reading of one of `hosts`, the MAX of each of the first `metrics` [`CPU_METRICS`], in bucket
+	/// order. Buckets with no reading are absent, as `GROUP BY` leaves them.
+	///
+	/// TSBS picks the hosts and the window at random from its own seed; the caller passes the ones
+	/// a generated query names, so the reference and the engine answer the same question.
+	///
+	/// # Errors
+	///
+	/// `metrics` of 0 or more than ten, an empty or unknown host, or an empty window.
+	pub fn single_groupby(&self, metrics: usize, hosts: &[&str], start_ns: i64, end_ns: i64) -> anyhow::Result<Vec<MinuteMax>> {
+		anyhow::ensure!((1..=CPU_METRICS.len()).contains(&metrics), "a single-groupby takes 1 to {} metrics, not {metrics}", CPU_METRICS.len());
+		anyhow::ensure!(!hosts.is_empty(), "a single-groupby names at least one host");
+		anyhow::ensure!(start_ns < end_ns, "the window [{start_ns}, {end_ns}) is empty");
+		let mut buckets: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+		for host in hosts {
+			let readings = self.hosts.get(*host).ok_or_else(|| anyhow::anyhow!("no host {host:?} in the TSBS data"))?;
+			let first = readings.partition_point(|r| r.ts_ns < start_ns);
+			for reading in readings[first..].iter().take_while(|r| r.ts_ns < end_ns) {
+				let minute_ns = reading.ts_ns.div_euclid(MINUTE_NS) * MINUTE_NS;
+				let max = buckets.entry(minute_ns).or_insert_with(|| reading.values[..metrics].to_vec());
+				for (m, v) in max.iter_mut().zip(&reading.values[..metrics]) {
+					*m = (*m).max(*v);
+				}
+			}
+		}
+		Ok(buckets.into_iter().map(|(minute_ns, max)| MinuteMax { minute_ns, max }).collect())
+	}
+
+	/// `lastpoint`'s answer: every host's latest reading, hosts in byte order of their names.
+	#[must_use]
+	pub fn lastpoint(&self) -> Vec<(&str, &CpuReading)> {
+		self.hosts.iter().filter_map(|(host, readings)| readings.last().map(|r| (host.as_str(), r))).collect()
+	}
+}
+
+/// Read every host's `cpu` readings from the TSBS file at `path`, up to `span_secs` after the
+/// file's first reading.
+///
+/// # Errors
+///
+/// See [`load_cpu_from_reader`].
+pub fn load_cpu(path: &Path, span_secs: i64) -> anyhow::Result<TsbsCpu> {
+	let file = std::fs::File::open(path).map_err(|e| anyhow::anyhow!("cannot open {}: {e}", path.display()))?;
+	load_cpu_from_reader(std::io::BufReader::new(file), span_secs).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+}
+
+/// The reader half of [`load_cpu`]. Stops at the first line past the span, as [`load_from_reader`]
+/// does.
+///
+/// # Errors
+///
+/// A malformed line; a `cpu` line without a `hostname` tag or a timestamp, or with a
+/// [`CPU_METRICS`] field missing or not an `i` integer; a host whose tag set changes; a host's
+/// readings that do not strictly increase; or no reading at all.
+pub fn load_cpu_from_reader(reader: impl BufRead, span_secs: i64) -> anyhow::Result<TsbsCpu> {
+	let mut cpu = TsbsCpu::default();
+	let mut keys: BTreeMap<String, SeriesKey> = BTreeMap::new();
+	let mut end_ns = None;
+	for (idx, line) in reader.lines().enumerate() {
+		let line_no = idx + 1;
+		let line = line.map_err(|e| anyhow::anyhow!("line {line_no}: {e}"))?;
+		let records = weft_line_protocol::parse(&line).map_err(|e| anyhow::anyhow!("line {line_no}: {e}"))?;
+		let Some(record) = records.into_iter().next() else { continue };
+		if record.measurement != MEASUREMENT {
+			continue;
+		}
+		let ts_ns = record.timestamp.ok_or_else(|| anyhow::anyhow!("line {line_no}: a {MEASUREMENT} line without a timestamp"))?;
+		match end_ns {
+			Some(end) if ts_ns > end => break,
+			Some(_) => {}
+			None => end_ns = Some(ts_ns.saturating_add(span_secs.saturating_mul(1_000_000_000))),
+		}
+		let host = record.tag("hostname").ok_or_else(|| anyhow::anyhow!("line {line_no}: a {MEASUREMENT} line without a hostname tag"))?.to_string();
+		let mut values = [0_i64; 10];
+		for (slot, metric) in values.iter_mut().zip(CPU_METRICS) {
+			*slot = match record.field(metric) {
+				Some(FieldValue::Integer(v)) => *v,
+				Some(other) => anyhow::bail!("line {line_no}: {host}'s {metric} is {other:?}, not an integer"),
+				None => anyhow::bail!("line {line_no}: {host} has no {metric}"),
+			};
+		}
+		let key = record.series_key();
+		match keys.get(&host) {
+			None => {
+				keys.insert(host.clone(), key);
+			}
+			Some(first) if *first != key => anyhow::bail!("line {line_no}: {host} changed its tag set to {}", record.describe_series()),
+			Some(_) => {}
+		}
+		let readings = cpu.hosts.entry(host).or_default();
+		if let Some(last) = readings.last() {
+			anyhow::ensure!(ts_ns > last.ts_ns, "line {line_no}: a reading at {ts_ns} does not follow {}", last.ts_ns);
+		}
+		readings.push(CpuReading { ts_ns, values });
+	}
+	anyhow::ensure!(!cpu.is_empty(), "no {MEASUREMENT} readings");
+	Ok(cpu)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -141,5 +340,91 @@ cpu,hostname=host_1,region=us-west-1 usage_user=83i,usage_system=12i 14516064200
 		let retagged = "cpu,hostname=host_0,rack=1 usage_user=1i 10\ncpu,hostname=host_0,rack=2 usage_user=2i 20\n";
 		assert!(load_from_reader(retagged.as_bytes(), DEFAULT_HOST, DEFAULT_FIELD, 3600).expect_err("two tag sets").to_string().contains("changed its tag set"));
 		assert!(load_from_reader(&b"cpu,hostname=host_0 usage_user=\n"[..], DEFAULT_HOST, DEFAULT_FIELD, 3600).is_err());
+	}
+	/// Three hosts with all ten fields, a reading every 30 s from 2016-01-01T00:00:00Z, so two
+	/// readings per minute; `host_10` sorts before `host_2`.
+	fn cpu_sample() -> String {
+		use std::fmt::Write as _;
+
+		let mut out = String::new();
+		for step in 0..6_i64 {
+			for (h, host) in ["host_0", "host_2", "host_10"].iter().enumerate() {
+				let h = i64::try_from(h).expect("small");
+				let fields: Vec<String> = CPU_METRICS.iter().enumerate().map(|(m, name)| format!("{name}={}i", 10 * h + step + i64::try_from(m).expect("small") * 100)).collect();
+				writeln!(out, "cpu,hostname={host},region=r{h} {} {}", fields.join(","), 1_451_606_400_000_000_000 + step * 30_000_000_000).expect("writes to a String");
+			}
+		}
+		out
+	}
+
+	#[test]
+	fn reads_every_hosts_ten_fields() {
+		let cpu = load_cpu_from_reader(cpu_sample().as_bytes(), 3600).expect("reads");
+		assert_eq!(cpu.hosts.keys().map(String::as_str).collect::<Vec<_>>(), ["host_0", "host_10", "host_2"]);
+		assert_eq!(cpu.len(), 18);
+		let first = &cpu.hosts["host_2"][0];
+		assert_eq!((first.ts_ns, first.values[0], first.values[9]), (1_451_606_400_000_000_000, 10, 910));
+		assert_eq!(load_cpu_from_reader(cpu_sample().as_bytes(), 30).expect("reads").len(), 6, "the span keeps the first two instants");
+	}
+
+	#[test]
+	fn single_groupby_is_the_per_minute_max_over_the_named_hosts() {
+		let cpu = load_cpu_from_reader(cpu_sample().as_bytes(), 3600).expect("reads");
+		let t0 = 1_451_606_400_000_000_000_i64;
+		// Steps 0..6 at 30 s are minutes 0, 0, 1, 1, 2, 2; host_2's usage_user is 10 + step.
+		let one = cpu.single_groupby(1, &["host_2"], t0, t0 + 3 * MINUTE_NS).expect("answers");
+		assert_eq!(one, [MinuteMax { minute_ns: t0, max: vec![11] }, MinuteMax { minute_ns: t0 + MINUTE_NS, max: vec![13] }, MinuteMax { minute_ns: t0 + 2 * MINUTE_NS, max: vec![15] }]);
+		// Two hosts and two metrics: host_10 (20 + step) dominates host_0 (step) in every bucket.
+		let two = cpu.single_groupby(2, &["host_0", "host_10"], t0, t0 + 2 * MINUTE_NS).expect("answers");
+		assert_eq!(two.iter().map(|r| r.max.clone()).collect::<Vec<_>>(), [vec![21, 121], vec![23, 123]]);
+		// The window is half-open and cuts inside a bucket: only step 1 (t0 + 30 s) is in it.
+		let cut = cpu.single_groupby(1, &["host_0"], t0 + 1, t0 + MINUTE_NS).expect("answers");
+		assert_eq!(cut, [MinuteMax { minute_ns: t0, max: vec![1] }]);
+		assert!(cpu.single_groupby(1, &["host_0"], t0 + 10 * MINUTE_NS, t0 + 11 * MINUTE_NS).expect("answers").is_empty(), "no reading, no bucket");
+	}
+
+	#[test]
+	fn single_groupby_refuses_a_question_it_cannot_answer() {
+		let cpu = load_cpu_from_reader(cpu_sample().as_bytes(), 3600).expect("reads");
+		assert!(cpu.single_groupby(0, &["host_0"], 0, 1).is_err());
+		assert!(cpu.single_groupby(11, &["host_0"], 0, 1).is_err());
+		assert!(cpu.single_groupby(1, &[], 0, 1).is_err());
+		assert!(cpu.single_groupby(1, &["host_0"], 1, 1).is_err());
+		assert!(cpu.single_groupby(1, &["host_9"], 0, 1).expect_err("unknown host").to_string().contains("host_9"));
+	}
+
+	#[test]
+	fn lastpoint_is_each_hosts_latest_reading_in_name_order() {
+		let cpu = load_cpu_from_reader(cpu_sample().as_bytes(), 3600).expect("reads");
+		let last: Vec<(&str, i64, i64)> = cpu.lastpoint().into_iter().map(|(h, r)| (h, r.ts_ns, r.values[0])).collect();
+		let t5 = 1_451_606_400_000_000_000 + 5 * 30_000_000_000;
+		assert_eq!(last, [("host_0", t5, 5), ("host_10", t5, 25), ("host_2", t5, 15)]);
+	}
+
+	#[test]
+	fn query_names_round_trip_as_tsbs_spells_them() {
+		for q in TsbsQuery::ALL {
+			assert_eq!(TsbsQuery::parse(&q.name()).expect("parses"), q);
+		}
+		assert_eq!(TsbsQuery::ALL[0].name(), "single-groupby-1-1-1");
+		assert_eq!(TsbsQuery::ALL[5].name(), "single-groupby-5-8-1");
+		assert!(TsbsQuery::parse("double-groupby-1").expect_err("not yet").to_string().contains("supported: single-groupby-1-1-1"));
+	}
+
+	#[test]
+	fn load_cpu_refuses_what_tsbs_does_not_write() {
+		let ok = |fields: &str| format!("cpu,hostname=host_0 {fields} 10\n");
+		let all: Vec<String> = CPU_METRICS.iter().map(|m| format!("{m}=1i")).collect();
+		assert!(load_cpu_from_reader(ok(&all.join(",")).as_bytes(), 3600).is_ok());
+		let float = all.join(",").replacen("usage_user=1i", "usage_user=1.5", 1);
+		assert!(load_cpu_from_reader(ok(&float).as_bytes(), 3600).expect_err("float").to_string().contains("not an integer"));
+		assert!(load_cpu_from_reader(ok(&all[1..].join(",")).as_bytes(), 3600).expect_err("missing").to_string().contains("has no usage_user"));
+		let untagged = format!("cpu {} 10\n", all.join(","));
+		assert!(load_cpu_from_reader(untagged.as_bytes(), 3600).expect_err("no host").to_string().contains("hostname"));
+		let backwards = format!("cpu,hostname=host_0 {0} 20\ncpu,hostname=host_0 {0} 10\n", all.join(","));
+		assert!(load_cpu_from_reader(backwards.as_bytes(), 3600).expect_err("backwards").to_string().contains("does not follow"));
+		let retagged = format!("cpu,hostname=host_0,rack=1 {0} 10\ncpu,hostname=host_0,rack=2 {0} 20\n", all.join(","));
+		assert!(load_cpu_from_reader(retagged.as_bytes(), 3600).expect_err("two tag sets").to_string().contains("changed its tag set"));
+		assert!(load_cpu_from_reader(&b"mem,hostname=host_0 used=1i 10\n"[..], 3600).expect_err("empty").to_string().contains("no cpu readings"));
 	}
 }
