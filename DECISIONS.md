@@ -6661,6 +6661,34 @@ needs `soak-baseline/` to be re-cut deliberately, not silently by a green check.
 (`scripts/annotate-soak-drift.py`) still emits `::warning::` and exits 0, which #688 does not ask to change;
 a refusal is the absence of a measurement, drift is a measurement that moved.
 
+## 2026-11-22 — `chrono` v0.4 inventory and migration path (#791)
+
+**Decision:** commission `docs/research/chrono-inventory.md` as the single source of truth for the
+workspace's `chrono` dependency surface, to be referenced by follow-up issues Phases A–D.
+
+**Chosen: document and file follow-ups, do not migrate now.** The dependency is stable (`0.4`, 9
+consuming crates, ~272 call sites) and the workspace's `serde = "0.4"` workspace entry is
+well-pinned. Migration would be 10–20 engineer-days across three phases, beginning after a
+dedicated newtype layer in `weft-physical-type`. The published crate boundaries (`weftdb`,
+`weft-client`) mean any replacement of `DateTime<Utc>` in public signatures is a semver-breaking
+change that must wait for the next major version.
+
+**Chosen: four phases, each its own issue.** Phase A (clock reads → `SystemTime`) is safe for
+today; Phase B (Duration newtype in `weft-physical-type`) needs no public API change; Phase C
+(Instant newtype in published signatures) is semver-breaking; Phase D purges the workspace
+dependency. Each phase is independently revertible and testable.
+
+**Chosen: leave the `compat` fixture crate on chrono.** It produces fixed binary test fixtures
+for an old format and must not drift.
+
+**Chosen: advisory codelines / architectural markers only.** The ROADMAP.md is not annotated
+because no line names `chrono` by name today (verified via `git grep -in chrono ROADMAP.md`).
+Two lines (`ROADMAP.md:374`, `docs/roadmap-notes.md:446`) contain a date stamp
+(`MEASURED 2026-10-08`) but reference backup costs, not chrono — not annotated.
+
+**Cost, stated plainly:** no code changed, no dependency removed. Every follow-up issue must be
+scoped to avoid scope creep: each phase addresses exactly one chrono feature-group and must not
+add features to the in-repo types beyond what chrono provided.
 ## 2026-11-11 — FRE-9b: the OpenAPI document becomes the contract candidate (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the 1.0 plan (§6 W11) says only that "FRE-9b's annotations land
@@ -9389,6 +9417,25 @@ before anyone starts. The loop did not claim either.
 
 **Needs human.** #873 needs the public-surface decision (an `Arc<Database>` or a `&Database` facade)
 while the #238 freeze is open.
+## 2026-11-22 — What "REST facade remainder" means, and what is actually missing (#360)
+
+**Question.** `ROADMAP.md:194` reads `- [ ] **B-rest** REST facade remainder` under Phase 22 — Connectors and ingest interop. `docs/roadmap-notes.md:449` lists it as `- **B-rest** *(Phase 2 · partial)*`. Neither says what "remainder" means. Two readings are possible: (a) gaps in WeftDB's own HTTP API ("the REST facade" per `weft-server/src/storage.rs:427), or (b) a vendor-compatible `/query`+`/write` shim implied by the Phase 22 connector context.
+
+**Chosen.** Treat (a) as the primary reading, document (b) as an alternative reading in the same doc with the evidence that the codebase does not use "facade" for that sense. Under either reading, the set of missing endpoints differs only by the InfluxDB query protocol and Prometheus remote write/read — the latter is already an explicit sub-bullet on the same roadmap line.
+
+**What the audit found.** 72 routes across 10 scopes. The `weftdb` library exposes ~90+ public methods through `SegmentStore`; every storage read, write, declare and backup path has a corresponding route. Four real gaps were identified:
+
+- **Row TTL expiry** (`expiry_sweep`, `purge_expired` in `weftdb/src/types/segment_store/maint.rs:22,82`): no endpoint calls them (#878).
+- **Manual segment split** (`split_segment` in `maint.rs:983`): called only internally by the overlap reconciler (#879).
+- **Metadata repair and rollup backfill** (`rebuild_aspect_metadata`, `rebuild_all_metadata`, `backfill_missing_rollups` in `maint.rs:2231,2250,2277`): no endpoint (#880).
+- **Series resolution and tag lookup** (`resolve_series`, `series_tags` in `weftdb/src/types/segment_store/read.rs:681,712`): library-only after TAG-10 landed per-series read variants (#881).
+
+**Not gaps.** `changes_since`/`ack_changes` overlap with B-conncache (#871–#873). `declare_with_upsert_keys` is a minor library variant. `interpolate_range_f64` is a precision trade-off already documented. `reap`/`mark_clean_shutdown`/`subscribe_poison` are deliberate daemon-only lifecycle.
+
+**What the doc rests on.** Every citation is from a fresh `rg`/`grep` at `5294136a7` (origin/main). Route inventory from `weft-server/src/routes.rs:805-975`; OpenAPI path list from `compat/openapi/weftdb.json`; library API from `weftdb/src/types/segment_store/`.
+
+**Alternative reading considered and rejected as primary.** The vendor-compatible shim reading would add InfluxDB v1 `/query` and Prometheus remote write/read as gaps. Prometheus remote write/read is already an explicit roadmap sub-item (`ROADMAP.md:198`); InfluxDB `/query` is not supported and no codebase evidence suggests it was intended. The `REST facade` term in the codebase (`weft-server/src/storage.rs:427`) refers to WeftDB's own HTTP API, not a shim.
+
 ## 2026-11-22 — A worker's progress log reached `main`, and the fix is to ignore the class (#876)
 
 **Ambiguity.** `progress.md` sat at the repository root on `main`: a 163-line run log for issue
