@@ -48,6 +48,15 @@ changed and writes full copies again when it next correlates; a signal step that
 before that correlation step finds no occurrences for them. Returning to v0.4.0 retires
 the copies again on its first correlation run.
 
+## New aspects are seal-backed by default (v0.3.x → v0.4.0, #768)
+
+With `WEFT_LEGACY_DEFAULT_STORAGE` unset, an aspect created by v0.4.0 stores its
+measurements in the `.weftseg` seal store, not in its `measurements.db`. Existing aspects
+keep their mode. **Rollback:** v0.3.7 and earlier do not know `aspects.storage_mode`, so they
+read zero measurements from a seal-backed aspect instead of refusing it. A deployment that
+must stay able to roll back to 0.3.x should set `WEFT_LEGACY_DEFAULT_STORAGE=rows` before it
+creates aspects on v0.4.0. See [docs/upgrade-notes.md](docs/upgrade-notes.md).
+
 ## Duplicate timestamps on seal-backed aspects (#802, SEAL-DUP)
 
 Aspect storage mode differences: **rows mode** stores every row at every timestamp; a

@@ -140,6 +140,8 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 
 ## Phase 14 — Beta tag (was W11)
 
+The changes up to this point ship first as **v0.4.0** (breaking weftdb API change in #897); the beta tag comes after it.
+
 - [ ] Approve and push the **v1.0.0-beta.1** tag on FRE-9b's merge *(owner)*
 - [x] **FRE-16** CI compatibility gates: OpenAPI breaking-change check, fixture guard, golden coverage
 - [ ] **7.6 Quotas/limits** (ROB-14 + ROB-24 evidence)

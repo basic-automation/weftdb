@@ -1722,3 +1722,34 @@ async fn idle_closed_files_reopen_with_their_data() -> Result<()> {
 	assert_eq!(db.get_measurements_count(&aspect.id()).await?, 25, "writes after a reopen survive the next close");
 	Ok(())
 }
+
+/// File descriptors this process holds on `path` or its sidecars (`-log`, `-wal`).
+#[cfg(target_os = "linux")]
+fn open_fds_on(path: &str) -> usize {
+	std::fs::read_dir("/proc/self/fd").map_or(0, |fds| fds.filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok()).filter(|target| target.to_string_lossy().starts_with(path)).count())
+}
+
+/// A file opened through a `get_*_db` getter is really closed by the idle sweep once the
+/// caller's clone drops: the per-handle cache keeps only the path, so nothing else holds
+/// the core database (its fd, MVCC state and ~3 MB arena). The next getter call reopens it.
+#[cfg(target_os = "linux")]
+#[serial]
+#[tokio::test]
+async fn the_idle_sweep_closes_a_file_opened_through_a_getter() -> Result<()> {
+	let (_temp, db, _subject, aspect) = setup_test_database().await?;
+	let path = db.get_correlations_db_path(&aspect.id()).await?;
+	let correlations = db.get_correlations_db(&aspect.id()).await?;
+	// A second call is served from the shared cache, and caches nothing of its own.
+	drop(db.get_correlations_db(&aspect.id()).await?);
+	correlations.connect()?.query("SELECT COUNT(*) FROM correlations", ()).await?.next().await?;
+	assert!(open_fds_on(&path) > 0, "the getter did not open {path}");
+	drop(correlations);
+
+	::weftdb::close_idle_databases(std::time::Duration::ZERO).await;
+	assert_eq!(open_fds_on(&path), 0, "a swept file is still open: some cache still holds its database");
+
+	let mut rows = db.get_correlations_db(&aspect.id()).await?.connect()?.query("SELECT COUNT(*) FROM correlations", ()).await?;
+	assert_eq!(rows.next().await?.context("no row")?.get::<i64>(0)?, 0, "the reopened file lost its tables");
+	assert!(open_fds_on(&path) > 0, "the getter did not reopen {path}");
+	Ok(())
+}

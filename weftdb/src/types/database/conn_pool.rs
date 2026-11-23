@@ -56,8 +56,9 @@ pub fn used_within(db: &turso::Database, role: Role, within: std::time::Duration
 }
 
 /// Whether `db` currently has a `role` pool. A clone kept past an idle sweep of its file
-/// has none; callers holding such clones re-resolve the handle instead of using it, since
-/// every transaction on it would open (and leak) a fresh connection with a cold page cache.
+/// has none. Production code keeps no such clones (`Database::get_*_db` caches paths), so
+/// only tests ask.
+#[cfg(test)]
 pub fn is_pooled(db: &turso::Database, role: Role) -> bool {
 	POOLS.lock().unwrap_or_else(PoisonError::into_inner).contains_key(&(identity(db), role))
 }

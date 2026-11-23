@@ -8,6 +8,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-23
+
 ### Documentation
 
 - **B-poll / B-retry / B-register audit (#361).** `docs/research/client-poll-retry-register-audit.md` published: all three backlog items are either already present (retry-for-503) or not needed (polling daemon, source registration). No behaviour changed. Phase label reconciled to Phase&nbsp;23.
@@ -31,7 +33,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   dictionary per call, pipeline dictionaries first, then every dictionary file).
   Correlation writes no longer touch `correlation_occurrences`, so a pattern gaining
   an occurrence writes nothing to its correlations, and `get_correlations` no longer
-  reads or parses per-occurrence JSON. The next minor release is 0.4.0 for this.
+  reads or parses per-occurrence JSON. This is why this release is 0.4.0.
 - **Copied occurrence rows are retired once per process per aspect.**
   `Database::retire_correlation_occurrences` deletes `correlation_occurrences` rows
   that are a prefix of the pattern's log (compared to the millisecond) and rows of
@@ -3475,7 +3477,8 @@ before this release. A bare "0.1" in them means splimes 0.1.
   advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
   unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.
 
-[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.3.7...HEAD
+[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/basic-automation/weftdb/compare/v0.3.7...v0.4.0
 [0.3.7]: https://github.com/basic-automation/weftdb/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/basic-automation/weftdb/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/basic-automation/weftdb/compare/v0.3.4...v0.3.5
