@@ -3347,11 +3347,7 @@ mod tests {
 	async fn copy_occurrence_rows(db: &Database, aspect: &AspectId, correlation_id: &str, occurrences: &[weftdb::Occurrence]) -> Result<()> {
 		let conn = weftdb::database::traits::DatabaseStructure::get_correlations_db(db, aspect).await?.connect()?;
 		for (index, o) in occurrences.iter().enumerate() {
-			conn.execute(
-				"INSERT INTO correlation_occurrences (correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-				(correlation_id.to_string(), i64::try_from(index)?, o.aspect().to_string(), o.resolution().to_string(), i64::try_from(o.size())?, serde_json::to_string(o.database_info())?, o.pattern_id().to_string(), o.beginning().timestamp_millis(), o.end().timestamp_millis()),
-			)
-			.await?;
+			conn.execute("INSERT INTO correlation_occurrences (correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (correlation_id.to_string(), i64::try_from(index)?, o.aspect().to_string(), o.resolution().to_string(), i64::try_from(o.size())?, serde_json::to_string(o.database_info())?, o.pattern_id().to_string(), o.beginning().timestamp_millis(), o.end().timestamp_millis())).await?;
 		}
 		Ok(())
 	}

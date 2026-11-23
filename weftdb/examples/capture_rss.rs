@@ -8,8 +8,7 @@ use std::str::FromStr;
 
 use bigdecimal::BigDecimal;
 use weftdb::{
-	database::traits::{AspectStructure, DatabaseStructure, Inputs},
-	Database, DatasetId, InputMeasurement,
+	database::traits::{AspectStructure, DatabaseStructure, Inputs}, Database, DatasetId, InputMeasurement
 };
 
 /// Keep every opened database alive for the whole run, as WeftDB's handle cache does.
@@ -45,7 +44,9 @@ async fn main() -> anyhow::Result<()> {
 			let path = format!("{dir}/raw.db");
 			let mut db = turso::Builder::new_local(&path).build().await?;
 			let conn = db.connect()?;
-			if std::env::var("NOMVCC").is_err() { conn.execute("PRAGMA journal_mode=experimental_mvcc", ()).await.ok(); }
+			if std::env::var("NOMVCC").is_err() {
+				conn.execute("PRAGMA journal_mode=experimental_mvcc", ()).await.ok();
+			}
 			let threshold = std::env::var("WEFT_MVCC_CHECKPOINT_BYTES").unwrap_or_else(|_| "65536".into());
 			conn.execute(&format!("PRAGMA mvcc_checkpoint_threshold={threshold}"), ()).await.ok();
 			conn.execute("CREATE TABLE m (ts INTEGER NOT NULL, dataset TEXT, value TEXT)", ()).await?;
@@ -76,8 +77,13 @@ async fn main() -> anyhow::Result<()> {
 				if (i + 1) % step == 0 {
 					if std::env::var("IDLE_CKPT").is_ok() {
 						let c = db.connect()?;
-						let r = match c.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await { Ok(mut rows) => rows.next().await.map(|r| r.map(|r| format!("{:?}", r.get_value(0)))), Err(e) => Err(e) };
-						if i + 1 == step { println!("idle checkpoint: {r:?}"); }
+						let r = match c.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await {
+							Ok(mut rows) => rows.next().await.map(|r| r.map(|r| format!("{:?}", r.get_value(0)))),
+							Err(e) => Err(e),
+						};
+						if i + 1 == step {
+							println!("idle checkpoint: {r:?}");
+						}
 					}
 					if std::env::var("REOPEN").is_ok() {
 						drop(db);
@@ -105,7 +111,9 @@ async fn main() -> anyhow::Result<()> {
 				conn.execute("PRAGMA journal_mode=experimental_mvcc", ()).await.ok();
 				conn.execute("CREATE TABLE IF NOT EXISTS m (ts INTEGER)", ()).await?;
 				let conn = db.connect()?;
-				if let Some(c) = &cache { conn.execute(&format!("PRAGMA cache_size={c}"), ()).await?; }
+				if let Some(c) = &cache {
+					conn.execute(&format!("PRAGMA cache_size={c}"), ()).await?;
+				}
 				match std::env::var("WORK").as_deref() {
 					Ok("none") => {}
 					Ok("read") => {
@@ -118,7 +126,9 @@ async fn main() -> anyhow::Result<()> {
 						conn.execute("COMMIT", ()).await?;
 					}
 				}
-				if keep { held.push(conn); }
+				if keep {
+					held.push(conn);
+				}
 				held_dbs(db);
 				if (i + 1) % step == 0 {
 					let a = anon_mb();

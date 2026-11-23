@@ -377,7 +377,7 @@ impl DatabaseStructure for Database {
 		tokio::task::yield_now().await;
 
 		conn_pool::register(&turso_db, conn_pool::Role::Legacy);
-			cache.insert(db_path.to_string(), turso_db.clone());
+		cache.insert(db_path.to_string(), turso_db.clone());
 		touch_cached(db_path);
 		drop(cache);
 		Ok((turso_db, true)) // Newly created

@@ -1607,11 +1607,7 @@ impl Database {
 	async fn scan_correlation_tables(conn: &cache::Connection) -> Result<(Vec<CorrelationID>, HashMap<String, std::result::Result<CorrelationRowData, String>>, ErrorRatesByCorrelation)> {
 		let mut order = Vec::new();
 		let mut rows_by_id: HashMap<String, std::result::Result<CorrelationRowData, String>> = HashMap::new();
-		let mut rows = conn
-			.as_ref()
-			.query("SELECT id, dictionary_id, subject_id, aspect_id, pattern_id, event_id, average_distance_value, average_distance_units FROM correlations", turso::params![])
-			.await
-			.map_err(|e| Error::DatabaseError(format!("Failed to query correlations: {e}")))?;
+		let mut rows = conn.as_ref().query("SELECT id, dictionary_id, subject_id, aspect_id, pattern_id, event_id, average_distance_value, average_distance_units FROM correlations", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query correlations: {e}")))?;
 		loop {
 			let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation row: {e}")))? else { break };
 			let Some(id_text) = row.get_value(0).ok().and_then(|v| v.as_text().cloned()) else { continue };
@@ -1622,11 +1618,7 @@ impl Database {
 		drop(rows);
 
 		let mut error_rates: ErrorRatesByCorrelation = HashMap::new();
-		let mut rows = conn
-			.as_ref()
-			.query("SELECT correlation_id, signal_type, error_rate_value, error_rate_units FROM correlation_error_rates", turso::params![])
-			.await
-			.map_err(|e| Error::DatabaseError(format!("Failed to query correlation error rates: {e}")))?;
+		let mut rows = conn.as_ref().query("SELECT correlation_id, signal_type, error_rate_value, error_rate_units FROM correlation_error_rates", turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query correlation error rates: {e}")))?;
 		loop {
 			let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get correlation error rate row: {e}")))? else { break };
 			let Some(correlation_id) = row.get_value(0).ok().and_then(|v| v.as_text().cloned()) else { continue };
@@ -2050,12 +2042,7 @@ mod tests {
 				error_rate.insert(SignalType::PredictEnd, ErrorRate::new(bigdecimal::BigDecimal::from(n * 3), splimes::Resolution::Milliseconds));
 			}
 			let average_distance = (n % 3 != 0).then(|| Distance::new(bigdecimal::BigDecimal::from(n), splimes::Resolution::Seconds));
-			Correlation::new(
-				Some(CorrelationID::from_uuid(uuid::Uuid::new_v4())),
-				CorrelationKeys { dictionary_id: DictionaryId::from_uuid(uuid::Uuid::new_v4()), subject_id, aspect_id, pattern_id, event_id: EventID::from_uuid(uuid::Uuid::new_v4()) },
-				error_rate,
-				average_distance,
-			)
+			Correlation::new(Some(CorrelationID::from_uuid(uuid::Uuid::new_v4())), CorrelationKeys { dictionary_id: DictionaryId::from_uuid(uuid::Uuid::new_v4()), subject_id, aspect_id, pattern_id, event_id: EventID::from_uuid(uuid::Uuid::new_v4()) }, error_rate, average_distance)
 		}
 
 		/// The bulk read returns what the per-id read returns, in the table's order, and the
@@ -2091,11 +2078,7 @@ mod tests {
 			}
 
 			let conn = <Database as crate::database::traits::connection::Connection>::begin_concurrent(&corr_db, &corr_path, None).await?;
-			for (sql, index) in [
-				("EXPLAIN QUERY PLAN SELECT id FROM correlations WHERE id = '00000000-0000-0000-0000-000000000000'", "idx_correlations_id"),
-				("EXPLAIN QUERY PLAN SELECT signal_type FROM correlation_error_rates WHERE correlation_id = 'x'", "idx_correlation_error_rates_correlation"),
-				("EXPLAIN QUERY PLAN SELECT size FROM correlation_occurrences WHERE correlation_id = 'x'", "idx_correlation_occurrences_correlation"),
-			] {
+			for (sql, index) in [("EXPLAIN QUERY PLAN SELECT id FROM correlations WHERE id = '00000000-0000-0000-0000-000000000000'", "idx_correlations_id"), ("EXPLAIN QUERY PLAN SELECT signal_type FROM correlation_error_rates WHERE correlation_id = 'x'", "idx_correlation_error_rates_correlation"), ("EXPLAIN QUERY PLAN SELECT size FROM correlation_occurrences WHERE correlation_id = 'x'", "idx_correlation_occurrences_correlation")] {
 				let mut rows = conn.as_ref().query(sql, turso::params![]).await?;
 				let mut plan = String::new();
 				while let Some(row) = turso::Rows::next(&mut rows).await? {
@@ -2144,12 +2127,7 @@ mod tests {
 			drop(rows);
 			assert_eq!(count, Some(0), "a correlation write copied occurrences");
 			for c in &inserted {
-				conn.as_ref()
-					.execute(
-						"INSERT INTO correlation_occurrences (correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp) VALUES (?, 0, ?, 'Seconds', 1, '{not json', ?, 0, 1)",
-						turso::params![c.id().to_string(), aspect_id.to_string(), c.pattern_id().to_string()],
-					)
-					.await?;
+				conn.as_ref().execute("INSERT INTO correlation_occurrences (correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp) VALUES (?, 0, ?, 'Seconds', 1, '{not json', ?, 0, 1)", turso::params![c.id().to_string(), aspect_id.to_string(), c.pattern_id().to_string()]).await?;
 			}
 			<Database as crate::database::traits::connection::Connection>::commit_concurrent(&conn).await?;
 			drop(conn);

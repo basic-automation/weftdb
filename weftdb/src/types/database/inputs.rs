@@ -2352,11 +2352,7 @@ impl Database {
 	async fn upsert_event_rows(conn: &Connection, event: &Event) -> Result<u64> {
 		let event_id = event.id().to_string();
 		let description = event.description().clone().unwrap_or_default();
-		let mut added = conn
-			.as_ref()
-			.execute("INSERT INTO events (id, name, description, created_at) SELECT ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM events WHERE id = ?)", turso::params![event_id.clone(), event.name().to_string(), description, chrono::Utc::now().timestamp_millis(), event_id.clone()])
-			.await
-			.map_err(|e| queue_write_error("Failed to insert unprocessed event", &e))?;
+		let mut added = conn.as_ref().execute("INSERT INTO events (id, name, description, created_at) SELECT ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM events WHERE id = ?)", turso::params![event_id.clone(), event.name().to_string(), description, chrono::Utc::now().timestamp_millis(), event_id.clone()]).await.map_err(|e| queue_write_error("Failed to insert unprocessed event", &e))?;
 
 		// Each stored manifestation of the event: its id and span. A detected span that is the
 		// same occurrence as a stored one (see [`crate::spans_coincide`]) widens it in place
@@ -2375,19 +2371,13 @@ impl Database {
 			if let Some((id, (_, held_start, held_end))) = same {
 				let (union_start, union_end) = ((*held_start).min(start), (*held_end).max(end));
 				if (union_start, union_end) != (*held_start, *held_end) {
-					conn.as_ref()
-						.execute("UPDATE event_manifestations SET start_timestamp = ?, end_timestamp = ? WHERE id = ? AND event_id = ?", turso::params![union_start, union_end, id.clone(), event_id.clone()])
-						.await
-						.map_err(|e| queue_write_error("Failed to widen unprocessed event manifestation", &e))?;
+					conn.as_ref().execute("UPDATE event_manifestations SET start_timestamp = ?, end_timestamp = ? WHERE id = ? AND event_id = ?", turso::params![union_start, union_end, id.clone(), event_id.clone()]).await.map_err(|e| queue_write_error("Failed to widen unprocessed event manifestation", &e))?;
 					(*held_start, *held_end) = (union_start, union_end);
 					added += 1;
 				}
 				continue;
 			}
-			conn.as_ref()
-				.execute("INSERT INTO event_manifestations (id, event_id, dataset_id, start_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?)", turso::params![manifestation_id.to_uuid().to_string(), event_id.clone(), dataset.clone(), start, end])
-				.await
-				.map_err(|e| queue_write_error("Failed to insert unprocessed event manifestation", &e))?;
+			conn.as_ref().execute("INSERT INTO event_manifestations (id, event_id, dataset_id, start_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?)", turso::params![manifestation_id.to_uuid().to_string(), event_id.clone(), dataset.clone(), start, end]).await.map_err(|e| queue_write_error("Failed to insert unprocessed event manifestation", &e))?;
 			held.push((manifestation_id.to_uuid().to_string(), (dataset, start, end)));
 			added += 1;
 		}
@@ -2450,11 +2440,7 @@ impl Database {
 				continue; // One row, every occurrence once: nothing to merge.
 			}
 			// One event under its stable id when several ids share the name; the one id otherwise.
-			let target = if fragmented {
-				EventID::for_name(aspect_id.as_uuid(), &name)
-			} else {
-				EventID::from_uuid(uuid::Uuid::parse_str(ids[0]).map_err(|e| anyhow::anyhow!("Invalid event id {}: {e}", ids[0]))?)
-			};
+			let target = if fragmented { EventID::for_name(aspect_id.as_uuid(), &name) } else { EventID::from_uuid(uuid::Uuid::parse_str(ids[0]).map_err(|e| anyhow::anyhow!("Invalid event id {}: {e}", ids[0]))?) };
 			let description = rows.iter().map(|(_, (_, d, _))| d.as_str()).find(|d| !d.is_empty()).unwrap_or_default().to_string();
 			let created_at = rows.iter().map(|(_, (_, _, c))| *c).min().unwrap_or_default();
 			// Each occurrence under the first id seen for it, or its stable id when re-keyed.

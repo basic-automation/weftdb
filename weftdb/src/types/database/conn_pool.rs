@@ -21,8 +21,7 @@
 //! share connections.
 
 use std::{
-	collections::HashMap,
-	sync::{Arc, LazyLock, Mutex, PoisonError},
+	collections::HashMap, sync::{Arc, LazyLock, Mutex, PoisonError}
 };
 
 /// Idle connections kept per database by default. More concurrent transactions than this on
