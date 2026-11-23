@@ -9452,3 +9452,32 @@ the issue tells you to apply to the old one.
 reference drive at L120, marked `*(owner)*`, and a local `cargo run`, which this host does not do); no
 `bench/claims.json` entry; no `weft-xbench` change (the nightly routine loop's lane, open PR #842); no
 `CHANGELOG.md` entry (nothing user-visible changed).
+
+## 2026-11-22 — B-object is absent; the freeze blocks it; defer to post-1.0 (#363)
+
+**Context.** Issue #363 "B-object (Phase 4 · absent)" from the predecessor backlog asks whether
+WeftDB has a schemaless object/annotation store beside numeric aspects. The audit
+(`docs/research/object-store-audit.md`) confirms:
+
+- **Nothing covers it.** Every `PhysicalType` variant (`weft-physical-type/src/lib.rs:161-200`)
+  is numeric (F64, F32, ScaledI64, ScaledI128, Decimal128, BigDecimalText).
+  `BigDecimalText` is an exactness escape hatch for decimal values, not a type escape hatch:
+  `parse_decimal` (`weft-physical-type/src/lib.rs:438`) rejects non-decimal text.
+- **No string/JSON/blob route path.** Every ingest point value is lifted through
+  `parse_decimal` to `BigDecimal` (`weft-server/src/ingest.rs:960,1042`). The segment frame
+  format has no non-numeric column model.
+- **The freeze blocks adding one.** Issue #238 ("Public surface declared and frozen", Phase 18
+  — Release candidate) prohibits new routes and JSON schema changes. B-object needs at minimum
+  a write route and a read route.
+- **Phase label reconciled.** Issue body says "Phase 4"; `ROADMAP.md:319` puts it under Phase 28
+  (Analytics premium); `docs/roadmap-notes.md` had "Phase 4 · absent". Corrected to Phase 28.
+
+**Chosen: defer to post-1.0, file no follow-ups, keep the box unchecked.**
+
+No implementation issues filed: creating fictionally actionable backlog items during the freeze
+would be speculative. The audit doc records the gap and recommends the post-1.0 re-evaluation
+scope a complete feature umbrella.
+
+**Needs human.** Whether the project wants object storage at all post-1.0, and whether it
+should be a new crate (`weft-object`) or a widened weft-physical-type. The audit doc recommends
+the crate path.

@@ -89,12 +89,11 @@ jobs:
       # a cache and printed `Checked 7 crates`, with `weft-bench` never linted at all, and
       # the same tree then failed clippy on a cold runner (#635). This step makes every
       # workspace crate dirty and lints the lot, so the lints the cached gate cannot see
-      # are at least named. Report-only on purpose: the first runs are expected to list
-      # real defects, and a gate that goes red for pre-existing ones stops being a signal.
-      # When this step reports zero errors and full coverage, delete `continue-on-error`
-      # and promote it to the gate, which is the actual fix for #635.
-      - name: Cold re-lint (report only, #635)
-        continue-on-error: true
+      # are at least named. Promoted to the gate 2026-11-22: run #1400 confirmed the
+      # step reports full coverage (11 of 11) with zero errors, so it now fails the job
+      # on a clippy failure, incomplete coverage, or any error line — which is the
+      # actual fix for #635.
+      - name: Cold re-lint (#635)
         shell: bash
         env:
           RUSTFLAGS: ""
@@ -108,13 +107,21 @@ jobs:
           checked=$(grep -c '^ *Checking ' /tmp/relint.log || true)
           errors=$(grep -c '^error' /tmp/relint.log || true)
           echo "cold re-lint: $checked of $expected workspace crates compiled, clippy exit $status, $errors error lines"
+          failed=0
+          if [ "$status" -ne 0 ]; then
+            echo "::error::cold re-lint clippy exited $status"
+            failed=1
+          fi
           if [ "$checked" -lt "$expected" ]; then
-            echo "::warning::cold re-lint compiled $checked of $expected workspace crates; something is still skipping the lint pass"
+            echo "::error::cold re-lint compiled $checked of $expected workspace crates; something is still skipping the lint pass"
+            failed=1
           fi
           if [ "$errors" -gt 0 ]; then
-            echo "::warning::cold re-lint found $errors error lines that the cached gate above did not see"
+            echo "::error::cold re-lint found $errors error lines that the cached gate above did not see"
             grep '^error' /tmp/relint.log | head -n 40
+            failed=1
           fi
+          exit "$failed"
 
   # Every performance figure in the README is vouched for by an entry in
   # bench/claims.json, which names the bench or the local corpus behind it and says

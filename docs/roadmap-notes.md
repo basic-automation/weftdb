@@ -462,7 +462,8 @@ The interpolation item (B-interp, Phase 5) is done.
 - **B-poll / B-retry / B-register** *(Phase 23 · absent — see docs/research/client-poll-retry-register-audit.md; all three are not needed or already present)*
 - **B-analysis** *(Phase 4/9 · verify)*
   - 2026-11-22: wiring audit produced (`docs/research/per-point-analysis-wiring.md`) — **not wired** end-to-end: no producer on any product path (`Batch::process()` is called only from `weft-orchestration` and two `weftdb` tests; `process_batches()` has zero call sites), never persisted and every read path resets it (`BatchedMeasurement::new` fixes `analysis: None`), no `weft-server` surface, and the `trend` half has no producer. Defects filed as #862/#863; the `ROADMAP.md` line stays unchecked (#362)
-- **B-object** *(Phase 4 · absent)*
+- **B-object** *(Phase 28 · absent)*
+  - 2026-11-22: object-store audit produced (`docs/research/object-store-audit.md`) — **does not exist** anywhere in the codebase; every PhysicalType variant is numeric, every ingest path parses BigDecimal, the segment frame has no non-numeric column model, and the HTTP surface has no object/annotation route. The freeze (#238, Phase 18) blocks adding routes. Defer to post-1.0; the ROADMAP.md line stays unchecked (#363). Label corrected from Phase 4 to Phase 28 to match the live ROADMAP.md position.
 - **B-windows** *(Phase 9 · absent/partial)*
 - **B-dedup** *(Phase 7 · partial)*
 - **B-sim** *(Phase 9 · partial)*
