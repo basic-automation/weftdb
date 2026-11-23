@@ -20,6 +20,12 @@ ignore = [
     # with `error[unexpected-keys]: found 1 unexpected keys, expected: ["id", "reason"]`,
     # which is why the exception was documentation-only until #794 bumped the pin.
     { id = "RUSTSEC-2026-0543", reason = "unmaintained, no upgrade path: chrono 0.4.45 is the newest release and arrow 60.1.0 requires chrono ^0.4.40; moving to time or jiff is #791", expiry = "2027-01-31" },
+    # RUSTSEC-2026-0595 (2026-11-23): parquet writes bloom filters in plaintext inside
+    # encrypted files. No crate here enables parquet's `encryption` feature (workspace pin
+    # uses ["arrow", "snap"], weft-xbench ["arrow", "snap", "zstd"]), so no encrypted
+    # file is ever written. Patched in parquet 60.2.0; weft-xbench pins =60.0.0, so the
+    # exception buys time for that bump rather than living on.
+    { id = "RUSTSEC-2026-0595", reason = "unsound only for encrypted Parquet writes; no crate enables parquet's encryption feature; bump to parquet >= 60.2.0 (weft-xbench pins =60.0.0)", expiry = "2026-12-31" },
 ]
 
 # An ignore that stops matching is a bug, not a free pass: the entry is stale, the

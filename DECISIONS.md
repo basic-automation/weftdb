@@ -9334,6 +9334,31 @@ specified and that does not match the product's architecture. No code is missing
 is an accurate record of a feature that was never needed. Filing follow-ups for "not needed"
 findings would be editorial noise. The audit doc (`docs/research/client-poll-retry-register-audit.md`)
 records the evidence.
+## 2026-11-22 — ILP writer lives in `weft-line-protocol`, not a connector crate (#866)
+
+**The item asked: add an ILP writer so `LineRecord` can produce wire form, not only parse it.**
+The writer was added in the parser crate rather than a future connector crate (#867) because it
+shares escaping helpers with the parser and must round-trip against the exact dialect the parser
+accepts; a separate crate would duplicate the escaping logic and drift. The writer widens the
+published `weft-line-protocol` API while the public-surface freeze (#238) is still open. This is
+accepted because the freeze covers the *interface* (the record types and parse functions already
+shipped) and the writer is additive — it does not change any existing signature.
+
+**Guarantees.** The writer guarantees that every `LineRecord` parsed from a valid input line can
+be written back to a string that, when parsed again, yields an identical record — with the one
+exception recorded at the end of this paragraph. The output uses
+canonical forms: booleans as `t`/`f`, the shortest round-trip `f64` display, integers with `i`,
+unsigned with `u`, strings double-quoted with backslash escapes. Where the parser is broader
+than the published InfluxDB spec (boolean tokens `T`/`TRUE`/`True`/`F`/`FALSE`/`False`, raw
+`NaN`/`inf` floats), the writer emits only the canonical subset, and records containing non-finite
+floats are written as the `Display` of their `f64` (`NaN`, `inf`, `-inf`). The text round-trips;
+the **equality** half of the guarantee does not hold for `NaN`, because `FieldValue` derives
+`PartialEq` and `f64::NAN != f64::NAN`: a record carrying `NaN` re-parses to a record that is not
+`==` to the one written. `inf` and `-inf` do compare equal. The test
+`non_finite_floats_keep_their_text_but_not_their_equality` pins both halves. Neither value can reach
+storage in any case, because `parse_points` refuses a non-finite named field (ROB-7), so the
+caveat is confined to records that never leave the caller.
+
 ## 2026-11-22 — The cached-connection audit answers its roadmap line without ticking it (#369)
 
 **Question.** "Complete the cached-connection migration" (`ROADMAP.md`) presumes a migration that
@@ -9406,6 +9431,24 @@ describing this very incident, so a CI rule on headings would fail honest write-
 the rule exists to stop. A gate that fails legitimate prose gets routed around by a blanket exemption
 nobody re-reads, so the heading rule stays a review rule and the filename rule — which has no
 legitimate counter-use — is the one CI enforces.
+
+## 2026-11-21 — What TSBS's tag-grouped queries mean in `weft-xbench`, and what answers them first (TAG-12, #341)
+
+**Ambiguous.** The TAG-12 line names "TSBS tag-grouped query suite" and lists `single-groupby-*`, `double-groupby-*`, `lastpoint` and `high-cpu-*`. TSBS's README describes `single-groupby` as a MAX "every 5 mins", while the SQL TSBS generates buckets by one minute; and the line does not say how an engine's answer is judged.
+
+**Chosen.**
+
+- **TSBS's generated queries are the definition, not its README.** `single-groupby-M-H-T` is the MAX of the first `M` of TSBS's `cpuMetrics` over `H` named hosts per **one-minute** bucket in a half-open `[start, end)` window. Every generator read agrees: TimescaleDB `time_bucket('60 seconds', time)`, ClickHouse `toStartOfMinute`, InfluxDB `group by time(1m)`, QuestDB `SAMPLE BY 1m`. The README mismatch is [timescale/tsbs#214](https://github.com/timescale/tsbs/issues/214), open since 2022. Only the six variants TSBS registers (`1-1-1`, `1-1-12`, `1-8-1`, `5-1-1`, `5-1-12`, `5-8-1`) are named.
+- **An in-process reference judges every engine.** `tsbs::TsbsCpu` answers each query from the parsed file. TSBS picks hosts and windows from its own seed, so the caller passes the ones a generated query names, and the reference and the engine answer the same question. There is no ground truth beyond this, as with the `tsbs` interpolation datasets (2026-10-31).
+- **The fields stay TSBS's integers.** `load_cpu` refuses a float, unsigned, boolean or string field instead of converting it, so the reference is exact by construction and WeftDB stores the values as `ScaledI64` at scale 0 with no lossy step.
+- **WeftDB answers first, untimed.** `TsbsWeft` stores one aspect per metric and one series per `hostname` and answers from `downsample_range_of` (MAX per minute) and whole-series reads (`lastpoint`). A timed phase, the report and other engines come after the answers are pinned equal.
+
+**Rejected.**
+
+- The README's five-minute buckets: no engine TSBS benchmarks would run that query.
+- Timing first and checking later: a fast wrong answer is the failure this harness exists to catch.
+- Running TSBS's Go query generator in CI for the reference: the reference is twenty lines of Rust over data the tests already build, and the nightly does not carry a Go toolchain (2026-10-31).
+
 ## 2026-11-22 — A doc comment that says a shipped feature is absent is its own defect (#860, TAG-12 residual)
 
 **Ambiguity.** `weft-bench/src/fan_out.rs` opened with "On `main` `git grep -l fan-out` matches only
@@ -9481,3 +9524,20 @@ scope a complete feature umbrella.
 **Needs human.** Whether the project wants object storage at all post-1.0, and whether it
 should be a new crate (`weft-object`) or a widened weft-physical-type. The audit doc recommends
 the crate path.
+
+## 2026-11-23 — How the TSBS query phase draws, warms and times its queries (TAG-12, #341)
+
+**Ambiguous.** The TAG-12 sub-item asks for "a timed `weft-xbench` TSBS-query phase with the reference gate in the report". It does not say which hosts and windows a timed rep asks for, whether reps repeat one question or ask new ones, what counts as warm-up, how much of the TSBS file the phase reads, or what `combine` does with the result.
+
+**Chosen.**
+
+- **Instances are drawn as `tsbs_generate_queries` draws them, from our own seed.** Hosts are a uniformly random subset of distinct hosts (`getRandomHosts` → `GetRandomSubsetPerm` in `cmd/tsbs_generate_queries/uses/devops/common.go`), and the window's start is uniform in `[first, end − window)` at nanosecond granularity, `end = start + window` (`TimeInterval.RandWindow` in `internal/utils/time_interval.go`). The seed is `weft-xbench`'s `--seed`, one stream per query type, so the instances are reproducible but are not the same instances a TSBS query file with the same seed would hold (Go's `math/rand` stream is not reproduced).
+- **Each timed rep answers a different instance**, as `tsbs_run_queries` runs a file of generated queries once each. With its defaults (`--burn-in 0`, `--workers 1`, `--prewarm-queries false`, `pkg/query/benchmarker.go`) TSBS times every query once. The phase answers one extra instance untimed first, as a burn-in of one, so the first timed rep does not alone pay whatever the store defers to its first read after a load. That reason is a precaution, not a measured effect.
+- **The gate runs outside the timed span**, on every instance, and a query type passes only when every instance equals the reference. A failure fails the run (`all_correct`), and the report flags it as any other gate failure does.
+- **The phase reads the whole `--tsbs` file**, whatever `--scales` says. TSBS draws its windows over the generator's whole interval, and the tiny scale's hour has no 12-hour window in it.
+- **`combine` refuses reports that carry TSBS query results** rather than pooling them. Carrying run 1's results alone would present one run as the pool, and pooling needs the same instance draw in every run, which has not been designed.
+- **Report schema v9**: `tsbs_queries` is a new top-level list, not a new `Phase` of `ArmResult`. An `ArmResult` is shaped around one dataset's grid (input points, missingness, accuracy against ground truth), none of which a TSBS query has.
+
+**Rejected.** Reusing one instance for every rep (it would time a cache, not TSBS's workload); TSBS's `--prewarm-queries` cold/warm pair (no cold hook is wired to this phase yet); timing the reference (it is the gate, not an engine).
+
+**Not decided here.** `lastpoint` reads every series' whole range, because `SegmentStore` has no per-series latest-row read (`read.rs` exposes range, point and downsample reads; `aspect_stats` has an aspect-wide time range only). TSBS's TimescaleDB `lastpoint` is a `LATERAL … ORDER BY time DESC LIMIT 1` per tag set. Whether WeftDB gets a latest-row read is an engine change and needs a benchmark behind it, so it is a ROADMAP sub-item, not part of this phase.

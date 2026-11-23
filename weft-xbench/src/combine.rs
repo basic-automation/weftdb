@@ -35,6 +35,8 @@ const fn bootstrap_seed(seed: u64) -> u64 {
 /// Fewer than two runs, runs that are not the same benchmark, or a result without raw samples.
 pub fn combine(runs: &[XbenchReport], sources: Vec<InputFile>) -> anyhow::Result<XbenchReport> {
 	ensure!(runs.len() >= 2, "combining needs at least two runs, got {}", runs.len());
+	// Pooling TSBS query timings is not built yet; carrying run 1's alone would pass one run off as the pool.
+	ensure!(runs.iter().all(|r| r.tsbs_queries.is_empty()), "combine does not pool TSBS query results (`--tsbs-queries`) yet; render each run on its own");
 	let first = &runs[0];
 	for (n, run) in runs.iter().enumerate().skip(1) {
 		let (a, b) = (&first.metadata, &run.metadata);
@@ -123,7 +125,7 @@ mod tests {
 	}
 
 	fn run(level: u64, digest: &str) -> XbenchReport {
-		XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata: RunMetadata::capture("2026-11-02T00:00:00Z".into()), engines: vec![], seed: 7, source_commit: None, invocation: vec![], scratch_dir: None, optimized: Some(true), cold_hook: None, results: vec![result(level, digest)], inputs: vec![], binary_sha256: None, containers: vec![], combined_from: vec![] }
+		XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata: RunMetadata::capture("2026-11-02T00:00:00Z".into()), engines: vec![], seed: 7, source_commit: None, invocation: vec![], scratch_dir: None, optimized: Some(true), cold_hook: None, results: vec![result(level, digest)], inputs: vec![], binary_sha256: None, containers: vec![], combined_from: vec![], tsbs_queries: vec![] }
 	}
 
 	#[test]
@@ -191,5 +193,13 @@ mod tests {
 		let mut no_samples = run(1_000, "a");
 		no_samples.results[0].samples_ns.clear();
 		assert!(combine(&[run(1_000, "a"), no_samples], vec![]).expect_err("needs samples").to_string().contains("v5"));
+	}
+
+	#[test]
+	fn runs_with_tsbs_query_results_are_refused_not_pooled_from_run_one() {
+		let mut with_queries = run(1_000, "a");
+		let (latency, latency_ci) = latency(&[1_000, 1_100], 7);
+		with_queries.tsbs_queries.push(crate::TsbsQueryResult { query: "lastpoint".into(), arm: "weftdb-store".into(), hosts: 10, readings: 100, reps: 2, latency, latency_ci, samples_ns: vec![1_000, 1_100], answer_rows: 20, mismatches: 0, passed: true });
+		assert!(combine(&[with_queries.clone(), with_queries], vec![]).expect_err("not pooled").to_string().contains("--tsbs-queries"));
 	}
 }
