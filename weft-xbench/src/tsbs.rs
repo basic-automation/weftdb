@@ -232,6 +232,98 @@ impl TsbsCpu {
 	pub fn lastpoint(&self) -> Vec<(&str, &CpuReading)> {
 		self.hosts.iter().filter_map(|(host, readings)| readings.last().map(|r| (host.as_str(), r))).collect()
 	}
+
+	/// The half-open span `[first, last + 1 ns)` the readings cover across every host, or `None`
+	/// when there are none.
+	#[must_use]
+	pub fn span(&self) -> Option<(i64, i64)> {
+		let first = self.hosts.values().filter_map(|r| r.first()).map(|r| r.ts_ns).min()?;
+		let last = self.hosts.values().filter_map(|r| r.last()).map(|r| r.ts_ns).max()?;
+		Some((first, last.saturating_add(1)))
+	}
+
+	/// `count` seeded instances of `query`, drawn the way `tsbs_generate_queries` draws them: the
+	/// named hosts are a uniformly random subset of distinct hosts (`getRandomHosts` in
+	/// `uses/devops/common.go`), and the window is `hours` long with its start uniform in
+	/// `[first, end - window)` at nanosecond granularity (`TimeInterval.RandWindow` in
+	/// `internal/utils/time_interval.go`), over the span the readings cover. A `lastpoint` instance
+	/// names every host and the whole span; TSBS's `lastpoint` takes no parameters, so its
+	/// instances are all the same question.
+	///
+	/// # Errors
+	///
+	/// No readings; more hosts asked for than the data holds; or a window not shorter than the span,
+	/// which TSBS refuses too.
+	pub fn instances(&self, query: TsbsQuery, count: usize, seed: u64) -> anyhow::Result<Vec<QueryInstance>> {
+		use rand::{RngExt as _, SeedableRng as _};
+
+		let (first, end) = self.span().ok_or_else(|| anyhow::anyhow!("no readings to draw {} instances from", query.name()))?;
+		let names: Vec<&String> = self.hosts.keys().collect();
+		let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+		match query {
+			TsbsQuery::SingleGroupby { hosts, hours, .. } => {
+				anyhow::ensure!(hosts <= names.len(), "{} names {hosts} hosts and the data holds {}", query.name(), names.len());
+				let window = i64::from(hours).saturating_mul(3_600_000_000_000);
+				let upper = end.saturating_sub(window);
+				anyhow::ensure!(upper > first, "{} needs a {hours}-hour window and the data spans {} s", query.name(), (end - first) / 1_000_000_000);
+				Ok((0..count)
+					.map(|_| {
+						let picked = rand::seq::index::sample(&mut rng, names.len(), hosts).into_iter().map(|i| names[i].clone()).collect();
+						let start_ns = first + rng.random_range(0..upper - first);
+						QueryInstance { hosts: picked, start_ns, end_ns: start_ns + window }
+					})
+					.collect())
+			}
+			TsbsQuery::Lastpoint => Ok(vec![QueryInstance { hosts: names.into_iter().cloned().collect(), start_ns: first, end_ns: end }; count]),
+		}
+	}
+
+	/// The reference answer to one instance of `query`.
+	///
+	/// # Errors
+	///
+	/// As [`Self::single_groupby`].
+	pub fn answer(&self, query: TsbsQuery, instance: &QueryInstance) -> anyhow::Result<TsbsAnswer> {
+		match query {
+			TsbsQuery::SingleGroupby { metrics, .. } => {
+				let hosts: Vec<&str> = instance.hosts.iter().map(String::as_str).collect();
+				Ok(TsbsAnswer::Minutes(self.single_groupby(metrics, &hosts, instance.start_ns, instance.end_ns)?))
+			}
+			TsbsQuery::Lastpoint => Ok(TsbsAnswer::Latest(self.lastpoint().into_iter().map(|(h, r)| (h.to_string(), r.clone())).collect())),
+		}
+	}
+}
+
+/// One generated instance of a [`TsbsQuery`]: the hosts it names and its half-open window, as one
+/// line of a `tsbs_generate_queries` file would carry them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryInstance {
+	/// The `hostname` tags the query names, in the order drawn.
+	pub hosts: Vec<String>,
+	/// The window's start, in nanoseconds since the Unix epoch (inclusive).
+	pub start_ns: i64,
+	/// The window's end (exclusive).
+	pub end_ns: i64,
+}
+
+/// An answer to one [`QueryInstance`], from the reference or from an engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TsbsAnswer {
+	/// A `single-groupby`: one row per one-minute bucket.
+	Minutes(Vec<MinuteMax>),
+	/// A `lastpoint`: one row per host, in name order.
+	Latest(Vec<(String, CpuReading)>),
+}
+
+impl TsbsAnswer {
+	/// How many rows the answer holds.
+	#[must_use]
+	pub const fn rows(&self) -> usize {
+		match self {
+			Self::Minutes(rows) => rows.len(),
+			Self::Latest(rows) => rows.len(),
+		}
+	}
 }
 
 /// Read every host's `cpu` readings from the TSBS file at `path`, up to `span_secs` after the
@@ -399,6 +491,46 @@ cpu,hostname=host_1,region=us-west-1 usage_user=83i,usage_system=12i 14516064200
 		let last: Vec<(&str, i64, i64)> = cpu.lastpoint().into_iter().map(|(h, r)| (h, r.ts_ns, r.values[0])).collect();
 		let t5 = 1_451_606_400_000_000_000 + 5 * 30_000_000_000;
 		assert_eq!(last, [("host_0", t5, 5), ("host_10", t5, 25), ("host_2", t5, 15)]);
+	}
+
+	#[test]
+	fn instances_draw_distinct_hosts_and_a_window_inside_the_span_as_tsbs_does() {
+		use std::fmt::Write as _;
+
+		let cpu = load_cpu_from_reader(cpu_sample().as_bytes(), 3600).expect("reads");
+		let (first, end) = cpu.span().expect("has readings");
+		assert_eq!((first, end), (1_451_606_400_000_000_000, 1_451_606_400_000_000_000 + 150_000_000_001));
+		// The sample spans 150 s, so a one-hour window does not fit: TSBS refuses that too.
+		assert!(cpu.instances(TsbsQuery::SingleGroupby { metrics: 1, hosts: 1, hours: 1 }, 3, 7).expect_err("too short").to_string().contains("1-hour window"));
+		let mut long = String::new();
+		for step in 0..200_i64 {
+			for host in ["host_0", "host_1", "host_2", "host_3"] {
+				let fields: Vec<String> = CPU_METRICS.iter().map(|m| format!("{m}={step}i")).collect();
+				writeln!(long, "cpu,hostname={host} {} {}", fields.join(","), 1_451_606_400_000_000_000 + step * 60_000_000_000).expect("writes to a String");
+			}
+		}
+		let cpu = load_cpu_from_reader(long.as_bytes(), 86_400).expect("reads");
+		let (first, end) = cpu.span().expect("has readings");
+		let query = TsbsQuery::SingleGroupby { metrics: 5, hosts: 3, hours: 1 };
+		let drawn = cpu.instances(query, 50, 7).expect("draws");
+		assert_eq!(drawn, cpu.instances(query, 50, 7).expect("draws"), "seeded");
+		assert_ne!(drawn, cpu.instances(query, 50, 8).expect("draws"), "another seed, other instances");
+		for i in &drawn {
+			assert_eq!(i.end_ns - i.start_ns, 3_600_000_000_000);
+			assert!(i.start_ns >= first && i.end_ns <= end, "{i:?} inside [{first}, {end})");
+			let distinct: BTreeSet<&String> = i.hosts.iter().collect();
+			assert_eq!((i.hosts.len(), distinct.len()), (3, 3), "{i:?}");
+			assert!(i.hosts.iter().all(|h| cpu.hosts.contains_key(h)));
+		}
+		assert!(drawn.iter().map(|i| i.start_ns).collect::<BTreeSet<_>>().len() > 40, "starts are drawn, not fixed");
+		assert!(cpu.instances(TsbsQuery::SingleGroupby { metrics: 1, hosts: 5, hours: 1 }, 1, 7).expect_err("five of four").to_string().contains("holds 4"));
+		let last = cpu.instances(TsbsQuery::Lastpoint, 2, 7).expect("draws");
+		assert_eq!(last[0], last[1]);
+		assert_eq!(last[0].hosts, ["host_0", "host_1", "host_2", "host_3"]);
+		let TsbsAnswer::Latest(rows) = cpu.answer(TsbsQuery::Lastpoint, &last[0]).expect("answers") else { panic!("a lastpoint answer") };
+		assert_eq!(rows.iter().map(|(_, r)| r.values[0]).collect::<Vec<_>>(), [199, 199, 199, 199]);
+		let answer = cpu.answer(query, &drawn[0]).expect("answers");
+		assert_eq!(answer.rows(), 60, "a one-hour window over one reading a minute is sixty buckets");
 	}
 
 	#[test]

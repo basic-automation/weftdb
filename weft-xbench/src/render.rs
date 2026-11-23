@@ -36,7 +36,7 @@ const FEW_REPS: usize = 10;
 
 /// Workloads and engines outside this benchmark, listed in every report so a reader does not take
 /// silence for coverage.
-const NOT_IN_SCOPE: [&str; 7] = ["TSBS's query suite (`cpu-max-all`, `high-cpu`, `groupby-orderby-limit`, `lastpoint` and the rest): those queries group many hosts' series by tag, which WeftDB stores only once tagged ingest lands (TAG-11); the `tsbs` datasets run TSBS's data through this benchmark's own phases, one host at a time.", "Gap fill, point and range reads: measured by `weft-bench` against WeftDB's own baselines, not against another engine.", "Spline (quadratic, cubic) reconstruction: none of DuckDB, ClickHouse, TimescaleDB, QuestDB, InfluxDB 3 and IoTDB has a built-in spline in the SQL these arms use (IoTDB's optional UDF library has one for its tree model, not loaded here), so only linear interpolation is compared.", "Concurrent ingest and query, many series, and long-running behaviour: covered by the soak harness, not by this report.", "Enterprise editions of QuestDB and InfluxDB 3 are excluded by their licences (see WILLINGNESS-TO-PAY.md).", "kdb+ and AVEVA PI: their licences bar benchmarking or publishing results without written consent.", "GPU backends: every arm runs splimes' automatic backend selection; GPU-specific tuning is a separate report."];
+const NOT_IN_SCOPE: [&str; 7] = ["TSBS's query suite against the other engines, and its `double-groupby`, `high-cpu`, `cpu-max-all` and `groupby-orderby-limit` queries: `--tsbs-queries` times only WeftDB's answers to `single-groupby` and `lastpoint`, each gated against an in-memory reference. The `tsbs` datasets run TSBS's data through this benchmark's own phases, one host at a time.", "Gap fill, point and range reads: measured by `weft-bench` against WeftDB's own baselines, not against another engine.", "Spline (quadratic, cubic) reconstruction: none of DuckDB, ClickHouse, TimescaleDB, QuestDB, InfluxDB 3 and IoTDB has a built-in spline in the SQL these arms use (IoTDB's optional UDF library has one for its tree model, not loaded here), so only linear interpolation is compared.", "Concurrent ingest and query, many series, and long-running behaviour: covered by the soak harness, not by this report.", "Enterprise editions of QuestDB and InfluxDB 3 are excluded by their licences (see WILLINGNESS-TO-PAY.md).", "kdb+ and AVEVA PI: their licences bar benchmarking or publishing results without written consent.", "GPU backends: every arm runs splimes' automatic backend selection; GPU-specific tuning is a separate report."];
 
 /// How one WeftDB arm compares with the fastest other engine on one dataset and phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,6 +237,24 @@ fn results_section(report: &XbenchReport, b: &mut Vec<Block>) {
 		})
 		.collect();
 	b.push(Block::Table(["dataset", "phase", "arm", "class", "input", "p50 [CI]", "p95", "reps", "gate", "RMSE", "B/pt"].map(String::from).to_vec(), rows));
+}
+
+/// The TSBS query phase (`--tsbs-queries`), when it ran.
+fn tsbs_queries_section(report: &XbenchReport, b: &mut Vec<Block>) {
+	if report.tsbs_queries.is_empty() {
+		return;
+	}
+	b.push(Block::Heading(2, "TSBS queries".into()));
+	b.push(Block::Para("WeftDB alone, answering TSBS's tag-grouped devops queries over the whole `--tsbs` file, stored one series per host and metric, tagged `hostname`. Each rep answers a different seeded instance (random hosts and window, drawn as `tsbs_generate_queries` draws them), so these are not raced against another engine and make no comparison. The gate compares every answer with an in-memory reference outside the timed span. Latency in milliseconds.".into()));
+	let rows = report
+		.tsbs_queries
+		.iter()
+		.map(|q| {
+			let gate = if q.passed { "PASS".to_string() } else { format!("FAIL ({} of {} instances)", q.mismatches, q.reps) };
+			vec![q.query.clone(), q.arm.clone(), q.hosts.to_string(), q.readings.to_string(), ci(&q.latency_ci.p50), ms(q.latency.p95_ns), q.reps.to_string(), q.answer_rows.to_string(), gate]
+		})
+		.collect();
+	b.push(Block::Table(["query", "arm", "hosts", "readings", "p50 [CI]", "p95", "reps", "rows", "gate"].map(String::from).to_vec(), rows));
 }
 
 /// The interpolation classes and the native fills.
@@ -455,6 +473,7 @@ pub fn blocks(report: &XbenchReport) -> Vec<Block> {
 	let mut b = vec![Block::Heading(1, "WeftDB cross-engine benchmark".into())];
 	header_section(report, &mut b);
 	results_section(report, &mut b);
+	tsbs_queries_section(report, &mut b);
 	classes_section(report, &mut b);
 	honesty_section(report, &mut b);
 	not_tested_section(report, &mut b);
@@ -577,7 +596,7 @@ mod tests {
 	}
 
 	fn report(results: Vec<ArmResult>) -> XbenchReport {
-		XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata: RunMetadata::capture("2026-10-29T00:00:00Z".into()), engines: vec![], seed: 7, source_commit: Some("abc123".into()), invocation: vec!["weft-xbench".into(), "--scales".into(), "tiny".into()], scratch_dir: Some("/mnt/weftbench/tmp".into()), optimized: Some(true), cold_hook: None, results, inputs: Vec::new(), binary_sha256: None, containers: Vec::new(), combined_from: Vec::new() }
+		XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata: RunMetadata::capture("2026-10-29T00:00:00Z".into()), engines: vec![], seed: 7, source_commit: Some("abc123".into()), invocation: vec!["weft-xbench".into(), "--scales".into(), "tiny".into()], scratch_dir: Some("/mnt/weftbench/tmp".into()), optimized: Some(true), cold_hook: None, results, inputs: Vec::new(), binary_sha256: None, containers: Vec::new(), combined_from: Vec::new(), tsbs_queries: Vec::new() }
 	}
 
 	const FAST: [u64; 12] = [100, 101, 99, 100, 102, 98, 100, 101, 99, 100, 100, 101];
@@ -700,7 +719,7 @@ mod tests {
 	#[test]
 	fn tsbs_is_named_as_missing_or_carries_its_shape() {
 		let without = to_markdown(&blocks(&report(vec![])));
-		for needle in ["The `tsbs` datasets did not run (pass `--tsbs FILE`)", "TSBS's query suite", "tsbs_generate_data@8323e59"] {
+		for needle in ["The `tsbs` datasets did not run (pass `--tsbs FILE`)", "TSBS's query suite against the other engines", "tsbs_generate_data@8323e59"] {
 			assert!(without.contains(needle), "missing {needle:?} in\n{without}");
 		}
 		assert!(!without.contains("one host's (`host_0`)"), "no TSBS limitation without a TSBS dataset");
@@ -709,6 +728,19 @@ mod tests {
 		let with = to_markdown(&blocks(&report(vec![tsbs])));
 		assert!(with.contains("one host's (`host_0`) `usage_user`"), "{with}");
 		assert!(!with.contains("The `tsbs` datasets did not run"), "{with}");
+	}
+
+	#[test]
+	fn the_tsbs_query_table_shows_only_when_the_phase_ran_and_names_a_failure() {
+		assert!(!to_markdown(&blocks(&report(vec![]))).contains("## TSBS queries"));
+		let mut r = report(vec![]);
+		let (latency, latency_ci) = crate::latency(&FAST, 7);
+		let query = |name: &str, mismatches: usize| crate::TsbsQueryResult { query: name.into(), arm: "weftdb-store".into(), hosts: 10, readings: 604_810, reps: FAST.len(), latency: latency.clone(), latency_ci: latency_ci.clone(), samples_ns: FAST.to_vec(), answer_rows: 60, mismatches, passed: mismatches == 0 };
+		r.tsbs_queries = vec![query("single-groupby-1-1-1", 0), query("lastpoint", 2)];
+		let md = to_markdown(&blocks(&r));
+		assert!(md.contains("## TSBS queries") && md.contains("| single-groupby-1-1-1 | weftdb-store | 10 | 604810 |"), "{md}");
+		assert!(md.contains(&format!("FAIL (2 of {} instances)", FAST.len())), "{md}");
+		assert!(md.contains("At least one result failed its correctness gate"), "a failed TSBS query flags the report: {md}");
 	}
 
 	#[test]

@@ -88,7 +88,10 @@ use weft_bench::{
 /// v8 (#516) adds each gate's `indeterminate`: a digest disagreement where every run stayed inside
 /// its tolerance is non-determinism, not a wrong answer and not a failure. The combined gate's
 /// `passed` stays false to keep the row out of verdicts.
-pub const XBENCH_SCHEMA_VERSION: u32 = 8;
+///
+/// v9 (TAG-12, #341) adds `tsbs_queries`: WeftDB's timed answers to TSBS's tag-grouped devops
+/// queries (`--tsbs-queries`), each gated against the in-memory reference. Absent when empty.
+pub const XBENCH_SCHEMA_VERSION: u32 = 9;
 
 /// The reductions the downsample phase computes per bucket.
 pub const DOWNSAMPLE_AGGREGATIONS: [weft_reduce::Aggregation; 3] = [weft_reduce::Aggregation::Min, weft_reduce::Aggregation::Max, weft_reduce::Aggregation::Avg];
@@ -682,6 +685,41 @@ pub struct XbenchReport {
 	/// For a combined report, each pooled run's report file and its SHA-256 (v6); empty for one run.
 	#[serde(default)]
 	pub combined_from: Vec<InputFile>,
+	/// WeftDB's timed answers to TSBS's tag-grouped queries (`--tsbs-queries`, v9); empty when the
+	/// phase did not run.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub tsbs_queries: Vec<TsbsQueryResult>,
+}
+
+/// One TSBS query type, timed over its seeded instances against the WeftDB store (TAG-12, #341).
+///
+/// Each rep answers a different instance, as a `tsbs_run_queries` file of generated queries does,
+/// so the latency spans the hosts and windows drawn, not one cached question. Every answer is
+/// compared with [`tsbs::TsbsCpu::answer`] outside the timed span.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TsbsQueryResult {
+	/// The query type, as `tsbs_generate_queries --query-type` names it.
+	pub query: String,
+	/// The engine arm that answered (`weftdb-store` for now).
+	pub arm: String,
+	/// Hosts in the loaded data.
+	pub hosts: usize,
+	/// Readings loaded, across every host (each one ten field values).
+	pub readings: usize,
+	/// Timed instances.
+	pub reps: usize,
+	/// Latency distribution over the reps.
+	pub latency: LatencyStats,
+	/// Bootstrap confidence intervals for the latency.
+	pub latency_ci: LatencyCis,
+	/// Every timed rep, in nanoseconds and in the order taken.
+	pub samples_ns: Vec<u64>,
+	/// Rows returned across every instance.
+	pub answer_rows: usize,
+	/// Instances whose answer differed from the reference.
+	pub mismatches: usize,
+	/// Every instance answered as the reference does.
+	pub passed: bool,
 }
 
 /// A file the run read, as the run found it.
@@ -775,10 +813,10 @@ impl Container {
 }
 
 impl XbenchReport {
-	/// True when every interpolation result passed its correctness gate.
+	/// True when every interpolation result and every TSBS query passed its correctness gate.
 	#[must_use]
 	pub fn all_correct(&self) -> bool {
-		self.results.iter().filter_map(|r| r.correctness.as_ref()).all(|c| c.passed)
+		self.results.iter().filter_map(|r| r.correctness.as_ref()).all(|c| c.passed) && self.tsbs_queries.iter().all(|q| q.passed)
 	}
 }
 
@@ -1024,7 +1062,51 @@ pub async fn run(datasets: &[Dataset], servers: &Servers, protocol: &Protocol, m
 	if let Some(server) = &servers.iotdb {
 		engines.push(EngineVersion { engine: "iotdb".into(), version: server.version()? });
 	}
-	Ok(XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata, engines, seed: protocol.seed, source_commit, invocation, scratch_dir: Some(std::env::temp_dir().display().to_string()), optimized: Some(!cfg!(debug_assertions)), cold_hook: protocol.cold.as_ref().map(|c| c.hook.clone()), results, inputs: Vec::new(), binary_sha256: None, containers: Vec::new(), combined_from: Vec::new() })
+	Ok(XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata, engines, seed: protocol.seed, source_commit, invocation, scratch_dir: Some(std::env::temp_dir().display().to_string()), optimized: Some(!cfg!(debug_assertions)), cold_hook: protocol.cold.as_ref().map(|c| c.hook.clone()), results, inputs: Vec::new(), binary_sha256: None, containers: Vec::new(), combined_from: Vec::new(), tsbs_queries: Vec::new() })
+}
+
+/// Time WeftDB's answers to each of `queries` over `cpu`, loaded once into a tagged store.
+///
+/// The store is a [`weft::TsbsWeft`]. Each query type draws `reps + 1` seeded instances: the first
+/// is answered untimed as a warm-up, then each of the others is timed and then gated against the
+/// reference outside the timed span.
+///
+/// # Errors
+///
+/// If the store cannot be loaded, an instance cannot be drawn ([`tsbs::TsbsCpu::instances`]), or
+/// the store fails a query outright. A wrong answer is not an error; it fails that query's gate.
+pub async fn run_tsbs_queries(cpu: &tsbs::TsbsCpu, queries: &[tsbs::TsbsQuery], reps: usize, seed: u64) -> anyhow::Result<Vec<TsbsQueryResult>> {
+	run_tsbs_queries_against(cpu, cpu, queries, reps, seed).await
+}
+
+/// [`run_tsbs_queries`] with the store loaded from `loaded` and the answers gated against
+/// `reference`: the same data in a run, and different data in the test that the gate can fail.
+async fn run_tsbs_queries_against(loaded: &tsbs::TsbsCpu, reference: &tsbs::TsbsCpu, queries: &[tsbs::TsbsQuery], reps: usize, seed: u64) -> anyhow::Result<Vec<TsbsQueryResult>> {
+	anyhow::ensure!(reps > 0, "the TSBS query phase needs at least one rep");
+	let cpu = reference;
+	let store = weft::TsbsWeft::load(loaded).await?;
+	let mut out = Vec::with_capacity(queries.len());
+	for (q, &query) in queries.iter().enumerate() {
+		// One stream per query type, so adding a type does not redraw another's instances.
+		let instances = cpu.instances(query, reps + 1, seed.wrapping_add(u64::try_from(q)?.wrapping_mul(0x9E37_79B9_7F4A_7C15)))?;
+		let (warm, timed) = instances.split_first().ok_or_else(|| anyhow::anyhow!("no instance drawn for {}", query.name()))?;
+		store.answer(query, warm).await?;
+		let mut samples_ns = Vec::with_capacity(reps);
+		let (mut answer_rows, mut mismatches) = (0, 0);
+		for instance in timed {
+			let t0 = Instant::now();
+			let got = store.answer(query, instance).await?;
+			samples_ns.push(span_ns(t0));
+			answer_rows += got.rows();
+			if got != cpu.answer(query, instance)? {
+				mismatches += 1;
+			}
+		}
+		let (latency, latency_ci) = latency(&samples_ns, seed);
+		out.push(TsbsQueryResult { query: query.name(), arm: "weftdb-store".into(), hosts: cpu.hosts.len(), readings: cpu.len(), reps, latency, latency_ci, samples_ns, answer_rows, mismatches, passed: mismatches == 0 });
+	}
+	drop(store);
+	Ok(out)
 }
 
 #[cfg(test)]
@@ -1034,6 +1116,54 @@ mod tests {
 
 	use super::*;
 	use crate::weft::Arm;
+
+	/// `hosts` hosts with seeded integer readings every minute for thirteen hours from
+	/// 2016-01-01, long enough for TSBS's 12-hour windows.
+	fn tsbs_cpu(hosts: usize) -> tsbs::TsbsCpu {
+		let mut rng = ChaCha8Rng::seed_from_u64(341);
+		let mut cpu = tsbs::TsbsCpu::default();
+		for h in 0..hosts {
+			let readings = (0..780_i64).map(|step| tsbs::CpuReading { ts_ns: 1_451_606_400_000_000_000 + step * 60_000_000_000, values: std::array::from_fn(|_| rng.random_range(0..100)) }).collect();
+			cpu.hosts.insert(format!("host_{h}"), readings);
+		}
+		cpu
+	}
+
+	#[tokio::test]
+	async fn the_tsbs_query_phase_times_every_query_and_passes_on_the_same_data() {
+		let cpu = tsbs_cpu(9);
+		let results = run_tsbs_queries(&cpu, &tsbs::TsbsQuery::ALL, 3, 7).await.expect("runs");
+		assert_eq!(results.iter().map(|r| r.query.as_str()).collect::<Vec<_>>(), tsbs::TsbsQuery::ALL.map(tsbs::TsbsQuery::name));
+		for r in &results {
+			assert!(r.passed && r.mismatches == 0, "{}: {} mismatches", r.query, r.mismatches);
+			assert_eq!((r.reps, r.samples_ns.len(), r.hosts, r.readings), (3, 3, 9, 9 * 780), "{}", r.query);
+			assert!(r.answer_rows > 0, "{}: a real answer, not an empty one", r.query);
+		}
+		// lastpoint names every host in each of its three instances.
+		assert_eq!(results.last().map(|r| r.answer_rows), Some(3 * 9));
+	}
+
+	#[tokio::test]
+	async fn the_tsbs_query_gate_fails_an_answer_that_differs_from_the_reference() {
+		let loaded = tsbs_cpu(9);
+		let mut reference = loaded.clone();
+		// Every host's every reading is one higher in the reference: every MAX and every latest
+		// value differs, so every instance must count as a mismatch.
+		for readings in reference.hosts.values_mut() {
+			for r in readings {
+				r.values[0] += 1;
+			}
+		}
+		let queries = [tsbs::TsbsQuery::SingleGroupby { metrics: 1, hosts: 1, hours: 1 }, tsbs::TsbsQuery::Lastpoint];
+		let results = run_tsbs_queries_against(&loaded, &reference, &queries, 2, 7).await.expect("runs");
+		for r in &results {
+			assert!(!r.passed && r.mismatches == 2, "{}: passed {} with {} mismatches", r.query, r.passed, r.mismatches);
+		}
+		let mut report = XbenchReport { schema_version: XBENCH_SCHEMA_VERSION, metadata: RunMetadata::capture("2026-11-23T00:00:00Z".into()), engines: vec![], seed: 7, source_commit: None, invocation: vec![], scratch_dir: None, optimized: None, cold_hook: None, results: vec![], inputs: vec![], binary_sha256: None, containers: vec![], combined_from: vec![], tsbs_queries: vec![] };
+		assert!(report.all_correct());
+		report.tsbs_queries = results;
+		assert!(!report.all_correct(), "a failed TSBS query fails the run");
+	}
 
 	#[test]
 	fn a_container_is_described_with_its_secrets_redacted() {

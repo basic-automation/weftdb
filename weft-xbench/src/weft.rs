@@ -269,6 +269,22 @@ impl TsbsWeft {
 		}
 		Ok(out)
 	}
+
+	/// The store's answer to one instance of `query`, for comparison with
+	/// [`tsbs::TsbsCpu::answer`].
+	///
+	/// # Errors
+	///
+	/// As [`Self::single_groupby`] and [`Self::lastpoint`].
+	pub async fn answer(&self, query: tsbs::TsbsQuery, instance: &tsbs::QueryInstance) -> anyhow::Result<tsbs::TsbsAnswer> {
+		match query {
+			tsbs::TsbsQuery::SingleGroupby { metrics, .. } => {
+				let hosts: Vec<&str> = instance.hosts.iter().map(String::as_str).collect();
+				Ok(tsbs::TsbsAnswer::Minutes(self.single_groupby(metrics, &hosts, instance.start_ns, instance.end_ns).await?))
+			}
+			tsbs::TsbsQuery::Lastpoint => Ok(tsbs::TsbsAnswer::Latest(self.lastpoint().await?)),
+		}
+	}
 }
 
 /// WeftDB interpolating and reducing on read from a `SegmentStore`.
