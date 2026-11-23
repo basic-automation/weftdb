@@ -1,0 +1,227 @@
+# Float roundtrip A/B — serde_json `float_roundtrip` request-level comparison.
+#
+# Only runs when manually dispatched: the feature flip invalidates the dependency
+# cache, so the two arms cannot share one target directory. A full-workspace build
+# is what this workflow pays for, and it pays it once per arm instead of twice in
+# one job.
+#
+# History that shapes this file. Three dispatches of the one-job version ended with
+# `The runner has received a shutdown signal` and exit 143 while still compiling,
+# around the 11th minute, without ever reaching a timing loop; `CARGO_BUILD_JOBS=2`
+# roughly doubled the wall time of that cold build. Splitting the arms into two jobs
+# fixed the sharing problem but not the cold build: dispatch 43809114630 shows a
+# restore step of 1 second, a post step skipped on the failed arm, and the `on` arm
+# killed with exit 143 at 9m43s — still compiling. Three separate causes, each fixed
+# below and each verified against the repository rather than inferred:
+#
+# 1. The cache never landed. `Swatinem/rust-cache` at the pinned SHA has no
+#    `save-always` input (its inputs are prefix-key, shared-key, key, add-job-id-key
+#    and add-rust-environment-hash-key), so passing it did nothing: the action saves
+#    in a post step that is skipped when the job fails, and the job never got far
+#    enough to succeed. So the cold build is paid again every dispatch.
+# 2. The cold build is unusually expensive here. `[profile.bench]` sets `lto = true`
+#    and `codegen-units = 1` (`Cargo.toml:154-157`, matching `[profile.release]`), and
+#    the release profile's `debug = true` (`Cargo.toml:143`) comes through to bench.
+#    Fat LTO with one codegen unit over ~600 crates is what runs past the point where a
+#    hosted runner is reclaimed.
+# 3. The `off` arm never built anything: its guard grepped Cargo.toml for the bare
+#    token `float_roundtrip`, which the explanatory comment at `Cargo.toml:61` also
+#    contains, so a *successful* strip was reported as a failure.
+#
+# 1 and 3 are fixed outright. 2 is fixed for this workflow only, by overriding the
+# bench profile's LTO/codegen-units/debug in the job's environment: both arms run
+# under identical settings, so the A/B delta stays the answer, while the absolute
+# nanoseconds are those of a non-LTO build and are reported as such. The shipped
+# profiles in Cargo.toml are not touched. Bump the cache key below whenever that
+# override changes, so a target directory built under the old settings is not reused.
+#
+# The `off` arm strips the feature with sed in the job only. It is never committed,
+# and the step at the end proves it.
+
+name: float roundtrip A/B
+
+on:
+  workflow_dispatch:
+    inputs:
+      values:
+        description: Number of float values in the request body (default 20000)
+        required: false
+        default: "20000"
+      reps:
+        description: Timed repetitions after one untimed warm-up (default 20)
+        required: false
+        default: "20"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  arm:
+    name: float_roundtrip ${{ matrix.arm }}
+    strategy:
+      fail-fast: false
+      # Quoted on purpose: an unquoted `on`/`off` in YAML resolves to the booleans
+      # true/false, which would make the `matrix.arm == 'off'` guards never fire and
+      # quietly turn the A/B into two identical runs of the shipped configuration.
+      matrix:
+        arm: ["on", "off"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # Cause 2 above: a cold fat-LTO single-codegen-unit build of this graph does not
+    # survive a hosted runner. opt-level stays 3, because that is what the measurement
+    # depends on; LTO, codegen-units and debug info are build cost, not measurement
+    # cost, and both arms get the same treatment. Cargo.toml itself is untouched.
+    env:
+      CARGO_PROFILE_BENCH_LTO: "false"
+      CARGO_PROFILE_BENCH_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_BENCH_DEBUG: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Read the release toolchain
+        id: toolchain
+        shell: bash
+        run: echo "version=$(tr -d '[:space:]' < .github/release-toolchain)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
+      # Keyed per arm, because the two arms link different serde_json builds. There is
+      # no save-always here to ask for: this action's pinned version has no such input,
+      # which is why the cache never landed before. It saves when the job succeeds, so
+      # the point of the rest of this file is to let the job succeed.
+      - name: Cache the dependency graph for this arm
+        uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          key: float-ab-v2-${{ matrix.arm }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Strip float_roundtrip (in-job only — never committed)
+        if: matrix.arm == 'off'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i 's/features = \["float_roundtrip"\]/features = []/' Cargo.toml
+          # The guard has to name the dependency line, not the token: the comment at
+          # Cargo.toml:61 explains why the feature is on and mentions it by name, so a
+          # grep for the bare word matches a file that was stripped correctly.
+          if grep -q 'features = \["float_roundtrip"\]' Cargo.toml; then
+            echo "::error::sed did not strip float_roundtrip from the serde_json dependency"
+            grep -n 'serde_json' Cargo.toml
+            exit 1
+          fi
+          if git diff --quiet -- Cargo.toml; then
+            echo "::error::the strip changed nothing in Cargo.toml"
+            exit 1
+          fi
+          grep -n 'serde_json = ' Cargo.toml
+          echo "float_roundtrip stripped in-job for the off arm"
+          echo "(the comment at Cargo.toml:61 naming it is still there, on purpose)"
+
+      # The bench reads its size and repetition count from the environment, so the
+      # workflow inputs have to be exported or they do nothing. It is a hand-rolled
+      # timing loop, not criterion, so criterion flags would be ignored.
+      # Build and run are separate steps so that a log says which one the runner gave
+      # up in; a single step says only "still compiling or still running".
+      - name: Build the bench (cold on the first dispatch of a given key)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "profile: lto=${CARGO_PROFILE_BENCH_LTO} codegen-units=${CARGO_PROFILE_BENCH_CODEGEN_UNITS}"
+          echo "debug=${CARGO_PROFILE_BENCH_DEBUG}; opt-level stays 3 from Cargo.toml:154-157"
+          start=$SECONDS
+          cargo bench --no-run -p weft-server --bench json_body_cost 2>&1 | tail -40
+          echo "cold-or-warm build wall time: $((SECONDS - start))s"
+
+      # A tiny run first, through the same code path and the same built binary. The
+      # bench's assertion now prints the response envelope when the route refuses the
+      # body; at 100 000 values a refusal kills the step inside the timing loop, after
+      # the build has already cost minutes. Eight values cost milliseconds, so the
+      # message that explains a 400 is in the log before the expensive run begins.
+      - name: Smoke one tiny request through the same path
+        shell: bash
+        env:
+          WEFT_JBC_VALUES: "8"
+          WEFT_JBC_REPS: "1"
+        run: |
+          set -euo pipefail
+          cargo bench -p weft-server --bench json_body_cost 2>&1 | tail -20
+
+      - name: Time one whole interpolate request
+        id: bench
+        shell: bash
+        env:
+          WEFT_JBC_VALUES: ${{ inputs.values }}
+          WEFT_JBC_REPS: ${{ inputs.reps }}
+          ARM: ${{ matrix.arm }}
+        run: |
+          set -euo pipefail
+          cargo bench -p weft-server --bench json_body_cost 2>&1 | tee "bench-$ARM.txt"
+          echo "result=$(grep -m1 'ns/value=' "bench-$ARM.txt" || true)" >> "$GITHUB_OUTPUT"
+
+      # Run 43866691718 showed both arms panicking at the bench step with the
+      # same `400 invalid_json: Failed to buffer the request body: length limit
+      # exceeded` — the default 2 MB body limit on the interpolate route (only
+      # the ingest routes carry a custom DefaultBodyLimit). 100k values produce
+      # ~7 MB; the default is now 20k (~1.4 MB). If it fails again, re-run with
+      # backtrace and a tiny body to tell the failure mode from the body size.
+      - name: Diagnostic re-run on failure
+        if: failure() && steps.bench.outcome == 'failure'
+        shell: bash
+        env:
+          RUST_BACKTRACE: "full"
+          WEFT_JBC_VALUES: "8"
+          WEFT_JBC_REPS: "1"
+        run: |
+          set -euo pipefail
+          cargo bench -p weft-server --bench json_body_cost 2>&1 || true
+          echo "---"
+          echo "requested values: ${{ inputs.values }}; default now 20000 to stay inside axum's 2 MB body limit"
+          echo "body bytes for 1 value; ~70 bytes: $(echo -n '{"spline":"cubic","resolution":"seconds","start":"2020-01-01T00:00:00+00:00","end":"2020-01-01T00:00:00+00:00","points":[{"timestamp":"2020-01-01T00:00:00+00:00","value":0.0}]}' | wc -c)"
+
+      - name: Restore Cargo.toml (undo in-job strip)
+        if: always() && matrix.arm == 'off'
+        shell: bash
+        run: git checkout Cargo.toml
+
+      - name: Assert Cargo.toml was never committed stripped
+        if: always() && matrix.arm == 'off'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code -- Cargo.toml; then
+            echo "::error::Cargo.toml has unstaged changes after restore"
+            git diff Cargo.toml
+            exit 1
+          fi
+          if ! git diff --cached --exit-code -- Cargo.toml; then
+            echo "::error::Cargo.toml has staged changes after restore"
+            git diff --cached Cargo.toml
+            exit 1
+          fi
+          echo "Cargo.toml matches HEAD — the strip was in-job only"
+
+      - name: Publish this arm's numbers
+        if: always()
+        shell: bash
+        env:
+          ARM: ${{ matrix.arm }}
+          VALUES: ${{ inputs.values }}
+          REPS: ${{ inputs.reps }}
+        run: |
+          {
+            echo "## Float roundtrip A/B — arm \`$ARM\`"
+            echo ""
+            echo "values=$VALUES reps=$REPS"
+            echo ""
+            echo "Built with \`lto=$CARGO_PROFILE_BENCH_LTO\`, \`codegen-units=$CARGO_PROFILE_BENCH_CODEGEN_UNITS\` and"
+            echo "\`debug=$CARGO_PROFILE_BENCH_DEBUG\` at \`opt-level = 3\` — not the shipped \`[profile.bench]\`"
+            echo "(\`lto = true\`, \`codegen-units = 1\`), which a hosted runner does not finish compiling. Both arms"
+            echo "share those settings, so the delta is the answer; the absolute nanoseconds are a non-LTO build's."
+            echo '```'
+            cat "bench-$ARM.txt" 2>/dev/null || echo "(no bench output — this arm never reached the timing loop)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

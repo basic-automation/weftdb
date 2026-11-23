@@ -48,6 +48,15 @@ changed and writes full copies again when it next correlates; a signal step that
 before that correlation step finds no occurrences for them. Returning to v0.4.0 retires
 the copies again on its first correlation run.
 
+## Duplicate timestamps on seal-backed aspects (#802, SEAL-DUP)
+
+Aspect storage mode differences: **rows mode** stores every row at every timestamp; a
+range read returns all of them. **Seal-backed aspects** at a shared timestamp keep only
+the newest call's rows (duplicates inside one call are all kept). This is a behaviour
+change for any aspect that becomes seal-backed, because the rows mode they replaced
+appended. A migrating deployment whose workload depends on reading back multiple rows at
+the same timestamp must pin `WEFT_LEGACY_DEFAULT_STORAGE=rows` to stay in rows mode.
+
 ---
 
 ## Layout 1 → layout 2 (v0.1.0 → v0.2.0)
@@ -101,6 +110,18 @@ below.
 
 ### What happens to a layout-2 store opened by an older binary
 
+What continuous integration does and does not do with a released binary is worth stating
+here, because it bounds what the version table above has actually been measured against. The
+`pinned release archives` job in `.github/workflows/ci.yml` downloads the v0.1.0 archive for
+the runner's platform with `python3 scripts/compat/releases.py fetch --dest <dir> --extract`
+and fails if the bytes hash to anything other than the sha256 recorded in
+`compat/releases.toml`; it then checks that the archive holds a `weft-server`. It never runs
+that binary, and no job yet points an old binary at a store the candidate wrote — the
+version table's rows about older binaries are therefore reasoned from the marker protocol,
+not executed. One measured fact bears on any attempt to do that: the v0.1.0 `weft-server`
+takes no `--version` and no `--help`. Asked for either, it prints its configuration banner
+and starts listening. A leg that wants to talk to it must set its environment and speak HTTP.
+
 A v0.1.0 binary does not know about the `STORE_FORMAT` marker at all: it never reads it,
 so it would open a migrated store without refusal. **Do not run v0.1.0 on a store that
 a newer binary has opened.** The v0.1.0 binary writes frames in the old v1 frame format
@@ -128,14 +149,42 @@ not see the tagged rows.
 
 **Rollback from layout 2 to layout 1:** Not supported. A store whose `STORE_FORMAT`
 marker records `layout_version: 2` is refused by any build whose `SUPPORTED_LAYOUT`
-is 1. No such build exists after v0.1.0, and the repository does not test this path.
+is 1. No such build exists after v0.1.0.
 
-**No CI job performs a real rollback after writes.** The `compat_v010.rs` test
-(which opens the v0.1.0 fixture with the current build) tests only the upgrade leg:
-it verifies that a v0.1.0 store is migrated forward and that the same values read back.
-It does **not** run the v0.1.0 binary against a store that the current build has written
-to. Rollback-after-writes is unsupported for 1.0 — a store written by the current layout
-is not readable by older binaries.
+**What a rollback attempt does — refuses, loses nothing.** The store's
+`STORE_FORMAT` marker is read before any database is opened. When the marker's
+`min_write_layout` is above the opening build's [`SUPPORTED_LAYOUT`], the open
+fails with [`StoreError::IncompatibleLayout`] and **nothing is changed** — only
+`LOCK` and `LOCK.holder` are touched. The refusal is the same whether the store
+was written by a genuine newer binary or the marker has been tampered; the store
+itself is not damaged, and a subsequent open with the correct binary reads every
+row the older binary could not.
+
+This contract is pinned in `weftdb/tests/compat_v010.rs`
+([`v010_compat_fre13_rollback_after_writes_loses_nothing`]) which:
+1. Opens the v0.1.0 fixture, upgrades it to layout 2, writes new data, and closes.
+2. Tampers the `STORE_FORMAT` marker to raise `min_write_layout` above
+   `SUPPORTED_LAYOUT` — simulating what a newer binary would write.
+3. Asserts the open is refused with `StoreError::IncompatibleLayout`.
+4. Restores the marker and reopens — asserts every row written before the
+   refusal reads back, and that no migration reruns.
+
+**What the pinned legs are, and who checks that.** `compat/releases.toml` pins v0.1.0
+with `legs = ["upgrade"]`. The two tests that run that leg are
+`a_v010_store_migrates_forward_and_keeps_reading_its_own_values` (open a store v0.1.0
+wrote, and re-read every measurement its own server recorded while it held the files) and
+`v010_compat_fre13_upgrade_contract` (assert the shape of the refusal). The test above is
+a **substitute** for the `rollback` leg, not a run of it: it tampers the marker instead of
+pointing an older binary at the candidate's store. `scripts/compat/test_leg_coverage.py`
+holds that mapping as data — every leg of a pinned release is a runner, a substitute, or a
+cited absence — and greps for the names it lists, so renaming a compat test without
+updating the gate fails CI.
+
+**No CI job performs a real old-binary rollback after writes.** The test above
+expresses the layout-floor contract in-process; it does **not** run the v0.1.0
+binary against a store that the current build has written to (no v0.1.0 binary
+artifact is available in CI). Rollback-after-writes using a real older binary is
+unsupported for 1.0.
 
 ### Rollback procedure for layout 2
 
@@ -192,12 +241,58 @@ a 1.0 compatibility promise.
 
 ---
 
+## Unreleased — a caller-identity entry point for seal ingest (#803, #768)
+
+The legacy seal adapter's idempotency key is **unchanged**: `weftdb::legacy_seal::ingest_batch`,
+which every legacy facade call site uses, still derives `legacy:{dataset_id}:{crc32-of-payload}:{row-count}`
+from the payload, so an identical re-run of the same call is still absorbed as a replay of the first
+receipt.  That absorption is what issue #803 reports, and through this entry point it is not fixable:
+`batch_capture_measurements(aspect_id, dataset_id, rows)` carries no call identity, so a retry and an
+identical new call are the same request by construction.
+
+What this release adds is the entry point callers can use in the meantime:
+`weftdb::legacy_seal::ingest_batch_with_gate(store, aspect_id, dataset_id, idempotency_token, rows, squash_target_rows)`
+keys the write `legacy:{token}`.  The token argument is **required**, so a new caller cannot opt out of
+replay protection by accident: replaying a token with the same payload returns the first receipt, and
+presenting a different payload under a token that is already committed is a loud
+`IdempotencyConflict` (HTTP 409 over the server) rather than a silent absorb.  Distinct tokens always
+write, even for byte-identical rows under one `DatasetId`.
+
+HTTP clients are unaffected either way: the server never enters the seal gate — it puts the
+`Idempotency-Key` header into `IngestBatch.key` and the store's own idempotency ledger answers a replay
+with `replayed: true`, pinned by `weft-server/tests/seal_idem_http_replay.rs` (#824).  Ledger rows
+written under the payload-derived key keep their shape and stay in the ledger; nothing was renamed and
+no ledger rows were invalidated.
+
+---
+
+## Experimental variables can change meaning: `WEFT_ROW_TTL` (#799)
+
+`WEFT_ROW_TTL` is `Tier::Experimental`, and it changed meaning rather than being renamed.
+It used to be a bare count read **in each aspect's own time unit**, so one setting meant
+different real durations per aspect. It is now a duration with a unit: `90s`, `250ms`,
+`500us`, `2ns`, or a bare number meaning **seconds**. If you had it set, re-read the value:
+what you wrote as `3600` now expires rows older than 3600 **seconds** in every aspect, not
+3600 ticks of each aspect's unit. Nothing on disk records the old interpretation — expiry is
+a read-time and sweep-time rule — so there is no data to migrate.
+
+---
+
 ## What is NOT guaranteed
 
-- **A real rollback-after-writes CI test.** No CI job today downloads the previous
-  release's binary, writes data with the current build, and reads it back with the
-  older binary. Rollback-after-writes is unsupported for 1.0: a store written by the
-  current layout is not readable by older binaries.
+- **A real rollback-after-writes CI test.** No CI job today writes data with the current
+  build and reads it back with the previous release's binary. Rollback-after-writes is
+  unsupported for 1.0: a store written by the current layout is not readable by older
+  binaries. One of the three pieces that job needs now exists: `scripts/compat/releases.py
+  fetch` downloads a pinned archive and refuses it unless its bytes hash to the digest in
+  `compat/releases.toml`, and the `pinned release archives` job does that on every CI run.
+  Two do not. The first is a scratch copy of the store to point the old process at, because
+  a v0.1.0 binary classifies a layout-2 tree as layout 1 and writes into it — and that
+  binary answers neither `--version` nor `--help`, it prints its configuration banner and
+  starts listening, so a leg has to drive it through its environment and its HTTP endpoints.
+  The second is a pinned release whose binaries can read the current layout: only v0.1.0 is
+  pinned, and a newer pin block needs a committed fixture set of its own before
+  `scripts/compat/releases.py verify` accepts it. Tracked as #762.
 - **Cross-version binary compatibility for the server binary itself.** The v0.1.0
   `weft-server` binary cannot be swapped in for v0.2.x: its configuration variables,
   its command-line flags and its HTTP routes differ. The store-format compatibility

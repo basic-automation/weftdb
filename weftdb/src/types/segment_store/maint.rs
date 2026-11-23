@@ -4,6 +4,301 @@
 use super::*;
 
 impl SegmentStore {
+	/// **Expiry sweep** (P12-722, cut 1): count the rows that are expired at `now_ns`.
+	///
+	/// Visit every declared aspect under the store's `expiry` policy and return a report.
+	///
+	/// Cut 1 is **report-only**: no rows or segments are deleted. The sweep is idempotent
+	/// (running it twice finds the same expired rows).
+	/// Counting expired rows is the safe half of a TTL; physically dropping what no
+	/// read can reach is [`purge_expired`](Self::purge_expired). Aspects whose maintenance breaker is
+	/// tripped or whose maintenance lock is held by another operation are skipped and
+	/// reported in [`busy`](row_expiry::ExpirySweep::busy).
+	///
+	/// # Errors
+	///
+	/// Propagates index read errors. Per-aspect failures are reported in
+	/// [`failed`](row_expiry::ExpirySweep::failed) rather than aborting the entire sweep.
+	pub async fn expiry_sweep(&self, now_ns: i64) -> Result<row_expiry::ExpirySweep> {
+		if self.expiry == row_expiry::RowExpiryPolicy::NoExpiry {
+			return Ok(row_expiry::ExpirySweep::default());
+		}
+		let aspects = self.list_declared_aspects().await?;
+		let mut sweep = row_expiry::ExpirySweep::default();
+		for aspect in &aspects {
+			if !self.breaker_permits(aspect) {
+				sweep.busy.push(aspect.clone());
+				continue;
+			}
+			if !self.decode_breaker_permits(aspect) {
+				sweep.busy.push(aspect.clone());
+				continue;
+			}
+			let Some(held) = self.sweep_maintain(aspect, None).await else {
+				sweep.busy.push(aspect.clone());
+				continue;
+			};
+			let result = self.expire_aspect_held(&held, now_ns).await;
+			match result {
+				Ok(swept) => {
+					if swept.rows_expired > 0 {
+						sweep.aspects_cleaned.push(aspect.clone());
+						sweep.rows_expired += swept.rows_expired;
+					}
+				}
+				Err(err) => {
+					sweep.failed.push((aspect.clone(), err));
+				}
+			}
+		}
+		Ok(sweep)
+	}
+
+	/// **Expiry purge** (#775, cut 2): remove the segments whose every row is expired.
+	///
+	/// Same shape as [`expiry_sweep`](Self::expiry_sweep) — one pass per declared aspect, an
+	/// aspect that is busy or breaker-tripped reported rather than waited for — but it goes
+	/// through the maintenance swap, so a segment wholly past the cutoff leaves the index and
+	/// its frame is retired to the reaper. A segment that straddles the cutoff is left on
+	/// disk and counted: this pass never rewrites a frame.
+	///
+	/// It is **not** a default and no policy selects it. A TTL decides what a read may
+	/// return; only this call decides what the store keeps. Repeated calls are idempotent in
+	/// what they remove — a wholly expired segment that is gone stays gone — though a
+	/// partially expired one is counted again every pass until a later change learns to
+	/// rewrite it.
+	///
+	/// Unlike the report-only sweep, a purge records its outcome with the maintenance
+	/// breaker: an aspect whose purge keeps failing should trip the breaker rather than be
+	/// retried by every pass, because it is doing real work that can go wrong half done.
+	///
+	/// # Errors
+	///
+	/// Propagates index read errors. Per-aspect failures are reported in
+	/// [`failed`](row_expiry::ExpirySweep::failed) rather than aborting the entire sweep. A
+	/// failed aspect may already have had some segments dropped: an aspect that lost three
+	/// segments and then failed is reported in `failed` with its drops counted, because
+	/// neither "clean" nor "nothing happened" would be true of it.
+	pub async fn purge_expired(&self, now_ns: i64) -> Result<row_expiry::ExpirySweep> {
+		if self.expiry == row_expiry::RowExpiryPolicy::NoExpiry {
+			return Ok(row_expiry::ExpirySweep::default());
+		}
+		let aspects = self.list_declared_aspects().await?;
+		let mut sweep = row_expiry::ExpirySweep::default();
+		for aspect in &aspects {
+			if !self.breaker_permits(aspect) {
+				sweep.busy.push(aspect.clone());
+				continue;
+			}
+			if !self.decode_breaker_permits(aspect) {
+				sweep.busy.push(aspect.clone());
+				continue;
+			}
+			let Some(held) = self.sweep_maintain(aspect, None).await else {
+				sweep.busy.push(aspect.clone());
+				continue;
+			};
+			match self.purge_aspect_held(&held, now_ns).await {
+				Ok(swept) => {
+					// #798: a partial sweep (completed: false, set when a chunk or plan
+					// failed) counts the drops already committed but does not charge the
+					// breaker — the partial progress is real and the next pass should retry
+					// the remaining segments rather than being blocked by a tripped
+					// circuit breaker until the cooldown expires.
+					if swept.completed {
+						self.breaker_record(aspect, false);
+					} else {
+						tracing::warn!(aspect, "purge_aspect_held completed=false, counting partial drops");
+					}
+					sweep.rows_expired += swept.rows_expired;
+					sweep.segments_dropped += swept.segments_dropped;
+					sweep.partial_segments += swept.partial_segments;
+					sweep.shadowed_and_kept += swept.shadowed_and_kept;
+					// `aspects_cleaned` answers "did this purge change this aspect", so it keys on
+					// what left the store, not on the count of expired rows: a straddling frame's
+					// expired rows are counted on every pass, and reporting the aspect as cleaned
+					// each time would make a second purge look like a first one.
+					if swept.segments_dropped > 0 && swept.completed {
+						sweep.aspects_cleaned.push(aspect.clone());
+					}
+				}
+				Err(err) => {
+					// A genuine error (not a chunk failure, which is now Ok with
+					// completed=false) means the aspect could not be purged at all.
+					// Committed drops from prior chunks are already in the index.
+					self.breaker_record(aspect, true);
+					sweep.failed.push((aspect.clone(), err));
+				}
+			}
+		}
+		Ok(sweep)
+	}
+
+	/// One aspect's purge, under the maintenance lock `held`.
+	///
+	/// Only a segment whose recorded extent ends **strictly** before the cutoff is a member:
+	/// `max_ts < cutoff` is `is_row_expired`'s test applied to the whole extent, so the
+	/// segment's newest row is expired and therefore every older row in it is. A segment with
+	/// no recorded extent is skipped, for the same reason the sweep skips one: a maintenance
+	/// pass must not guess at an extent it was never told.
+	///
+	/// Members are grouped by series, because a swap plan may not mix series.
+	pub(crate) async fn purge_aspect_held(&self, held: &MaintGuard, now_ns: i64) -> Result<row_expiry::AspectExpirySwept> {
+		self.writable()?;
+		let aspect = held.aspect();
+		let schema = self.require_schema(aspect).await?;
+		let unit = &schema.timestamp_unit;
+		let cutoff = row_expiry::expired_cutoff(&self.expiry, now_ns, unit);
+		if cutoff == i64::MIN {
+			// Nothing can be expired, so there is nothing to drop and no transaction to open.
+			return Ok(row_expiry::AspectExpirySwept::default());
+		}
+		let rows = self.index.rows(aspect).await?;
+		let mut rows_expired: u64 = 0;
+		let mut oldest_expired_ts: Option<i64> = None;
+		let mut newest_expired_ts: Option<i64> = None;
+		let mut partial_segments: u64 = 0;
+		let mut shadowed_and_kept: u64 = 0;
+		// Survivors: segments that survive this pass (straddling or kept past the cutoff).
+		let mut survivors: std::collections::HashMap<u64, Vec<IndexRow>> = std::collections::HashMap::new();
+		let mut doomed: std::collections::BTreeMap<u64, Vec<IndexRow>> = std::collections::BTreeMap::new();
+		for row in &rows {
+			let (Some(min_ts), Some(max_ts)) = (row.desc.min_ts, row.desc.max_ts) else {
+				continue;
+			};
+			if max_ts < cutoff {
+				// The whole frame is past the cutoff: every row it holds is expired, so a read
+				// that respects the TTL has nothing left to lose from dropping it.
+				rows_expired += row.desc.row_count as u64;
+				note_extremes(&mut oldest_expired_ts, &mut newest_expired_ts, min_ts, max_ts);
+				doomed.entry(row.series_id).or_default().push(row.clone());
+			} else if min_ts <= cutoff {
+				// Straddles the cutoff: count the expired rows, leave the frame alone.
+				let decoded = self.read_bound_frame(row).await?;
+				let mut counted: u64 = 0;
+				for (t, _) in decoded.timestamps.into_iter().zip(decoded.values) {
+					if row_expiry::is_row_expired(&self.expiry, now_ns, t, unit) {
+						counted += 1;
+						note_extremes(&mut oldest_expired_ts, &mut newest_expired_ts, t, t);
+					}
+				}
+				if counted > 0 {
+					partial_segments += 1;
+					rows_expired += counted;
+				}
+				survivors.entry(row.series_id).or_default().push(row.clone());
+			} else {
+				// An entirely livable segment (min_ts > cutoff): kept past the cutoff.
+				survivors.entry(row.series_id).or_default().push(row.clone());
+			}
+		}
+		// #797 — shadow-segment guard: remove doomed segments whose extent overlaps a
+		// surviving segment of the same series. Dropping a correction or null-out would
+		// re-expose the superseded rows of the survivor.
+		let mut filtered_doomed: std::collections::BTreeMap<u64, Vec<IndexRow>> = std::collections::BTreeMap::new();
+		for (series_id, series_doomed) in doomed {
+			if let Some(series_survivors) = survivors.get(&series_id) {
+				for segment in series_doomed {
+					if series_survivors.iter().any(|survivor| {
+						let s_min = survivor.desc.min_ts.unwrap();
+						let s_max = survivor.desc.max_ts.unwrap();
+						let d_min = segment.desc.min_ts.unwrap();
+						let d_max = segment.desc.max_ts.unwrap();
+						d_max >= s_min && d_min <= s_max
+					}) {
+						tracing::debug!(series = series_id, segment_id = segment.desc.id, segment_min_ts = segment.desc.min_ts, segment_max_ts = segment.desc.max_ts, aspect = aspect, "doomed segment shadows a surviving segment: keeping it on disk",);
+						shadowed_and_kept += 1;
+						continue;
+					}
+					filtered_doomed.entry(series_id).or_default().push(segment);
+				}
+			} else {
+				// No survivors of this series — all expired segments can be dropped.
+				filtered_doomed.entry(series_id).or_default().extend(series_doomed);
+			}
+		}
+		if filtered_doomed.is_empty() {
+			return Ok(row_expiry::AspectExpirySwept { rows_expired, segments_dropped: 0, partial_segments, shadowed_and_kept, oldest_expired_ts, newest_expired_ts, completed: true });
+		}
+		// #798 — submit plans in chunks of MAX_PLANS_PER_TXN.  A later chunk that fails
+		// does not discard the drops of earlier chunks: we set completed: false and return
+		// Ok so the breaker is not charged and the caller counts the drops that really
+		// happened.
+		let mut series_plans: Vec<Vec<IndexRow>> = filtered_doomed.into_values().collect();
+		let mut dropped: u64 = 0;
+		let mut completed = true;
+		while !series_plans.is_empty() {
+			let tail = series_plans.split_off(MAX_PLANS_PER_TXN.min(series_plans.len()));
+			let batch = std::mem::take(&mut series_plans);
+			let chunk: Vec<SwapPlan> = batch.into_iter().map(SwapPlan::purge).collect();
+			let members: Vec<usize> = chunk.iter().map(|plan| plan.members.len()).collect();
+			match self.swap_plans(held, &schema, chunk).await {
+				Ok(outcomes) => {
+					debug_assert_eq!(outcomes.len(), members.len(), "one outcome per purge plan per chunk");
+					for (count, outcome) in members.into_iter().zip(outcomes) {
+						match outcome {
+							Ok(_) => dropped += count as u64,
+							Err(e) => {
+								tracing::warn!(aspect, error = %e, "a purge swap plan failed but committed drops are already counted");
+								completed = false;
+							}
+						}
+					}
+				}
+				Err(e) => {
+					tracing::warn!(aspect, error = %e, "purge_aspect_held chunk failed after committed drops: partial progress reported");
+					completed = false;
+					break;
+				}
+			}
+			series_plans = tail;
+		}
+		Ok(row_expiry::AspectExpirySwept { rows_expired, segments_dropped: dropped, partial_segments, shadowed_and_kept, oldest_expired_ts, newest_expired_ts, completed })
+	}
+
+	/// Count expired rows in one aspect under the maintenance lock `held`.
+	/// Reads the index rows, decodes segments that are partially expired, and
+	/// returns a count and the oldest/newest expired timestamps.
+	/// Cut 1: report-only, no deletion.
+	pub(crate) async fn expire_aspect_held(&self, held: &MaintGuard, now_ns: i64) -> Result<row_expiry::AspectExpirySwept> {
+		let aspect = held.aspect();
+		let schema = self.require_schema(aspect).await?;
+		let unit = &schema.timestamp_unit;
+		let cutoff = row_expiry::expired_cutoff(&self.expiry, now_ns, unit);
+		if cutoff == i64::MIN {
+			// No expiry possible (NoExpiry or underflow).
+			return Ok(row_expiry::AspectExpirySwept::default());
+		}
+		let rows = self.index.rows(aspect).await?;
+		let mut rows_expired: u64 = 0;
+		let mut oldest_expired_ts: Option<i64> = None;
+		let mut newest_expired_ts: Option<i64> = None;
+
+		for row in &rows {
+			// A descriptor with no recorded extent is an empty segment, or one
+			// written before the extent was tracked. Either way there is nothing
+			// to expire, and a maintenance sweep must not panic over it.
+			let (Some(min_ts), Some(max_ts)) = (row.desc.min_ts, row.desc.max_ts) else {
+				continue;
+			};
+			if max_ts < cutoff {
+				// All rows in this segment are expired.
+				rows_expired += row.desc.row_count as u64;
+				note_extremes(&mut oldest_expired_ts, &mut newest_expired_ts, min_ts, max_ts);
+			} else if min_ts <= cutoff {
+				// Partially expired — decode and count row by row.
+				let decoded = self.read_bound_frame(row).await?;
+				for (t, _) in decoded.timestamps.into_iter().zip(decoded.values) {
+					if row_expiry::is_row_expired(&self.expiry, now_ns, t, unit) {
+						rows_expired += 1;
+						note_extremes(&mut oldest_expired_ts, &mut newest_expired_ts, t, t);
+					}
+				}
+			}
+		}
+		Ok(row_expiry::AspectExpirySwept { rows_expired, segments_dropped: 0, partial_segments: 0, shadowed_and_kept: 0, oldest_expired_ts, newest_expired_ts, completed: true })
+	}
+
 	/// Hold `aspect`'s maintenance lock until the returned guard drops, as a maintenance
 	/// operation in progress would, without running one. The hook for tests of the layers
 	/// above (`weft-server`'s `409 Conflict` and its daemon's skip), which cannot reach the
@@ -844,10 +1139,13 @@ impl SegmentStore {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let deadline = wait.deadline();
+		let time_deadline = self.maintenance_deadline();
 		let mut sweep = ReconcileSweep { aspects_scanned: aspects.len(), ..ReconcileSweep::default() };
 		for aspect in &aspects {
-			if cancel.is_requested() {
-				sweep.cancelled = true;
+			if cancel.is_requested() || time_deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+				if !sweep.cancelled && (cancel.is_requested() || time_deadline.is_some()) {
+					sweep.cancelled = true;
+				}
 				break;
 			}
 			if !self.breaker_permits(aspect) {
@@ -990,10 +1288,13 @@ impl SegmentStore {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let deadline = wait.deadline();
+		let time_deadline = self.maintenance_deadline();
 		let mut sweep = HotColdSweep { aspects_scanned: aspects.len(), ..HotColdSweep::default() };
 		for aspect in &aspects {
-			if cancel.is_requested() {
-				sweep.cancelled = true;
+			if cancel.is_requested() || time_deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+				if !sweep.cancelled && (cancel.is_requested() || time_deadline.is_some()) {
+					sweep.cancelled = true;
+				}
 				break;
 			}
 			if !self.breaker_permits(aspect) {
@@ -1047,7 +1348,7 @@ impl SegmentStore {
 	/// is zero and a point/range read over the merged window opens a single segment.
 	///
 	/// **Merge semantics — newer wins (upsert).** Members are folded in ascending seal
-	/// id (oldest → newest) with [`merge_newer_wins`], so at any timestamp two members
+	/// id (oldest → newest) with [`merge_newer_wins`](weft_physical_type::merge_newer_wins), so at any timestamp two members
 	/// share, the more-recently-sealed value supersedes the older one — the same
 	/// last-writer-wins answer [`read_point`](SegmentStore::read_point) already gives
 	/// across overlapping segments. This *dedups* cross-segment duplicate timestamps
@@ -1105,7 +1406,7 @@ impl SegmentStore {
 	/// but `policy` governs whether each overlap component is fully rewritten or split.
 	///
 	/// **Merge semantics — newer wins (upsert).** Every component's members are folded
-	/// oldest → newest with [`merge_newer_wins`], so at any shared timestamp the
+	/// oldest → newest with [`merge_newer_wins`](weft_physical_type::merge_newer_wins), so at any shared timestamp the
 	/// more-recently-sealed value supersedes the older one (dedup / last-writer-wins),
 	/// exactly as [`reconcile_overlaps`](SegmentStore::reconcile_overlaps) documents. The
 	/// *logical* result is identical regardless of `policy`; only the on-disk layout
@@ -1145,22 +1446,46 @@ impl SegmentStore {
 
 	/// [`reconcile_overlaps_with_policy`](Self::reconcile_overlaps_with_policy) under the
 	/// maintenance lock `held`.
+	/// The wall-clock deadline for this maintenance sweep, computed from
+	/// [`self.maintenance_op_max_secs`](SegmentStore::maintenance_op_max_secs)
+	/// (ROB-20 G5); `None` when the budget is unset.
+	fn maintenance_deadline(&self) -> Option<tokio::time::Instant> {
+		Some(tokio::time::Instant::now() + tokio::time::Duration::from_secs(self.maintenance_op_max_secs?))
+	}
+
 	pub(crate) async fn reconcile_overlaps_held(&self, held: &MaintGuard, policy: SplitPolicy) -> Result<usize> {
 		self.writable()?;
 		let aspect = held.aspect();
 		aspect_name::validate(aspect)?;
+		let deadline = self.maintenance_deadline();
 		// M1: the rows, as the swaps' preconditions will name them. Only this operation,
 		// under the maintenance lock, changes them; a seal meanwhile only adds rows.
 		let components = overlap_components(self.index.rows(aspect).await?);
 		let schema = self.require_schema(aspect).await?;
 		let mut removed = 0;
 		for mut members in components {
+			if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+				break;
+			}
 			if members.len() < 2 {
 				continue;
 			}
 			// Fold members oldest → newest so the most-recently-sealed value wins a tie.
 			members.sort_by_key(|member| member.desc.id);
 			let component_bytes: u64 = members.iter().map(|member| member.desc.byte_len).sum();
+			// The whole operation's planned output, before any merge (ROB-20). A component
+			// larger than the per-operation budget is refused here, which is what makes the
+			// budget mean something: the read that would have produced the memory spike never
+			// happens. Nothing has been written and no member has been marked at this point,
+			// so the refusal leaves the aspect exactly as it was.
+			//
+			// The figure is the members' on-disk bytes, the same estimate the disk guard
+			// admits against. It bounds what the pass plans to fold, not the transient decoded
+			// rows, which are larger per row than the compressed bytes: the budget is a ceiling
+			// on the operation's size, not a byte-exact prediction.
+			if let Some(budget) = self.maintenance_output_budget.filter(|budget| component_bytes > *budget) {
+				return Err(crate::StoreError::OverBudget { aspect: aspect.to_string(), budget_bytes: budget, planned_bytes: component_bytes }.into());
+			}
 			let component_rows: usize = members.iter().map(|member| member.desc.row_count).sum();
 			// The second-earliest member start: rows before it are the cold prefix (carried by
 			// one member, no cross-segment overlap). Every member has a time range.
@@ -1187,9 +1512,18 @@ impl SegmentStore {
 			// Full rewrite: one output under the lowest member id. Split: the cold
 			// prefix under the lowest id and the merged hot suffix under the next lowest (P1),
 			// cut at the timestamp where the suffix starts; the two are disjoint in time.
-			let cuts: &[i64] = if split { &[cold_boundary] } else { &[] };
+			// ROB-20 G4: an output frame estimated above the store's segment ceiling is re-cut at
+			// row-range boundaries, one output per member at most, which is what keeps the swap
+			// legal (`size_driven_cuts`). These cuts are merged with the cold/hot boundary the
+			// split decision asked for, because both cut the same output.
+			let mut cuts = size_driven_cuts(&all_ts, component_bytes, self.maintenance_segment_ceiling, members.len());
+			if split {
+				cuts.push(cold_boundary);
+			}
+			cuts.sort_unstable();
+			cuts.dedup();
 			let rows_per_page = merge_rows_per_page(all_ts.len());
-			let plan = SwapPlan::cut(members, all_ts, all_values, rows_per_page, cuts);
+			let plan = SwapPlan::cut(members, all_ts, all_values, rows_per_page, &cuts);
 			removed += plan.removes();
 			self.swap_plan(held, &schema, plan).await?;
 		}
@@ -1364,7 +1698,7 @@ impl SegmentStore {
 	/// segments (a growing pile of carved-off cold prefixes). Left unchecked that
 	/// fragments an aspect and multiplies the per-segment read/prune overhead. Squash is
 	/// the QuestDB-style bound on that fragmentation: it folds **every** segment of
-	/// `aspect` — in ascending seal id, [`merge_newer_wins`] so any residual shared
+	/// `aspect` — in ascending seal id, [`merge_newer_wins`](weft_physical_type::merge_newer_wins) so any residual shared
 	/// timestamp still resolves last-writer-wins — into a single time-sorted segment
 	/// (paged past 4,096 rows) under the lowest id, deleting the rest. After it, the aspect is one segment
 	/// with no cross-segment overlap. The natural trigger is a segment count past a
@@ -1414,9 +1748,13 @@ impl SegmentStore {
 	/// segments removed. Series squashed before a failure stay squashed.
 	async fn squash_series_held(&self, held: &MaintGuard, series: Vec<Vec<IndexRow>>, max_segments: usize) -> Result<usize> {
 		let aspect = held.aspect();
+		let deadline = self.maintenance_deadline();
 		let mut removed = 0;
 		let mut schema = None;
 		for members in series {
+			if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+				break;
+			}
 			if members.len() < 2 || members.len() <= max_segments {
 				continue;
 			}
@@ -1426,8 +1764,12 @@ impl SegmentStore {
 			};
 			// Fold oldest → newest so the most-recently-sealed value wins any residual tie.
 			let (all_ts, all_values) = self.merge_members(&members).await?;
+			// ROB-20 G4: the group's inputs estimate its output; over the ceiling, the output is
+			// re-cut at row-range boundaries, one output per member at most.
+			let group_bytes: u64 = members.iter().map(|member| member.desc.byte_len).sum();
+			let cuts = size_driven_cuts(&all_ts, group_bytes, self.maintenance_segment_ceiling, members.len());
 			let rows_per_page = merge_rows_per_page(all_ts.len());
-			let plan = SwapPlan::cut(members, all_ts, all_values, rows_per_page, &[]);
+			let plan = SwapPlan::cut(members, all_ts, all_values, rows_per_page, &cuts);
 			let plan_removes = plan.removes();
 			self.swap_plan(held, schema, plan).await?;
 			removed += plan_removes;
@@ -1517,10 +1859,13 @@ impl SegmentStore {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let deadline = wait.deadline();
+		let time_deadline = self.maintenance_deadline();
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
-			if cancel.is_requested() {
-				sweep.cancelled = true;
+			if cancel.is_requested() || time_deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+				if !sweep.cancelled && (cancel.is_requested() || time_deadline.is_some()) {
+					sweep.cancelled = true;
+				}
 				break;
 			}
 			if !self.breaker_permits(aspect) {
@@ -1568,7 +1913,7 @@ impl SegmentStore {
 	/// rather than a single giant one.
 	///
 	/// Grouping is by ascending seal id (≈ time order for append-mostly ingest); each group
-	/// merges oldest→newest via [`merge_newer_wins`] so a residual shared timestamp still
+	/// merges oldest→newest via [`merge_newer_wins`](weft_physical_type::merge_newer_wins) so a residual shared timestamp still
 	/// resolves last-writer-wins, and the merged rows are time-sorted so every output is
 	/// sorted. A `target_rows` of 0 clamps to 1, so every segment forms its own singleton
 	/// group and the call is a no-op. A single-segment group is never rewritten.
@@ -1597,6 +1942,7 @@ impl SegmentStore {
 		self.writable()?;
 		let aspect = held.aspect();
 		aspect_name::validate(aspect)?;
+		let deadline = self.maintenance_deadline();
 		let target_rows = target_rows.max(1);
 		// M1: every row, ascending by id, as the swaps' preconditions will name them.
 		let rows = self.index.rows(aspect).await?;
@@ -1629,14 +1975,23 @@ impl SegmentStore {
 		let schema = self.require_schema(aspect).await?;
 		let mut removed = 0usize;
 		for members in groups {
+			if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+				break;
+			}
 			if members.len() < 2 {
 				continue;
 			}
 			// One swap per group: its members folded oldest → newest (the most-recently-sealed
 			// value wins any residual tie) into one output under the group's lowest id.
+			// ROB-20 G4: over the store's segment ceiling that one output is re-cut at
+			// row-range boundaries, one output per member at most, which is also what keeps the
+			// swap legal (rule P2). A squash that would leave a giant frame leaves several
+			// bounded ones, and removes correspondingly fewer segments.
 			let (all_ts, all_values) = self.merge_members(&members).await?;
+			let group_bytes: u64 = members.iter().map(|member| member.desc.byte_len).sum();
+			let cuts = size_driven_cuts(&all_ts, group_bytes, self.maintenance_segment_ceiling, members.len());
 			let rows_per_page = merge_rows_per_page(all_ts.len());
-			let plan = SwapPlan::cut(members, all_ts, all_values, rows_per_page, &[]);
+			let plan = SwapPlan::cut(members, all_ts, all_values, rows_per_page, &cuts);
 			removed += plan.removes();
 			self.swap_plan(held, &schema, plan).await?;
 		}
@@ -1689,10 +2044,13 @@ impl SegmentStore {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let deadline = wait.deadline();
+		let time_deadline = self.maintenance_deadline();
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
-			if cancel.is_requested() {
-				sweep.cancelled = true;
+			if cancel.is_requested() || time_deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+				if !sweep.cancelled && (cancel.is_requested() || time_deadline.is_some()) {
+					sweep.cancelled = true;
+				}
 				break;
 			}
 			if !self.breaker_permits(aspect) {
@@ -1813,10 +2171,13 @@ impl SegmentStore {
 		self.writable()?;
 		let aspects = self.list_declared_aspects().await?;
 		let deadline = wait.deadline();
+		let time_deadline = self.maintenance_deadline();
 		let mut sweep = SquashSweep { aspects_scanned: aspects.len(), ..SquashSweep::default() };
 		for aspect in &aspects {
-			if cancel.is_requested() {
-				sweep.cancelled = true;
+			if cancel.is_requested() || time_deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+				if !sweep.cancelled && (cancel.is_requested() || time_deadline.is_some()) {
+					sweep.cancelled = true;
+				}
 				break;
 			}
 			if !self.breaker_permits(aspect) {
@@ -1924,4 +2285,50 @@ impl SegmentStore {
 		}
 		Ok(backfilled)
 	}
+}
+
+/// Fold one expired row's extent into the sweep's oldest/newest witnesses.
+fn note_extremes(oldest: &mut Option<i64>, newest: &mut Option<i64>, lo: i64, hi: i64) {
+	*oldest = Some(oldest.map_or(lo, |seen| seen.min(lo)));
+	*newest = Some(newest.map_or(hi, |seen| seen.max(hi)));
+}
+
+/// The timestamps to cut a merged maintenance output at, so that no output frame is estimated
+/// above the store's segment ceiling (roadmap ROB-20 G4).
+///
+/// [`SegmentStoreOptions::max_maintenance_segment_bytes`] is that ceiling and `est_bytes` estimates the output's size and is deliberately the **sum of
+/// the inputs' realized sizes**, which over-counts a fold (a fold usually writes fewer bytes
+/// than the segments it consumed): the error is towards more, smaller frames, never fewer.
+///
+/// `max_outputs` bounds how many outputs the plan may carry, and every caller passes the number
+/// of segments it is replacing. That cap, not the ceiling, decides how far one merge may be
+/// divided, and it is what keeps the swap legal: with one output per member each output takes a
+/// member's id under precedence rule **P1** and none needs a fresh id, so the refusal that
+/// [`SwapPlan`]'s rule **P2** documents (an extra output whose span an outranking row overlaps)
+/// cannot fire at all. A single segment already larger than the ceiling is therefore **not**
+/// re-split here; only a fold of two or more is. That is the part of G4 a fold cannot do, and it
+/// is why the operator-facing split stays a separate call.
+///
+/// Cuts are chosen by **even division of the merged row range**: coarse, deterministic, and it
+/// needs no decode. A cut is a timestamp, so [`SwapPlan::cut`] puts a whole run of equal
+/// timestamps into one output (design D17), and a cut at or below the first timestamp is a no-op
+/// and dropped. The result is sorted and deduplicated, ready to hand to `SwapPlan::cut`.
+pub fn size_driven_cuts(timestamps: &[i64], est_bytes: u64, ceiling_bytes: Option<u64>, max_outputs: usize) -> Vec<i64> {
+	let Some(ceiling) = ceiling_bytes.filter(|ceiling| *ceiling > 0) else {
+		return Vec::new();
+	};
+	// A fold of one row, or a plan allowed only one output, has nowhere to cut.
+	if timestamps.len() < 2 || max_outputs < 2 {
+		return Vec::new();
+	}
+	let rows = timestamps.len() as u64;
+	let pieces = est_bytes.div_ceil(ceiling).min(max_outputs as u64).min(rows);
+	if pieces < 2 {
+		return Vec::new();
+	}
+	let first = timestamps[0];
+	let mut cuts: Vec<i64> = (1..pieces).map(|piece| usize::try_from(piece * rows / pieces).unwrap_or(usize::MAX)).filter(|at| *at < timestamps.len()).map(|at| timestamps[at]).filter(|cut| *cut > first).collect();
+	cuts.sort_unstable();
+	cuts.dedup();
+	cuts
 }

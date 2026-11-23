@@ -106,6 +106,12 @@ harness = false
 name = "stored_interpolate"
 harness = false
 
+# Request-level cost of serde_json's `float_roundtrip` feature on a whole JSON compute
+# request (Phase 12): `cargo bench -p weft-server --bench json_body_cost`.
+[[bench]]
+name = "json_body_cost"
+harness = false
+
 [dev-dependencies]
 arrow-array = { workspace = true }  # a RecordBatch with a raw IEEE-754 NaN, for the ingest non-finite test (production code keeps arrow types inside weft-arrow)
 arrow-schema = { workspace = true }  # the schema of that test batch

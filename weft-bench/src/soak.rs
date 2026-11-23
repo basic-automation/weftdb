@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-	redaction, report::{DiskInfo, RunMetadata}, soak_backup::BackupLaneVerdict, soak_digest::WindowDigest, soak_failure::{PhaseRecord, RecoveryRecord, SigtermVerdict, SoakPhase}, soak_oracle::OracleVerdict, soak_read::DerivedReadVerdict, soak_upgrade::UpgradeLaneVerdict
+	redaction, report::{DiskInfo, RunMetadata}, soak_backup::BackupLaneVerdict, soak_digest::WindowDigest, soak_failure::{PhaseRecord, RecoveryRecord, SigtermVerdict, SoakPhase}, soak_oracle::OracleVerdict, soak_read::DerivedReadVerdict, soak_ttl::TtlLaneVerdict, soak_upgrade::UpgradeLaneVerdict
 };
 
 /// Version of the soak run record. Bump on any breaking field change to
@@ -69,7 +69,9 @@ use crate::{
 /// the same way.
 /// v7 (SOA-16) adds the optional upgrade lane verdict on [`SoakRun`],
 /// the same way.
-pub const SOAK_SCHEMA_VERSION: u32 = 7;
+/// v8 (SOA-15) adds the optional TTL lane verdict on [`SoakRun`],
+/// the same way.
+pub const SOAK_SCHEMA_VERSION: u32 = 8;
 
 /// Configuration for one soak run.
 ///
@@ -203,6 +205,14 @@ pub struct SoakRun {
 	/// with no upgrade lane, which must never read as a passed lane.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub upgrade: Option<UpgradeLaneVerdict>,
+	/// The TTL lane's verdict on this run (SOA-15), recorded through
+	/// [`SoakHarness::record_ttl_verdict`] (or populated by the soak
+	/// driver directly) once the lane has opened the store with a real
+	/// expiry policy and run the expiry sweep. `None` until then — and
+	/// forever for a run with no TTL lane, which must never read as a
+	/// passed lane.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub ttl: Option<TtlLaneVerdict>,
 }
 
 impl SoakRun {
@@ -367,7 +377,7 @@ impl SoakHarness {
 	/// [`RunMetadata::capture`]), not a second probe.
 	#[must_use]
 	pub const fn new(config: SoakConfig, metadata: RunMetadata) -> Self {
-		Self { run: SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Created, steps: 0, oracle: None, windows: Vec::new(), phases: Vec::new(), recoveries: Vec::new(), sigterm: None, derived: None, backup: None, upgrade: None } }
+		Self { run: SoakRun { soak_schema_version: SOAK_SCHEMA_VERSION, config, metadata, state: SoakState::Created, steps: 0, oracle: None, windows: Vec::new(), phases: Vec::new(), recoveries: Vec::new(), sigterm: None, derived: None, backup: None, upgrade: None, ttl: None } }
 	}
 
 	/// Current lifecycle state.
@@ -537,6 +547,28 @@ impl SoakHarness {
 		anyhow::ensure!(self.run.state == SoakState::Running, "soak upgrade verdict can only be recorded while Running, not {:?}", self.run.state);
 		anyhow::ensure!(self.run.upgrade.is_none(), "soak upgrade verdict has already been recorded for this run");
 		self.run.upgrade = Some(verdict);
+		Ok(())
+	}
+
+	/// Record the TTL lane's verdict on this run (SOA-15): the expiry
+	/// policy the store was opened with and what the expiry sweep
+	/// reported, kept in the run record beside the oracle, derived-read,
+	/// backup and upgrade verdicts so a published run carries the
+	/// evidence that its TTL lane exercised the expiry path.
+	///
+	/// Recorded exactly once, while `Running` — the driver judges the
+	/// lane, records the verdict, and then finishes the run. A second
+	/// recording is refused rather than overwriting the first: a
+	/// verdict that can be quietly replaced is not evidence.
+	///
+	/// # Errors
+	///
+	/// Returns an error when the harness is not `Running`, or when a
+	/// verdict has already been recorded.
+	pub fn record_ttl_verdict(&mut self, verdict: TtlLaneVerdict) -> anyhow::Result<()> {
+		anyhow::ensure!(self.run.state == SoakState::Running, "soak TTL verdict can only be recorded while Running, not {:?}", self.run.state);
+		anyhow::ensure!(self.run.ttl.is_none(), "soak TTL verdict has already been recorded for this run");
+		self.run.ttl = Some(verdict);
 		Ok(())
 	}
 
@@ -720,7 +752,7 @@ mod tests {
 		harness.start().expect("start");
 		let record = harness.run_record();
 		assert_eq!(record.soak_schema_version, SOAK_SCHEMA_VERSION);
-		assert_eq!(record.soak_schema_version, 7, "the soak's own schema line: v1 from SOA-1, v2 from SOA-6's oracle field, v3 from SOA-7's window digests, v4 from SOA-8's failure-deck fields, v5 from SOA-10's derived-read field, v6 from SOA-11's backup-lane field, v7 from SOA-16's upgrade-lane field, independent of the bench schema");
+		assert_eq!(record.soak_schema_version, 8, "the soak's own schema line: v1 from SOA-1, v2 from SOA-6's oracle field, v3 from SOA-7's window digests, v4 from SOA-8's failure-deck fields, v5 from SOA-10's derived-read field, v6 from SOA-11's backup-lane field, v7 from SOA-16's upgrade-lane field, v8 from SOA-15's TTL-lane field, independent of the bench schema");
 		// Reuse, not redefinition: the record's metadata is EVI-3's capture,
 		// with the same crate version / OS / arch / timestamp it was built from.
 		assert!(!record.metadata.weft_bench_version.is_empty(), "metadata must carry the bench crate version");
@@ -884,6 +916,29 @@ mod tests {
 		json.as_object_mut().expect("object").remove("upgrade");
 		let back: SoakRun = serde_json::from_value(json).expect("v6-shaped record deserializes");
 		assert!(back.upgrade.is_none(), "an absent upgrade field reads as no verdict, never a pass");
+	}
+
+	#[test]
+	fn ttl_verdict_is_recorded_once_while_running() {
+		use crate::soak_ttl::{TtlExpirySweepReport, TtlLaneVerdict, TtlPolicyLabel};
+
+		let verdict = TtlLaneVerdict { store_expiry_policy: TtlPolicyLabel::Ttl { ttl: 3600 }, expiry_sweep: TtlExpirySweepReport { aspects_cleaned: vec!["cpu".to_string()], busy: Vec::new(), failed: Vec::new(), rows_expired: 10, segments_dropped: 0, partial_segments: 0 } };
+		let mut harness = SoakHarness::new(config(), metadata());
+		assert!(harness.run_record().ttl.is_none(), "no TTL verdict before one is recorded");
+		assert!(harness.record_ttl_verdict(verdict.clone()).is_err(), "a verdict cannot be recorded before the run starts");
+		harness.start().expect("start");
+		harness.record_ttl_verdict(verdict.clone()).expect("record while Running");
+		assert_eq!(harness.run_record().ttl.as_ref(), Some(&verdict), "the recorded verdict is on the run record");
+		assert_eq!(harness.run_record().ttl.as_ref().map(|v| &v.store_expiry_policy), Some(&TtlPolicyLabel::Ttl { ttl: 3600 }), "the recorded verdict carries the TTL policy");
+		assert!(harness.record_ttl_verdict(verdict).is_err(), "a second verdict must not overwrite the first");
+		harness.finish().expect("finish");
+		assert!(harness.run_record().ttl.is_some(), "the verdict survives the finish");
+		// The field is additive: a v7 artifact without it deserializes
+		// with no verdict.
+		let mut json = serde_json::to_value(harness.run_record().redacted_copy()).expect("record to json");
+		json.as_object_mut().expect("object").remove("ttl");
+		let back: SoakRun = serde_json::from_value(json).expect("v7-shaped record deserializes");
+		assert!(back.ttl.is_none(), "an absent ttl field reads as no verdict, never a pass");
 	}
 
 	#[test]

@@ -74,6 +74,7 @@ pub mod interpolate;
 /// reason as [`import_rows_mode`]: its parsing and file handling are testable.
 pub mod keygen;
 pub mod maintain;
+pub mod memory_budget;
 pub mod metrics;
 mod num;
 /// FRE-9a: OpenAPI 3.1 document generated from the route registry.
@@ -144,7 +145,7 @@ pub use tls::{PlaintextGate, TlsConfig, ALLOW_PLAINTEXT_ENV, AUTH_DISABLED, AUTH
 pub use version::{build_info, version, BuildInfo, ScopeInfo, ScopePinInfo, StoreIdentity, VersionResponse};
 
 pub use crate::{
-	declare::{declare_aspect, DeclareAspectRequest, DeclareAspectResponse}, ingest::{ingest_csv, ingest_ilp, ingest_parquet, ingest_points, CsvIngestParams, IlpIngestParams, IngestConfig, IngestPoint, IngestRequest, IngestResponse, ParquetIngestParams, DEFAULT_MAX_INGEST_BYTES, INGEST_MAX_INFLIGHT_BYTES_ENV, MAX_INGEST_BYTES_ENV}, maintain::{fsck_store, purge_expired_quarantine, quarantine_list, quarantine_purge, quarantine_release, reconcile_aspect, reconcile_store, PurgeExpiredResponse, QuarantineParams, ReconcileResponse, ReconcileStoreResponse, SweepFailure}
+	declare::{declare_aspect, DeclareAspectRequest, DeclareAspectResponse}, ingest::{ingest_csv, ingest_ilp, ingest_parquet, ingest_points, CsvIngestParams, IlpIngestParams, IngestConfig, IngestPoint, IngestRequest, IngestResponse, ParquetIngestParams, DEFAULT_MAX_INGEST_BYTES, INGEST_MAX_INFLIGHT_BYTES_ENV, MAX_INGEST_BYTES_ENV}, maintain::{fsck_store, purge_expired_quarantine, quarantine_list, quarantine_purge, quarantine_release, reconcile_aspect, reconcile_store, PurgeExpiredResponse, QuarantineParams, ReconcileResponse, ReconcileStoreResponse, SweepFailure}, memory_budget::{budget_from_env, parse_override, read_cgroup_limit, read_cgroup_limit_at, MemoryBudget, Reservation, ReserveError}
 };
 
 /// The server's package version, surfaced in probe responses so a deployed

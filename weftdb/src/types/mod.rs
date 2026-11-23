@@ -33,6 +33,10 @@ pub use quarantine::{decode_failure_action, QuarantineClass, QuarantineRecord, Q
 pub use relative::Relative;
 pub use rows_mode::{discover, import_into, read_import_record, record_key, ImportRecord, ImportedAspect, LegacyAspect, LegacyCatalogAspect, LegacyTree, NotCarried, RowsModeError, DEFAULT_ROWS_PER_SEGMENT, IMPORT_RECORD_KEY, MEASUREMENTS_FILE, TIMESTAMP_COLUMN, TIMESTAMP_TIME_UNIT, TIMESTAMP_UNIT};
 pub use segment_index::{SegmentChange, SegmentIndexStore};
+/// P12-722: store-level row expiry. Public because `SegmentStoreOptions::expiry` and
+/// `SegmentStore::expiry_sweep` name these types; the re-export matches how the other
+/// segment-store policies reach `weftdb::types`.
+pub use segment_store::row_expiry::{AspectExpirySwept, ExpirySweep, RowExpiryPolicy};
 #[cfg(feature = "fault-injection")]
 #[doc(hidden)]
 pub use segment_store::MaintenanceHold;

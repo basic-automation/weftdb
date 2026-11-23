@@ -497,6 +497,124 @@ fn unescape(s: &str) -> String {
 	out
 }
 
+// ---------------------------------------------------------------------------
+// Writer
+// ---------------------------------------------------------------------------
+
+/// Escape `s` for use in the measurement/tag/field-key region of a line-protocol
+/// line (before the first unquoted space).
+///
+/// Structural characters that the parser treats as delimiters via
+/// [`split_unescaped`] — backslash, space, comma, equals — are backslash-escaped
+/// so their literal meaning is preserved. This mirrors what the parser's
+/// [`unescape`] can reverse for measurement names, tag keys/values, and field keys.
+fn escape_key(s: &str) -> String {
+	let mut out = String::with_capacity(s.len() + 4);
+	for c in s.chars() {
+		match c {
+			'\\' => out.push_str("\\\\"),
+			' ' => out.push_str("\\ "),
+			',' => out.push_str("\\,"),
+			'=' => out.push_str("\\="),
+			_ => out.push(c),
+		}
+	}
+	out
+}
+
+/// Escape a string for use inside a double-quoted field value.
+///
+/// The parser's [`parse_field_value`] strips the outer quotes and runs
+/// [`unescape`] on the content, so the only characters we need to escape are
+/// backslash and the double-quote itself — commas and spaces are harmless inside
+/// double quotes.
+fn escape_quoted(s: &str) -> String {
+	let mut out = String::with_capacity(s.len() + 2);
+	for c in s.chars() {
+		match c {
+			'\\' => out.push_str("\\\\"),
+			'"' => out.push_str("\\\""),
+			_ => out.push(c),
+		}
+	}
+	out
+}
+
+impl std::fmt::Display for FieldValue {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Float(v) => write!(f, "{v}"),
+			Self::Integer(v) => write!(f, "{v}i"),
+			Self::Unsigned(v) => write!(f, "{v}u"),
+			Self::Boolean(true) => f.write_str("t"),
+			Self::Boolean(false) => f.write_str("f"),
+			Self::Str(s) => write!(f, "\"{}\"", escape_quoted(s)),
+		}
+	}
+}
+
+impl LineRecord {
+	/// Serialise this record as an InfluxDB Line Protocol string.
+	///
+	/// The output uses canonical forms that the parser's `parse_line` is known
+	/// to accept: booleans are written `t` / `f` (the shortest forms), floats use
+	/// Rust's default [`std::fmt::Display`] (which produces the shortest string that
+	/// round-trips to the same `f64`), integers carry the `i` suffix, unsigned
+	/// integers the `u` suffix, and strings are double-quoted with backslash
+	/// escaping.
+	///
+	/// # Note on parsing divergence from the Influx spec
+	///
+	/// The parser accepts a broader set of boolean tokens (`T`, `TRUE`, `True`,
+	/// `F`, `FALSE`, `False`) and raw `NaN`/`inf` floats — forms that InfluxDB 2.x
+	/// rejects at the wire level. This writer emits only the canonical subset the
+	/// parser produces and the parser can still round-trip. Where the parser
+	/// differs from the published Influx spec, this writer follows the parser so
+	/// that records are written exactly as the crate's own parser expects them.
+	///
+	/// # Round-trip caveat
+	///
+	/// A record carrying `NaN` writes back as the token the parser took and re-parses to a
+	/// non-finite float, but it is **not** equal to the record it came from: `FieldValue` derives
+	/// `PartialEq` and `f64::NAN != f64::NAN`. `inf` and `-inf` compare equal, and neither a `NaN`
+	/// nor an infinity can be stored: `parse_points` refuses a non-finite named field (ROB-7).
+	#[must_use]
+	pub fn to_ilp(&self) -> String {
+		self.to_string()
+	}
+}
+
+impl std::fmt::Display for LineRecord {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		// Measurement (escaped).
+		write!(f, "{}", escape_key(&self.measurement))?;
+
+		// Tags, comma-separated.
+		for (k, v) in &self.tags {
+			write!(f, ",{}={}", escape_key(k), escape_key(v))?;
+		}
+
+		// Space, then fields.
+		let mut first = true;
+		for (k, v) in &self.fields {
+			if first {
+				f.write_str(" ")?;
+				first = false;
+			} else {
+				f.write_str(",")?;
+			}
+			write!(f, "{}={}", escape_key(k), v)?;
+		}
+
+		// Optional timestamp.
+		if let Some(ts) = self.timestamp {
+			write!(f, " {ts}")?;
+		}
+
+		Ok(())
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::str::FromStr;
@@ -704,5 +822,122 @@ mod tests {
 		let err = parse_points("weather temp=1 100\nweather temp=NaN 110\n", "temp", TimestampPrecision::Seconds).expect_err("a NaN field is refused, not skipped");
 		assert_eq!(err.kind, ParseErrorKind::NonFiniteValue);
 		assert_eq!(err.line, 2, "the refusal names the line the sender counts");
+	}
+
+	// -----------------------------------------------------------------------
+	// Writer tests
+	// -----------------------------------------------------------------------
+
+	#[test]
+	fn display_field_value_round_trips_every_type() {
+		let cases: Vec<(FieldValue, &str)> = vec![(FieldValue::Float(1.5), "1.5"), (FieldValue::Float(0.0), "0"), (FieldValue::Float(-3.5), "-3.5"), (FieldValue::Integer(42), "42i"), (FieldValue::Integer(-7), "-7i"), (FieldValue::Unsigned(99), "99u"), (FieldValue::Boolean(true), "t"), (FieldValue::Boolean(false), "f"), (FieldValue::Str("hello".to_string()), r#""hello""#), (FieldValue::Str(r#"a "quote""#.to_string()), r#""a \"quote\"""#), (FieldValue::Str("back\\slash".to_string()), r#""back\\slash""#)];
+		for (val, expected) in cases {
+			assert_eq!(val.to_string(), expected, "FieldValue::Display mismatch for {val:?}");
+		}
+	}
+
+	#[test]
+	fn write_a_full_line_with_tags_fields_and_timestamp() {
+		let record = LineRecord { measurement: "cpu".to_string(), tags: vec![("host".to_string(), "a".to_string()), ("region".to_string(), "us".to_string())], fields: vec![("load".to_string(), FieldValue::Float(0.5)), ("count".to_string(), FieldValue::Integer(3))], timestamp: Some(1_577_836_800_000_000_000) };
+		let expected = "cpu,host=a,region=us load=0.5,count=3i 1577836800000000000";
+		assert_eq!(record.to_ilp(), expected);
+	}
+
+	#[test]
+	fn write_line_without_tags_or_timestamp() {
+		let record = LineRecord { measurement: "weather".to_string(), tags: vec![], fields: vec![("temp".to_string(), FieldValue::Float(21.3))], timestamp: None };
+		let expected = "weather temp=21.3";
+		assert_eq!(record.to_ilp(), expected);
+	}
+
+	#[test]
+	fn write_escaped_measurement_and_tags() {
+		// This is the round-trip from the parser test `honors_escaped_commas_spaces_and_equals_in_keys`:
+		// the parser accepted `my\ measurement,tag\=key=tag\,val field\ name=1` and produced
+		// a LineRecord whose fields have their escapes resolved. We assert that writing that
+		// record reproduces the original wire form with the correct backslash escapes.
+		let record = LineRecord { measurement: "my measurement".to_string(), tags: vec![("tag=key".to_string(), "tag,val".to_string())], fields: vec![("field name".to_string(), FieldValue::Float(1.0))], timestamp: None };
+		let expected = r"my\ measurement,tag\=key=tag\,val field\ name=1";
+		assert_eq!(record.to_ilp(), expected);
+	}
+
+	#[test]
+	fn write_all_field_value_types() {
+		let record = LineRecord { measurement: "m".to_string(), tags: vec![], fields: vec![("f".to_string(), FieldValue::Float(1.5)), ("i".to_string(), FieldValue::Integer(7)), ("u".to_string(), FieldValue::Unsigned(9)), ("bt".to_string(), FieldValue::Boolean(true)), ("bf".to_string(), FieldValue::Boolean(false)), ("s".to_string(), FieldValue::Str("hi".to_string()))], timestamp: None };
+		let expected = r#"m f=1.5,i=7i,u=9u,bt=t,bf=f,s="hi""#;
+		assert_eq!(record.to_ilp(), expected);
+	}
+
+	#[test]
+	fn write_string_field_with_escaped_content() {
+		let record = LineRecord { measurement: "m".to_string(), tags: vec![], fields: vec![("note".to_string(), FieldValue::Str(r#"a, b "c""#.to_string())), ("value".to_string(), FieldValue::Integer(2))], timestamp: Some(10) };
+		let expected = r#"m note="a, b \"c\"",value=2i 10"#;
+		assert_eq!(record.to_ilp(), expected);
+	}
+
+	#[test]
+	fn round_trip_over_existing_test_cases() {
+		// Every test-input line from the parser tests above: parse, write,
+		// re-parse, assert records are equal.
+		let cases = [
+			// Full line with tags, fields, timestamp.
+			"cpu,host=a,region=us load=0.5,count=3i 1577836800000000000",
+			// Line without tags or timestamp.
+			"weather temp=21.3",
+			// All field value types.
+			r#"m f=1.5,i=7i,u=9u,bt=t,bf=f,s="hi""#,
+			// String fields with special characters.
+			r#"m note="a, b \"c\"",value=2i 10"#,
+			// Escaped characters in keys.
+			r"my\ measurement,tag\=key=tag\,val field\ name=1",
+			// Float with the value the parser typically interprets.
+			"cpu,host=a load=0.9 2000000000",
+			// Multiple fields.
+			"cpu,host=a,region=us load=0.2,other=5i 3000000000",
+			// Measurement without tags.
+			"weather temp=1 100",
+			// Measurement with one tag.
+			"cpu,host=a load=0.1 1000000000",
+			// Measurement with unsigned integer.
+			"m u=42u",
+		];
+
+		for input in &cases {
+			let parsed = parse(input).expect("parse should succeed for a known-good line");
+			assert_eq!(parsed.len(), 1, "each case is exactly one record");
+
+			let written = parsed[0].to_ilp();
+			let reparsed = parse(&written).expect("round-trip write should parse again");
+			assert_eq!(reparsed.len(), 1, "round-trip produces one record");
+
+			assert_eq!(reparsed[0], parsed[0], "round-trip mismatch for input: `{input}`\n  written: `{written}`");
+		}
+	}
+
+	#[test]
+	fn non_finite_floats_keep_their_text_but_not_their_equality() {
+		// The writer round-trips every record it is given except one case, and this pins which. `FieldValue` derives `PartialEq` (lib.rs:71), so `Float(NaN)` is not equal to its own round-trip: `f64::NAN != f64::NAN`. The text still comes back byte-identical, and `parse_points` refuses a non-finite named field (the ROB-7 test above), so a NaN never reaches storage.
+		for token in ["NaN", "inf", "-inf"] {
+			let line = format!("m v={token} 1");
+			let parsed = parse(&line).expect("a non-finite field value parses into a record");
+			assert!(parsed[0].field_is_non_finite("v"), "`{token}` should read as non-finite");
+			assert_eq!(parsed[0].to_ilp(), line, "`{token}` must write back as the token the parser took");
+			let reparsed = parse(&parsed[0].to_ilp()).expect("the written form must parse again");
+			assert!(reparsed[0].field_is_non_finite("v"), "`{token}` must re-parse to a non-finite float");
+		}
+		// `inf` compares equal to itself, so it round-trips in every sense. `NaN` does not.
+		let inf = parse("m v=inf 1").expect("`inf` parses");
+		assert_eq!(parse(&inf[0].to_ilp()).expect("`inf` round-trips")[0], inf[0], "`inf` is equal to its own round-trip");
+		let nan = parse("m v=NaN 1").expect("`NaN` parses");
+		assert_ne!(parse(&nan[0].to_ilp()).expect("`NaN` round-trips as text")[0], nan[0], "`NaN` is not equal to itself, which is why the guarantee excludes it");
+	}
+
+	#[test]
+	fn round_trip_multiple_lines() {
+		let input = concat!("cpu,host=a load=0.1 1000000000\n", "cpu,host=b other=5i 2000000000\n", "weather temp=21.3\n",);
+		let records = parse(input).expect("parse multi-line input");
+		let written: Vec<String> = records.iter().map(LineRecord::to_ilp).collect();
+		let reparsed: Vec<LineRecord> = parse(&written.join("\n")).expect("re-parse round-tripped lines");
+		assert_eq!(reparsed, records, "round-trip preserves all records");
 	}
 }

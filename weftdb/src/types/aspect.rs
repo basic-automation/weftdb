@@ -1787,9 +1787,16 @@ impl Aspect {
 		self.compression_config.as_ref()
 	}
 
-	/// Set the compression configuration for this aspect.
-	/// This updates the in-memory configuration. Call `save_compression_config`
-	/// to persist to the database.
+	/// Set the compression configuration for this aspect in memory only.
+	/// The caller must use [`set_compression_config`](Self::set_compression_config)
+	/// to persist the config to the metadata database, which also validates the
+	/// storage mode and refuses a seal-backed aspect.
+	///
+	/// This setter has no database handle and cannot check the aspect's storage
+	/// mode, so it is safe to call on a seal-backed aspect in contexts where no
+	/// write will follow: setting up a local config before a test, or clearing
+	/// the in-memory copy after a refusal. The seal-backed guard lives in
+	/// [`set_compression_config`](Self::set_compression_config) and [`compress_with_progress`](Self::compress_with_progress).
 	pub fn set_compression_config_local(&mut self, config: Option<CompressionConfig>) {
 		self.compression_config = config;
 	}
@@ -1813,9 +1820,17 @@ impl Aspect {
 	///
 	/// # Errors
 	///
-	/// Returns an error if database operations fail.
-	#[instrument(skip(self))]
-	pub async fn set_compression_config(&mut self, config: Option<CompressionConfig>) -> Result<()> {
+	/// Returns an error if database operations fail or the aspect is
+	/// seal-backed (compress is not supported for seal-backed aspects).
+	#[instrument(skip(self, database))]
+	pub async fn set_compression_config(&mut self, database: &Database, config: Option<CompressionConfig>) -> Result<()> {
+		// Refuse when the aspect is seal-backed: compress reads from the seal
+		// store then deletes and inserts rows in the per-aspect measurements.db
+		// that no seal-backed read ever consults (#801).
+		if database.is_seal_backed(&self.id).await? {
+			return Err(crate::Error::SealBackedRejected(format!("compression config cannot be set for a seal-backed aspect {}", self.id)).into());
+		}
+
 		tracing::info!(">>> set_compression_config: cloning config");
 		self.compression_config.clone_from(&config);
 
@@ -1847,6 +1862,9 @@ impl Aspect {
 	/// Returns `CompressionSummary` with results from both time-based and size-based modes.
 	/// If no compression config is set, returns an error.
 	///
+	/// Delegates to [`compress_with_progress`](Self::compress_with_progress) which
+	/// refuses a seal-backed aspect.
+	///
 	/// # Execution Order
 	/// 1. Apply time-based compression first (if configured)
 	/// 2. Check if size constraint is met
@@ -1855,6 +1873,7 @@ impl Aspect {
 	/// # Errors
 	///
 	/// Returns an error if:
+	/// - The aspect is seal-backed
 	/// - No compression config is set for this aspect
 	/// - Database operations fail
 	/// - Compression algorithm fails
@@ -1877,6 +1896,7 @@ impl Aspect {
 	/// # Errors
 	///
 	/// Returns an error if:
+	/// - The aspect is seal-backed
 	/// - No compression config is set for this aspect
 	/// - Database operations fail
 	/// - Compression algorithm fails
@@ -1892,6 +1912,13 @@ impl Aspect {
 		if !config.enabled {
 			tracing::info!("Compression is disabled for this aspect");
 			return Ok(DetailedCompressionSummary { summary: CompressionSummary::default(), tier_results: Vec::new(), started_at, completed_at: chrono::Utc::now(), total_duration_ms: 0 });
+		}
+
+		// Refuse when the aspect is seal-backed: compress reads from the seal
+		// store then deletes and inserts rows in the per-aspect measurements.db
+		// that no seal-backed read consults (#801).
+		if database.is_seal_backed(&self.id).await? {
+			return Err(crate::Error::SealBackedRejected(format!("compress is not supported for seal-backed aspect {}", self.id)).into());
 		}
 
 		// Report initialization

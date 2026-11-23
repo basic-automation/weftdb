@@ -16,8 +16,10 @@ import hashlib
 import os
 import subprocess
 import sys
+import tarfile
 import tempfile
 import tomllib
+from io import BytesIO
 import unittest
 from pathlib import Path
 
@@ -301,3 +303,204 @@ class ThePinnedTree(unittest.TestCase):
 
 if __name__ == "__main__":
 	unittest.main()
+class Fetch(unittest.TestCase):
+	"""`fetch` must check the bytes against the pin, and must not be reachable for an
+	artifact the pin does not vouch for. A fake `gh` copies a file the test made; nothing
+	in this class reaches GitHub."""
+
+	def setUp(self):
+		self.gh_calls = []
+		self.real_gh = releases.gh
+
+	def fake_gh(self, src: Path, copy: bool = True):
+		"""Stand in for `gh release download … --pattern NAME --dir D`."""
+
+		def gh(*args: str) -> str:
+			self.gh_calls.append(args)
+			pattern = args[args.index("--pattern") + 1] if "--pattern" in args else None
+			dest = Path(args[args.index("--dir") + 1])
+			dest.mkdir(parents=True, exist_ok=True)
+			if copy and pattern:
+				(dest / pattern).write_bytes(src.read_bytes())
+			return ""
+
+		releases.gh = gh
+
+	def archive(self, tmp: Path, name: str = "weftdb-v0.1.0-x86_64-unknown-linux-gnu.tar.gz") -> Path:
+		"""A release-shaped tarball holding an executable and a README."""
+		payload = tmp / "stage"
+		(payload / "bin").mkdir(parents=True)
+		(payload / "bin" / "weft-server").write_text("#!/bin/sh\necho v0.1.0\n")
+		(payload / "bin" / "weft-server").chmod(0o755)
+		(payload / "README").write_text("v0.1.0\n")
+		archive = tmp / name
+		with tarfile.open(archive, "w:gz") as tar:
+			tar.add(payload / "bin" / "weft-server", arcname="weftdb-v0.1.0-x86_64-unknown-linux-gnu/bin/weft-server")
+			tar.add(payload / "README", arcname="weftdb-v0.1.0-x86_64-unknown-linux-gnu/README")
+		return archive
+
+	def tearDown(self):
+		# Put the module's own `gh` back: a deleted attribute breaks the next test in the
+		# class, which is the mistake this class made once already.
+		releases.gh = self.real_gh
+
+	def test_the_digest_of_the_bytes_arrived_is_the_digest_returned(self):
+		with tempfile.TemporaryDirectory() as raw:
+			tmp = Path(raw)
+			archive = self.archive(tmp)
+			name = archive.name
+			self.fake_gh(archive)
+			pinned = block(assets={name: hashlib.sha256(archive.read_bytes()).hexdigest()})
+			path, digest, unpacked = releases.fetch_asset(pinned, tmp / "out", host=("linux", "x86_64"))
+			self.assertEqual(digest, hashlib.sha256(archive.read_bytes()).hexdigest())
+			self.assertEqual(path, tmp / "out" / name)
+			self.assertEqual(unpacked, [])
+
+	def test_bytes_that_do_not_match_the_pin_are_refused_naming_both(self):
+		with tempfile.TemporaryDirectory() as raw:
+			tmp = Path(raw)
+			archive = self.archive(tmp)
+			self.fake_gh(archive)
+			pinned = block(assets={archive.name: "b" * 64})
+			with self.assertRaises(releases.PinError) as caught:
+				releases.fetch_asset(pinned, tmp / "out", host=("linux", "x86_64"))
+			message = str(caught.exception)
+			self.assertIn("b" * 64, message)
+			self.assertIn(hashlib.sha256(archive.read_bytes()).hexdigest(), message)
+			# The point of the sentence, not its punctuation: the pin is history.
+			self.assertIn("append-only", message)
+
+	def test_an_asset_the_pin_does_not_carry_is_refused_before_any_download(self):
+		with tempfile.TemporaryDirectory() as raw:
+			tmp = Path(raw)
+			archive = self.archive(tmp)
+			self.fake_gh(archive)
+			pinned = block(assets={archive.name: hashlib.sha256(archive.read_bytes()).hexdigest()})
+			with self.assertRaises(releases.PinError) as caught:
+				releases.fetch_asset(pinned, tmp / "out", asset="weftdb-v0.1.0-x86_64-unknown-linux-musl.tar.gz", host=("linux", "x86_64"))
+			self.assertIn("x86_64-unknown-linux-gnu.tar.gz", str(caught.exception))
+			self.assertEqual(self.gh_calls, [], "the pin was consulted before the network")
+
+	def test_a_release_that_shipped_no_binaries_has_nothing_to_fetch(self):
+		with tempfile.TemporaryDirectory() as raw:
+			tmp = Path(raw)
+			self.fake_gh(Path("nowhere"))
+			with self.assertRaises(releases.PinError) as caught:
+				releases.fetch_asset(block(binaries=False), tmp / "out", host=("linux", "x86_64"))
+			self.assertIn("binaries = false", str(caught.exception))
+			self.assertEqual(self.gh_calls, [])
+
+	def test_gh_lying_about_success_is_caught(self):
+		with tempfile.TemporaryDirectory() as raw:
+			tmp = Path(raw)
+			archive = self.archive(tmp)
+			self.fake_gh(archive, copy=False)
+			pinned = block(assets={archive.name: hashlib.sha256(archive.read_bytes()).hexdigest()})
+			with self.assertRaises(releases.PinError) as caught:
+				releases.fetch_asset(pinned, tmp / "out", host=("linux", "x86_64"))
+			self.assertIn("left no", str(caught.exception))
+
+	def test_each_machine_gets_the_archive_named_for_its_triple(self):
+		assets = {
+			"weftdb-v0.1.0-aarch64-apple-darwin.tar.gz": "1" * 64,
+			"weftdb-v0.1.0-aarch64-unknown-linux-gnu.tar.gz": "2" * 64,
+			"weftdb-v0.1.0-x86_64-apple-darwin.tar.gz": "3" * 64,
+			"weftdb-v0.1.0-x86_64-pc-windows-msvc.zip": "4" * 64,
+			"weftdb-v0.1.0-x86_64-unknown-linux-gnu.tar.gz": "5" * 64,
+		}
+		for host, expected in (
+			(("linux", "x86_64"), "x86_64-unknown-linux-gnu.tar.gz"),
+			(("linux", "aarch64"), "aarch64-unknown-linux-gnu.tar.gz"),
+			(("darwin", "arm64"), "aarch64-apple-darwin.tar.gz"),
+			(("darwin", "x86_64"), "x86_64-apple-darwin.tar.gz"),
+			(("win32", "amd64"), "x86_64-pc-windows-msvc.zip"),
+		):
+			self.assertEqual(releases.pick_asset(assets, host=host).endswith(expected), True, f"{host} should get {expected}")
+
+	def test_a_machine_with_no_pinned_archive_is_told_what_exists(self):
+		with tempfile.TemporaryDirectory() as raw:
+			tmp = Path(raw)
+			archive = self.archive(tmp)
+			self.fake_gh(archive)
+			pinned = block(assets={"weftdb-v0.1.0-aarch64-unknown-linux-gnu.tar.gz": "a" * 64})
+			with self.assertRaises(releases.PinError) as caught:
+				releases.fetch_asset(pinned, tmp / "out", host=("linux", "x86_64"))
+			self.assertIn("x86_64-unknown-linux-gnu", str(caught.exception))
+			self.assertIn("aarch64-unknown-linux-gnu.tar.gz", str(caught.exception))
+			self.assertEqual(self.gh_calls, [])
+
+	def test_an_unknown_machine_is_told_to_name_the_asset(self):
+		assets = {"weftdb-v0.1.0-x86_64-unknown-linux-gnu.tar.gz": "a" * 64}
+		with self.assertRaises(releases.PinError) as caught:
+			releases.pick_asset(assets, host=("plan9", "hollybush"))
+		self.assertIn("--asset", str(caught.exception))
+
+	def test_two_archives_for_one_triple_is_not_guessed(self):
+		assets = {
+			"weftdb-v0.1.0-x86_64-unknown-linux-gnu.tar.gz": "a" * 64,
+			"weftdb-v0.1.0-x86_64-unknown-linux-gnu-static.tar.gz": "b" * 64,
+		}
+		with self.assertRaises(releases.PinError) as caught:
+			releases.pick_asset(assets, host=("linux", "x86_64"))
+		self.assertIn("--asset", str(caught.exception))
+
+	def test_extract_lands_the_binaries_next_to_the_archive(self):
+		with tempfile.TemporaryDirectory() as raw:
+			tmp = Path(raw)
+			archive = self.archive(tmp)
+			self.fake_gh(archive)
+			pinned = block(assets={archive.name: hashlib.sha256(archive.read_bytes()).hexdigest()})
+			path, digest, unpacked = releases.fetch_asset(pinned, tmp / "out", host=("linux", "x86_64"), extract=True)
+			names = [str(entry.relative_to(tmp / "out")) for entry in unpacked]
+			self.assertEqual(sorted(names), ["0.1.0/weftdb-v0.1.0-x86_64-unknown-linux-gnu/README", "0.1.0/weftdb-v0.1.0-x86_64-unknown-linux-gnu/bin/weft-server"])
+			self.assertTrue((tmp / "out" / "0.1.0" / "weftdb-v0.1.0-x86_64-unknown-linux-gnu" / "bin" / "weft-server").is_file())
+
+	def test_extract_refuses_a_zip_and_says_why(self):
+		with tempfile.TemporaryDirectory() as raw:
+			tmp = Path(raw)
+			archive = self.archive(tmp)
+			self.fake_gh(archive)
+			name = "weftdb-v0.1.0-x86_64-pc-windows-msvc.zip"
+			pinned = block(assets={name: hashlib.sha256(archive.read_bytes()).hexdigest()})
+			with self.assertRaises(releases.PinError) as caught:
+				releases.fetch_asset(pinned, tmp / "out", asset=name, host=("win32", "amd64"), extract=True)
+			self.assertIn("tar", str(caught.exception))
+
+	def test_unpack_refuses_a_member_that_escapes_the_destination(self):
+		with tempfile.TemporaryDirectory() as raw:
+			tmp = Path(raw)
+			archive = tmp / "weftdb-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
+			with tarfile.open(archive, "w:gz") as tar:
+				info = tarfile.TarInfo("../escaped")
+				info.size = 2
+				tar.addfile(info, BytesIO(b"hi"))
+			with self.assertRaises(releases.PinError) as caught:
+				releases.unpack_tar(archive, tmp / "out")
+			self.assertIn("outside", str(caught.exception))
+			self.assertFalse((tmp / "escaped").exists())
+
+	def test_unpack_refuses_a_link_member_because_it_bypasses_the_check(self):
+		with tempfile.TemporaryDirectory() as raw:
+			tmp = Path(raw)
+			archive = tmp / "weftdb-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
+			with tarfile.open(archive, "w:gz") as tar:
+				info = tarfile.TarInfo("weftdb-v0.1.0/bin/weft-server")
+				info.type = tarfile.SYMTYPE
+				info.linkname = "../../../../etc/passwd"
+				tar.addfile(info)
+			with self.assertRaises(releases.PinError) as caught:
+				releases.unpack_tar(archive, tmp / "out")
+			self.assertIn("link", str(caught.exception))
+
+	def test_fetch_on_the_committed_pin_names_the_archive_ci_downloads(self):
+		"""The pin in the repository must name an archive this machine can select — the CI
+		job runs with no --asset, so a pin that cannot be resolved by triple is a red job."""
+		releases_ = releases.load_pin(REPO_ROOT / "compat" / "releases.toml")
+		for entry in releases_:
+			assets = dict(entry.get("assets") or {})
+			if not entry.get("binaries"):
+				continue
+			names = [name for name in assets if "x86_64-unknown-linux-gnu" in name]
+			self.assertEqual(len(names), 1, f"{entry['tag']} must carry exactly one linux x86_64 archive for the CI job, found {names}")
+
+

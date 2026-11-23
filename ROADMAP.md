@@ -74,45 +74,69 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 
 ## Phase 12 — Close the pre-beta lanes (was W6, W8 and W9 open items)
 
-- [ ] START HERE (filed 2026-11-11 for the next run)
-- [ ] START HERE (rewritten 2026-11-11 for the next run)
-- [ ] START HERE (filed 2026-10-11 for the next run)
-- [ ] START HERE (filed 2026-10-09 for the next run)
-- [ ] (2026-10-08 list.) The 2026-10-08 run (PR `routine/dsp-2026-10-08`)
-- [ ] (2026-09-23 list; item 3 shipped 2026-10-08.) The 2026-09-23 run
 - [ ] Run D-S21's privileged power-loss validation (sudo: dm-log-writes or a QEMU hard reset) *(owner)*
 - [x] read lane: **X-READ** Read-time newer-wins merge across overlapping segments, per series
-- [ ] maint lane: **ROB-20** Maintenance resource limits, k-way merge, re-split of oversized frames
+- [x] maint lane: **ROB-20** Maintenance resource limits, k-way merge, re-split of oversized frames (byte budget #765 + disk-guard reserve #761 + per-op time budget #781; `merge_k_way` #772; output re-split #773. The time budget is honoured between swaps only, and one already-oversized segment is not auto re-split)
 - [x] open lane: **ROB-22** Suspect-frame policy and background-decode crash-loop breaker
 - [x] L-INGEST: **ROB-18** Two-phase ingest admission, total body deadline, panic mapping by phase
-- [ ] **FRE-10a** Contract tests: probes, compute endpoints, metrics and roles
+- [x] **FRE-10a** Contract tests: probes, compute endpoints, metrics and roles
 - [ ] **ROB-14** Cgroup-aware memory budget with per-request reservations
 - [x] Restoring *into a chosen new root* over HTTP (7.3) (#213, 2026-11-14: `POST /api/v1/storage/restore/into?label=...&name=...` into `WEFT_RESTORE_BASE_DIR`; the offline drill at `weft-server/src/restore.rs` is unchanged)
-- [ ] Store-side row-level TTL/expiry (prerequisite for the SOA-15 TTL lane)
+- [x] Store-side row-level TTL/expiry (prerequisite for the SOA-15 TTL lane) *(cut 1 shipped 2026-11-15 in #752: the policy, the read-path filter and a report-only sweep; cut 2 shipped 2026-11-16 in #775: `purge_expired` drops whole segments whose every row is expired, and the reaper unlinks them; cut 3, the environment switch, landed in #784 for issue #783: the `WEFT_ROW_TTL` env var, the settings entry and the config-schema docs; cut 4, the daemon call site, shipped 2026-11-17 in #786 for issue #785: `reconcile_tick_purge_expired` in `weft-server/src/reconcile_daemon.rs` calls `SegmentStore::purge_expired` on the daemon's own tick and records the sweep, so expiry no longer waits for an operator call; with `NoExpiry` the tick is a recorded no-op)*
 - [x] Real-filesystem ENOSPC test for #656 on the injectable space source (#694 merged)
-- [ ] **Measurement bulk ingest routed through the `.weftseg` seal**
+- [x] **Measurement bulk ingest routed through the `.weftseg` seal** *(part 1 shipped 2026-11-16: the two legacy bulk writers that do not read the stored range first were routed through the seal store, and the aspect's own latest-timestamp read was fixed to consult it. #768 then made new legacy aspects seal-backed by default, with `WEFT_LEGACY_DEFAULT_STORAGE=rows` as the opt-out, so a fresh deployment writes sealed frames through every ingest entry point)*
 - [x] **CI**
 - [x] Packaging (1.0 minimum)
+- [x] **Row-TTL purge defects** *(found 2026-11-17 by a read-only audit of #776; the three defects landed 2026-11-19/20 — #797 and #798 through PR #810, #799 through PR #822 — and the daemon call site they gated landed in PR #786 (issue #785): `reconcile_tick_purge_expired` runs the expired-row sweep from the reconcile daemon loop)*
+  - [x] **TTL-PURGE** Dropping an expired segment must not bring back the values it superseded in a surviving overlapping segment (#797, 2026-11-19: `purge_aspect_held` keeps a wholly-expired segment on disk when its `[min_ts, max_ts]` extent overlaps a surviving segment of the same series, so a plain read cannot revert to superseded values)
+  - [x] **TTL-PURGE** An aspect with more than 32 series with expired segments can be purged, and partial drops are counted (#798, 2026-11-19: the swap plans are applied in chunks that stay inside the store's per-transaction plan ceiling, and the sweep report counts the aspects and segments it actually dropped)
+  - [x] **TTL-UNIT** The row TTL carries a unit instead of being a bare number read in each aspect's own time unit (#799, 2026-11-19: `RowExpiryPolicy::Ttl` carries a `TimeUnit`, `WEFT_ROW_TTL` takes an `ns`/`us`/`ms`/`s` suffix with bare = seconds, and the read filter and the purge sweep share one cutoff rule)
+- [ ] **Legacy seal routing defects** *(found 2026-11-17 by a read-only audit of #769, #770 and #780; these gated the seal-backed default in #768, which landed as PR #777 on 2026-11-17 — the sub-item below is what is left)*
+  - [x] **SEAL-COUNT** The count of a seal-backed aspect agrees with what a range read returns after a batch rewrites a timestamp (#800, 2026-11-19: `ingest_batch_with_gate` now folds overlapping clusters with `SegmentStore::reconcile_overlaps` after every ingest, so the segment index stays overlap-free and the rollup count equals the read)
+  - [x] **SEAL-REPLACE** `replace_measurements_in_range` and `compress()` never write to the unread rows file of a seal-backed aspect (#801, 2026-11-19: the rows-mode-only entry points refuse up front with `Error::SealBackedRejected` when the aspect is seal-backed; `set_compression_config` and `capture_new_measurement_chunk` are covered by the same guard)
+  - [x] **SEAL-DUP** The replace-not-append rule for duplicate timestamps is documented and pinned by a test (#802)
+  - [ ] **SEAL-IDEM** A reused `DatasetId` cannot lose a write or fail on a CRC-32 collision (#803; 2026-11-22: **split — the collision half is closed, the lost-write half is open** — the collision half landed as #849 (PR #850, squash `c3379fc`): the key is now `legacy:{dataset_id}:{payload_digest}:{count}` with a 128-bit SHA-256 prefix (`weftdb/src/types/legacy_seal.rs:178`), so a distinct batch is no longer dropped behind a 32-bit checksum; the caller-identity half is deferred past 1.0. The payload-derived key `legacy:{dataset_id}:{payload_crc}:{count}` (`weftdb/src/types/legacy_seal.rs:178`) is inherited state stored on disk (`ingest_ledger.key`, `weftdb/src/types/segment_index.rs:1102`) and pinned by its landed tests; `ingest_batch_with_gate` (`:315`) already carries a required token for identity-aware callers, but the legacy facades that still derive the key take no token, so making a repeat of byte-identical content seal twice would break the deduplication those tests exist to protect)
 - [ ] Make the ghcr.io weftdb package public after PAC-10's first push *(owner)*
 - [ ] Write or approve the honesty-page narrative *(owner)*
 - [ ] Report the three `parquet` 60.0.0 decoder panics and the `arrow-buffer` 60.0.0 panic upstream to apache/arrow-rs *(owner: outward-facing)*
-- [ ] What `float_roundtrip` costs a whole JSON compute or ingest request
+- [x] What `float_roundtrip` costs a whole JSON compute or ingest request *(measured 2026-11-16: below what CI can resolve at whole-request granularity — the parse figure predicts 0.34 ms on a 20,000-value request against arm-to-arm swings of 0.58 ms and 6.07 ms, both in the wrong direction; the parse-only +17 ns/value (≈ 1.42×) stays the cost statement, and `docs/roadmap-notes.md` records both dispatches. A resolvable answer needs a self-hosted runner with a warm target directory.)*
 - [x] Flaky under GPU contention: `gpu_memory::tests::the_pool_stays_bounded_and_stable_on_a_real_gpu`
 - [x] Guard the `#[serial]`-above-`#[test]` ordering (#726, 2026-11-13: the guard reads the keyed `#[serial(key)]` form too and requires a test attribute in the same attribute block; either position in that block serialises, so the "above" ordering is no longer enforced)
 
 ## Phase 13 — Contract candidate (was W9 gates and W11)
 
-- [ ] **7.3 Corruption detection** (D-S12 + ROB-8/9/22 + HTTP restore)
-- [ ] **7.5 Compaction** with query consistency, cancellation, and resource limits (ROB-19/20/21)
-- [ ] **Compatibility tests** (FRE-13 + PAC-14a)
-- [ ] Ship honesty pages / **Honesty pages shipped** (EVI-16, EVI-17 and the owner narrative)
+- [x] **7.3 Corruption detection** (D-S12 + ROB-8/9/22 + HTTP restore) (2026-11-20 audit: every named component is closed. D-S12 landed 2026-10-29 (`DECISIONS.md:3570`) — startup recovery, quarantine with TTL (`weftdb/src/types/quarantine.rs`) and the fsck endpoint (`weft-server/src/routes.rs:967` `POST /api/v1/storage/fsck`, scope `maintain`); ROB-8 frame decode hardening (#265), ROB-9 mutation harness for frames, sidecars and Parquet (#315) and ROB-22 frame-fault policy verification (#446) plus the suspect-frame policy and background-decode crash-loop breaker (#720) are closed; restoring into a chosen new root over HTTP landed 2026-11-14 (#213, `POST /api/v1/storage/restore/into?label=…&name=…` → `WEFT_RESTORE_BASE_DIR/<name>`)
+  - [x] D-S12 startup recovery, quarantine with TTL, the fsck endpoint and the `/ready` report (Phase 6; `POST /api/v1/storage/fsck` in `weft-server/src/routes.rs`; `startup_recovery_quarantines_a_corrupt_frame`, `fsck_rebuilds_a_row_whose_length_is_stale`)
+  - [x] ROB-8 hardened frame decoding (Phase 6; `weft-server/tests/frame_fault.rs`)
+  - [x] ROB-9 mutation harness over frames, sidecars and Parquet (Phase 10; `weft-arrow-store/tests/parquet_mutation.rs`, `weft-physical-type/tests/mutation.rs`)
+  - [x] ROB-22 suspect-frame policy and decode crash-loop breaker (Phase 12, #740; `suspect_frame_policy_tests`, `types::quarantine::tests`)
+  - [x] Restore into a chosen new root over HTTP (Phase 12, #739; `weft-server/tests/restore_into.rs`)
+- [x] **7.5 Compaction** with query consistency, cancellation, and resource limits (ROB-19/20/21) *(reconciled 2026-11-17 by the routine from its parts, all shipped; the evidence tests below were re-run on `435553e` and pass. The limits ROB-20's line states carry over: the time budget is honoured between swaps only, and one already-oversized segment is not auto re-split.)*
+  - [x] Query consistency: readers never error or see a merged member beside its output (`swap_tests::a_reader_looping_during_merges_never_errors_or_sees_a_member_beside_its_output`), with read-time newer-wins across overlapping segments (X-READ, Phase 12)
+  - [x] Cancellation: ROB-21 (`MaintenanceCancel` on the store-wide sweeps, RAII guards, maintenance metrics; `segment_store::cancel_tests`, `weft-server/tests/maintenance_busy.rs`)
+  - [x] Resource limits: ROB-19 scheduler with per-aspect breaker, and ROB-20 byte, disk-reserve and time budgets with `merge_k_way` and output re-split (#765, #761, #781, #772, #773)
+- [x] **Compatibility tests** (FRE-13 + PAC-14a) (2026-11-16, #240: legs A and C are on main and green — run 43759178987 at `8b00486` succeeded, and all ten `weftdb/tests/compat_v010.rs` tests report `ok` in `test (ubuntu|windows|macos)`, including `v010_compat_fre13_upgrade_contract` (leg A: a store the real v0.1.0 binary wrote, read by this build) and `v010_compat_fre13_rollback_after_writes_loses_nothing` (leg C); `UPGRADING.md` and `compat/releases.toml` pin v0.1.0. The third leg those files name, `binary` — a released binary reading a store this build wrote — still has **no** runner: that gap is #762, and it is not claimed by this line.)
+- [ ] Ship honesty pages *(2026-11-22: EVI-16 (#277) and EVI-17 (#319) are closed and `HONESTY.md` is on main, so the pages themselves are shipped; what is left is the owner narrative, which is the project owner's to approve, so this box stays unchecked)*
 - [ ] Move the T7 reference drive (`/mnt/weftbench`) to a 10 Gbps port before calibration *(owner)*
 - [x] **FRE-9b** OpenAPI: storage and operator endpoints — the last change before the beta tag
   - [x] Extend the release tag grammar to `vX.Y.Z-beta.N` (`TAG_RE` in `scripts/release/verify.sh`)
 - [x] **FRE-10b** Contract tests: storage and operator endpoints, plus coverage
 - [ ] **TAG-12** Multi-series crash matrix, fan-out and TSBS benchmarks, fixtures, freeze docs
+  - [x] Multi-series ingest crash cell: `kill-ingest-tagged` in `Failure::ALL` (2026-11-17, `routine/weftdb-2026-11-17`: three tagged series of one aspect, per-series acknowledged-rows and exactness gate, resume to whole; `crash_matrix_tests` passes it at seeds 5 and 6, and a wrong-series read mutant fails it. Linux only, like the other SIGKILL cells, until tursodatabase/turso#7480 is fixed)
+  - [x] Tagged `kill-compaction` and `corrupt-segment` cells (2026-11-17, `routine/weftdb-2026-11-17`: `kill-compaction-tagged` (every series exact after a SIGKILLed compaction, `fsck` clean, rerun exact) and `corrupt-segment-tagged` (served rows are their own series' values, losses are quarantined, at most one series loses rows); each fails a wrong-series mutant through the CLI. The matrix is six cells, and its CI runtime with the three tagged cells is not yet measured)
+  - [ ] Fan-out benchmark (one tagged write or read across many series) *(2026-11-22: the arm itself landed — `weft-bench/src/fan_out.rs` behind `--fan-out`, wired at `weft-bench/src/main.rs:539`, PR #809 merged 2026-11-19 — but there is no ladder run, no `bench/claims.json` entry and no report, and the arm's module doc still says "there is no measurement"; a ladder run belongs on the reference drive at the line above, so this stays open)*
+  - [ ] TSBS tag-grouped query suite in `weft-xbench` (`--tsbs` reads only `host_0` today; `single-groupby-*`, `double-groupby-*`, `lastpoint`, `high-cpu-*` group by `hostname`)
+    - [x] Every host's ten `cpu` fields loaded, and the six `single-groupby-*` variants and `lastpoint` answered in process as the reference (2026-11-21, `routine/weftdb-2026-11-21`: `weft-xbench/src/tsbs.rs` `load_cpu`, `TsbsCpu`, `TsbsQuery`; one-minute buckets as TSBS's generated SQL has them, not the README's "every 5 mins")
+    - [x] WeftDB answers the same seven queries from a store tagged by `hostname`, equal to the reference (2026-11-21, `routine/weftdb-2026-11-21`: `weft-xbench/src/weft.rs` `TsbsWeft`; a test over 10 hosts × 720 readings, and an inclusive-end mutant fails it. Not timed; `lastpoint` reads each series whole)
+    - [ ] A timed `weft-xbench` TSBS-query phase with the reference gate in the report, over the full TSBS file on a quiet host
+      - [x] The phase and its gate: `--tsbs-queries` times `--reps` seeded instances of each of the seven queries over the whole file, gates every answer against the reference, and reports them as schema v9's `tsbs_queries` (2026-11-23, `routine/weftdb-2026-11-23`: `weft_xbench::run_tsbs_queries`, `TsbsCpu::instances`; a mutated-reference test fails the gate on every instance; a debug run over `/mnt/weftbench/tsbs/cpu-only.lp` passes all seven on a busy host, timings unpublished)
+      - [ ] A release-build run over the full file on a quiet host, published as a report artifact
+    - [ ] A per-series latest-row read in `SegmentStore`, so `lastpoint` stops reading every series whole (TSBS's TimescaleDB `lastpoint` is a `LATERAL … ORDER BY time DESC LIMIT 1` per host); benchmark it against today's full-range read first
+    - [ ] The other engines' TSBS SQL (TSBS's own per-engine generators), each checked against the reference
+    - [ ] `double-groupby-*`, `high-cpu-*`, `cpu-max-all-*` and `groupby-orderby-limit`
+  - [ ] Tagged fixtures and freeze docs
 - [x] **ROB-24** Limits and overload evidence; frozen configuration documentation
-- [ ] **SOA-15** part 2: TTL lane
+- [x] **SOA-15** part 2: TTL lane
 
 ## Phase 14 — Beta tag (was W11)
 
@@ -131,7 +155,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
   - [ ] **SOA-18** 24 h acceptance run on the reference SSD, published as an artifact
   - [ ] Run the privileged power-loss validation on the acceptance commit *(owner)*
 - [ ] Legal review of competitor benchmark-publication terms + codec licenses
-  - [ ] Review each competitor's benchmark-publication terms (kdb+ especially)
+  - [x] Review each competitor's benchmark-publication terms (kdb+ especially)
   - [ ] **Open with counsel:** Amazon FOR (US 11,308,093), Tiger Data, SAP (before 6.2), **WEFTDB** trademark clearance, the benchmark policy
   - [ ] **Codec patent/licence gate (owner decisions 2026-10-08).**
     - [ ] **Default FOR codec and the Tiger Data family: with counsel.**
@@ -144,7 +168,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 ## Phase 17 — Freeze (was W13)
 
 - [ ] **7.2 WAL & crash consistency** (crash matrix, kill test and power-loss run green)
-- [ ] **FRE-18** rc.1 freeze cut and layout-2 baseline fixtures; the OpenAPI breaking-change check blocks
+- [ ] **FRE-18** rc.1 freeze cut and layout-2 baseline fixtures; the OpenAPI breaking-change check blocks *(2026-11-22: the checker and its rc.1 baseline shipped — PR #839 merged 2026-11-20 as `ecb0744`, with hardening follow-ups #843/#845 — so what is left of this line is the freeze cut itself and the layout-2 baseline fixtures)*
 
 ## Phase 18 — Release candidate (was W13)
 
@@ -159,8 +183,8 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 
 ## Phase 20 — 1.0 claims and release notes (was W14 and W15)
 
-- [ ] Every performance claim in the README links to a benchmark artifact
-- [ ] Upgrade/rollback procedure, exercised against the previous release
+- [x] Every performance claim in the README links to a benchmark artifact
+- [x] Upgrade procedure exercised against the pinned previous release (v0.1.0, layout 1 → 2); rollback-after-writes is a documented non-goal for 1.0 (FRE-16)
 - [ ] Write or approve the 1.0 release notes and upgrade notes before the cut *(owner)*
 - [ ] **EVI-22** README 1.0 project status, badge and versions
 
@@ -169,15 +193,15 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] README *Project status* table updated to reflect 1.0 and the status badge changed from `pre-beta`
 - [ ] **PAC-18** Cut 1.0.0: binaries, image, release notes
   - [ ] Approve and push the **v1.0.0** tag *(owner)*
-- [ ] **Semver policy + `CHANGELOG.md`**, starting from the first tagged pre-release
+- [x] **Semver policy + `CHANGELOG.md`**, starting from the first tagged pre-release
 
 ## Phase 22 — Connectors and ingest interop
 
 - [ ] **B-conn** Vendor-neutral connector trait + registry
-- [ ] **B-ilp** ILP/Influx interop connector crate
+- [ ] **B-ilp** ILP/Influx interop connector crate — audited 2026-11-22 (#359, `docs/research/ilp-interop-audit.md`): inbound interop is real (own parser crate, four HTTP ILP endpoints, `write_ilp` in both SDKs, precision mapping), outbound is absent (no InfluxDB client in `Cargo.lock`, no ILP writer, no connector trait, no UDP); prerequisite #358 (B-conn trait) is filed and unassigned, follow-ups #866 writer / #867 connector crate / #868 round-trip suite / #869 docs + examples.
 - [ ] **B-rest** REST facade remainder
 - [ ] **B-resilience** Write retry, size-tiered write selector, interpolation window extension
-- [ ] **B-conncache** Complete the cached-connection migration
+- [ ] **B-conncache** Complete the cached-connection migration — audited 2026-11-22 (PR #870, `docs/research/cached-connection-audit.md`): the process-wide `CONNECTION_DATABASES` cache and its idle sweep exist and already cover the sub-aspect databases; what is left is a read-only cache for rows-mode opens (#871), calling `close_idle_databases` from the server loop (#872), and a per-path `Database` singleton (#873). Left unchecked on purpose — #871/#872 sit in the owner's `p12/fanctl-correlation-growth` connection-reuse lane (`docs/roadmap-notes.md:767`) and #873 changes public surface while the #238 freeze is open
 - [ ] Grafana → Prometheus remote write/read (if monitoring) → R/Arrow workflows
   - [ ] **Prometheus remote write/read**: a remote-write series is a metric plus a label set
 - [ ] Lean on production MVCC concurrent writes for concurrent ingest + catalog updates under load
@@ -234,13 +258,13 @@ The phase also cleared the remaining loose ends. The stale README status was fix
   - [ ] **NEXT — the sidecar build.**
   - [ ] *(original item)* **a `ScaledI64`-native reduction fast path in `weft-reduce`**
 - [ ] **BENCHMARK HYGIENE — the synthetic ingest corpus flatters WeftDB, by a lot (measured 2026-07-23).**
-  - [ ] Audit the other `weft-bench` workloads' generators for the same class of flattery
+  - [x] Audit the other `weft-bench` workloads' generators for the same class of flattery *(audited 2026-11-20, #396 → `docs/research/bench-generator-audit.md`)*
     - [ ] **NEXT — a representative storage generator, or real-corpus defaults.**
     - [ ] **FOUND (2026-10-09) — `sketch_p99`'s published ~2.6× speed-up over exact `p99` was the generator's.**
       - [ ] **Research (2026-10-09) — a cheaper sketch index, if the sketch format is ever revised.**
       - [ ] **Positioning (2026-10-09) — exact percentiles are a differentiator against QuestDB.**
       - [ ] **NEXT — select on the mantissas when a partial is not merged.** (#401)
-- [ ] **Adopt the TSM-Bench QUERY SPEC (not the repo) as Weft-Bench's external comparison workload.**
+- [x] **Adopt the TSM-Bench QUERY SPEC (not the repo) as Weft-Bench's external comparison workload.**
 - [ ] **Research (2026-10-09) — DuckDB has a native linear-interpolation arm**
 - [ ] **NEXT — (3c) materialized tiers, remaining**
 - [ ] **Positioning — WeftDB's `.weftpart` sidecar IS the "incremental materialized view", and mergeable DDSketch is its edge (this run's research)**
@@ -298,9 +322,9 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] Per-stage audit trail
 - [ ] **B-windows** Sliding/overlapping + event-centered windows, horizon fan-out, min-density validation
 - [ ] **B-sim** Full variability-metric matrix, fixed-point dedup, occurrence-distance constraint
-- [ ] **B-analysis** Verify the per-point analysis model is wired end-to-end
+- [ ] **B-analysis** Verify the per-point analysis model is wired end-to-end — audited 2026-11-22: **not wired** (no producer on any product path, never persisted and every read resets it to `None`, no server surface, and the `trend` half has no producer); defects filed as #862/#863, findings in `docs/research/per-point-analysis-wiring.md`
 - [ ] **B-snapshot** Pipeline state-snapshot audit trail
-- [ ] **B-object** Schemaless object/annotation store beside numeric aspects
+- [ ] **B-object** Schemaless object/annotation store beside numeric aspects (audit 2026-11-22: docs/research/object-store-audit.md — **does not exist**; freeze blocks it; defer to post-1.0; box stays open by design)
 
 ## Phase 29 — SQL surface
 

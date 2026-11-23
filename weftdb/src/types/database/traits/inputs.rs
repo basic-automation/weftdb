@@ -58,7 +58,12 @@ pub trait Inputs {
 	//
 
 	/// Capture a new measurement for a given aspect
-	/// If a measurement with the same timestamp already exists, the average of the two values is stored.
+	/// For **rows mode**: a timestamp already stored is stored again, so a range read
+	/// returns both rows. Nothing is averaged and no error is raised — see the
+	/// note on [`batch_capture_measurements`](Self::batch_capture_measurements).
+	/// For **seal-backed aspects** (#802): at a shared timestamp only the newest call's
+	/// rows survive (rows inside one call are all kept). This replaces behaviour from
+	/// rows mode, where both rows were kept.
 	///
 	/// # Crash consistency (rows mode)
 	///
@@ -86,8 +91,16 @@ pub trait Inputs {
 	/// [`insert_unprocessed_batch`](Self::insert_unprocessed_batch)) skips the repeat.
 	async fn capture_measurement(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurement: &InputMeasurement) -> Result<TxId>;
 
-	/// Capture new measurements for a given aspect
-	/// If a measurement with the same timestamp already exists, an error is returned.
+	/// Capture one measurement with a plain insert.
+	///
+	/// No duplicate handling: rows mode has no unique constraint to violate
+	/// (`weftdb/src/types/aspect.rs:511-523` creates `measurements` with a
+	/// non-unique index on `timestamp`), so a timestamp already stored is stored
+	/// again and a range read returns both rows; nothing is averaged and no error
+	/// is raised, whatever the older version of this comment said. Seal-backed
+	/// aspects differ (#802): at a shared timestamp only the newest call's rows
+	/// survive (rows inside one call are all kept). Equal timestamps across calls
+	/// resolve newest-first when the frames are read.
 	///
 	/// # Errors
 	///
@@ -96,11 +109,17 @@ pub trait Inputs {
 	/// fails the call although the row is stored. The enqueue is an upsert, which writes an
 	/// entry that is already queued (crash-consistency design, S18), so it can lose an MVCC
 	/// write-write conflict to a queue consumer dequeuing that entry; such a conflict is
-	/// retried for about three seconds before it fails the call.
+	/// retried for about three seconds before it fails the call. For a seal-backed aspect
+	/// there is no enqueue at all (slice D-S20): the ingest commit records the aspect's
+	/// change-log row, which is what a batch consumer reads instead.
 	async fn capture_new_measurement(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurement: &InputMeasurement) -> Result<TxId>;
 
 	/// Capture multiple measurements for a given aspect
-	/// If a measurement with the same timestamp already exists, the average of the two values is stored.
+	/// No duplicate handling: rows mode inserts every row, a timestamp already stored
+	/// twice is stored twice. A seal-backed aspect at a shared timestamp keeps only the
+	/// newest call's rows (rows inside one call are all kept). This is a behaviour
+	/// change from rows mode (#802, SEAL-DUP). Nothing is averaged, whatever the older
+	/// version of this comment said (#232).
 	///
 	/// # Crash consistency (rows mode)
 	///
@@ -158,20 +177,41 @@ pub trait Inputs {
 
 	/// Capture a chunk of measurements - generates `TxIds` internally
 	///
+	/// On a seal-backed aspect (slice D-S19, #232 follow-up: this entry point
+	/// was not yet routed), the whole chunk is one ingest transaction in the seal
+	/// store, all-or-nothing, and a repeated call replays the store's receipt, the
+	/// way [`batch_capture_measurements`](Self::batch_capture_measurements) does.
+	///
 	/// # Errors
 	///
-	/// The chunk's timestamps are queued only after its rows are committed, so an error
-	/// from the enqueue fails the call although the rows are stored; an MVCC conflict with
-	/// a consumer dequeuing the same entries is retried first, as for
+	/// The chunk's timestamps are queued only after its rows are committed (rows
+	/// mode only, because seal mode has no per-timestamp queue), so an error from
+	/// the enqueue fails the call although the rows are stored; an MVCC conflict
+	/// with a consumer dequeuing the same entries is retried first, as for
 	/// [`capture_new_measurement`](Self::capture_new_measurement).
 	async fn capture_measurement_chunk(&self, aspect_id: &AspectId, dataset_id: DatasetId, chunk: &[InputMeasurement]) -> Result<Vec<TxId>>;
 
-	/// Capture multiple measurements for a given aspect
-	/// If a measurement with the same timestamp already exists, the measurement is skipped.
+	/// Insert every measurement one at a time, and in rows mode skip a row whose
+	/// insert failed rather than failing the call: the result can be shorter than
+	/// the input. Nothing rejects or skips a duplicate timestamp (see
+	/// [`capture_new_measurement`](Self::capture_new_measurement)); the older
+	/// version of this comment said the measurement is skipped, and the only
+	/// skipping this does is over a row whose own insert failed.
+	///
+	/// A seal-backed aspect takes the whole call as one ingest transaction in the
+	/// seal store instead (#232), the way
+	/// [`batch_capture_measurements`](Self::batch_capture_measurements) does: it is
+	/// all-or-nothing, a repeated call with the same rows replays the store's
+	/// receipt, and one call records exactly one change-log row (slice D-S20).
 	async fn batch_capture_new_measurements(&self, aspect_id: &AspectId, dataset_id: &DatasetId, input_measurements: Vec<InputMeasurement>) -> Result<Vec<TxId>>;
 
 	/// Capture a chunk of new measurements with batch processing; `tx_ids[i]` is the
 	/// transaction id of `chunk[i]`.
+	///
+	/// Rows mode only: the caller supplies the rows-mode measurements database, and a
+	/// seal-backed aspect's rows must not be written there, because its reads go to the
+	/// seal store (slice D-S19). The bulk paths dispatch to the seal before any chunk
+	/// loop, so nothing reaches this through them (#232).
 	///
 	/// # Errors
 	///

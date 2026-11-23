@@ -3,8 +3,9 @@
 #
 # Two matrices, one verdict:
 #   1. The subprocess SIGKILL soak: `weft-bench --crash-matrix` runs every
-#      failure test (kill-ingest, kill-compaction, corrupt-segment) at every
-#      matrix seed, and fails if any cell's reopened store misbehaves.
+#      failure test (kill-ingest, kill-ingest-tagged, kill-compaction,
+#      kill-compaction-tagged, corrupt-segment, corrupt-segment-tagged) at
+#      every matrix seed, and fails if any cell's reopened store misbehaves.
 #   2. The fault-injection crash matrix: `weftdb`'s `swap_tests` crash matrix
 #      (errors, power cuts and aborts at every swap point), the orchestration
 #      legacy-queue crash test, and the server's poisoned-ready test — the
@@ -121,6 +122,8 @@ done
 if [ "$skip_fault" -eq 0 ]; then
 	# shellcheck disable=SC2086
 	$cargo_cmd test -p weftdb --features fault-injection --locked --test db_tests -- database_new_crash --test-threads=4
+	# shellcheck disable=SC2086
+	$cargo_cmd test -p weftdb --features fault-injection --locked --test multiseries_crash -- multiseries_crash --test-threads=1
 	# shellcheck disable=SC2086
 	$cargo_cmd test -p weft-orchestration --features fault-injection --locked --test legacy_queue_crash -- --test-threads=4
 	# shellcheck disable=SC2086

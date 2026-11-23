@@ -89,15 +89,15 @@ jobs:
       # a cache and printed `Checked 7 crates`, with `weft-bench` never linted at all, and
       # the same tree then failed clippy on a cold runner (#635). This step makes every
       # workspace crate dirty and lints the lot, so the lints the cached gate cannot see
-      # are at least named. Report-only on purpose: the first runs are expected to list
-      # real defects, and a gate that goes red for pre-existing ones stops being a signal.
-      # When this step reports zero errors and full coverage, delete `continue-on-error`
-      # and promote it to the gate, which is the actual fix for #635.
-      - name: Cold re-lint (report only, #635)
-        continue-on-error: true
+      # are at least named. Promoted to the gate 2026-11-22: run #1400 confirmed the
+      # step reports full coverage (11 of 11) with zero errors, so it now fails the job
+      # on a clippy failure, incomplete coverage, or any error line — which is the
+      # actual fix for #635.
+      - name: Cold re-lint (#635)
         shell: bash
         env:
           RUSTFLAGS: ""
+          CARGO_TERM_COLOR: never
         run: |
           set -uo pipefail
           expected=$(cargo metadata --no-deps --format-version 1 | jq '[.packages[] | select(.source == null)] | length')
@@ -107,13 +107,21 @@ jobs:
           checked=$(grep -c '^ *Checking ' /tmp/relint.log || true)
           errors=$(grep -c '^error' /tmp/relint.log || true)
           echo "cold re-lint: $checked of $expected workspace crates compiled, clippy exit $status, $errors error lines"
+          failed=0
+          if [ "$status" -ne 0 ]; then
+            echo "::error::cold re-lint clippy exited $status"
+            failed=1
+          fi
           if [ "$checked" -lt "$expected" ]; then
-            echo "::warning::cold re-lint compiled $checked of $expected workspace crates; something is still skipping the lint pass"
+            echo "::error::cold re-lint compiled $checked of $expected workspace crates; something is still skipping the lint pass"
+            failed=1
           fi
           if [ "$errors" -gt 0 ]; then
-            echo "::warning::cold re-lint found $errors error lines that the cached gate above did not see"
+            echo "::error::cold re-lint found $errors error lines that the cached gate above did not see"
             grep '^error' /tmp/relint.log | head -n 40
+            failed=1
           fi
+          exit "$failed"
 
   # Every performance figure in the README is vouched for by an entry in
   # bench/claims.json, which names the bench or the local corpus behind it and says
@@ -147,6 +155,60 @@ jobs:
       - run: python3 -m unittest discover -s scripts/config -p 'test_*.py' -v
         env:
           PYTHONDONTWRITEBYTECODE: "1"
+      # OpenAPI breaking-change check against the freeze baseline (FRE-18a, #838).
+      - run: python3 scripts/ci/check-openapi-breaking.py
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+      # Unit tests for the OpenAPI breaking-change checker.
+      - run: python3 -m unittest discover -s scripts/ci -p 'test_check_openapi_breaking.py' -v
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+      # The baseline is a copy of the spec it polices; a PR must not move it
+      # silently. Assert the committed baseline matches its recorded digest (#838).
+      - run: |
+          expected=$(awk '{print $1}' compat/openapi/baseline/weftdb.json.sha256)
+          actual=$(sha256sum compat/openapi/baseline/weftdb.json | awk '{print $1}')
+          if [ "$expected" != "$actual" ]; then
+            echo "compat/openapi/baseline/weftdb.json moved without updating compat/openapi/baseline/weftdb.json.sha256" >&2
+            exit 1
+          fi
+      # Every test script under scripts/ and tools/ must be invoked by a
+      # workflow step (CI-GATES, #853).  A gate that nothing invokes is not
+      # a gate: scripts/ci is discovered by narrow -p patterns, so a test
+      # file added there is invisible to CI unless a step names it.
+      - run: python3 scripts/ci/check-test-wiring.py
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+      # Unit tests for the wiring guard (explicit step, not discover:
+      # scripts/ci discovery is deliberately narrow, and a discover line
+      # would contradict the point of the guard).
+      - run: python3 scripts/ci/test_check_test_wiring.py
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+      # No agent scaffolding may be tracked: a run log or handoff note committed
+      # as documentation reads like a claim about the product (#876 removed the
+      # first one that reached main). Pattern list lives in the checker (#885).
+      - run: python3 scripts/ci/check-tracked-scaffolding.py
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+      # Unit tests for the scaffolding guard (explicit step, same reason).
+      - run: python3 scripts/ci/test_check_tracked_scaffolding.py
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+      # The control check's own unit tests run here too, not only in the release
+      # workflow: an unexercised gate is an unenforced gate (FRE-18c, P2).
+      - run: python3 scripts/ci/test_check_baseline_control.py
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+      # Non-tautological baseline control: compare the committed digest against
+      # the base branch's copy (FRE-18c, P1).  Uses gh api to fetch the base
+      # branch's digest file -- no extra checkout or fetch-depth needed.  The
+      # Actions runner's `gh` refuses to authenticate unless GH_TOKEN is set in
+      # the step environment, which surfaced as `gh api failed (exit 4)`.
+      - run: python3 scripts/ci/check-baseline-control.py --digest-file compat/openapi/baseline/weftdb.json.sha256
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          GH_TOKEN: ${{ github.token }}
 
   # weft-xbench is its own workspace (it builds DuckDB from C++), so nothing else builds it on
   # every push. Its lock is seeded from the workspace's; this fails when a shared dependency
@@ -157,6 +219,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: python3 scripts/xbench/check-lock.py
+      # check-lock.py compares the packages the two locks share; it cannot see a dependency a
+      # workspace crate gained that weft-xbench's lock never recorded. Resolving with --locked can:
+      # a stale lock fails here on the push, not first in the nightly cross-engine smoke.
+      - run: cargo metadata --locked --format-version 1 --manifest-path weft-xbench/Cargo.toml > /dev/null
       - run: python3 -m unittest discover -s scripts/xbench -p 'test_*.py' -v
         env:
           PYTHONDONTWRITEBYTECODE: "1"
@@ -190,7 +256,13 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # 75, not 60. The Windows leg's own work fits inside an hour; what the ceiling was cutting off
+    # is its tail. Run 44761112603 (push to main, 2026-11-20, job 136373576261): Build 15:17:02Z ->
+    # 15:34:23Z (17 min) success, Test 15:34:23Z -> 16:15:43Z (41 min) success, and the job was
+    # killed at 16:16:09Z, exactly 60:00 after it started, in `Post Run Swatinem/rust-cache`.
+    # Run 44751684242 finished the same leg in 51 min. A gate that is red on main is not a gate: it
+    # teaches everyone to merge over it. See #835 for the measurements and the alternatives rejected.
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -244,6 +316,20 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" != "schedule" ]; then export SKIP_SLOW_TESTS=1; fi
           cargo test --workspace --locked -- --test-threads=4
+      # TEMPORARY diagnosis for the row-TTL branch: libtest prints no failure detail
+      # blocks in these jobs, so re-run just the expiry tests single-threaded and
+      # uncaptured when the job has already failed. Remove once the cause is fixed.
+      - name: "Debug: row expiry tests, single-threaded, uncaptured"
+        if: failure()
+        shell: bash
+        run: cargo test -p weftdb --lib --locked -- row_expiry --test-threads=1 --nocapture
+      # TEMPORARY diagnosis for the maintenance-output-budget branch (#758), same reason as
+      # the step above: re-run just the budget tests single-threaded and uncaptured when the
+      # job has already failed, so the assertion text reaches the log. Remove once green.
+      - name: "Debug: maintenance budget tests, single-threaded, uncaptured"
+        if: failure()
+        shell: bash
+        run: cargo test -p weftdb --lib --locked -- maintenance_budget --test-threads=1 --nocapture
       # The crash tests arm fault points, which only a `fault-injection` build has. The
       # workspace test above must leave the feature off (weftdb's durable_fault_disabled
       # checks that a production build keeps the points inert), so they run here, per
@@ -254,6 +340,7 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" != "schedule" ]; then export SKIP_SLOW_TESTS=1; fi
           cargo test -p weftdb --features fault-injection --locked --test db_tests -- database_new_crash --test-threads=4
+          cargo test -p weftdb --features fault-injection --locked --test multiseries_crash -- multiseries_crash --test-threads=1
           cargo test -p weft-orchestration --features fault-injection --locked --test legacy_queue_crash -- --test-threads=4
           # Not a crash test, but it poisons a store through the same feature's hook.
           cargo test -p weft-server --features fault-injection --locked --test ready_poisoned -- --test-threads=4
@@ -397,7 +484,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
         with:
           command: check advisories bans licenses sources
 
@@ -519,3 +606,25 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
       - run: python3 scripts/compat/releases.py verify
+
+  # Not a compatibility leg: no old binary is pointed at anything here. What this checks is
+  # that the archives `compat/releases.toml` names still exist and still hash to the digest
+  # written when the release was pinned, and that a downloaded archive can be unpacked on a
+  # runner. Every binary leg described in `UPGRADING.md` starts by putting a released binary
+  # on disk, and until this job that step had never run in CI.
+  archives:
+    name: pinned release archives
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 scripts/compat/releases.py fetch --dest "$RUNNER_TEMP/weft-archive" --extract
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PYTHONDONTWRITEBYTECODE: "1"
+      - name: the archive carries the server binary a binary leg would run
+        run: |
+          set -euo pipefail
+          tar tzf "$RUNNER_TEMP"/weft-archive/*.tar.gz | grep -E '(^|/)weft-server$'
+          test -f "$RUNNER_TEMP"/weft-archive/0.1.0/weftdb-v0.1.0-x86_64-unknown-linux-gnu/weft-server

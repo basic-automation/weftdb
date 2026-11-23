@@ -57,7 +57,11 @@ splimes = { workspace = true, features = ["tokio", "gpu"] }
 wgpu = "30"
 pollster = "1"
 sysinfo = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 
 [dev-dependencies]
+# The arm's tests open real stores under a shared temp root and hit the same GPU, so they run
+# one at a time; serial_test's async feature is what the workspace pins.
+serial_test = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util", "macros"] }

@@ -176,9 +176,146 @@ pub fn merge_newer_wins<V: Clone>(older: &[(i64, V)], newer: &[(i64, V)]) -> Vec
 	out
 }
 
+/// Merge `frames` into one non-decreasing run under the **newer-wins** rule of
+/// [`merge_newer_wins`], in one pass over `k` cursors rather than `k` pairwise folds.
+///
+/// Each frame must be **non-decreasing by timestamp**, and the frames themselves ordered
+/// oldest frame first. At an instant carried by more than one frame, every row of the
+/// **later** frame supersedes every row of every earlier frame; rows at an instant unique
+/// to one frame are kept as they are, a within-frame run of equal timestamps included.
+/// The output is row-for-row what folding the frames pairwise would give
+/// (`merge_newer_wins(&merge_newer_wins(a, b), c)`), for `O(rows + instants · log k)`
+/// rather than the fold's `O(rows · k)` row moves — the fold re-clones the whole merged
+/// prefix once per frame, which is what the maintenance merge of many overlapping members
+/// paid for (roadmap ROB-20 G3, `docs/maintenance-budgets-plan.md` slice 3).
+///
+/// Implementation: a k-way cursor over a min-heap keyed by `(timestamp, frame index)`,
+/// frame index descending, so the cursor parked at the next instant newest-frame first is
+/// the one handed over, its run at that instant is emitted, and every other cursor parked
+/// at the same instant is advanced past the instant — not dropped, because its later
+/// instants still have to be merged.
+#[must_use]
+pub fn merge_k_way<V: Clone>(frames: &[&[(i64, V)]]) -> Vec<(i64, V)> {
+	// `Reverse` turns the max-heap into a min-heap on the tuple; the inner
+	// `Reverse(frame)` makes the *newest* frame the smallest at a shared instant, which is
+	// the whole newer-wins rule in one comparison.
+	type Cursor = std::cmp::Reverse<(i64, std::cmp::Reverse<usize>, usize)>; // (instant, newest-first frame, position)
+	let mut heap: std::collections::BinaryHeap<Cursor> = std::collections::BinaryHeap::new();
+	for (frame, rows) in frames.iter().enumerate() {
+		if let Some(&(t, _)) = rows.first() {
+			heap.push(std::cmp::Reverse((t, std::cmp::Reverse(frame), 0_usize)));
+		}
+	}
+	let mut out: Vec<(i64, V)> = Vec::with_capacity(frames.iter().map(|rows| rows.len()).sum());
+	while let Some(std::cmp::Reverse((t, std::cmp::Reverse(winner), mut pos))) = heap.pop() {
+		let run = frames[winner];
+		while pos < run.len() && run[pos].0 == t {
+			out.push(run[pos].clone());
+			pos += 1;
+		}
+		if pos < run.len() {
+			heap.push(std::cmp::Reverse((run[pos].0, std::cmp::Reverse(winner), pos)));
+		}
+		// The rest of the group parked at `t` is older frames' rows at an instant the
+		// winner already covers: skip their run at `t` and re-park each frame at its next
+		// instant, so nothing after `t` is lost.
+		while heap.peek().is_some_and(|&std::cmp::Reverse((parked, _, _))| parked == t) {
+			if let Some(std::cmp::Reverse((_, std::cmp::Reverse(loser), mut pos))) = heap.pop() {
+				let run = frames[loser];
+				while pos < run.len() && run[pos].0 == t {
+					pos += 1;
+				}
+				if pos < run.len() {
+					heap.push(std::cmp::Reverse((run[pos].0, std::cmp::Reverse(loser), pos)));
+				}
+			}
+		}
+	}
+	out
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn merge_k_way_supersedes_an_older_run_at_a_shared_instant() {
+		let older = [(1, 0), (2, 1), (3, 2)];
+		let middle = [(2, 10)];
+		let newer = [(2, 20), (2, 21), (4, 30)];
+		assert_eq!(merge_k_way(&[&older[..], &middle[..], &newer[..]]), vec![(1, 0), (2, 20), (2, 21), (3, 2), (4, 30)]);
+	}
+
+	#[test]
+	fn merge_k_way_keeps_a_superseded_frames_later_instants() {
+		// The regression this guards: a loser cursor must be advanced past the instant, not
+		// popped and discarded, or (6, 2) disappears from the output.
+		let older = [(5, 1), (6, 2), (7, 3)];
+		let newer = [(5, 10), (7, 20)];
+		assert_eq!(merge_k_way(&[&older[..], &newer[..]]), vec![(5, 10), (6, 2), (7, 20)]);
+	}
+
+	#[test]
+	fn merge_k_way_keeps_a_within_frame_run_of_equal_timestamps() {
+		let older = [(1, 1)];
+		let newer = [(1, 2), (1, 3), (1, 4)];
+		assert_eq!(merge_k_way(&[&older[..], &newer[..]]), vec![(1, 2), (1, 3), (1, 4)]);
+	}
+
+	#[test]
+	fn merge_k_way_of_nothing_and_of_one_are_the_trivial_cases() {
+		let none: Vec<&[(i64, u8)]> = Vec::new();
+		assert_eq!(merge_k_way(&none), Vec::<(i64, u8)>::new(), "no frames merge to nothing");
+		let empty_run: &[(i64, u8)] = &[];
+		assert_eq!(merge_k_way(&[empty_run]), Vec::<(i64, u8)>::new(), "one frame with no rows merges to nothing");
+		let one: &[(i64, u8)] = &[(7, 9)];
+		assert_eq!(merge_k_way(&[one]), vec![(7, 9)], "one frame passes its rows through unchanged");
+	}
+
+	#[test]
+	fn merge_k_way_concatenates_frames_that_do_not_overlap() {
+		let first = [(1, 1), (2, 2)];
+		let second = [(3, 3)];
+		let third = [(4, 4), (5, 5)];
+		assert_eq!(merge_k_way(&[&first[..], &second[..], &third[..]]), vec![(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]);
+	}
+
+	/// The acceptance test of the plan: over a deterministic sweep of frame counts and
+	/// overlap shapes (a 32-bit LCG, so a failure reproduces from the round number), the
+	/// k-way output must equal the serial pairwise fold row for row. Values carry their
+	/// frame and their position, so a wrong winner or a lost row names itself.
+	#[test]
+	fn merge_k_way_matches_the_pairwise_fold_on_every_overlap_shape() {
+		let mut state: u32 = 0x5bd1_e995;
+		let mut next = move || {
+			state ^= state << 13;
+			state ^= state >> 17;
+			state ^= state << 5;
+			state
+		};
+		for round in 0..600_usize {
+			let frames_in = round % 8 + 1;
+			let mut runs: Vec<Vec<(i64, usize)>> = Vec::with_capacity(frames_in);
+			for frame in 0..frames_in {
+				let len = usize::try_from(next() % 14).expect("a value under 14 fits in usize");
+				let mut t = i64::from(next() % 7) - 3;
+				let mut run = Vec::with_capacity(len);
+				for index in 0..len {
+					// A step of 0..=2 over a small range: adjacent frames share instants
+					// often, and a frame repeats an instant as often as its neighbour does.
+					t += i64::from(next() % 3);
+					run.push((t, frame * 1000 + index));
+				}
+				runs.push(run);
+			}
+			let mut expected: Vec<(i64, usize)> = Vec::new();
+			for run in &runs {
+				expected = merge_newer_wins(&expected, run);
+			}
+			let refs: Vec<&[(i64, usize)]> = runs.iter().map(Vec::as_slice).collect();
+			assert_eq!(merge_k_way(&refs), expected, "round {round} of {runs:?}");
+		}
+	}
 
 	#[test]
 	fn split_fires_when_prefix_dominates_and_clears_the_floor() {

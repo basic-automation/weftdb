@@ -41,7 +41,7 @@ use std::sync::Arc;
 use axum::extract::FromRef;
 use weftdb::SegmentStore;
 
-use crate::{admission::AdmissionConfig, audit::AuditLog, auth::AuthConfig, bench_runs::BenchRuns, host_guard::HostGuard, ingest::IngestConfig, interpolate::InterpolateConfig, metrics::SharedMetrics, read_limits::ReadLimits, store_open::ServingScope};
+use crate::{admission::AdmissionConfig, audit::AuditLog, auth::AuthConfig, bench_runs::BenchRuns, host_guard::HostGuard, ingest::IngestConfig, interpolate::InterpolateConfig, memory_budget::MemoryBudget, metrics::SharedMetrics, read_limits::ReadLimits, store_open::ServingScope};
 
 /// The router state shared by every handler: the process metrics, the interpolation
 /// settings, and an optional segment store backing the storage-query endpoints.
@@ -53,6 +53,10 @@ pub struct AppState {
 	metrics: SharedMetrics,
 	/// The on-disk segment store, present only when a store root is configured.
 	store: Option<Arc<SegmentStore>>,
+	/// The container memory budget (ROB-14), read from the cgroup filesystem and
+	/// the operator's `WEFT_MEMORY_BUDGET_BYTES` at startup. Holds a counter that
+	/// every [`Reservation`] accounts against (cut 1 does not enforce yet).
+	memory_budget: MemoryBudget,
 	/// What the `/api/v1/interpolate*` handlers allow (the output-grid cap).
 	interpolate: InterpolateConfig,
 	/// The `Host`/`Origin` checks applied to every request (off unless set).
@@ -87,19 +91,20 @@ pub struct AppState {
 }
 
 impl AppState {
-	/// Build state with a fresh metrics registry, the default interpolation settings
-	/// and no segment store — the shape the stateless API (and the existing tests) run
-	/// under.
+	/// Build state with a fresh metrics registry, the default interpolation settings,
+	/// no segment store, and an unbounded memory budget — the shape the stateless
+	/// API (and the existing tests) run under.
 	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
 	}
 
 	/// Build state over a caller-supplied [`SharedMetrics`] (so a test can observe
-	/// the counters), the default interpolation settings and no segment store.
+	/// the counters), the default interpolation settings, no segment store and an
+	/// unbounded memory budget.
 	#[must_use]
-	pub const fn with_metrics(metrics: SharedMetrics) -> Self {
-		Self { metrics, store: None, interpolate: InterpolateConfig::DEFAULT, host_guard: HostGuard::Off, auth: AuthConfig::off(), ingest: IngestConfig::DEFAULT, admission: AdmissionConfig::DEFAULT, read_limits: ReadLimits::defaults(), audit: None, bench_runs: None, serving: None }
+	pub fn with_metrics(metrics: SharedMetrics) -> Self {
+		Self { metrics, store: None, memory_budget: MemoryBudget::new(None), interpolate: InterpolateConfig::DEFAULT, host_guard: HostGuard::Off, auth: AuthConfig::off(), ingest: IngestConfig::DEFAULT, admission: AdmissionConfig::DEFAULT, read_limits: ReadLimits::defaults(), audit: None, bench_runs: None, serving: None }
 	}
 
 	/// Attach a segment store, enabling the storage-query endpoints.
@@ -247,6 +252,21 @@ impl AppState {
 	#[must_use]
 	pub const fn bench_runs(&self) -> Option<&Arc<BenchRuns>> {
 		self.bench_runs.as_ref()
+	}
+
+	/// Attach a [`MemoryBudget`] read from the environment; the binary passes
+	/// the budget it composed from the cgroup limit and `WEFT_MEMORY_BUDGET_BYTES`.
+	#[must_use]
+	pub fn with_memory_budget(mut self, budget: MemoryBudget) -> Self {
+		self.memory_budget = budget;
+		self
+	}
+
+	/// The container memory budget, present even when unbounded (it accounts every
+	/// [`Reservation`](crate::memory_budget::Reservation) the server makes).
+	#[must_use]
+	pub const fn memory_budget(&self) -> &MemoryBudget {
+		&self.memory_budget
 	}
 }
 

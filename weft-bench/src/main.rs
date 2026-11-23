@@ -35,7 +35,7 @@ use std::{
 use chrono::Utc;
 use splimes::{Resolution, Spline};
 use weft_bench::{
-	engine, load_csv_corpus, load_uci_corpus, manifest::{Problem, RunManifest}, report::{default_filename, default_html_filename}, run_analytics_pipeline, run_compressed_query, run_compression, run_compression_on, run_downsample, run_downsample_on, run_gap_fill, run_gap_fill_on, run_ingest_growth, run_ingest_on, run_ingest_online, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, run_sparse, scale::ScalePreset, sparse::{SparseParams, SparseProfile}, Aggregation, AnalyticsParams, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressedQueryParams, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, ForwardFillAdapter, GapFillParams, GapFillProfile, IngestProfile, InterpolationProfile, LookupMode, OnlineParams, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, StoredWeftAdapter, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter, DEFAULT_INGEST_BATCH_ROWS, DEFAULT_UCI_COLUMN
+	engine, load_csv_corpus, load_uci_corpus, manifest::{Problem, RunManifest}, report::{default_filename, default_html_filename}, run_analytics_pipeline, run_compressed_query, run_compression, run_compression_on, run_downsample, run_downsample_on, run_fan_out, run_gap_fill, run_gap_fill_on, run_ingest_growth, run_ingest_on, run_ingest_online, run_point_lookup, run_point_lookup_on, run_profile, run_range_fetch, run_range_fetch_on, run_sparse, scale::ScalePreset, sparse::{SparseParams, SparseProfile}, Aggregation, AnalyticsParams, BaselineLinearAdapter, BenchReport, BenchResult, CalibrationStatus, CompressedQueryParams, CompressionParams, CompressionProfile, CorpusRun, DownsampleParams, DownsampleProfile, EngineMetadata, FanOutParams, ForwardFillAdapter, GapFillParams, GapFillProfile, IngestProfile, InterpolationProfile, LookupMode, OnlineParams, PointLookupParams, PointLookupProfile, RangeFetchParams, RangeFetchProfile, RunMetadata, SignalShape, StoredWeftAdapter, SyntheticParams, TimestampPrecision, ValueShape, WeftAdapter, DEFAULT_INGEST_BATCH_ROWS, DEFAULT_UCI_COLUMN
 };
 
 /// Program name used in usage / error output.
@@ -159,6 +159,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
 	}
 	if cli.mode == InputMode::Ingest {
 		return run_ingest_workload(&cli).await;
+	}
+	if cli.mode == InputMode::FanOut {
+		return run_fan_out_workload(&cli).await;
 	}
 
 	// Build the profile from whichever input mode was selected. Synthetic mode
@@ -529,6 +532,17 @@ async fn run_ingest_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
 	let result = run_ingest_on(&profile, &corpus.timestamps, &corpus.values, corpus.decimal_scale, corpus.missingness_fraction(), generation_ns, cli.reps).await.map_err(|e| anyhow::anyhow!("ingest benchmark run failed: {e}"))?;
 	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
 	let report = BenchReport::with_results(metadata, vec![result]);
+	finish(cli, &report)
+}
+
+/// Run the fan-out workload: measure the cost of reading across many tagged series.
+async fn run_fan_out_workload(cli: &Cli) -> anyhow::Result<ExitCode> {
+	let steps: Vec<usize> = cli.fo_series_steps.split(',').map(|s| s.trim().parse::<usize>().map_err(|_| anyhow::anyhow!("--fo-series-steps must be comma-separated integers, got {cli:?}"))).collect::<Result<Vec<_>, _>>()?;
+	anyhow::ensure!(!steps.is_empty(), "at least one series-count step is required");
+	let params = FanOutParams { seed: cli.seed, series_steps: steps, rows_per_series: cli.fo_rows_per_series, read_window_ns: cli.fo_read_window_secs * 1_000_000_000 };
+	let results = run_fan_out(&params, cli.reps).await?;
+	let metadata = RunMetadata::capture(Utc::now().to_rfc3339());
+	let report = BenchReport::with_results(metadata, results);
 	finish(cli, &report)
 }
 
@@ -995,6 +1009,34 @@ fn run_soak(name: &str, seed: u64, duration_secs: u64, ticks: u64, _window_ticks
 			return ExitCode::FAILURE;
 		}
 	}
+
+	// Drive the TTL lane (SOA-15, part 2): open a temp store with a configured TTL,
+	// ingest rows that straddle the expiry cutoff, run sweep + purge, and record
+	// the outcome on the verdict.
+	let ttl_secs = 3600u64;
+	let now_ns = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+		Ok(d) => d.as_nanos().try_into().unwrap_or(i64::MAX),
+		Err(e) => {
+			eprintln!("{PROG}: soak-run: clock error before TTL lane: {e:#}");
+			return ExitCode::FAILURE;
+		}
+	};
+	// `run_soak` is synchronous and runs before `main`'s own runtime exists, so the
+	// lane gets a current-thread runtime here: the same sync-to-async bridge `main`
+	// uses for the failure-matrix child. Calling an `async fn` without `block_on`
+	// would build a future and drop it, and the lane would never run.
+	let ttl_verdict = match tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(anyhow::Error::from).and_then(|rt| rt.block_on(weft_bench::soak_ttl::run_ttl_lane(ttl_secs, now_ns))) {
+		Ok(v) => v,
+		Err(e) => {
+			eprintln!("{PROG}: soak-run: TTL lane failed: {e:#}");
+			return ExitCode::FAILURE;
+		}
+	};
+	if let Err(e) = harness.record_ttl_verdict(ttl_verdict) {
+		eprintln!("{PROG}: soak-run: failed to record TTL verdict: {e:#}");
+		return ExitCode::FAILURE;
+	}
+
 	if let Err(e) = harness.finish() {
 		eprintln!("{PROG}: soak-run: failed to finish harness: {e:#}");
 		return ExitCode::FAILURE;
@@ -1358,6 +1400,12 @@ struct Cli {
 	rf_windows: usize,
 	/// Range-fetch mode: rows per page (`0` = single-block; `>0` = paged segment).
 	rf_rows_per_page: usize,
+	/// Fan-out mode: series-count ladder rungs as comma-separated integers.
+	fo_series_steps: String,
+	/// Fan-out mode: rows ingested into each series.
+	fo_rows_per_series: usize,
+	/// Fan-out mode: read window in seconds (converted to ns internally).
+	fo_read_window_secs: i64,
 	/// Synthetic generator seed (published for reproducibility).
 	seed: u64,
 	/// Synthetic post-missingness target sample count.
@@ -1463,6 +1511,8 @@ enum InputMode {
 	/// The ingest workload (EVI-6): load a UCI household-power column and seal
 	/// it into a fresh `SegmentStore` in batches, gated on an exact read-back.
 	Ingest,
+	/// The fan-out workload: measure the cost of reading across many tagged series.
+	FanOut,
 }
 
 /// What the parsed command line asks the program to do.
@@ -1653,6 +1703,9 @@ impl Cli {
 			rf_window: rf_defaults.window_rows,
 			rf_windows: rf_defaults.window_count,
 			rf_rows_per_page: rf_defaults.rows_per_page,
+			fo_series_steps: "1,10,100,1000".to_string(),
+			fo_rows_per_series: 1_000,
+			fo_read_window_secs: 1_000,
 			seed: defaults.seed,
 			points: defaults.input_points,
 			missingness: defaults.missingness_fraction,
@@ -1723,6 +1776,7 @@ impl Cli {
 			"--gpu-memory" => modes.push(InputMode::GpuMemory),
 			"--gpu-economics" => modes.push(InputMode::GpuEconomics),
 			flag if GPU_ECONOMICS_FLAGS.contains(&flag) => set_gpu_economics_knob(&mut self.gpu_economics, flag, &take_value(key)?)?,
+			"--fan-out" => modes.push(InputMode::FanOut),
 			"--ingest" => modes.push(InputMode::Ingest),
 			"--uci" => self.uci = Some(PathBuf::from(take_value(key)?)),
 			"--uci-column" => self.uci_column = take_value(key)?,
@@ -1777,6 +1831,9 @@ impl Cli {
 			"--rf-window" => self.rf_window = parse_query_count(&take_value(key)?)?,
 			"--rf-windows" => self.rf_windows = parse_query_count(&take_value(key)?)?,
 			"--rf-rows-per-page" => self.rf_rows_per_page = parse_rows_per_page(&take_value(key)?)?,
+			"--fo-series-steps" => self.fo_series_steps = take_value(key)?,
+			"--fo-rows" => self.fo_rows_per_series = parse_points_count(&take_value(key)?)?,
+			"--fo-window-secs" => self.fo_read_window_secs = take_value(key)?.parse::<i64>().map_err(|_| "--fo-window-secs must be an integer (seconds)".to_string())?,
 			"--seed" => self.seed = parse_seed(&take_value(key)?)?,
 			"--points" => self.points = parse_points_count(&take_value(key)?)?,
 			"--missingness" => self.missingness = parse_fraction(&take_value(key)?, "missingness")?,
@@ -2049,6 +2106,7 @@ const fn self_generating_mode_flag(mode: InputMode) -> Option<&'static str> {
 		InputMode::GpuMemory => Some("--gpu-memory"),
 		InputMode::GpuEconomics => Some("--gpu-economics"),
 		InputMode::Ingest => Some("--ingest"),
+		InputMode::FanOut => Some("--fan-out"),
 		InputMode::LineProtocol | InputMode::Synthetic => None,
 	}
 }
@@ -2096,7 +2154,7 @@ fn validate_mode(mode: InputMode, input: Option<&PathBuf>, field: Option<&str>, 
 				return Err("missing required `--field <name>`".to_string());
 			}
 		}
-		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression | InputMode::Downsample | InputMode::GapFill | InputMode::Sparse | InputMode::GpuMemory | InputMode::GpuEconomics | InputMode::Ingest => unreachable!("handled by self_generating_mode_flag above"),
+		InputMode::PointLookup | InputMode::RangeFetch | InputMode::Compression | InputMode::Downsample | InputMode::GapFill | InputMode::Sparse | InputMode::GpuMemory | InputMode::GpuEconomics | InputMode::Ingest | InputMode::FanOut => unreachable!("handled by self_generating_mode_flag above"),
 	}
 	Ok(())
 }
@@ -2440,6 +2498,7 @@ USAGE:
     weft-bench --gpu-memory [GPU-MEMORY OPTIONS]
     weft-bench --gpu-economics [GPU-ECONOMICS OPTIONS]
     weft-bench --ingest --uci <FILE.txt> [INGEST OPTIONS]
+    weft-bench --fan-out [FAN-OUT OPTIONS]
     weft-bench verify <RUN.manifest.json> [--accept-advisories]
     weft-bench combine --out <FILE.json> [--no-manifest] <RUN.json> <RUN.json>...
     weft-bench compare <BASELINE.json> <CANDIDATE.json> [COMPARE OPTIONS]
@@ -2477,6 +2536,11 @@ INPUT MODE (choose one):
                              held as one nullable column, and timed as a block-aligned mean
                              scan over the present cells. Reports the share of the grid that
                              turned out to be holes, so a presence bitmap has a before number.
+    --fan-out                Run the fan-out workload: measure the cost of reading across
+                             many tagged series. Opens a fresh SegmentStore, ingests a
+                             seeded multi-series corpus (one aspect, one physical-type),
+                             then reads every series at each rung of a series-count ladder
+                             (default 1, 10, 100, 1000). Gated on exact row-count per series.
 
 STORAGE-WORKLOAD OPTIONS (with --point-lookup or --range-fetch):
         --irregular          Jittered timestamps (decode + search/filter) instead of
@@ -2606,7 +2670,7 @@ INGEST OPTIONS (with --ingest):
                              Then compact the store to segments of ROWS rows and ask
                              the same windows again, as `-compacted` results that must
                              answer exactly as before (post-compaction reads)
-        --failure <kill-ingest|kill-compaction|corrupt-segment|all>
+        --failure <kill-ingest|kill-ingest-tagged|kill-compaction|kill-compaction-tagged|corrupt-segment|corrupt-segment-tagged|all>
                              Failure tests instead: a child process (this binary) seals
                              the corpus, or compacts a store of it, and is SIGKILLed at
                              a seeded point; or one seeded byte of a closed store's
@@ -2648,6 +2712,14 @@ INGEST OPTIONS (with --ingest):
                              Rows held back for the incremental run [default: a tenth]
         --analytics-batch <N>
                              The pipeline's batch size, in minutes [default: 1440]
+
+FAN-OUT OPTIONS (with --fan-out; seeded by --seed):
+        --fo-series-steps <LIST>
+                             Series-count ladder rungs, comma-separated integers
+                                                  [default: 1,10,100,1000]
+        --fo-rows <N>       Rows ingested into each series (>=1)      [default: 1000]
+        --fo-window-secs <N>
+                             Read window in seconds                      [default: 1000]
 
 GPU-MEMORY OPTIONS (with --gpu-memory; needs a hardware GPU; seeded by --seed):
         --gm-rounds <N>      Rounds; each calls every size once       [default: 20]
@@ -2823,8 +2895,11 @@ mod tests {
 	#[test]
 	fn failure_takes_a_test_or_all_and_stands_alone() {
 		let cli = expect_run(&["--ingest", "--uci", "u.txt", "--failure", "all", "--failure-rows", "2M", "--failure-reps", "3"]);
-		assert_eq!((cli.failure.len(), cli.failure_rows, cli.failure_reps), (3, 2_000_000, 3));
+		assert_eq!((cli.failure.len(), cli.failure_rows, cli.failure_reps), (6, 2_000_000, 3));
 		assert_eq!(expect_run(&["--ingest", "--uci", "u.txt", "--failure", "kill-ingest"]).failure, [weft_bench::failure::Failure::KillIngest]);
+		assert_eq!(expect_run(&["--ingest", "--uci", "u.txt", "--failure", "kill-ingest-tagged"]).failure, [weft_bench::failure::Failure::KillIngestTagged]);
+		assert_eq!(expect_run(&["--ingest", "--uci", "u.txt", "--failure", "kill-compaction-tagged"]).failure, [weft_bench::failure::Failure::KillCompactionTagged]);
+		assert_eq!(expect_run(&["--ingest", "--uci", "u.txt", "--failure", "corrupt-segment-tagged"]).failure, [weft_bench::failure::Failure::CorruptSegmentTagged]);
 		for bad in [&["--ingest", "--uci", "u.txt", "--failure", "power-loss"][..], &["--failure", "kill-ingest"][..], &["--ingest", "--uci", "u.txt", "--failure", "all", "--query-mix", "3"][..]] {
 			assert!(run_cli(bad).is_err(), "{bad:?}");
 		}

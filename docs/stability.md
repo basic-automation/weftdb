@@ -44,6 +44,25 @@ assume that every route in that release's OpenAPI spec works as documented. The 
 maps one-to-one with the HTTP API; a client upgrade may lag the server by one minor
 version, but the SDK's own changelog names any compatibility shifts.
 
+### Pre-release tags (1.0.0-beta.1, 1.0.0-rc.1, …)
+
+`0.x` tags are ordinary releases, not semver pre-releases; the changelog baseline is
+`v0.1.0` (2026-10-08) and every release since has a section. Starting with the 1.0
+series:
+
+1. A semver pre-release tag (`v1.0.0-beta.1`, `v1.0.0-rc.1`, …) gets **its own**
+   `CHANGELOG.md` section, cut from `## [Unreleased]` at tag time with the tag date;
+   `Unreleased` then starts fresh.
+2. Between a beta and its first rc: fixes only, no new features and no breaking
+   changes; a new pre-release line (`.2`, `.3`) may be cut for a fix round, each
+   with its own section.
+3. Promoting an rc to `v1.0.0` moves that section's entries into the
+   `## [1.0.0] - <date>` section unchanged; nothing is rewritten or dropped in
+   promotion.
+4. Pre-release sections are **not** merged into one another retroactively: the notes
+   published at a beta are the notes that beta shipped with, so a reader can diff what
+   a given artifact contains.
+
 ---
 
 ## Surface stability table
@@ -65,6 +84,19 @@ reinterpretations as announced in the changelog.
 **Basis:** [`compat/openapi/weftdb.json`](../compat/openapi/weftdb.json) and the drift
 test [`generated_spec_matches_committed_file`](../weft-server/src/openapi.rs), which
 the CI `test` job runs on every push and pull request (`cargo test --workspace`).
+The [breaking-change checker](../scripts/ci/check-openapi-breaking.py) compares the
+live spec against the rc.1 baseline
+([`compat/openapi/baseline/weftdb.json`](../compat/openapi/baseline/weftdb.json))
+on every push and pull request.
+
+The checker does not yet classify the following OpenAPI top-level documents:
+``security`` / ``securitySchemes`` / ``servers`` / ``info`` / ``tags`` /
+``externalDocs`` — these are defined globally and not compared between the
+baseline and the live spec (declared out of scope for the 1.0 surface freeze).
+Combinator member content (``allOf`` / ``oneOf`` / ``anyOf``) **is** now
+compared (FRE-18c).
+
+For changes the checker *does* handle, see the rule families above.
 
 ### `weftdb-client` (the Rust SDK, crate directory `weft-client/`)
 
@@ -168,8 +200,14 @@ The compatibility suite lives in two places:
 
    The [`compat` job in `ci.yml`](../.github/workflows/ci.yml) runs `releases.py verify`
    on every CI run. That command re-checks every pin against git and against
-   `compat/fixtures/`, so a fixture that drifts fails CI. The leg that does run as code
-   is the upgrade path, in `tests/compat_v010.rs`.
+   `compat/fixtures/`, so a fixture that drifts fails CI. A second job, `pinned release
+   archives`, runs `releases.py fetch --extract`: it downloads the newest pinned release's
+   archive for the runner's platform and fails if the bytes hash to anything other than the
+   sha256 the pin carries, so the digest column of the pin is tested against the published
+   artifact instead of being trusted. Neither job runs the old binary. The leg that would is
+   the absence the gate reports, and it needs a store to point that binary at and a pin whose
+   binaries can read the current layout. The leg that does run as code is the upgrade path,
+   in `tests/compat_v010.rs`.
 
    Since [FRE-16](https://github.com/basic-automation/weftdb/issues/FRE-16), a
    dedicated gate (`scripts/compat/test_leg_coverage.py`) refuses to let a pin declare

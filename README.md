@@ -179,13 +179,8 @@ The [HTTP API reference](docs/reference.md#http-api) lists every endpoint.
 The cross-engine benchmark compares WeftDB with DuckDB, ClickHouse, TimescaleDB, QuestDB,
 InfluxDB 3 and IoTDB on the same data, the same machine and a correctness check for every
 answer. The latest pooled run is in
-[`bench/reports/phase1-pooled/`](bench/reports/phase1-pooled/README.md). In short:
-
-- **WeftDB wins at interpolating inside the database:** it beats the same reconstruction
-  written in SQL on all four datasets at the smaller scale, and on two of the four at the
-  larger one.
-- **It loses on bulk loading, and to fetching the raw points and interpolating in a fast
-  client.** The report gives every figure, win and loss, with how far each one holds.
+[`bench/reports/phase1-pooled/`](bench/reports/phase1-pooled/README.md) — see that report for
+where WeftDB wins and loses, with every figure and how far each one holds.
 
 Run it yourself with `weft-xbench`; see [Benchmarking](docs/reference.md#benchmarking).
 
