@@ -666,6 +666,21 @@ pub static DEFAULT_ERROR_RATE: LazyLock<weftdb::Distance> = LazyLock::new(|| {
 /// aspect's queue, and [`signals_for`] copies out only that queue.
 static SIGNALS_QUEUE: LazyLock<Mutex<HashMap<AspectId, Signals>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Each (correlation, manifestation) pair whose historical signals were already generated
+/// into an aspect's queue, with the correlation's occurrence count and the manifestation's
+/// span at the time.
+type GeneratedHistorical = HashMap<(weftdb::CorrelationID, weftdb::ManifestationId), (usize, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>;
+
+/// Per aspect, the pairs [`create_signals`] has already generated historical signals for.
+/// A historical signal predicts a manifestation that has already happened, so the
+/// [`filter_expired_signals`] pass that follows each generation resolves it at once;
+/// generating the same pair again every run (every correlation × every manifestation ×
+/// every occurrence) rebuilt and re-resolved the whole history each time. A pair is
+/// generated again when its correlation's occurrences or the manifestation's span change
+/// (a manifestation still under way widens). Kept beside the queue it
+/// describes and reset whenever that queue is (re)created, so a cleared queue is rebuilt.
+static HISTORICAL_GENERATED: LazyLock<Mutex<HashMap<AspectId, GeneratedHistorical>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// A copy of `aspect_id`'s live signal queue (empty if it has none).
 pub(crate) async fn signals_for(aspect_id: &AspectId) -> Signals {
 	SIGNALS_QUEUE.lock().await.get(aspect_id).cloned().unwrap_or_default()
@@ -685,27 +700,39 @@ type ExpiredSignal = (weftdb::CorrelationID, weftdb::ManifestationId, SignalType
 /// Remove `signals_to_remove` from `signals` with error correction (see
 /// [`Signals::remove_with_error_correction`]), each against its own correlation.
 ///
-/// Answers the correlations the removals corrected, one per correlation however many of
-/// its signals were removed, and how many signals were removed.
+/// Answers the correlations whose stored fields the removals actually changed, one per
+/// correlation however many of its signals were removed, and how many signals were removed.
+/// A correlation the correction left as it was is not answered: writing it back would be a
+/// DELETE+INSERT of its error-rate and occurrence rows for no change, which on a large
+/// dictionary rewrote every correlation with an expired signal on every run.
 fn remove_expired_signals(signals: &mut Signals, correlations: &[weftdb::Correlation], signals_to_remove: Vec<ExpiredSignal>) -> (Vec<weftdb::Correlation>, usize) {
-	// Each correlation is copied out once, on its first signal, and every later signal of it
-	// corrects the same copy, so each is updated once however many of its signals expire.
+	// A correlation is copied only once a correction changes it; every later signal of it
+	// corrects that copy, so each is written back once however many of its signals expire,
+	// and one nothing changed is neither copied nor compared.
 	let mut corrected: Vec<weftdb::Correlation> = Vec::new();
 	let mut slots: std::collections::HashMap<weftdb::CorrelationID, usize> = std::collections::HashMap::new();
 	let mut removed_count = 0;
 	let by_id: std::collections::HashMap<&weftdb::CorrelationID, &weftdb::Correlation> = correlations.iter().rev().map(|c| (c.id(), c)).collect();
 	for (correlation_id, manifestation_id, signal_type, resolution_time) in signals_to_remove {
-		let slot = if let Some(&slot) = slots.get(&correlation_id) {
-			slot
+		let slot = slots.get(&correlation_id).copied();
+		let outcome = if let Some(slot) = slot {
+			signals.remove_with_error_correction(&corrected[slot], &manifestation_id, &signal_type, resolution_time)
+		} else if let Some(&correlation) = by_id.get(&correlation_id) {
+			signals.remove_with_error_correction(correlation, &manifestation_id, &signal_type, resolution_time)
 		} else {
-			let Some(&correlation) = by_id.get(&correlation_id) else { continue };
-			corrected.push(correlation.clone());
-			slots.insert(correlation_id, corrected.len() - 1);
-			corrected.len() - 1
+			continue;
 		};
-		// Use error correction when removing the signal
-		if let Ok(Some(_removed_signal)) = signals.remove_with_error_correction(&mut corrected[slot], &manifestation_id, &signal_type, resolution_time) {
+		let Ok((removed, change)) = outcome else { continue };
+		if removed.is_some() {
 			removed_count += 1;
+		}
+		if let Some(change) = change {
+			if let Some(slot) = slot {
+				corrected[slot] = change;
+			} else {
+				slots.insert(correlation_id, corrected.len());
+				corrected.push(change);
+			}
 		}
 	}
 	(corrected, removed_count)
@@ -724,7 +751,7 @@ fn collect_expired_signals(signals: &Signals, events: &[weftdb::Event], correlat
 
 		if let Some(event_id) = signal_event_id {
 			if let Some(&event) = events_by_id.get(&event_id) {
-				if let Some((_, predicted_manifestation)) = event.manifestations().iter().find(|(_, m)| m.id() == signal.manifestation_id()) {
+				if let Some(predicted_manifestation) = event.manifestations().get(signal.manifestation_id()) {
 					let prediction_point = match signal.signal_type() {
 						SignalType::PredictStart | SignalType::PredictMid => predicted_manifestation.midpoint(),
 						SignalType::PredictEnd => *predicted_manifestation.end(),
@@ -1098,7 +1125,10 @@ pub async fn create_event_and_manifestations(database: &Database, aspect: &Aspec
 		}
 	}
 
-	// Store all detected events in the database
+	// Store all detected events in the database, under the event's stable identity: every
+	// run adds the months it has not stored yet, and widens the month still under way (the
+	// same start, a later end) instead of storing it again.
+	let event = event.into_stable(aspect.as_uuid());
 	if !event.manifestations().is_empty() {
 		database.insert_unprocessed_event(aspect, &event).await?;
 		tracing::info!(
@@ -1117,8 +1147,9 @@ pub async fn create_event_and_manifestations(database: &Database, aspect: &Aspec
 /// creating the foundation for signal prediction.
 ///
 /// It is idempotent per pattern and event: a pair that already has a correlation keeps it,
-/// with its id and learned error rates, and is rewritten only when the pattern's occurrences
-/// or the average distance changed. Events stay unprocessed across runs, so without this
+/// with its id and learned error rates, and is rewritten only when its dictionary or the
+/// average distance changed. A correlation holds no occurrences (it names its pattern, whose
+/// log holds them), so a pattern gaining occurrences writes nothing here. Events stay unprocessed across runs, so without this
 /// every run would add another copy of every pair, and each copy multiplies the signals
 /// and the cost of every probability query. Copies left by earlier versions are removed,
 /// keeping the one with the most learned error rates.
@@ -1126,12 +1157,20 @@ pub async fn create_event_and_manifestations(database: &Database, aspect: &Aspec
 /// # Errors
 ///
 /// Returns an error if:
-/// - Database operations fail (getting events, marking events processed)
+/// - Database operations fail (getting patterns, events or correlations, writing or removing correlations)
 /// - Correlation creation fails
 pub async fn create_correlations_for_events(database: &Database, dictionary: &Dictionary, aspect_id: &AspectId) -> Result<()> {
 	// Get patterns directly from database (not from dictionary object which may have filtered patterns)
 	let patterns: Vec<weftdb::Pattern> = database.get_dictionary_patterns(aspect_id, dictionary.name()).await?.try_collect().await?;
-	let events: Vec<weftdb::Event> = database.get_unprocessed_events(aspect_id).await?.try_collect().await?;
+	let mut events: Vec<weftdb::Event> = database.get_unprocessed_events(aspect_id).await?.try_collect().await?;
+	// A store written before events had stable ids holds one event per detector run. Merge
+	// it once into one event per name; afterwards nothing is fragmented and this is a check.
+	if is_fragmented(&events) {
+		let merged = database.merge_events_by_name(aspect_id).await?;
+		tracing::info!(removed_events = merged.len(), "Merged fragmented events into one per name");
+		events = database.get_unprocessed_events(aspect_id).await?.try_collect().await?;
+	}
+	retire_copied_occurrences_once(database, aspect_id).await;
 	let aspect = database.get_aspect(aspect_id).await?;
 
 	// Exit early if no patterns or events to correlate
@@ -1208,12 +1247,14 @@ pub async fn create_correlations_for_events(database: &Database, dictionary: &Di
 
 			if let Some(copies) = existing.remove(&(pattern.id(), event.id().clone())) {
 				let kept = keep_best_copy(copies, &mut duplicates);
-				let unchanged = kept.dictionary_id() == &keys.dictionary_id && kept.average_distance() == average_distance.as_ref() && same_occurrences(kept.occurrences(), pattern.occurrences());
-				let refreshed = (!unchanged).then(|| Correlation::new(Some(kept.id().clone()), keys, kept.error_rate().clone(), pattern.occurrences().clone(), average_distance));
+				// The occurrences are the pattern's, read through its id, so a pattern gaining
+				// one is not a change to the correlation.
+				let unchanged = kept.dictionary_id() == &keys.dictionary_id && kept.average_distance() == average_distance.as_ref();
+				let refreshed = (!unchanged).then(|| Correlation::new(Some(kept.id().clone()), keys, kept.error_rate().clone(), average_distance));
 				drop(kept);
 				refreshed_correlations.extend(refreshed);
 			} else {
-				let correlation = Correlation::new(None, keys, HashMap::new(), pattern.occurrences().clone(), average_distance);
+				let correlation = Correlation::new(None, keys, HashMap::new(), average_distance);
 				database.insert_correlation(aspect_id, &correlation).await?;
 				inserted += 1;
 			}
@@ -1221,12 +1262,22 @@ pub async fn create_correlations_for_events(database: &Database, dictionary: &Di
 	}
 	drop(aspect);
 
-	// Pairs this run did not visit (a pattern no longer in the dictionary, say) keep one copy too.
-	for copies in existing.into_values() {
-		if copies.len() > 1 {
-			keep_best_copy(copies, &mut duplicates);
+	// Pairs this run did not visit: one whose event no longer exists (merged away, or
+	// removed) is dropped, since no signal can come of it and it would be read on every run;
+	// one whose pattern is gone from this dictionary (or is another dictionary's) keeps one copy.
+	let live_events: std::collections::HashSet<&weftdb::EventID> = events.iter().map(weftdb::Event::id).collect();
+	let mut orphaned = 0usize;
+	for ((_, event_id), copies) in existing {
+		if live_events.contains(&event_id) {
+			if copies.len() > 1 {
+				keep_best_copy(copies, &mut duplicates);
+			}
+		} else {
+			orphaned += copies.len();
+			duplicates.extend(copies.into_iter().map(|copy| copy.id().clone()));
 		}
 	}
+	drop(live_events);
 	// One transaction for every rewrite: per-correlation updates each scan the unindexed
 	// occurrence table, which made this step grow with pairs × table size.
 	let updated = refreshed_correlations.len();
@@ -1234,11 +1285,37 @@ pub async fn create_correlations_for_events(database: &Database, dictionary: &Di
 	drop(refreshed_correlations);
 	if !duplicates.is_empty() {
 		database.remove_correlations(aspect_id, &duplicates).await?;
-		tracing::info!(removed = duplicates.len(), "Removed duplicate correlations");
+		tracing::info!(removed = duplicates.len(), orphaned, "Removed duplicate and orphaned correlations");
 	}
 
 	tracing::info!(inserted, updated, "Pattern-Event correlation completed successfully");
 	Ok(())
+}
+
+/// Aspects whose copied correlation occurrences this process has already retired.
+static RETIRED_OCCURRENCES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<AspectId>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Run [`Database::retire_correlation_occurrences`] the first time this process
+/// correlates `aspect_id`. Correlations no longer copy their pattern's occurrences, so
+/// what older releases copied is deleted where the dictionary holds it. A failure is
+/// logged; the next process start tries again.
+async fn retire_copied_occurrences_once(database: &Database, aspect_id: &AspectId) {
+	if !RETIRED_OCCURRENCES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(*aspect_id) {
+		return;
+	}
+	if let Err(e) = database.retire_correlation_occurrences(aspect_id).await {
+		tracing::warn!(error = %e, %aspect_id, "Failed to retire copied correlation occurrences");
+	}
+}
+
+/// Whether `events` hold what [`Inputs::merge_events_by_name`] merges: two events of one
+/// name, or one event holding one occurrence more than once (see [`weftdb::fold_spans`]).
+fn is_fragmented(events: &[weftdb::Event]) -> bool {
+	let mut names = std::collections::HashSet::new();
+	events.iter().any(|event| {
+		let spans: Vec<_> = event.manifestations().values().map(|m| (*m.dataset_id(), *m.start(), *m.end(), ())).collect();
+		!names.insert(event.name().to_string()) || weftdb::fold_spans(spans).len() < event.manifestations().len()
+	})
 }
 
 /// The copy of one pattern-event pair to keep: the one with the most learned error rates,
@@ -1255,19 +1332,21 @@ fn keep_best_copy(mut copies: Vec<Correlation>, duplicates: &mut Vec<weftdb::Cor
 	kept
 }
 
-/// Whether two occurrence lists match as stored: timestamps compare at the millisecond
-/// precision the correlation tables keep, so a round trip through the database is not a change.
-fn same_occurrences(stored: &[weftdb::Occurrence], current: &[weftdb::Occurrence]) -> bool {
-	stored.len() == current.len() && stored.iter().zip(current).all(|(a, b)| a.pattern_id() == b.pattern_id() && a.resolution() == b.resolution() && a.size() == b.size() && a.beginning().timestamp_millis() == b.beginning().timestamp_millis() && a.end().timestamp_millis() == b.end().timestamp_millis())
-}
-
-fn process_correlation_signals(signals: &mut Signals, correlation: &weftdb::Correlation, events: &[weftdb::Event]) -> Result<usize> {
+/// The signals of one correlation, from `occurrences`, its pattern's log.
+/// `as_vec` decodes the log once, shared by every correlation of the pattern for the run
+/// (the resolver owns it), instead of a clone-heavy decode per loop.
+fn process_correlation_signals(signals: &mut Signals, correlation: &weftdb::Correlation, occurrences: &weftdb::OccurrenceLog, events: &[weftdb::Event], generated: &mut GeneratedHistorical) -> Result<usize> {
 	let mut signals_count = 0usize;
 
 	if let Some(event) = events.iter().find(|e| e.id() == correlation.event_id()) {
 		// For each manifestation of the event, create signals based on pattern occurrences
 		for manifestation in event.manifestations().values() {
-			for occurrence in correlation.occurrences() {
+			// Already generated against these occurrences and this span: still queued, or already resolved.
+			let basis = (occurrences.len(), *manifestation.start(), *manifestation.end());
+			if generated.insert((correlation.id().clone(), manifestation.id().clone()), basis) == Some(basis) {
+				continue;
+			}
+			for occurrence in occurrences.as_vec() {
 				let manifestation_start = *manifestation.start();
 				let manifestation_midpoint = manifestation.midpoint();
 				let manifestation_end = *manifestation.end();
@@ -1302,7 +1381,7 @@ fn process_correlation_signals(signals: &mut Signals, correlation: &weftdb::Corr
 		if let Some(latest_manifest_time) = latest_manifestation {
 			let mut min_distance: Option<i64> = None;
 			for manifestation in event.manifestations().values() {
-				for occurrence in correlation.occurrences() {
+				for occurrence in occurrences.as_vec() {
 					let occurrence_end = *occurrence.end();
 					let manifestation_start = *manifestation.start();
 					if occurrence_end < manifestation_start {
@@ -1317,7 +1396,7 @@ fn process_correlation_signals(signals: &mut Signals, correlation: &weftdb::Corr
 			}
 
 			if let Some(pred_distance) = min_distance {
-				for occurrence in correlation.occurrences() {
+				for occurrence in occurrences.as_vec() {
 					let occurrence_end = *occurrence.end();
 					if occurrence_end > latest_manifest_time {
 						let pattern_resolution = *occurrence.resolution();
@@ -1358,8 +1437,12 @@ pub async fn create_signals(database: &Database, aspect_id: &AspectId) -> Result
 
 	tracing::info!(correlations = correlations.len(), events = events.len(), "Creating signals");
 
+	// Each correlation's occurrences are its pattern's, resolved once for the run.
+	let resolved = database.correlation_occurrences(aspect_id, &correlations).await?;
+
 	let live: std::collections::HashSet<&weftdb::CorrelationID> = correlations.iter().map(Correlation::id).collect();
 	let mut queue = SIGNALS_QUEUE.lock().await;
+	let fresh_queue = !queue.contains_key(aspect_id);
 	let signals = queue.entry(*aspect_id).or_default();
 	// Signals of correlations that no longer exist (duplicates removed above) can never be
 	// resolved against one, so they would sit in the queue for the life of the process.
@@ -1367,10 +1450,26 @@ pub async fn create_signals(database: &Database, aspect_id: &AspectId) -> Result
 	if orphaned > 0 {
 		tracing::info!(orphaned, "Dropped signals of removed correlations");
 	}
-	let mut signals_count = 0usize;
-	for correlation in &correlations {
-		signals_count += process_correlation_signals(signals, correlation, &events)?;
+	let mut generated_by_aspect = HISTORICAL_GENERATED.lock().await;
+	let generated = generated_by_aspect.entry(*aspect_id).or_default();
+	if fresh_queue {
+		generated.clear();
 	}
+	// Pairs of correlations that no longer exist will never be generated again.
+	generated.retain(|(correlation_id, _), _| live.contains(correlation_id));
+	let mut signals_count = 0usize;
+	let mut unresolved = 0usize;
+	for correlation in &correlations {
+		let Some(occurrences) = resolved.get(correlation) else {
+			unresolved += 1;
+			continue;
+		};
+		signals_count += process_correlation_signals(signals, correlation, occurrences, &events, generated)?;
+	}
+	if unresolved > 0 {
+		tracing::warn!(unresolved, "Correlations whose pattern no dictionary holds produced no signals");
+	}
+	drop(generated_by_aspect);
 	drop(queue);
 
 	tracing::info!(signals_created = signals_count, "Signal creation completed");
@@ -1481,6 +1580,8 @@ pub async fn filter_expired_signals(database: &Database, aspect_id: &AspectId, c
 		outcome
 	}; // guard released here; every await below this point is unguarded
 
+	// Only correlations the corrections actually changed are here (none while error
+	// correction changes no stored field), so an expiry run rewrites nothing it did not change.
 	// The signals behind these corrections already left the queue, so a failed batch must
 	// not lose them all: it rolled back whole, and writing one at a time keeps every
 	// correction before a failure, as before batching.
@@ -1669,7 +1770,7 @@ mod tests {
 			let mut multi_occurrence_count = 0usize;
 			while let Some(result) = correlation_stream.next().await {
 				if let Ok(correlation) = result {
-					if correlation.occurrences().len() > 1 {
+					if patterns.iter().find(|p| p.id() == *correlation.pattern_id()).is_some_and(|p| p.occurrence_count() > 1) {
 						multi_occurrence_count += 1;
 					}
 				}
@@ -1894,7 +1995,7 @@ mod tests {
 			let mut multi_occurrence_count = 0usize;
 			while let Some(result) = correlation_stream.next().await {
 				if let Ok(correlation) = result {
-					if correlation.occurrences().len() > 1 {
+					if patterns.iter().find(|p| p.id() == *correlation.pattern_id()).is_some_and(|p| p.occurrence_count() > 1) {
 						multi_occurrence_count += 1;
 					}
 				}
@@ -2074,7 +2175,7 @@ mod tests {
 			let mut multi_occurrence_count = 0usize;
 			while let Some(result) = correlation_stream.next().await {
 				if let Ok(correlation) = result {
-					if correlation.occurrences().len() > 1 {
+					if patterns.iter().find(|p| p.id() == *correlation.pattern_id()).is_some_and(|p| p.occurrence_count() > 1) {
 						multi_occurrence_count += 1;
 					}
 				}
@@ -2273,7 +2374,7 @@ mod tests {
 			let mut multi_occurrence_count = 0usize;
 			while let Some(result) = correlation_stream.next().await {
 				if let Ok(correlation) = result {
-					if correlation.occurrences().len() > 1 {
+					if patterns.iter().find(|p| p.id() == *correlation.pattern_id()).is_some_and(|p| p.occurrence_count() > 1) {
 						multi_occurrence_count += 1;
 					}
 				}
@@ -2891,6 +2992,67 @@ mod tests {
 		Ok(())
 	}
 
+	/// Pattern extraction consumes each processed batch exactly once: a second run with no
+	/// new batches extracts nothing and adds no occurrence, and batches queued after it are
+	/// extracted by the next run. A cached processed-batch listing used to hand the first
+	/// run's batches to every run for the cache's TTL, hiding the new ones until it expired.
+	#[serial]
+	#[tokio::test]
+	#[allow(clippy::significant_drop_tightening)]
+	async fn extraction_consumes_each_batch_once_and_picks_up_new_ones() -> Result<()> {
+		async fn extract(db: &Database, aspect: &weftdb::AspectId, dictionary: &mut Dictionary, resolution: &Resolution, method: &Spline, batch_size: usize) -> Result<usize> {
+			crate::batch_utils::build_incremental_unprocessed_queue(db, aspect, resolution, method, batch_size).await?;
+			build_processed_batch_queue(db, aspect).await?;
+			let extracted = db.get_processed_batches(aspect).await?.try_collect::<Vec<Batch>>().await?.len();
+			load_dictionary(db, aspect, dictionary).await?;
+			build_patterns_queue(db, aspect, dictionary).await?;
+			load_dictionary(db, aspect, dictionary).await?;
+			anyhow::ensure!(db.get_processed_batches(aspect).await?.try_collect::<Vec<Batch>>().await?.is_empty(), "extraction left processed batches queued");
+			Ok(extracted)
+		}
+		let db_name = format!("extract_once_{}", uuid::Uuid::new_v4());
+		remove_database(&db_name);
+		let db = Database::new(&db_name).await?;
+		let subject = db.observe_subject("subject").await?;
+		let aspect = db.track_aspect(&subject.id(), "aspect", &Resolution::Seconds, None).await?;
+		let start = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+		let capture = |from: i64, to: i64| {
+			let db = db.clone();
+			let aspect = aspect.id();
+			async move {
+				for i in from..to {
+					let value = BigDecimal::from((i * 7) % 11);
+					db.capture_measurement(&aspect, &DatasetId::new(), &InputMeasurement::new(start + chrono::Duration::minutes(i), value)).await?;
+				}
+				anyhow::Ok(())
+			}
+		};
+		let constraints = DictionaryConstraints::new(Some(Steps::new(10, Spline::Linear)), Some(vec![VariablilityType::AveragePercentile(Variability::new(BigDecimal::from_f64(0.25).unwrap()))]));
+		let mut dictionary = Dictionary::new("extract".to_string(), "extraction test".to_string(), constraints);
+		let (resolution, method, batch_size) = (Resolution::Minutes, Spline::Linear, 10);
+		let occurrences = |d: &Dictionary| d.patterns().iter().map(Pattern::occurrence_count).sum::<usize>();
+
+		capture(0, 20).await?;
+		let first = extract(&db, &aspect.id(), &mut dictionary, &resolution, &method, batch_size).await?;
+		assert!(first > 0, "the first run extracts the first batches");
+		let after_first = occurrences(&dictionary);
+		assert!(after_first > 0);
+
+		let second = extract(&db, &aspect.id(), &mut dictionary, &resolution, &method, batch_size).await?;
+		assert_eq!(second, 0, "a run without new batches extracts nothing");
+		assert_eq!(occurrences(&dictionary), after_first, "a run without new batches adds no occurrence");
+
+		capture(20, 35).await?;
+		let third = extract(&db, &aspect.id(), &mut dictionary, &resolution, &method, batch_size).await?;
+		assert!(third > 0, "batches queued after a run are extracted by the next");
+		assert!(occurrences(&dictionary) > after_first, "the new batches add occurrences");
+
+		drop(aspect);
+		drop(db);
+		remove_database(&db_name);
+		Ok(())
+	}
+
 	/// The stored registration's `steps_interpolation` and its number of metadata rows.
 	async fn stored_registration(db: &Database, aspect_id: &AspectId, dictionary: &str) -> Result<(String, i64)> {
 		let conn = db.get_dictionary_db(aspect_id, dictionary).await?.connect()?;
@@ -2950,6 +3112,36 @@ mod tests {
 		Ok(())
 	}
 
+	/// Expiring signals whose removal changes no stored field of their correlation must not
+	/// hand that correlation back for a write: the write-back is a DELETE+INSERT of its
+	/// error-rate and occurrence rows, and the fanctl soak rewrote ~21k unchanged correlations
+	/// per run this way. Removal itself is unchanged: every expired signal leaves the queue.
+	#[test]
+	fn expiring_signals_hands_back_no_unchanged_correlation() {
+		let dataset_id = uuid::Uuid::new_v4();
+		let start = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+		let mut event = Event::new(None, "peak".into(), None, None);
+		let manifestation = Manifestation::new(dataset_id, start, start + chrono::Duration::minutes(10));
+		let manifestation_id = manifestation.id().clone();
+		event.add_manifestation(manifestation);
+		let keys = |pattern: uuid::Uuid| weftdb::CorrelationKeys { dictionary_id: weftdb::DictionaryId::from_uuid(uuid::Uuid::nil()), subject_id: weftdb::SubjectId::from_uuid(uuid::Uuid::nil()), aspect_id: AspectId::from_uuid(uuid::Uuid::nil()), pattern_id: weftdb::PatternID::from_uuid(pattern), event_id: event.id().clone() };
+		let correlations: Vec<Correlation> = (0..3).map(|_| Correlation::new(None, keys(uuid::Uuid::new_v4()), HashMap::new(), None)).collect();
+
+		let mut signals = Signals::default();
+		for correlation in &correlations {
+			for signal_type in [SignalType::PredictStart, SignalType::PredictEnd] {
+				signals.insert(Signal::new(correlation.id().clone(), manifestation_id.clone(), event.id().clone(), start - chrono::Duration::hours(1), signal_type, weftdb::Distance::new(BigDecimal::from(1), Resolution::Hours)));
+			}
+		}
+
+		let outcome = filter_queue_at(&mut signals, std::slice::from_ref(&event), &correlations, start + chrono::Duration::hours(1));
+		assert_eq!(outcome.removed_count, 6, "every expired signal is removed");
+		assert_eq!(outcome.remaining_count, 0);
+		let written_back = outcome.updated_correlations.len();
+		drop(outcome);
+		assert_eq!(written_back, 0, "no correlation changed, so none is written back");
+	}
+
 	/// Interleaved `filter_expired_signals` calls on the same aspect must complete,
 	/// must drain the queue, and must not lose or resurrect a signal.
 	///
@@ -2976,7 +3168,7 @@ mod tests {
 		event.add_manifestation(Manifestation::new(dataset_id, start, end));
 		Inputs::insert_unprocessed_event(&db, &aspect, &event).await?;
 
-		let correlation = Correlation::new(None, weftdb::CorrelationKeys { dictionary_id: weftdb::DictionaryId::from_uuid(uuid::Uuid::new_v4()), subject_id: subject.id(), aspect_id: aspect, pattern_id: weftdb::PatternID::from_uuid(uuid::Uuid::new_v4()), event_id: event.id().clone() }, HashMap::new(), vec![], Some(weftdb::Distance::new(BigDecimal::from(1), Resolution::Hours)));
+		let correlation = Correlation::new(None, weftdb::CorrelationKeys { dictionary_id: weftdb::DictionaryId::from_uuid(uuid::Uuid::new_v4()), subject_id: subject.id(), aspect_id: aspect, pattern_id: weftdb::PatternID::from_uuid(uuid::Uuid::new_v4()), event_id: event.id().clone() }, HashMap::new(), Some(weftdb::Distance::new(BigDecimal::from(1), Resolution::Hours)));
 		Inputs::insert_correlation(&db, &aspect, &correlation).await?;
 
 		// Lock signals queue, insert signals that are already expired (past their prediction point).
@@ -3027,7 +3219,6 @@ mod tests {
 	#[serial]
 	#[tokio::test(flavor = "multi_thread")]
 	async fn rerunning_correlation_keeps_one_correlation_per_pattern_and_event() -> Result<()> {
-		use anyhow::Context;
 		use futures::TryStreamExt;
 
 		let db_name = format!("correlate_idempotent_{}", uuid::Uuid::new_v4().simple());
@@ -3076,63 +3267,39 @@ mod tests {
 			assert_eq!(signals_for(&aspect).await.len(), signals_after_first, "run {run}: the signal queue grew");
 		}
 
-		// Occurrences come back at the millisecond timestamps they were written with, after an
-		// update as after an insert (an update used to write seconds, read back as 1970).
+		// A correlation write copies no occurrences: they stay in the pattern's log.
+		assert_eq!(correlation_column(&db, &aspect, "SELECT COUNT(*) FROM correlation_occurrences").await?, vec![0], "inserting correlations copied occurrences");
 		let mut error_rate = HashMap::new();
 		error_rate.insert(SignalType::PredictStart, weftdb::Distance::new(BigDecimal::from(3), Resolution::Minutes));
 		let learned = {
 			let source = &first[0];
-			Correlation::new(Some(source.id().clone()), weftdb::CorrelationKeys { dictionary_id: *source.dictionary_id(), subject_id, aspect_id: aspect, pattern_id: *source.pattern_id(), event_id: source.event_id().clone() }, error_rate, source.occurrences().clone(), source.average_distance().cloned())
+			Correlation::new(Some(source.id().clone()), weftdb::CorrelationKeys { dictionary_id: *source.dictionary_id(), subject_id, aspect_id: aspect, pattern_id: *source.pattern_id(), event_id: source.event_id().clone() }, error_rate, source.average_distance().cloned())
 		};
 		Inputs::update_correlation(&db, &aspect, &learned).await?;
-		// Read the rows themselves: `get_correlations` would return the copy the update cached.
-		let on_disk: Vec<i64> = {
-			let conn = weftdb::database::traits::DatabaseStructure::get_correlations_db(&db, &aspect).await?.connect()?;
-			let mut rows = conn.query(&format!("SELECT end_timestamp FROM correlation_occurrences WHERE correlation_id = '{}' ORDER BY occurrence_index", learned.id()), ()).await?;
-			let mut ends = Vec::new();
-			while let Some(row) = rows.next().await? {
-				ends.push(row.get::<i64>(0)?);
-			}
-			ends
-		};
-		let written: Vec<i64> = learned.occurrences().iter().map(|o| o.end().timestamp_millis()).collect();
-		assert!(!written.is_empty(), "the test needs occurrences to round-trip");
-		assert_eq!(on_disk, written, "update_correlation stored occurrence timestamps in other units than the reader decodes");
+		assert_eq!(correlation_column(&db, &aspect, "SELECT COUNT(*) FROM correlation_occurrences").await?, vec![0], "update_correlation copied occurrences");
 
 		// The batched update rewrites several correlations in one go; a repeated id keeps its last copy.
 		{
-			async fn column(db: &Database, aspect: &weftdb::AspectId, sql: &str) -> Result<Vec<i64>> {
-				let conn = weftdb::database::traits::DatabaseStructure::get_correlations_db(db, aspect).await?.connect()?;
-				let mut rows = conn.query(sql, ()).await?;
-				let mut values = Vec::new();
-				while let Some(row) = rows.next().await? {
-					values.push(row.get::<i64>(0)?);
-				}
-				Ok(values)
-			}
 			assert!(first.len() > 1, "the batch check needs two correlations");
-			let stale = Correlation::new(Some(learned.id().clone()), weftdb::CorrelationKeys { dictionary_id: *learned.dictionary_id(), subject_id, aspect_id: aspect, pattern_id: *learned.pattern_id(), event_id: learned.event_id().clone() }, HashMap::new(), learned.occurrences().clone(), learned.average_distance().cloned());
+			let stale = Correlation::new(Some(learned.id().clone()), weftdb::CorrelationKeys { dictionary_id: *learned.dictionary_id(), subject_id, aspect_id: aspect, pattern_id: *learned.pattern_id(), event_id: learned.event_id().clone() }, HashMap::new(), learned.average_distance().cloned());
 			let other = {
 				let source = &first[1];
 				let mut rate = HashMap::new();
 				rate.insert(SignalType::PredictEnd, weftdb::Distance::new(BigDecimal::from(7), Resolution::Minutes));
-				Correlation::new(Some(source.id().clone()), weftdb::CorrelationKeys { dictionary_id: *source.dictionary_id(), subject_id, aspect_id: aspect, pattern_id: *source.pattern_id(), event_id: source.event_id().clone() }, rate, source.occurrences().clone(), source.average_distance().cloned())
+				Correlation::new(Some(source.id().clone()), weftdb::CorrelationKeys { dictionary_id: *source.dictionary_id(), subject_id, aspect_id: aspect, pattern_id: *source.pattern_id(), event_id: source.event_id().clone() }, rate, source.average_distance().cloned())
 			};
-			let before = column(&db, &aspect, "SELECT COUNT(*) FROM correlation_occurrences").await?;
 			Inputs::update_correlations(&db, &aspect, &[stale, other.clone(), learned.clone()]).await?;
-			assert_eq!(column(&db, &aspect, "SELECT COUNT(*) FROM correlation_occurrences").await?, before, "the batched update duplicated or lost occurrence rows");
+			assert_eq!(correlation_column(&db, &aspect, "SELECT COUNT(*) FROM correlation_occurrences").await?, vec![0], "update_correlations copied occurrences");
 			for (correlation, rates) in [(&learned, 1), (&other, 1)] {
 				let id = correlation.id();
-				let ends = column(&db, &aspect, &format!("SELECT end_timestamp FROM correlation_occurrences WHERE correlation_id = '{id}' ORDER BY occurrence_index")).await?;
-				assert_eq!(ends, correlation.occurrences().iter().map(|o| o.end().timestamp_millis()).collect::<Vec<_>>(), "batched occurrences for {id} differ from what was written");
-				let stored_rates = column(&db, &aspect, &format!("SELECT COUNT(*) FROM correlation_error_rates WHERE correlation_id = '{id}'")).await?;
+				let stored_rates = correlation_column(&db, &aspect, &format!("SELECT COUNT(*) FROM correlation_error_rates WHERE correlation_id = '{id}'")).await?;
 				assert_eq!(stored_rates, vec![rates], "batched error rates for {id}: the last copy of a repeated id must win");
 			}
 		}
 
 		// Copies left by the old code: two fresh-id copies of the learned pair, which knows less.
 		for _ in 0..2 {
-			let copy = Correlation::new(None, weftdb::CorrelationKeys { dictionary_id: *learned.dictionary_id(), subject_id, aspect_id: aspect, pattern_id: *learned.pattern_id(), event_id: learned.event_id().clone() }, HashMap::new(), learned.occurrences().clone(), learned.average_distance().cloned());
+			let copy = Correlation::new(None, weftdb::CorrelationKeys { dictionary_id: *learned.dictionary_id(), subject_id, aspect_id: aspect, pattern_id: *learned.pattern_id(), event_id: learned.event_id().clone() }, HashMap::new(), learned.average_distance().cloned());
 			Inputs::insert_correlation(&db, &aspect, &copy).await?;
 		}
 		create_signals(&db, &aspect).await?;
@@ -3150,6 +3317,448 @@ mod tests {
 
 		SIGNALS_QUEUE.lock().await.remove(&aspect);
 		drop(db);
+		remove_database(&db_name);
+		Ok(())
+	}
+
+	/// `ts` cut to the millisecond, as the copied occurrence rows stored it.
+	fn to_millis(ts: chrono::DateTime<Utc>) -> chrono::DateTime<Utc> {
+		chrono::DateTime::from_timestamp_millis(ts.timestamp_millis()).expect("in range")
+	}
+
+	/// `occurrence` with its span moved by `by`.
+	fn shifted(occurrence: &weftdb::Occurrence, by: chrono::Duration) -> weftdb::Occurrence {
+		weftdb::Occurrence::new(*occurrence.aspect(), *occurrence.resolution(), occurrence.size(), occurrence.database_info().clone(), *occurrence.pattern_id(), *occurrence.beginning() + by, *occurrence.end() + by)
+	}
+
+	/// The integer column `sql` selects from the aspect's correlations database.
+	async fn correlation_column(db: &Database, aspect: &AspectId, sql: &str) -> Result<Vec<i64>> {
+		let conn = weftdb::database::traits::DatabaseStructure::get_correlations_db(db, aspect).await?.connect()?;
+		let mut rows = conn.query(sql, ()).await?;
+		let mut values = Vec::new();
+		while let Some(row) = rows.next().await? {
+			values.push(row.get::<i64>(0)?);
+		}
+		Ok(values)
+	}
+
+	/// Write `occurrences` as an older release copied them into `correlation_occurrences`:
+	/// one row each, in order, timestamps in milliseconds, the database info as JSON.
+	async fn copy_occurrence_rows(db: &Database, aspect: &AspectId, correlation_id: &str, occurrences: &[weftdb::Occurrence]) -> Result<()> {
+		let conn = weftdb::database::traits::DatabaseStructure::get_correlations_db(db, aspect).await?.connect()?;
+		for (index, o) in occurrences.iter().enumerate() {
+			conn.execute(
+				"INSERT INTO correlation_occurrences (correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				(correlation_id.to_string(), i64::try_from(index)?, o.aspect().to_string(), o.resolution().to_string(), i64::try_from(o.size())?, serde_json::to_string(o.database_info())?, o.pattern_id().to_string(), o.beginning().timestamp_millis(), o.end().timestamp_millis()),
+			)
+			.await?;
+		}
+		Ok(())
+	}
+
+	/// A pattern gaining occurrences writes nothing to its correlations: no row is
+	/// updated, and no occurrence is copied; the correlation reads the longer log.
+	#[serial]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn correlation_writes_do_not_follow_pattern_growth() -> Result<()> {
+		let db_name = format!("corr_growth_{}", uuid::Uuid::new_v4().simple());
+		let (db, aspect, dictionary, _, base, dataset) = store_with_patterns(&db_name).await?;
+		detect(&db, &aspect, dataset, &[base + chrono::Duration::hours(5), base + chrono::Duration::hours(6)]).await?;
+		create_correlations_for_events(&db, &dictionary, &aspect).await?;
+		let updated_before = correlation_column(&db, &aspect, "SELECT updated_at FROM correlations ORDER BY id").await?;
+		assert_ne!(updated_before.len(), 0);
+		assert_eq!(correlation_column(&db, &aspect, "SELECT COUNT(*) FROM correlation_occurrences").await?, vec![0]);
+
+		let mut patterns: Vec<weftdb::Pattern> = db.get_dictionary_patterns(&aspect, "preamble").await?.try_collect().await?;
+		let grown_id = patterns[0].id();
+		let before_len = patterns[0].occurrence_count();
+		for day in 1..=3 {
+			let first = patterns[0].first_occurrence().expect("a pattern has occurrences");
+			patterns[0].add_occurrence(shifted(&first, chrono::Duration::days(day)));
+		}
+		db.replace_dictionary_patterns(&aspect, "preamble", &patterns).await?;
+		drop(patterns);
+		tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+		create_correlations_for_events(&db, &dictionary, &aspect).await?;
+		assert_eq!(correlation_column(&db, &aspect, "SELECT updated_at FROM correlations ORDER BY id").await?, updated_before, "a pattern gaining occurrences rewrote correlations");
+		assert_eq!(correlation_column(&db, &aspect, "SELECT COUNT(*) FROM correlation_occurrences").await?, vec![0], "correlating copied occurrences");
+		let correlations: Vec<Correlation> = Outputs::get_correlations(&db, &aspect).await?.try_collect().await?;
+		let resolved = db.correlation_occurrences(&aspect, &correlations).await?;
+		let grown = correlations.iter().find(|c| *c.pattern_id() == grown_id).expect("the grown pattern is correlated");
+		assert_eq!(resolved.get(grown).map(weftdb::OccurrenceLog::len), Some(before_len + 3), "the correlation does not read its pattern's grown log");
+		drop(resolved);
+		drop(correlations);
+
+		SIGNALS_QUEUE.lock().await.remove(&aspect);
+		drop(db);
+		remove_database(&db_name);
+		Ok(())
+	}
+
+	/// Signals and probabilities from the pattern's log are those the old copy gave: the
+	/// expected set is built from the copy correlating used to store (the pattern's list
+	/// at correlate time, read back at millisecond precision).
+	#[serial]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn signals_match_the_copied_occurrences() -> Result<()> {
+		let db_name = format!("corr_signals_{}", uuid::Uuid::new_v4().simple());
+		let (db, aspect, dictionary, _, base, dataset) = store_with_patterns(&db_name).await?;
+		detect(&db, &aspect, dataset, &[5, 6, 7].map(|h| base + chrono::Duration::hours(h))).await?;
+		create_correlations_for_events(&db, &dictionary, &aspect).await?;
+		create_signals(&db, &aspect).await?;
+		let actual = signals_for(&aspect).await;
+
+		let correlations: Vec<Correlation> = Outputs::get_correlations(&db, &aspect).await?.try_collect().await?;
+		let patterns: Vec<weftdb::Pattern> = db.get_dictionary_patterns(&aspect, "preamble").await?.try_collect().await?;
+		let events: Vec<Event> = Outputs::get_unprocessed_events(&db, &aspect).await?.try_collect().await?;
+		let mut expected = Signals::new();
+		let mut generated: GeneratedHistorical = HashMap::new();
+		for correlation in &correlations {
+			let pattern = patterns.iter().find(|p| p.id() == *correlation.pattern_id()).expect("every correlation's pattern is stored");
+			let copy: weftdb::OccurrenceLog = pattern.occurrences().iter().map(|o| weftdb::Occurrence::new(*o.aspect(), *o.resolution(), o.size(), o.database_info().clone(), *o.pattern_id(), to_millis(*o.beginning()), to_millis(*o.end()))).collect();
+			process_correlation_signals(&mut expected, correlation, &copy, &events, &mut generated)?;
+		}
+		assert!(!expected.is_empty(), "the fixture needs signals");
+		assert_eq!(actual, expected, "signals from the pattern's log differ from those of the copy");
+
+		let event_id = weftdb::EventID::for_name(aspect.as_uuid(), "crossing");
+		for hours in [5, 7, 9] {
+			let at = base + chrono::Duration::hours(hours) + chrono::Duration::minutes(30);
+			for signal_type in [SignalType::PredictStart, SignalType::PredictMid, SignalType::PredictEnd] {
+				assert_eq!(actual.probability_sum_with(&event_id, &signal_type, at, &correlations)?, expected.probability_sum_with(&event_id, &signal_type, at, &correlations)?);
+				assert_eq!(actual.probability_average_with(&event_id, &signal_type, at, &correlations, &events)?, expected.probability_average_with(&event_id, &signal_type, at, &correlations, &events)?);
+				assert_eq!(actual.event_probability_with(&event_id, &signal_type, at, &correlations, &events)?, expected.event_probability_with(&event_id, &signal_type, at, &correlations, &events)?);
+			}
+		}
+
+		SIGNALS_QUEUE.lock().await.remove(&aspect);
+		drop(db);
+		remove_database(&db_name);
+		Ok(())
+	}
+
+	/// Copied occurrence rows are deleted where the pattern's log holds them (to the
+	/// millisecond, though the log keeps nanoseconds), and where no correlation has their
+	/// id; rows of a missing pattern or that differ are kept, and the orphan's still give
+	/// signals. A second run deletes nothing more.
+	#[serial]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn retiring_copied_occurrences() -> Result<()> {
+		let db_name = format!("corr_retire_{}", uuid::Uuid::new_v4().simple());
+		let (db, aspect, dictionary, _, base, dataset) = store_with_patterns(&db_name).await?;
+		detect(&db, &aspect, dataset, &[5, 6].map(|h| base + chrono::Duration::hours(h))).await?;
+		create_correlations_for_events(&db, &dictionary, &aspect).await?;
+		let correlations: Vec<Correlation> = Outputs::get_correlations(&db, &aspect).await?.try_collect().await?;
+		assert!(correlations.len() > 1, "the test needs two correlations");
+		let subject_id = db.get_aspect(&aspect).await?.subject_id();
+
+		// A sub-millisecond occurrence in the first pattern's log.
+		let mut patterns: Vec<weftdb::Pattern> = db.get_dictionary_patterns(&aspect, "preamble").await?.try_collect().await?;
+		let (c0, c1) = (&correlations[0], &correlations[1]);
+		let p0 = patterns.iter().position(|p| p.id() == *c0.pattern_id()).expect("stored");
+		let last = patterns[p0].occurrences().last().cloned().expect("occurrences");
+		patterns[p0].add_occurrence(shifted(&last, chrono::Duration::days(1) + chrono::Duration::nanoseconds(123_456)));
+		db.replace_dictionary_patterns(&aspect, "preamble", &patterns).await?;
+		let p0_log = patterns[p0].occurrences().clone();
+		let mut differs = patterns.iter().find(|p| p.id() == *c1.pattern_id()).expect("stored").occurrences().clone();
+		drop(patterns);
+
+		// c0: the whole log; c1: a list the log does not start with.
+		copy_occurrence_rows(&db, &aspect, &c0.id().to_string(), &p0_log).await?;
+		differs[0] = shifted(&differs[0], chrono::Duration::minutes(1));
+		copy_occurrence_rows(&db, &aspect, &c1.id().to_string(), &differs).await?;
+		let differs_len = i64::try_from(differs.len())?;
+		drop(differs);
+		// A correlation whose pattern no dictionary holds.
+		let orphan = Correlation::new(None, weftdb::CorrelationKeys { dictionary_id: *c0.dictionary_id(), subject_id, aspect_id: aspect, pattern_id: weftdb::PatternID::from_uuid(uuid::Uuid::new_v4()), event_id: c0.event_id().clone() }, HashMap::new(), c0.average_distance().cloned());
+		Inputs::insert_correlation(&db, &aspect, &orphan).await?;
+		copy_occurrence_rows(&db, &aspect, &orphan.id().to_string(), &p0_log[..2]).await?;
+		// Rows of no correlation.
+		let dangling = uuid::Uuid::new_v4().to_string();
+		copy_occurrence_rows(&db, &aspect, &dangling, &p0_log).await?;
+
+		let report = db.retire_correlation_occurrences(&aspect).await?;
+		assert_eq!((report.deleted, report.kept_mismatch, report.kept_orphan, report.dangling, report.complete), (1, 1, 1, 1, true), "{report:?}");
+		let rows_of = |id: String| {
+			let db = db.clone();
+			async move { correlation_column(&db, &aspect, &format!("SELECT COUNT(*) FROM correlation_occurrences WHERE correlation_id = '{id}'")).await }
+		};
+		assert_eq!(rows_of(c0.id().to_string()).await?, vec![0]);
+		assert_eq!(rows_of(dangling.clone()).await?, vec![0]);
+		assert_eq!(rows_of(c1.id().to_string()).await?, vec![differs_len]);
+		assert_eq!(rows_of(orphan.id().to_string()).await?, vec![2]);
+		let total = correlation_column(&db, &aspect, "SELECT COUNT(*) FROM correlation_occurrences").await?;
+
+		let again = db.retire_correlation_occurrences(&aspect).await?;
+		assert_eq!((again.deleted, again.kept_mismatch, again.kept_orphan, again.dangling), (0, 1, 1, 0), "{again:?}");
+		assert_eq!(correlation_column(&db, &aspect, "SELECT COUNT(*) FROM correlation_occurrences").await?, total);
+
+		// The orphan reads its kept copy and still gives signals.
+		let resolved = db.correlation_occurrences(&aspect, std::slice::from_ref(&orphan)).await?;
+		assert_eq!(resolved.get(&orphan).map(weftdb::OccurrenceLog::len), Some(2));
+		assert_eq!(resolved.legacy_count(), 1);
+		// A second call learns nothing new: no dictionary is read again for the orphan's
+		// pattern, and its copy comes from the cache, not a fresh parse.
+		let first_loads = resolved.dictionaries_loaded();
+		let again = db.correlation_occurrences(&aspect, std::slice::from_ref(&orphan)).await?;
+		assert!(again.dictionaries_loaded() < first_loads || first_loads == 0, "the orphan's pattern was searched for again");
+		assert_eq!(again.get(&orphan).map(weftdb::OccurrenceLog::len), Some(2));
+		drop(again);
+		drop(resolved);
+		create_signals(&db, &aspect).await?;
+		assert!(!signals_for(&aspect).await.find_by_correlation(orphan.id()).is_empty(), "the orphan's kept copy gave no signals");
+
+		SIGNALS_QUEUE.lock().await.remove(&aspect);
+		drop(db);
+		remove_database(&db_name);
+		Ok(())
+	}
+
+	/// Correlations resolve in their own dictionary, each dictionary is read once per
+	/// call, a dictionary taken off the pipeline (its file kept) still resolves, and
+	/// writing a smaller set of patterns keeps the stored ones.
+	#[serial]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn correlation_occurrences_resolve_across_dictionaries() -> Result<()> {
+		use weftdb::database::traits::PipelineInputs;
+		let db_name = format!("corr_resolve_{}", uuid::Uuid::new_v4().simple());
+		let (db, aspect, _, pattern_count, _, _) = store_with_patterns(&db_name).await?;
+		let subject_id = db.get_aspect(&aspect).await?.subject_id();
+		let patterns: Vec<weftdb::Pattern> = db.get_dictionary_patterns(&aspect, "preamble").await?.try_collect().await?;
+		let second = weftdb::Pattern::new(weftdb::PatternID::from_uuid(uuid::Uuid::new_v4()), patterns[0].occurrences()[..1].to_vec(), patterns[0].relatives().clone());
+		let mut second_dictionary = Dictionary::new("second".to_string(), "resolver test".to_string(), weftdb::DictionaryConstraints::new(Some(weftdb::Steps::new(10, Spline::Cubic)), None));
+		load_dictionary(&db, &aspect, &mut second_dictionary).await?;
+		drop(second_dictionary);
+		db.replace_dictionary_patterns(&aspect, "second", std::slice::from_ref(&second)).await?;
+		db.add_pipeline_dictionary(&aspect, "preamble").await?;
+		db.add_pipeline_dictionary(&aspect, "second").await?;
+		let second_id = second.id();
+		drop(second);
+
+		let correlation = |pattern_id: weftdb::PatternID| Correlation::new(None, weftdb::CorrelationKeys { dictionary_id: weftdb::DictionaryId::from_uuid(uuid::Uuid::new_v4()), subject_id, aspect_id: aspect, pattern_id, event_id: weftdb::EventID::from_uuid(uuid::Uuid::new_v4()) }, HashMap::new(), None);
+		let (in_first, in_second, nowhere) = (correlation(patterns[0].id()), correlation(second_id), correlation(weftdb::PatternID::from_uuid(uuid::Uuid::new_v4())));
+		let all = [in_first.clone(), in_second.clone(), nowhere.clone()];
+		let resolved = db.correlation_occurrences(&aspect, &all).await?;
+		assert_eq!(resolved.get(&in_first).map(weftdb::OccurrenceLog::len), Some(patterns[0].occurrence_count()));
+		assert_eq!(resolved.get(&in_second).map(weftdb::OccurrenceLog::len), Some(1));
+		assert!(resolved.get(&nowhere).is_none());
+		assert_eq!(resolved.dictionaries_loaded(), 2, "a dictionary was read more than once");
+
+		db.remove_pipeline_dictionary(&aspect, "second").await?;
+		let resolved = db.correlation_occurrences(&aspect, std::slice::from_ref(&in_second)).await?;
+		assert_eq!(resolved.get(&in_second).map(weftdb::OccurrenceLog::len), Some(1), "a dictionary off the pipeline no longer resolves");
+
+		// Writing back fewer patterns (a failed load hands in only new ones) keeps the rest.
+		db.replace_dictionary_patterns(&aspect, "preamble", &patterns[..1]).await?;
+		let stored: Vec<weftdb::Pattern> = db.get_dictionary_patterns(&aspect, "preamble").await?.try_collect().await?;
+		assert_eq!(stored.len(), pattern_count, "writing a smaller set dropped stored patterns");
+
+		drop(db);
+		remove_database(&db_name);
+		Ok(())
+	}
+
+	/// A store with minute data and a dictionary extracted from it, as the correlation tests need.
+	async fn store_with_patterns(db_name: &str) -> Result<(Database, AspectId, Dictionary, usize, chrono::DateTime<Utc>, uuid::Uuid)> {
+		use futures::TryStreamExt;
+		remove_database(db_name);
+		let db = Database::new(db_name).await?;
+		let subject = db.observe_subject("subject").await?;
+		let subject_id = subject.id();
+		drop(subject);
+		let aspect = db.track_aspect(&subject_id, "aspect", &Resolution::Minutes, None).await?.id();
+		let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+		let rows: Vec<InputMeasurement> = (0..240).map(|i: i32| InputMeasurement::new(base + chrono::Duration::minutes(i64::from(i)), BigDecimal::from_f64(10.0f64.mul_add((f64::from(i) / 20.0).sin(), 45.0)).unwrap())).collect();
+		db.batch_capture_measurements(aspect, DatasetId::new(), rows).await?;
+		build_incremental_unprocessed_queue(&db, &aspect, &Resolution::Minutes, &Spline::Linear, 30).await?;
+		build_processed_batch_queue(&db, &aspect).await?;
+		let mut dictionary = Dictionary::new("preamble".to_string(), "event identity test".to_string(), weftdb::DictionaryConstraints::new(Some(weftdb::Steps::new(10, Spline::Cubic)), None));
+		load_dictionary(&db, &aspect, &mut dictionary).await?;
+		build_patterns_queue(&db, &aspect, &mut dictionary).await?;
+		load_dictionary(&db, &aspect, &mut dictionary).await?;
+		let patterns: Vec<weftdb::Pattern> = db.get_dictionary_patterns(&aspect, "preamble").await?.try_collect().await?;
+		assert!(!patterns.is_empty(), "the test needs patterns to correlate");
+		let dataset = db.get_database_info().await?.id().as_uuid();
+		Ok((db, aspect, dictionary, patterns.len(), base, dataset))
+	}
+
+	/// What one detector run reports, stored as `Pipeline::detect_events` stores it: a fresh
+	/// event with fresh random manifestation ids, put under its stable identity.
+	async fn detect(db: &Database, aspect: &AspectId, dataset: uuid::Uuid, starts: &[chrono::DateTime<Utc>]) -> Result<()> {
+		let mut event = Event::new(None, "crossing".into(), Some("crosses above 50".into()), None);
+		for start in starts {
+			event.add_manifestation(Manifestation::new(dataset, *start, *start + chrono::Duration::minutes(1)));
+		}
+		Inputs::insert_unprocessed_event(db, aspect, &event.into_stable(aspect.as_uuid())).await?;
+		Ok(())
+	}
+
+	/// A detector's runs collect onto one event: two runs with a crossing each make one event
+	/// with two manifestations (so one correlation per pattern, each with an average distance),
+	/// detecting a crossing again adds nothing, and neither does a full re-detection after a
+	/// restart (`since` = None reports every past crossing). With the average distance known,
+	/// forward signals expire instead of staying queued for the life of the process.
+	#[serial]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn detector_runs_collect_onto_one_event() -> Result<()> {
+		let db_name = format!("event_identity_{}", uuid::Uuid::new_v4().simple());
+		let (db, aspect, dictionary, pattern_count, base, dataset) = store_with_patterns(&db_name).await?;
+		// Inside the data, so patterns occur both before the crossings and after the last one.
+		let (first, second) = (base + chrono::Duration::hours(1), base + chrono::Duration::hours(2));
+		let events = |db: Database| async move { Outputs::get_unprocessed_events(&db, &aspect).await?.try_collect::<Vec<Event>>().await };
+		let correlations = |db: Database| async move { Outputs::get_correlations(&db, &aspect).await?.try_collect::<Vec<Correlation>>().await };
+
+		detect(&db, &aspect, dataset, &[first]).await?;
+		create_correlations_for_events(&db, &dictionary, &aspect).await?;
+		detect(&db, &aspect, dataset, &[second]).await?;
+		// Read before correlating, which would also merge fragments: the writes alone must not fragment.
+		let stored = events(db.clone()).await?;
+		create_correlations_for_events(&db, &dictionary, &aspect).await?;
+		assert_eq!(stored.len(), 1, "two detector runs made {} events", stored.len());
+		assert_eq!(stored[0].id(), &weftdb::EventID::for_name(aspect.as_uuid(), "crossing"));
+		assert_eq!(stored[0].manifestations().len(), 2);
+		let correlated = correlations(db.clone()).await?;
+		assert_eq!(correlated.len(), pattern_count, "one correlation per pattern for the one event");
+		assert!(correlated.iter().all(|c| c.average_distance().is_some()), "the second manifestation must give every correlation its average distance");
+		let ids: std::collections::HashSet<_> = correlated.iter().map(|c| c.id().clone()).collect();
+
+		// The same crossing again, then everything again as after a restart.
+		for starts in [&[second][..], &[first, second][..]] {
+			detect(&db, &aspect, dataset, starts).await?;
+			let again = events(db.clone()).await?;
+			create_correlations_for_events(&db, &dictionary, &aspect).await?;
+			assert_eq!(again, stored, "re-detecting {} crossings changed the stored event", starts.len());
+			let recorrelated = correlations(db.clone()).await?;
+			assert_eq!(recorrelated.iter().map(|c| c.id().clone()).collect::<std::collections::HashSet<_>>(), ids, "re-detection changed the correlations");
+		}
+
+		// Every signal, forward ones included, expires once its time has passed.
+		create_signals(&db, &aspect).await?;
+		let held: std::collections::HashSet<_> = stored[0].manifestations().keys().cloned().collect();
+		let forward = signals_for(&aspect).await.values().filter(|s| !held.contains(s.manifestation_id())).count();
+		assert!(forward > 0, "the test needs forward signals to expire");
+		filter_expired_signals(&db, &aspect, Some(base + chrono::Duration::days(365))).await?;
+		let left = signals_for(&aspect).await.len();
+		assert_eq!(left, 0, "{left} signals never expired");
+
+		SIGNALS_QUEUE.lock().await.remove(&aspect);
+		drop(db);
+		remove_database(&db_name);
+		Ok(())
+	}
+
+	/// A store written before events had stable ids holds one event per detector run, each
+	/// with its own correlations. Correlating merges them into one event under its stable id,
+	/// keeping every distinct manifestation once, and drops the correlations of the merged-away
+	/// events; merging again finds nothing to do.
+	#[serial]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn correlating_merges_a_fragmented_store() -> Result<()> {
+		let db_name = format!("event_merge_{}", uuid::Uuid::new_v4().simple());
+		let (db, aspect, dictionary, pattern_count, base, dataset) = store_with_patterns(&db_name).await?;
+		let patterns: Vec<weftdb::Pattern> = db.get_dictionary_patterns(&aspect, "preamble").await?.try_collect().await?;
+		let subject_id = db.get_aspect(&aspect).await?.subject_id();
+
+		// Three runs the old way: random event and manifestation ids, the last re-reporting a crossing.
+		let hours = [vec![5], vec![6], vec![6, 7]];
+		let mut old_ids = Vec::new();
+		for run in &hours {
+			let mut event = Event::new(None, "crossing".into(), None, None);
+			for hour in run {
+				let start = base + chrono::Duration::hours(*hour);
+				event.add_manifestation(Manifestation::new(dataset, start, start + chrono::Duration::minutes(1)));
+			}
+			Inputs::insert_unprocessed_event(&db, &aspect, &event).await?;
+			let keys = weftdb::CorrelationKeys { dictionary_id: weftdb::DictionaryId::from_uuid(uuid::Uuid::new_v4()), subject_id, aspect_id: aspect, pattern_id: patterns[0].id(), event_id: event.id().clone() };
+			Inputs::insert_correlation(&db, &aspect, &Correlation::new(None, keys, HashMap::new(), None)).await?;
+			old_ids.push(event.id().clone());
+		}
+		drop(patterns);
+
+		create_correlations_for_events(&db, &dictionary, &aspect).await?;
+		let events: Vec<Event> = Outputs::get_unprocessed_events(&db, &aspect).await?.try_collect().await?;
+		assert_eq!(events.len(), 1, "the fragmented events were not merged");
+		let merged = &events[0];
+		assert_eq!(merged.id(), &weftdb::EventID::for_name(aspect.as_uuid(), "crossing"));
+		let mut starts: Vec<_> = merged.manifestations().values().map(|m| *m.start()).collect();
+		starts.sort();
+		assert_eq!(starts, [5, 6, 7].map(|h| base + chrono::Duration::hours(h)), "every distinct crossing is kept once");
+		let correlations: Vec<Correlation> = Outputs::get_correlations(&db, &aspect).await?.try_collect().await?;
+		assert_eq!(correlations.len(), pattern_count, "one correlation per pattern for the merged event");
+		assert!(correlations.iter().all(|c| c.event_id() == merged.id()), "correlations of merged-away events were kept");
+		assert!(old_ids.iter().all(|id| id != merged.id()));
+
+		assert!(Inputs::merge_events_by_name(&db, &aspect).await?.is_empty(), "merging a merged store changed it");
+		let again: Vec<Event> = Outputs::get_unprocessed_events(&db, &aspect).await?.try_collect().await?;
+		assert_eq!(&again, &events);
+
+		drop(db);
+		remove_database(&db_name);
+		Ok(())
+	}
+
+	/// An occurrence detected again is the stored one, not a new manifestation: the month
+	/// still under way comes back with a later end and widens the stored span, and a crossing
+	/// found again on a grid a fraction of a step away (a restart re-scanning from the first
+	/// measurement) folds into it. A distinct later occurrence is still added, and the store
+	/// is left with nothing for the merge to do.
+	#[serial]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn an_occurrence_detected_again_widens_the_stored_one() -> Result<()> {
+		use futures::TryStreamExt;
+		let db_name = format!("event_fold_{}", uuid::Uuid::new_v4().simple());
+		remove_database(&db_name);
+		let db = Database::new(&db_name).await?;
+		let subject = db.observe_subject("subject").await?;
+		let subject_id = subject.id();
+		drop(subject);
+		let aspect = db.track_aspect(&subject_id, "aspect", &Resolution::Minutes, None).await?.id();
+		let dataset = uuid::Uuid::new_v4();
+		let at = |seconds: i64| Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap() + chrono::Duration::seconds(seconds);
+		let store = |spans: Vec<(i64, i64)>| {
+			let (db, aspect) = (&db, &aspect);
+			async move {
+				let mut event = Event::new(None, "month".into(), None, None);
+				for (start, end) in spans {
+					event.add_manifestation(Manifestation::new(dataset, at(start), at(end)));
+				}
+				Inputs::insert_unprocessed_event(db, aspect, &event.into_stable(aspect.as_uuid())).await
+			}
+		};
+		store(vec![(0, 60)]).await?;
+		store(vec![(0, 300)]).await?; // the month under way, a later end
+		store(vec![(30, 90)]).await?; // the same occurrence on an offset grid
+		store(vec![(0, 300), (3600, 3660)]).await?; // a full re-detection plus a new occurrence
+		let events: Vec<Event> = Outputs::get_unprocessed_events(&db, &aspect).await?.try_collect().await?;
+		assert_eq!(events.len(), 1);
+		let mut spans: Vec<_> = events[0].manifestations().values().map(|m| (*m.start(), *m.end())).collect();
+		spans.sort();
+		assert_eq!(spans, vec![(at(0), at(300)), (at(3600), at(3660))], "each occurrence is stored once, widened to its union");
+		assert!(!is_fragmented(&events));
+		assert!(Inputs::merge_events_by_name(&db, &aspect).await?.is_empty(), "the store needs no merge");
+
+		drop(db);
+		remove_database(&db_name);
+		Ok(())
+	}
+
+	/// Two detectors that would emit one event name are refused before anything is stored:
+	/// an event is identified by its (aspect, name), so their manifestations would mix.
+	#[serial]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn detectors_sharing_an_event_name_are_refused() -> Result<()> {
+		let db_name = format!("detector_names_{}", uuid::Uuid::new_v4().simple());
+		remove_database(&db_name);
+		let db = Database::new(&db_name).await?;
+		let subject = db.observe_subject("subject").await?;
+		let subject_id = subject.id();
+		drop(subject);
+		let aspect = db.track_aspect(&subject_id, "aspect", &Resolution::Minutes, None).await?.id();
+		let pipeline = crate::Pipeline::builder(db.clone(), aspect).with_peak_detector("Extremes").with_valley_detector("Extremes").build().await?;
+		let error = pipeline.detect_events().await.expect_err("two detectors named alike were run");
+		assert!(error.to_string().contains("Extremes"), "{error}");
+		drop((pipeline, db));
 		remove_database(&db_name);
 		Ok(())
 	}

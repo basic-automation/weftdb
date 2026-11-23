@@ -199,6 +199,7 @@ pub async fn clear_connection_cache_by_name(name: &str) {
 pub mod config;
 pub(crate) mod conn_pool;
 pub mod connection;
+pub mod correlation_occurrences;
 mod creation;
 pub mod helpers;
 pub mod inputs;

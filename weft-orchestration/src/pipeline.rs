@@ -899,6 +899,18 @@ impl Pipeline {
 
 		tracing::info!(detector_count = self.event_detectors.len(), "Running event detectors...");
 
+		// An event's identity is its (aspect, name) (see `Event::into_stable`), so two detectors
+		// that emit one name would write into one event: peaks and valleys mixed, one average
+		// distance across both. That is refused before anything is stored, rather than merged.
+		let mut detector_names: HashMap<&str, &DetectorId> = HashMap::new();
+		for detector in self.event_detectors.values() {
+			if let Some(other) = detector_names.insert(detector.name(), detector.id()) {
+				anyhow::bail!("detectors {other} and {} share the name {:?}; an event is identified by its name, so give each detector its own", detector.id(), detector.name());
+			}
+		}
+
+		let mut detected: Vec<(&EventDetector, Vec<weftdb::Event>)> = Vec::with_capacity(self.event_detectors.len());
+		let mut owners: HashMap<String, &DetectorId> = HashMap::new();
 		for detector in self.event_detectors.values() {
 			tracing::debug!(
 			    detector_id = %detector.id(),
@@ -907,8 +919,21 @@ impl Pipeline {
 			);
 
 			let events = detector.detect(&self.database, &self.aspect_id, &self.resolution, &self.config.spline_method).await?;
+			for event in &events {
+				let owner = owners.entry(event.name().to_string()).or_insert_with(|| detector.id());
+				if *owner != detector.id() {
+					anyhow::bail!("detectors {owner} and {} both emit events named {:?}; an event is identified by its name, so each detector needs its own", detector.id(), event.name().to_string());
+				}
+			}
+			detected.push((detector, events));
+		}
 
+		for (detector, events) in detected {
 			for event in events {
+				// One event per (aspect, event name), with start-derived manifestation ids: every
+				// run of this detector, and a full re-detection after a restart, collects onto the
+				// same event, and an occurrence it already holds is not stored again.
+				let event = event.into_stable(self.aspect_id.as_uuid());
 				if !event.manifestations().is_empty() {
 					self.database.insert_unprocessed_event(&self.aspect_id, &event).await?;
 					tracing::info!(
@@ -996,6 +1021,7 @@ impl Pipeline {
 		}
 
 		// One read of each for all three measures, instead of one per measure.
+		// A correlation holds no occurrences (its pattern does), so this read does not grow with history.
 		let correlations: Vec<weftdb::Correlation> = self.database.get_correlations(&self.aspect_id).await?.filter_map(|r| async { r.ok() }).collect().await;
 		let events: Vec<weftdb::Event> = self.database.get_unprocessed_events(&self.aspect_id).await?.filter_map(|r| async { r.ok() }).collect().await;
 

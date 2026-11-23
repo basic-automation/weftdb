@@ -12,6 +12,44 @@ release pins that every compatibility gate checks are in
 
 ---
 
+## Correlations without copied occurrences (v0.3.x → v0.4.0)
+
+From v0.4.0 a correlation names its pattern and reads the pattern's occurrences from the
+dictionary; it no longer stores a copy in the aspect's `correlations.db`
+(`correlation_occurrences` table).
+
+### What the code does
+
+- No correlation write adds rows to `correlation_occurrences`.
+- The first time a process correlates an aspect, `retire_correlation_occurrences`
+  deletes the copied rows the dictionary already holds (the stored list is a prefix of
+  the pattern's log, compared to the millisecond) and rows of correlations that no
+  longer exist. It runs in chunks of 256 correlations, each its own transaction, and can
+  be interrupted and re-run. It logs `deleted`, `kept_orphan`, `kept_mismatch` and
+  `dangling` counts.
+- Rows of a correlation whose pattern no dictionary holds, or that do not match the
+  pattern, are kept and read as that correlation's occurrences. Nothing writes them
+  again.
+- The table, its DDL and its index are kept. The file does not shrink until a
+  checkpoint or `VACUUM` reuses the freed pages.
+
+### Library API
+
+`Correlation::new` loses its `occurrences` parameter and `Correlation::occurrences()` is
+removed; use `Database::correlation_occurrences(aspect_id, &correlations)` and
+`CorrelationOccurrences::get`. A `Correlation` serialized by v0.4.0 has no `occurrences`
+field and does not deserialize in older weftdb; older JSON with the field still
+deserializes.
+
+### What happens when an older binary opens the store
+
+It reads empty occurrence lists for correlations whose rows were retired, sees them as
+changed and writes full copies again when it next correlates; a signal step that runs
+before that correlation step finds no occurrences for them. Returning to v0.4.0 retires
+the copies again on its first correlation run.
+
+---
+
 ## Layout 1 → layout 2 (v0.1.0 → v0.2.0)
 
 Every WeftDB release since v0.2.0 writes store **layout 2**. A layout 1 store (written

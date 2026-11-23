@@ -6,7 +6,7 @@ use uuid::Uuid;
 // Import Distance from signal module for error rate types
 use crate::types::{dictionary::DictionaryId, signal::Distance};
 use crate::{
-	types::{aspect::AspectId, event::EventID, subject::SubjectId}, Occurrence, PatternID, SignalType
+	types::{aspect::AspectId, event::EventID, subject::SubjectId}, PatternID, SignalType
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
@@ -88,7 +88,6 @@ pub struct Correlation {
 	event_id: EventID,
 	#[serde(serialize_with = "serialize_error_rates", deserialize_with = "deserialize_error_rates")]
 	error_rate: HashMap<SignalType, ErrorRate>,
-	occurrences: Vec<Occurrence>,
 	/// The average distance from pattern occurrences to event manifestations.
 	/// Used as the divisor in probability calculations per documentation:
 	/// probability = `time_elapsed` / `average_distance`
@@ -110,11 +109,14 @@ pub struct CorrelationKeys {
 impl Correlation {
 	/// A correlation between the pattern and event `keys` name, with a fresh id when
 	/// `id` is `None`.
+	///
+	/// A correlation holds no occurrences: they are its pattern's, read through
+	/// [`Database::correlation_occurrences`](crate::Database::correlation_occurrences).
 	#[must_use]
-	pub fn new(id: Option<CorrelationID>, keys: CorrelationKeys, error_rate: HashMap<SignalType, ErrorRate>, occurrences: Vec<Occurrence>, average_distance: Option<Distance>) -> Self {
+	pub fn new(id: Option<CorrelationID>, keys: CorrelationKeys, error_rate: HashMap<SignalType, ErrorRate>, average_distance: Option<Distance>) -> Self {
 		let id = id.unwrap_or_default();
 		let CorrelationKeys { dictionary_id, subject_id, aspect_id, pattern_id, event_id } = keys;
-		Self { id, dictionary_id, subject_id, aspect_id, pattern_id, event_id, error_rate, occurrences, average_distance }
+		Self { id, dictionary_id, subject_id, aspect_id, pattern_id, event_id, error_rate, average_distance }
 	}
 
 	/// Get the average distance from pattern occurrences to event manifestations
@@ -140,11 +142,6 @@ impl Correlation {
 
 	pub fn set_error_rate(&mut self, signal_type: SignalType, error_rate: ErrorRate) {
 		self.error_rate.insert(signal_type, error_rate);
-	}
-
-	#[must_use]
-	pub const fn occurrences(&self) -> &Vec<Occurrence> {
-		&self.occurrences
 	}
 
 	#[must_use]

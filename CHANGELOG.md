@@ -8,6 +8,27 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- **Correlations reference their pattern instead of copying its occurrences (breaking,
+  weftdb API).** A `Correlation` no longer holds an `occurrences` list:
+  `Correlation::new` drops that parameter and `Correlation::occurrences()` is removed.
+  The occurrences are the pattern's lossless log in the dictionary, resolved by
+  `pattern_id` through the new `Database::correlation_occurrences` (one load per
+  dictionary per call, pipeline dictionaries first, then every dictionary file).
+  Correlation writes no longer touch `correlation_occurrences`, so a pattern gaining
+  an occurrence writes nothing to its correlations, and `get_correlations` no longer
+  reads or parses per-occurrence JSON. The next minor release is 0.4.0 for this.
+- **Copied occurrence rows are retired once per process per aspect.**
+  `Database::retire_correlation_occurrences` deletes `correlation_occurrences` rows
+  that are a prefix of the pattern's log (compared to the millisecond) and rows of
+  correlations that no longer exist; rows of a pattern no dictionary holds, or that do
+  not match, are kept and still read as a fallback. The table and its index stay.
+- **`replace_dictionary_patterns` never deletes a stored pattern.** It writes the
+  given patterns over the stored copies of the same ids and keeps the rest, so a
+  failed dictionary load followed by a write-back can no longer drop the patterns
+  correlations name.
+
 ### Testing
 
 - **Real-filesystem ENOSPC evidence (#723).** Two integration tests pin the

@@ -496,48 +496,26 @@ impl Signals {
 	/// - `correlation_id`: The correlation ID to remove signal for
 	/// - `manifestation_id`: The manifestation ID to remove signal for  
 	/// - `signal_type`: The signal type to remove
-	/// - `correlation`: Mutable reference to the correlation to update with new error rate
+	/// - `correlation`: The correlation the signal belongs to, as the caller last saw it
 	/// - `resolution_time`: The time when the event actually occurred
 	///
 	/// # Returns
 	/// - The removed signal if it existed, None otherwise
+	/// - The corrected correlation when the correction changed a stored field of it, None
+	///   when it changed nothing; callers persist only a returned correlation, so a removal
+	///   that changes nothing neither copies nor writes the correlation
 	///
-	/// # Error Correction Formula
-	/// The signal predicts an event at: `manifestation_date + distance + old_error_rate`
-	/// The event actually occurred at: `resolution_time`
+	/// # Error correction
 	///
-	/// Actual time from manifestation = `resolution_time` - `manifestation_date`
-	/// Predicted time from manifestation = distance + `old_error_rate`
-	/// Observed error = `actual_time` - `predicted_time` (can be positive or negative)
-	///
-	/// New Error Rate = alpha * `observed_error` + (1 - alpha) * `old_error_rate`
-	/// Where alpha = 0.2 (gives 20% weight to new observation, 80% to historical average)
+	/// No stored field of `correlation` is changed today, so the second value is always
+	/// None: the signal is only removed. Updating the error rate on every removal
+	/// accumulated without bound, so it was dropped.
 	///
 	/// # Errors
 	///
-	/// Returns an error if:
-	/// - No error rates are found for the signal type in the correlation
-	/// - Time difference calculation fails
-	///
-	/// # Panics
-	///
-	/// Panics if the alpha value (0.2) cannot be converted to `BigDecimal`, which should
-	/// not happen under normal circumstances.
-	pub fn remove_with_error_correction(&mut self, correlation: &mut Correlation, manifestation_id: &ManifestationId, signal_type: &SignalType, _resolution_time: DateTime<Utc>) -> Result<Option<Signal>> {
-		let correlation_id = correlation.id().clone();
-
-		// Get the signal before removing it
-		if self.get(&correlation_id, manifestation_id, signal_type).is_some() {
-			// Note: Error rate updates are now handled by calibrate_error_rates() during training.
-			// We don't update error_rate here to avoid accumulation issues with the
-			// formula: New Error Rate = (Signal - 1) + Current Error Rate
-			// which would cause unbounded growth.
-
-			// Just remove and return the signal
-			Ok(self.remove(&correlation_id, manifestation_id, signal_type))
-		} else {
-			Ok(None)
-		}
+	/// Never fails today; the `Result` is kept for a correction that can.
+	pub fn remove_with_error_correction(&mut self, correlation: &Correlation, manifestation_id: &ManifestationId, signal_type: &SignalType, _resolution_time: DateTime<Utc>) -> Result<(Option<Signal>, Option<Correlation>)> {
+		Ok((self.remove(correlation.id(), manifestation_id, signal_type), None))
 	}
 
 	/// Calculate the sum of probabilities for all signals of a given event and signal type at a specific date

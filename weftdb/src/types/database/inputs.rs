@@ -1593,23 +1593,8 @@ impl Inputs for Database {
 				}
 			}
 
-			// Insert occurrences
-			for (index, occurrence) in correlation.occurrences().iter().enumerate() {
-				let occurrence_index = i64::try_from(index).map_err(|_| anyhow::anyhow!("Occurrence index too large for i64"))?;
-				let size = i64::try_from(occurrence.size()).map_err(|_| anyhow::anyhow!("Occurrence size too large for i64"))?;
-				let database_info_json = serde_json::to_string(occurrence.database_info())?;
-				let insert_occ_sql = r"INSERT INTO correlation_occurrences (correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
-				let res = conn.as_ref().execute(insert_occ_sql, turso::params![correlation.id().to_string(), occurrence_index, occurrence.aspect().to_string(), occurrence.resolution().to_string(), size, database_info_json, occurrence.pattern_id().to_string(), occurrence.beginning().timestamp_millis(), occurrence.end().timestamp_millis()]).await;
-				match res {
-					Ok(_) => (),
-					Err(e) => {
-						let id = correlation.id();
-						tracing::warn!("Failed to insert occurrence {index} for correlation '{id}': {e}");
-						Self::rollback_after_error(&conn).await;
-						return Err(anyhow::anyhow!("Failed to insert correlation occurrence: {e}"));
-					}
-				}
-			}
+			// Occurrences are not copied: the pattern's occurrence log in the dictionary holds
+			// them, and `Database::correlation_occurrences` resolves them by `pattern_id`.
 
 			Self::commit_concurrent(&conn).await?;
 
@@ -1672,33 +1657,8 @@ impl Inputs for Database {
 				}
 			}
 
-			// Delete existing occurrences and re-insert
-			let delete_occ_sql = r"DELETE FROM correlation_occurrences WHERE correlation_id = ?";
-			let res = conn.as_ref().execute(delete_occ_sql, turso::params![correlation.id().to_string()]).await;
-			if let Err(e) = res {
-				let id = correlation.id();
-				tracing::warn!("Failed to delete occurrences for correlation '{id}': {e}");
-				Self::rollback_after_error(&conn).await;
-				return Err(anyhow::anyhow!("Failed to delete correlation occurrences: {e}"));
-			}
-
-			// Insert updated occurrences
-			for (index, occurrence) in correlation.occurrences().iter().enumerate() {
-				let occurrence_index = i64::try_from(index).map_err(|_| anyhow::anyhow!("Occurrence index too large for i64"))?;
-				let size = i64::try_from(occurrence.size()).map_err(|_| anyhow::anyhow!("Occurrence size too large for i64"))?;
-				let database_info_json = serde_json::to_string(occurrence.database_info())?;
-				let insert_occ_sql = r"INSERT INTO correlation_occurrences (correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
-				let res = conn.as_ref().execute(insert_occ_sql, turso::params![correlation.id().to_string(), occurrence_index, occurrence.aspect().to_string(), occurrence.resolution().to_string(), size, database_info_json, occurrence.pattern_id().to_string(), occurrence.beginning().timestamp_millis(), occurrence.end().timestamp_millis()]).await;
-				match res {
-					Ok(_) => (),
-					Err(e) => {
-						let id = correlation.id();
-						tracing::warn!("Failed to insert occurrence {index} for correlation '{id}': {e}");
-						Self::rollback_after_error(&conn).await;
-						return Err(anyhow::anyhow!("Failed to insert correlation occurrence: {e}"));
-					}
-				}
-			}
+			// `correlation_occurrences` is not touched: occurrences live in the pattern's log.
+			// Leftover rows from older releases are retired by `retire_correlation_occurrences`.
 
 			Self::commit_concurrent(&conn).await?;
 
@@ -1717,10 +1677,8 @@ impl Inputs for Database {
 	}
 
 	async fn update_correlations(&self, aspect_id: &AspectId, correlations: &[Correlation]) -> Result<TxId> {
-		// Same reasoning as `remove_correlations`: the child tables have no index, so the
-		// per-correlation deletes in `update_correlation` scan them once per correlation.
-		// Here the deletes go in `IN (...)` chunks and the re-inserts in multi-row statements,
-		// all in one transaction.
+		// The error-rate deletes go in `IN (...)` chunks and the re-inserts in multi-row
+		// statements, all in one transaction.
 		const ID_CHUNK: usize = 256;
 		const ROW_CHUNK: usize = 100;
 		if correlations.is_empty() {
@@ -1735,27 +1693,10 @@ impl Inputs for Database {
 		drop(last);
 
 		let mut error_rows: Vec<[turso::Value; 4]> = Vec::new();
-		let mut occurrence_rows: Vec<[turso::Value; 9]> = Vec::new();
 		for correlation in &unique {
 			let id = correlation.id().to_string();
 			for (signal_type, distance) in correlation.error_rate() {
 				error_rows.push([turso::Value::Text(id.clone()), turso::Value::Text(signal_type.to_string()), turso::Value::Text(distance.value().to_string()), turso::Value::Text(distance.units().to_string())]);
-			}
-			for (index, occurrence) in correlation.occurrences().iter().enumerate() {
-				let occurrence_index = i64::try_from(index).map_err(|_| anyhow::anyhow!("Occurrence index too large for i64"))?;
-				let size = i64::try_from(occurrence.size()).map_err(|_| anyhow::anyhow!("Occurrence size too large for i64"))?;
-				let database_info_json = serde_json::to_string(occurrence.database_info())?;
-				occurrence_rows.push([
-					turso::Value::Text(id.clone()),
-					turso::Value::Integer(occurrence_index),
-					turso::Value::Text(occurrence.aspect().to_string()),
-					turso::Value::Text(occurrence.resolution().to_string()),
-					turso::Value::Integer(size),
-					turso::Value::Text(database_info_json),
-					turso::Value::Text(occurrence.pattern_id().to_string()),
-					turso::Value::Integer(occurrence.beginning().timestamp_millis()),
-					turso::Value::Integer(occurrence.end().timestamp_millis()),
-				]);
 			}
 		}
 
@@ -1780,20 +1721,17 @@ impl Inputs for Database {
 			for chunk in unique.chunks(ID_CHUNK) {
 				let placeholders = vec!["?"; chunk.len()].join(", ");
 				let params: Vec<String> = chunk.iter().map(|correlation| correlation.id().to_string()).collect();
-				for table in ["correlation_error_rates", "correlation_occurrences"] {
-					let sql = format!("DELETE FROM {table} WHERE correlation_id IN ({placeholders})");
-					if let Err(e) = conn.as_ref().execute(&sql, turso::params_from_iter(params.clone())).await {
-						tracing::warn!("Failed to clear {table} for {} correlations in aspect {aspect_id}: {e}", chunk.len());
-						Self::rollback_after_error(&conn).await;
-						return Err(anyhow::anyhow!("Failed to clear {table}: {e}"));
-					}
+				// Error rates only: occurrences are the pattern's, and no correlation write touches
+				// `correlation_occurrences`.
+				let sql = format!("DELETE FROM correlation_error_rates WHERE correlation_id IN ({placeholders})");
+				if let Err(e) = conn.as_ref().execute(&sql, turso::params_from_iter(params)).await {
+					tracing::warn!("Failed to clear correlation_error_rates for {} correlations in aspect {aspect_id}: {e}", chunk.len());
+					Self::rollback_after_error(&conn).await;
+					return Err(anyhow::anyhow!("Failed to clear correlation_error_rates: {e}"));
 				}
 			}
 
-			let inserts: [(&str, &str, usize, Vec<turso::Value>); 2] = [
-				("correlation_error_rates", "(correlation_id, signal_type, error_rate_value, error_rate_units)", 4, error_rows.into_iter().flatten().collect()),
-				("correlation_occurrences", "(correlation_id, occurrence_index, aspect_id, resolution, size, database_info, pattern_id, beginning_timestamp, end_timestamp)", 9, occurrence_rows.into_iter().flatten().collect()),
-			];
+			let inserts: [(&str, &str, usize, Vec<turso::Value>); 1] = [("correlation_error_rates", "(correlation_id, signal_type, error_rate_value, error_rate_units)", 4, error_rows.into_iter().flatten().collect())];
 			for (table, columns, width, values) in inserts {
 				let row = format!("({})", vec!["?"; width].join(", "));
 				for chunk in values.chunks(width * ROW_CHUNK) {
@@ -1913,40 +1851,50 @@ impl Inputs for Database {
 	async fn insert_unprocessed_event(&self, aspect_id: &AspectId, event: &Event) -> Result<TxId> {
 		legacy_metadata_write(async move {
 			let tx_id = TxId::new();
-			let db = self.get_unprocessed_events_db(aspect_id).await?;
-			let db_path = self.get_unprocessed_events_db_path(aspect_id).await?;
-			let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
-			drop(db);
-			let _manifestations_json = serde_json::to_string(event.manifestations()).map_err(|e| anyhow::anyhow!(format!("Failed to serialize event manifestations: {e}")))?;
-			let event_id = event.id().to_string();
-			let description = event.description().clone().unwrap_or_default();
-
-			let res = conn.as_ref().execute("INSERT INTO events (id, name, description, created_at) VALUES (?, ?, ?, ?)", turso::params![event_id.clone(), event.name().to_string(), description, chrono::Utc::now().timestamp_millis()]).await;
-			match res {
-				Ok(_) => tracing::debug!("Inserted unprocessed event {} in database {}", event_id, self.id()),
-				Err(e) => {
-					let _ = Self::rollback_concurrent(&conn).await;
-					return Err(anyhow::anyhow!(format!("Failed to insert unprocessed event: {e}")));
-				}
+			let added = std::sync::atomic::AtomicU64::new(0);
+			retry_queue_write("Storing an unprocessed event", || async {
+				let rows = self.upsert_unprocessed_event(aspect_id, event).await?;
+				added.store(rows, std::sync::atomic::Ordering::Relaxed);
+				Ok(())
+			})
+			.await?;
+			let cache = self.cache.lock().await;
+			cache.invalidate_generation(&Self::unprocessed_events_cache_key(aspect_id)).await;
+			cache.invalidate(&format!("unprocessed_event_{}_{}", aspect_id.as_uuid(), event.id().to_uuid())).await;
+			drop(cache);
+			let added = added.load(std::sync::atomic::Ordering::Relaxed);
+			if added > 0 {
+				let log = format!("Stored unprocessed event {} for aspect {aspect_id} ({added} new rows)", event.id());
+				let _ = self.record_transaction(&log).await?;
 			}
-
-			// insert manifestations
-			for (manifestation_id, manifestation) in event.manifestations() {
-				let _manifestation_json = serde_json::to_string(manifestation).map_err(|e| anyhow::anyhow!(format!("Failed to serialize event manifestation: {e}")))?;
-				let res = conn.as_ref().execute("INSERT INTO event_manifestations (id, event_id, dataset_id, start_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?)", turso::params![manifestation_id.to_uuid().to_string(), event_id.clone(), manifestation.dataset_id().to_string(), manifestation.start().timestamp_millis(), manifestation.end().timestamp_millis()]).await;
-				match res {
-					Ok(_) => (),
-					Err(e) => {
-						let _ = Self::rollback_concurrent(&conn).await;
-						return Err(anyhow::anyhow!(format!("Failed to insert unprocessed event manifestation: {e}")));
-					}
-				}
-			}
-			Self::commit_concurrent(&conn).await?;
-			self.cache.lock().await.invalidate_generation(&Self::unprocessed_events_cache_key(aspect_id)).await;
-			let log = format!("Inserted unprocessed event {event_id} for aspect {aspect_id}");
-			let _ = self.record_transaction(&log).await?;
 			Ok(tx_id)
+		})
+		.await
+	}
+
+	async fn merge_events_by_name(&self, aspect_id: &AspectId) -> Result<Vec<EventID>> {
+		legacy_metadata_write(async move {
+			let outcome = std::sync::Mutex::new((Vec::new(), Vec::new()));
+			retry_queue_write("Merging fragmented events", || async {
+				let merged = self.merge_events_by_name_once(aspect_id).await?;
+				*outcome.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = merged;
+				Ok(())
+			})
+			.await?;
+			let (removed, touched) = outcome.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+			if !touched.is_empty() {
+				let cache = self.cache.lock().await;
+				cache.invalidate_generation(&Self::unprocessed_events_cache_key(aspect_id)).await;
+				for id in &touched {
+					cache.invalidate(&format!("unprocessed_event_{}_{}", aspect_id.as_uuid(), id.to_uuid())).await;
+				}
+				drop(cache);
+			}
+			if !removed.is_empty() {
+				let log = format!("Merged {} fragmented events by name for aspect {aspect_id}", removed.len());
+				let _ = self.record_transaction(&log).await?;
+			}
+			Ok(removed)
 		})
 		.await
 	}
@@ -2269,9 +2217,192 @@ impl Inputs for Database {
 }
 
 /// Dictionary persistence that is not part of the `Inputs` trait.
+/// An event row as stored: `(name, description, created_at)`.
+type EventRow = (String, String, i64);
+/// A manifestation span as stored: `(dataset_id, start_ms, end_ms)`.
+type Span = (String, i64, i64);
+
 impl Database {
-	/// Replace every pattern stored in `dictionary_name` for `aspect_id` with `patterns`,
-	/// in one transaction.
+	/// One transaction of [`Inputs::insert_unprocessed_event`]: add the event row if no row
+	/// has its id, and each manifestation that is not an occurrence the event already holds
+	/// (see [`crate::spans_coincide`]); one that is widens the stored span to their union. Answers how many rows it added. A conflict surfaces at COMMIT and is
+	/// retried by the caller on a fresh snapshot, where the winner's rows are seen and skipped.
+	///
+	/// Without a unique index two writers that commit the same new span both keep it; such a
+	/// pair shares its id (ids are derived from the start, see [`crate::ManifestationId::for_span`]),
+	/// so readers fold it into one and [`Inputs::merge_events_by_name`] removes it.
+	async fn upsert_unprocessed_event(&self, aspect_id: &AspectId, event: &Event) -> Result<u64> {
+		let db = self.get_unprocessed_events_db(aspect_id).await?;
+		let db_path = self.get_unprocessed_events_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
+		match Self::upsert_event_rows(&conn, event).await {
+			Ok(added) => {
+				commit_queue_write(&conn, "Storing an unprocessed event").await?;
+				Ok(added)
+			}
+			Err(e) => {
+				Self::rollback_after_error(&conn).await;
+				Err(e)
+			}
+		}
+	}
+
+	async fn upsert_event_rows(conn: &Connection, event: &Event) -> Result<u64> {
+		let event_id = event.id().to_string();
+		let description = event.description().clone().unwrap_or_default();
+		let mut added = conn
+			.as_ref()
+			.execute("INSERT INTO events (id, name, description, created_at) SELECT ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM events WHERE id = ?)", turso::params![event_id.clone(), event.name().to_string(), description, chrono::Utc::now().timestamp_millis(), event_id.clone()])
+			.await
+			.map_err(|e| queue_write_error("Failed to insert unprocessed event", &e))?;
+
+		// Each stored manifestation of the event: its id and span. A detected span that is the
+		// same occurrence as a stored one (see [`crate::spans_coincide`]) widens it in place
+		// rather than being stored beside it.
+		let mut held: Vec<(String, Span)> = Vec::new();
+		let mut rows = conn.as_ref().query("SELECT id, dataset_id, start_timestamp, end_timestamp FROM event_manifestations WHERE event_id = ?", turso::params![event_id.clone()]).await.map_err(|e| queue_write_error("Failed to read event manifestations", &e))?;
+		while let Some(row) = rows.next().await.map_err(|e| queue_write_error("Failed to read event manifestation row", &e))? {
+			let id = row.get_value(0)?.as_text().cloned().unwrap_or_default();
+			held.push((id, span_of(&row, 1)?));
+		}
+		drop(rows);
+
+		for (manifestation_id, manifestation) in event.manifestations() {
+			let (dataset, start, end) = (manifestation.dataset_id().to_string(), manifestation.start().timestamp_millis(), manifestation.end().timestamp_millis());
+			let same = held.iter_mut().find(|(_, (d, s, e))| *d == dataset && if *s <= start { crate::spans_coincide(s, e, &start) } else { crate::spans_coincide(&start, &end, s) });
+			if let Some((id, (_, held_start, held_end))) = same {
+				let (union_start, union_end) = ((*held_start).min(start), (*held_end).max(end));
+				if (union_start, union_end) != (*held_start, *held_end) {
+					conn.as_ref()
+						.execute("UPDATE event_manifestations SET start_timestamp = ?, end_timestamp = ? WHERE id = ? AND event_id = ?", turso::params![union_start, union_end, id.clone(), event_id.clone()])
+						.await
+						.map_err(|e| queue_write_error("Failed to widen unprocessed event manifestation", &e))?;
+					(*held_start, *held_end) = (union_start, union_end);
+					added += 1;
+				}
+				continue;
+			}
+			conn.as_ref()
+				.execute("INSERT INTO event_manifestations (id, event_id, dataset_id, start_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?)", turso::params![manifestation_id.to_uuid().to_string(), event_id.clone(), dataset.clone(), start, end])
+				.await
+				.map_err(|e| queue_write_error("Failed to insert unprocessed event manifestation", &e))?;
+			held.push((manifestation_id.to_uuid().to_string(), (dataset, start, end)));
+			added += 1;
+		}
+		Ok(added)
+	}
+
+	/// One transaction of [`Inputs::merge_events_by_name`]. Answers the ids it removed and
+	/// every id whose stored rows it rewrote.
+	async fn merge_events_by_name_once(&self, aspect_id: &AspectId) -> Result<(Vec<EventID>, Vec<EventID>)> {
+		let db = self.get_unprocessed_events_db(aspect_id).await?;
+		let db_path = self.get_unprocessed_events_db_path(aspect_id).await?;
+		let conn = Self::begin_concurrent(&db, &db_path, Some(self.cache.clone())).await?;
+		drop(db);
+		match Self::merge_event_rows(&conn, aspect_id).await {
+			Ok(outcome) => {
+				commit_queue_write(&conn, "Merging fragmented events").await?;
+				Ok(outcome)
+			}
+			Err(e) => {
+				Self::rollback_after_error(&conn).await;
+				Err(e)
+			}
+		}
+	}
+
+	async fn merge_event_rows(conn: &Connection, aspect_id: &AspectId) -> Result<(Vec<EventID>, Vec<EventID>)> {
+		// Every event row, grouped by name, and every manifestation row, by event.
+		let mut by_name: std::collections::BTreeMap<String, Vec<(String, EventRow)>> = std::collections::BTreeMap::new();
+		let mut rows = conn.as_ref().query("SELECT id, name, description, created_at FROM events", turso::params![]).await.map_err(|e| queue_write_error("Failed to read events", &e))?;
+		while let Some(row) = rows.next().await.map_err(|e| queue_write_error("Failed to read event row", &e))? {
+			let text = |i: usize| -> Result<String> { Ok(row.get_value(i)?.as_text().cloned().unwrap_or_default()) };
+			let created_at = row.get_value(3)?.as_integer().copied().unwrap_or_default();
+			let (id, name, description) = (text(0)?, text(1)?, text(2)?);
+			by_name.entry(name.clone()).or_default().push((id, (name, description, created_at)));
+		}
+		drop(rows);
+		let mut spans: std::collections::HashMap<String, Vec<(String, Span)>> = std::collections::HashMap::new();
+		let mut rows = conn.as_ref().query("SELECT id, event_id, dataset_id, start_timestamp, end_timestamp FROM event_manifestations", turso::params![]).await.map_err(|e| queue_write_error("Failed to read event manifestations", &e))?;
+		while let Some(row) = rows.next().await.map_err(|e| queue_write_error("Failed to read event manifestation row", &e))? {
+			let id = row.get_value(0)?.as_text().cloned().unwrap_or_default();
+			let event_id = row.get_value(1)?.as_text().cloned().unwrap_or_default();
+			spans.entry(event_id).or_default().push((id, span_of(&row, 2)?));
+		}
+		drop(rows);
+
+		let mut removed = Vec::new();
+		let mut touched = Vec::new();
+		for (name, rows) in by_name {
+			let mut ids: Vec<&String> = rows.iter().map(|(id, _)| id).collect();
+			ids.sort();
+			ids.dedup();
+			let held: Vec<&(String, Span)> = ids.iter().flat_map(|id| spans.get(*id).into_iter().flatten()).collect();
+			// Every occurrence once (see [`crate::fold_spans`]): repeats of a span, a
+			// manifestation stored again with a later end, and one found again a fraction of a
+			// grid step away all fold into their union, under the id of the earliest.
+			let folded = crate::fold_spans(held.iter().map(|(id, (dataset, start, end))| (dataset.clone(), *start, *end, id.clone())).collect());
+			let widened = folded.iter().any(|(dataset, start, end, id)| !held.iter().any(|(held_id, span)| held_id == id && *span == (dataset.clone(), *start, *end)));
+			let fragmented = ids.len() > 1;
+			if !fragmented && rows.len() == 1 && folded.len() == held.len() && !widened {
+				continue; // One row, every occurrence once: nothing to merge.
+			}
+			// One event under its stable id when several ids share the name; the one id otherwise.
+			let target = if fragmented {
+				EventID::for_name(aspect_id.as_uuid(), &name)
+			} else {
+				EventID::from_uuid(uuid::Uuid::parse_str(ids[0]).map_err(|e| anyhow::anyhow!("Invalid event id {}: {e}", ids[0]))?)
+			};
+			let description = rows.iter().map(|(_, (_, d, _))| d.as_str()).find(|d| !d.is_empty()).unwrap_or_default().to_string();
+			let created_at = rows.iter().map(|(_, (_, _, c))| *c).min().unwrap_or_default();
+			// Each occurrence under the first id seen for it, or its stable id when re-keyed.
+			let mut kept: Vec<(String, Span)> = Vec::with_capacity(folded.len());
+			for (dataset, start, end, id) in folded {
+				let id = if fragmented {
+					let dataset_uuid = uuid::Uuid::parse_str(&dataset).map_err(|e| anyhow::anyhow!("Invalid dataset id {dataset}: {e}"))?;
+					let start_at = chrono::DateTime::from_timestamp_millis(start).ok_or_else(|| anyhow::anyhow!("Invalid manifestation start {start}"))?;
+					crate::ManifestationId::for_span(&target, dataset_uuid, start_at).to_uuid().to_string()
+				} else {
+					id
+				};
+				kept.push((id, (dataset, start, end)));
+			}
+
+			for id in &ids {
+				conn.as_ref().execute("DELETE FROM event_manifestations WHERE event_id = ?", turso::params![(*id).clone()]).await.map_err(|e| queue_write_error("Failed to delete event manifestations", &e))?;
+				conn.as_ref().execute("DELETE FROM events WHERE id = ?", turso::params![(*id).clone()]).await.map_err(|e| queue_write_error("Failed to delete event", &e))?;
+			}
+			let target_text = target.to_uuid().to_string();
+			conn.as_ref().execute("INSERT INTO events (id, name, description, created_at) VALUES (?, ?, ?, ?)", turso::params![target_text.clone(), name.clone(), description, created_at]).await.map_err(|e| queue_write_error("Failed to insert merged event", &e))?;
+			for (id, (dataset, start, end)) in kept {
+				conn.as_ref().execute("INSERT INTO event_manifestations (id, event_id, dataset_id, start_timestamp, end_timestamp) VALUES (?, ?, ?, ?, ?)", turso::params![id, target_text.clone(), dataset, start, end]).await.map_err(|e| queue_write_error("Failed to insert merged event manifestation", &e))?;
+			}
+			for id in ids {
+				let id = EventID::from_uuid(uuid::Uuid::parse_str(id).map_err(|e| anyhow::anyhow!("Invalid event id {id}: {e}"))?);
+				if id != target {
+					removed.push(id.clone());
+				}
+				touched.push(id);
+			}
+			touched.push(target);
+		}
+		Ok((removed, touched))
+	}
+}
+
+/// The `(dataset_id, start, end)` span in columns `first..first + 3` of a manifestation row.
+fn span_of(row: &turso::Row, first: usize) -> Result<Span> {
+	let dataset = row.get_value(first)?.as_text().cloned().ok_or_else(|| anyhow::anyhow!("Manifestation dataset id is not text"))?;
+	let start = row.get_value(first + 1)?.as_integer().copied().ok_or_else(|| anyhow::anyhow!("Manifestation start is not an integer"))?;
+	let end = row.get_value(first + 2)?.as_integer().copied().ok_or_else(|| anyhow::anyhow!("Manifestation end is not an integer"))?;
+	Ok((dataset, start, end))
+}
+
+impl Database {
+	/// Write `patterns` over the stored copies of the same ids in `dictionary_name` for
+	/// `aspect_id`, in one transaction. A stored pattern whose id is not in `patterns` is
+	/// kept (insert or update only, never delete).
 	///
 	/// This is how a pipeline writes a dictionary back after an extraction run. The
 	/// in-memory dictionary is the whole truth (it was loaded from this store, then new
@@ -2297,8 +2428,17 @@ impl Database {
 			let conn = Self::begin_concurrent(&db, db_name, Some(self.cache.clone())).await?;
 
 			let result: Result<()> = async {
-				for sql in ["DELETE FROM pattern_relatives", "DELETE FROM pattern_occurrences", "DELETE FROM pattern_occurrence_blobs", "DELETE FROM patterns"] {
-					conn.as_ref().execute(sql, turso::params![]).await.map_err(|e| anyhow::anyhow!("Failed to clear dictionary '{dictionary_name}': {e}"))?;
+				// Only the patterns being written are cleared. A stored pattern missing from
+				// `patterns` is kept: correlations name their pattern and read its occurrences
+				// from here, so dropping it (a failed dictionary load hands in only the new
+				// patterns) would leave them with nothing.
+				let ids: Vec<String> = patterns.iter().map(|p| p.id().to_string()).collect();
+				for chunk in ids.chunks(256) {
+					let placeholders = vec!["?"; chunk.len()].join(", ");
+					for (table, column) in [("pattern_relatives", "pattern_id"), ("pattern_occurrences", "pattern_id"), ("pattern_occurrence_blobs", "pattern_id"), ("patterns", "id")] {
+						let sql = format!("DELETE FROM {table} WHERE {column} IN ({placeholders})");
+						conn.as_ref().execute(&sql, turso::params_from_iter(chunk.to_vec())).await.map_err(|e| anyhow::anyhow!("Failed to clear patterns of dictionary '{dictionary_name}': {e}"))?;
+					}
 				}
 				for pattern in patterns {
 					let id = pattern.id().to_string();

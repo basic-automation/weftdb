@@ -47,7 +47,7 @@ turso = { workspace = true }
 branches = { version = "0.4.3", default-features = false, features = ["std"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-uuid = { workspace = true, features = ["v4", "serde"] }
+uuid = { workspace = true, features = ["v4", "v5", "serde"] }
 wide = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }
 fastrand = { workspace = true }
