@@ -18,6 +18,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   resolution and tag lookup). No behaviour change; `ROADMAP.md:194` line left unchecked per the
   audit contract.
 
+- **B-object audit** — `docs/research/object-store-audit.md` confirms no schemaless object/annotation store exists; every PhysicalType is numeric, the segment frame has no non-numeric column model, and the public-surface freeze blocks new routes. Deferred to post-1.0. Phase label reconciled from the stale "Phase 4" (issue body) to Phase 28 (the live ROADMAP.md position). (#363)
+
 ### Changed
 
 - **`url` is 2.5.9, not 2.5.8 (#857).** RustSec advisory RUSTSEC-2026-0592
@@ -50,6 +52,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   an identical re-run through that wrapper is still absorbed, and #803 stays open pending the
   server-ledger identity under #768.
 
+- **A worker's progress log was tracked at `progress.md` (#876).** It was a run log for issue
+  #838: a Done checklist written by an agent into its worktree, committed, and merged. Nothing in
+  `.github/`, `scripts/`, `docs/` or `tools/` references it and no document links to it, so it read
+  as project documentation while being none. It is removed, and `.gitignore` now covers the class
+  (`progress.md`, `.briefs/`) beside the `.handoff-*.md` entry that already existed.
+
 ### Fixed
 
 - **The legacy ingest-ledger key now digests its payload with 128 bits instead
@@ -66,6 +74,23 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **TSBS tag-grouped queries in `weft-xbench`, answered and checked (TAG-12, #341).** `tsbs::load_cpu`
+  reads every host's ten `cpu` fields from a `tsbs_generate_data --use-case=cpu-only` file (integer
+  fields only; anything else is refused), and `TsbsCpu` answers TSBS's six `single-groupby-*` variants
+  and `lastpoint` in process as the reference. `TsbsWeft` stores the same data in a `SegmentStore`,
+  one aspect per metric and one series per `hostname`, and answers both query types from it; a test
+  pins the store's answers equal to the reference. `single-groupby` buckets by one minute, as TSBS's
+  generated SQL does for every engine, not every five minutes as TSBS's README says
+  ([timescale/tsbs#214](https://github.com/timescale/tsbs/issues/214)). Nothing is timed yet, and no
+  other engine runs these queries.
+- **`weft-xbench --tsbs FILE --tsbs-queries` times WeftDB's answers to TSBS's tag-grouped queries
+  (TAG-12, #341).** The phase loads the whole file into a store tagged by `hostname` and, for each of
+  the six `single-groupby-*` variants and `lastpoint`, answers `--reps` seeded instances. Each instance
+  picks distinct random hosts and a random window, drawn the way `tsbs_generate_queries` draws them.
+  One untimed burn-in instance comes first. Every answer is checked against the in-memory reference
+  outside the timed span. A mismatch fails the run's gate, as a failed interpolation result does. The
+  report schema is v9: a new top-level `tsbs_queries` list, rendered as a "TSBS queries" table that
+  compares no engines. `weft-xbench combine` refuses reports that carry it instead of pooling them.
 - **Multi-series crash cell (TAG-12, issue #341).** A new fault-injection test
   (`multiseries_crash`) writes interleaved frames across 8 series, then aborts the process
   with SIGABRT part-way through a second batch on one of them. The parent reopens the
@@ -233,6 +258,11 @@ origin/main
 
 ### Fixed
 
+- **The nightly cross-engine smoke builds again.** `weft-xbench/Cargo.lock` never recorded the
+  `tempfile` dependency `weft-bench` gained, so `cargo build --locked` for `weft-xbench` failed on every
+  scheduled `xbench-smoke` run from at least 2026-11-17 (through 2026-11-22). `weftdb`'s `sha2`
+  dependency, added by #849, was missing from it too. The lock now has both, and CI's `xbench-lock` job
+  also resolves `weft-xbench` with `cargo metadata --locked`, so a stale lock fails on the push.
 - **The cargo-deny exception for `chrono` (RUSTSEC-2026-0543) now expires on its date, not in prose.** The action pin was bumped to `EmbarkStudios/cargo-deny-action` v2.1.2 (commit `70f81531115945ba6eb6b941ec9d39d063438eb9`), which runs cargo-deny 0.21.0, and the ignore entry carries `expiry = "2027-01-31"`: once that date passes the advisory is reported again with `advisory-ignore-expired` and CI goes red until the migration (#791) lands or the exception is re-dated. The old pin (cargo-deny 0.20.2) rejected the `expiry` key with `error[unexpected-keys]`, which is why the deadline had only been documentation. Closes #794.
 - **TTL purge no longer drops a doomed segment that shadows a surviving segment of the same series (#797).**
   `purge_aspect_held` now builds a `survivors` map (straddling and wholly live segments)
