@@ -9358,3 +9358,139 @@ the **equality** half of the guarantee does not hold for `NaN`, because `FieldVa
 `non_finite_floats_keep_their_text_but_not_their_equality` pins both halves. Neither value can reach
 storage in any case, because `parse_points` refuses a non-finite named field (ROB-7), so the
 caveat is confined to records that never leave the caller.
+
+## 2026-11-22 — The cached-connection audit answers its roadmap line without ticking it (#369)
+
+**Question.** "Complete the cached-connection migration" (`ROADMAP.md`) presumes a migration that
+the code does not describe. What is the state, and does an audit let the line be ticked?
+
+**Chosen.** No. The audit (PR #870, `docs/research/cached-connection-audit.md`) records what exists
+and files what remains (#871, #872, #873); the line stays unchecked and its text carries the
+verdict.
+
+**Rationale.** Same rule already used for the other verification lines: an audit answers, it does
+not implement. Ticking would tell the next reader that the migration is finished, when the gap the
+roadmap names — the sites that still open their own handles — is still open.
+
+**What the audit rests on.** The vocabulary of the roadmap line does not match the code: there is no
+`ConnectionPool`, no `CachedConnection`, no `bb8`/`r2d2`. There are two caches, a process-wide
+`CONNECTION_DATABASES` map keyed by path and a per-`Database` aspect cache, plus an idle sweep that
+the server loop never calls. Those facts, not a guess about intent, are what the follow-up issues
+were written from.
+
+**Rejected.** Routing the SegmentStore's four control-plane handles through the shared cache — the
+store is a singleton per root, opens each file exactly once and holds it by value, so routing adds no
+deduplication and fights idle-close. Recorded as rejected in the audit rather than filed.
+
+**Lanes.** #871 and #872 overlap the owner's `p12/fanctl-correlation-growth` connection-reuse work
+(`docs/roadmap-notes.md:767`), which has no roadmap line "to avoid claiming it". They are filed so
+the gap is visible on the board, and the audit and the issues both say the lane must be checked
+before anyone starts. The loop did not claim either.
+
+**Needs human.** #873 needs the public-surface decision (an `Arc<Database>` or a `&Database` facade)
+while the #238 freeze is open.
+## 2026-11-22 — A worker's progress log reached `main`, and the fix is to ignore the class (#876)
+
+**Ambiguity.** `progress.md` sat at the repository root on `main`: a 163-line run log for issue
+#838, with a Done checklist and acceptance notes, written by an agent and merged along with the code
+it described. The question was whether such a file is documentation to keep, documentation to move
+under `docs/`, or scratch to delete. It is also the second scaffolding leak of this kind — the
+`.gitignore` scratch section already carries a `## Worker handoff notes are scratch, not repo
+content` entry for `.handoff-*.md`, which means the repo had already decided the class once.
+
+**Choice.** Delete the file and widen the ignore rule to the class: `progress.md` and `.briefs/`
+join the scratch section. Nothing references the file (`rg -n 'progress\.md' .github scripts docs
+tools` returns nothing), so deleting loses no information that anything depends on; the content
+itself describes work that is recorded properly in `ROADMAP.md`, `DECISIONS.md` and the issue
+tracker, which is where a reader looks for it.
+
+**Why not move it under `docs/`.** A run log is a statement about one agent's session, not about the
+system. Its claims were true at the moment the agent wrote them and are unverifiable afterwards, so
+placing it in `docs/` would add a document that invites trust it has not earned. The same reasoning
+already removed `DETAILED_CHANGES.txt` and `.handoff-*.md` from the tree.
+
+**The CI guard, and why it did not wait.** The complete fix is a check that no scaffolding filename
+is tracked, because an ignore rule only stops *this* checkout from re-adding one: `git add -f` and an
+already-tracked path both defeat it, and `progress.md` was already tracked when it was merged. The
+issue filed for that check (#885) said it should wait for the wiring-guard hardening branch
+(`ci-gates/wiring-basename`, #859), since both touch `scripts/ci/` and add a step to
+`.github/workflows/ci.yml`. While implementing it the wait looked wrong. The hazard #859 guards is a
+blanket `unittest discover` root — a workflow line that silently opts future files in. The steps this
+guard adds invoke two scripts by exact path, so they stay legal under #859's stricter rules whichever
+order they merge in; the residual cost is one possible `ci.yml` conflict on a branch that has to
+rebase anyway. The cost of waiting was not a conflict but a window: every agent that pushes to this
+repo meanwhile can land another `progress.md`, and the guard is what closes the window. Recorded
+because both the issue text and this section's first draft said the opposite.
+
+**What the guard enforces, and what it deliberately does not.** It enforces filename rules —
+`progress.md`, `progress-*.md`, `HANDOFF.md`, `.handoff-*.md` at any depth, and any path with a
+`.briefs` component. It does not enforce the heading rule, though the heading detector
+(`HANDOFF_HEADING`) is kept in the file so the rule stays expressible and can be wired into a
+pre-commit hook. The reason is concrete: `DECISIONS.md` on `main` quotes a `## Handoff` heading while
+describing this very incident, so a CI rule on headings would fail honest write-ups of the practice
+the rule exists to stop. A gate that fails legitimate prose gets routed around by a blanket exemption
+nobody re-reads, so the heading rule stays a review rule and the filename rule — which has no
+legitimate counter-use — is the one CI enforces.
+
+## 2026-11-21 — What TSBS's tag-grouped queries mean in `weft-xbench`, and what answers them first (TAG-12, #341)
+
+**Ambiguous.** The TAG-12 line names "TSBS tag-grouped query suite" and lists `single-groupby-*`, `double-groupby-*`, `lastpoint` and `high-cpu-*`. TSBS's README describes `single-groupby` as a MAX "every 5 mins", while the SQL TSBS generates buckets by one minute; and the line does not say how an engine's answer is judged.
+
+**Chosen.**
+
+- **TSBS's generated queries are the definition, not its README.** `single-groupby-M-H-T` is the MAX of the first `M` of TSBS's `cpuMetrics` over `H` named hosts per **one-minute** bucket in a half-open `[start, end)` window. Every generator read agrees: TimescaleDB `time_bucket('60 seconds', time)`, ClickHouse `toStartOfMinute`, InfluxDB `group by time(1m)`, QuestDB `SAMPLE BY 1m`. The README mismatch is [timescale/tsbs#214](https://github.com/timescale/tsbs/issues/214), open since 2022. Only the six variants TSBS registers (`1-1-1`, `1-1-12`, `1-8-1`, `5-1-1`, `5-1-12`, `5-8-1`) are named.
+- **An in-process reference judges every engine.** `tsbs::TsbsCpu` answers each query from the parsed file. TSBS picks hosts and windows from its own seed, so the caller passes the ones a generated query names, and the reference and the engine answer the same question. There is no ground truth beyond this, as with the `tsbs` interpolation datasets (2026-10-31).
+- **The fields stay TSBS's integers.** `load_cpu` refuses a float, unsigned, boolean or string field instead of converting it, so the reference is exact by construction and WeftDB stores the values as `ScaledI64` at scale 0 with no lossy step.
+- **WeftDB answers first, untimed.** `TsbsWeft` stores one aspect per metric and one series per `hostname` and answers from `downsample_range_of` (MAX per minute) and whole-series reads (`lastpoint`). A timed phase, the report and other engines come after the answers are pinned equal.
+
+**Rejected.**
+
+- The README's five-minute buckets: no engine TSBS benchmarks would run that query.
+- Timing first and checking later: a fast wrong answer is the failure this harness exists to catch.
+- Running TSBS's Go query generator in CI for the reference: the reference is twenty lines of Rust over data the tests already build, and the nightly does not carry a Go toolchain (2026-10-31).
+
+## 2026-11-22 — B-object is absent; the freeze blocks it; defer to post-1.0 (#363)
+
+**Context.** Issue #363 "B-object (Phase 4 · absent)" from the predecessor backlog asks whether
+WeftDB has a schemaless object/annotation store beside numeric aspects. The audit
+(`docs/research/object-store-audit.md`) confirms:
+
+- **Nothing covers it.** Every `PhysicalType` variant (`weft-physical-type/src/lib.rs:161-200`)
+  is numeric (F64, F32, ScaledI64, ScaledI128, Decimal128, BigDecimalText).
+  `BigDecimalText` is an exactness escape hatch for decimal values, not a type escape hatch:
+  `parse_decimal` (`weft-physical-type/src/lib.rs:438`) rejects non-decimal text.
+- **No string/JSON/blob route path.** Every ingest point value is lifted through
+  `parse_decimal` to `BigDecimal` (`weft-server/src/ingest.rs:960,1042`). The segment frame
+  format has no non-numeric column model.
+- **The freeze blocks adding one.** Issue #238 ("Public surface declared and frozen", Phase 18
+  — Release candidate) prohibits new routes and JSON schema changes. B-object needs at minimum
+  a write route and a read route.
+- **Phase label reconciled.** Issue body says "Phase 4"; `ROADMAP.md:319` puts it under Phase 28
+  (Analytics premium); `docs/roadmap-notes.md` had "Phase 4 · absent". Corrected to Phase 28.
+
+**Chosen: defer to post-1.0, file no follow-ups, keep the box unchecked.**
+
+No implementation issues filed: creating fictionally actionable backlog items during the freeze
+would be speculative. The audit doc records the gap and recommends the post-1.0 re-evaluation
+scope a complete feature umbrella.
+
+**Needs human.** Whether the project wants object storage at all post-1.0, and whether it
+should be a new crate (`weft-object`) or a widened weft-physical-type. The audit doc recommends
+the crate path.
+
+## 2026-11-23 — How the TSBS query phase draws, warms and times its queries (TAG-12, #341)
+
+**Ambiguous.** The TAG-12 sub-item asks for "a timed `weft-xbench` TSBS-query phase with the reference gate in the report". It does not say which hosts and windows a timed rep asks for, whether reps repeat one question or ask new ones, what counts as warm-up, how much of the TSBS file the phase reads, or what `combine` does with the result.
+
+**Chosen.**
+
+- **Instances are drawn as `tsbs_generate_queries` draws them, from our own seed.** Hosts are a uniformly random subset of distinct hosts (`getRandomHosts` → `GetRandomSubsetPerm` in `cmd/tsbs_generate_queries/uses/devops/common.go`), and the window's start is uniform in `[first, end − window)` at nanosecond granularity, `end = start + window` (`TimeInterval.RandWindow` in `internal/utils/time_interval.go`). The seed is `weft-xbench`'s `--seed`, one stream per query type, so the instances are reproducible but are not the same instances a TSBS query file with the same seed would hold (Go's `math/rand` stream is not reproduced).
+- **Each timed rep answers a different instance**, as `tsbs_run_queries` runs a file of generated queries once each. With its defaults (`--burn-in 0`, `--workers 1`, `--prewarm-queries false`, `pkg/query/benchmarker.go`) TSBS times every query once. The phase answers one extra instance untimed first, as a burn-in of one, so the first timed rep does not alone pay whatever the store defers to its first read after a load. That reason is a precaution, not a measured effect.
+- **The gate runs outside the timed span**, on every instance, and a query type passes only when every instance equals the reference. A failure fails the run (`all_correct`), and the report flags it as any other gate failure does.
+- **The phase reads the whole `--tsbs` file**, whatever `--scales` says. TSBS draws its windows over the generator's whole interval, and the tiny scale's hour has no 12-hour window in it.
+- **`combine` refuses reports that carry TSBS query results** rather than pooling them. Carrying run 1's results alone would present one run as the pool, and pooling needs the same instance draw in every run, which has not been designed.
+- **Report schema v9**: `tsbs_queries` is a new top-level list, not a new `Phase` of `ArmResult`. An `ArmResult` is shaped around one dataset's grid (input points, missingness, accuracy against ground truth), none of which a TSBS query has.
+
+**Rejected.** Reusing one instance for every rep (it would time a cache, not TSBS's workload); TSBS's `--prewarm-queries` cold/warm pair (no cold hook is wired to this phase yet); timing the reference (it is the gate, not an engine).
+
+**Not decided here.** `lastpoint` reads every series' whole range, because `SegmentStore` has no per-series latest-row read (`read.rs` exposes range, point and downsample reads; `aspect_stats` has an aspect-wide time range only). TSBS's TimescaleDB `lastpoint` is a `LATERAL … ORDER BY time DESC LIMIT 1` per tag set. Whether WeftDB gets a latest-row read is an engine change and needs a benchmark behind it, so it is a ROADMAP sub-item, not part of this phase.

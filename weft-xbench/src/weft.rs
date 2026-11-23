@@ -1,16 +1,17 @@
 //! The WeftDB arms: in-memory, and stored with exact-decimal or `f64` output in two segment layouts.
 
 use std::{
-	future::Future, path::{Path, PathBuf}, sync::atomic::{AtomicU64, Ordering}
+	collections::BTreeMap, future::Future, path::{Path, PathBuf}, sync::atomic::{AtomicU64, Ordering}
 };
 
-use bigdecimal::BigDecimal;
+use bigdecimal::{BigDecimal, ToPrimitive};
 use splimes::{Interpolator, Spline};
 use weft_bench::{adapter::SystemAdapter, WeftAdapter, DEFAULT_INGEST_BATCH_ROWS};
 use weft_physical_type::{AspectSchema, PhysicalType, TimeUnit};
-use weftdb::SegmentStore;
+use weft_reduce::Aggregation;
+use weftdb::{IngestBatch, Resolution, SegmentStore, SeriesId, SeriesSelector, TagSet};
 
-use crate::{ArmInfo, BucketRow, Dataset, Output, DOWNSAMPLE_AGGREGATIONS};
+use crate::{tsbs, ArmInfo, BucketRow, Dataset, Output, DOWNSAMPLE_AGGREGATIONS};
 
 /// A benchmark arm: something that can load a dataset, reconstruct its grid and reduce it into
 /// buckets.
@@ -148,6 +149,141 @@ struct Stored {
 impl Drop for Stored {
 	fn drop(&mut self) {
 		let _ = std::fs::remove_dir_all(&self.dir);
+	}
+}
+
+/// A TSBS `cpu-only` file in a WeftDB `SegmentStore`, tagged as TSBS tags it, answering TSBS's
+/// tag-grouped devops queries (TAG-12, #341).
+///
+/// Each of the ten [`tsbs::CPU_METRICS`] is an aspect (`cpu_<metric>`, exact `ScaledI64` at scale
+/// 0, nanosecond timestamps), and each host is one series of it, tagged `hostname=<host>`.
+/// The answers are compared with [`tsbs::TsbsCpu`]'s reference; this is not yet a timed arm.
+pub struct TsbsWeft {
+	/// `None` only while dropping, so the directory goes after the store has closed.
+	store: Option<SegmentStore>,
+	dir: PathBuf,
+	hosts: Vec<String>,
+}
+
+impl Drop for TsbsWeft {
+	fn drop(&mut self) {
+		self.store = None;
+		let _ = std::fs::remove_dir_all(&self.dir);
+	}
+}
+
+impl TsbsWeft {
+	/// The aspect a CPU metric is stored under.
+	#[must_use]
+	pub fn aspect(metric: &str) -> String {
+		format!("cpu_{metric}")
+	}
+
+	/// Store every host's readings of `cpu` in a fresh store under the system temp directory: one
+	/// tagged ingest per host and metric.
+	///
+	/// # Errors
+	///
+	/// If the store cannot be opened or refuses a declaration or an ingest.
+	pub async fn load(cpu: &tsbs::TsbsCpu) -> anyhow::Result<Self> {
+		let dir = std::env::temp_dir().join(format!("weft-xbench-tsbs-{}-{}", std::process::id(), NEXT_STORE.fetch_add(1, Ordering::Relaxed)));
+		std::fs::create_dir_all(&dir)?;
+		// Built before the store opens, so a refusal below still removes the directory.
+		let mut loaded = Self { store: None, dir, hosts: cpu.hosts.keys().cloned().collect() };
+		let store = SegmentStore::open(&loaded.dir).await?;
+		let schema = AspectSchema::new(PhysicalType::ScaledI64 { scale: 0 }, BigDecimal::from(0), TimeUnit::Nanos);
+		for metric in tsbs::CPU_METRICS {
+			store.declare(&Self::aspect(metric), &schema).await?;
+		}
+		for (host, readings) in &cpu.hosts {
+			let tags = TagSet::from_pairs([("hostname", host.as_str())])?;
+			let timestamps: Vec<i64> = readings.iter().map(|r| r.ts_ns).collect();
+			for (m, metric) in tsbs::CPU_METRICS.iter().enumerate() {
+				let values = readings.iter().map(|r| BigDecimal::from(r.values[m])).collect();
+				store.ingest(&Self::aspect(metric), &IngestBatch::dense(host.clone(), timestamps.clone(), values).with_groups(tags.clone())).await?;
+			}
+		}
+		loaded.store = Some(store);
+		Ok(loaded)
+	}
+
+	fn store(&self) -> anyhow::Result<&SegmentStore> {
+		self.store.as_ref().ok_or_else(|| anyhow::anyhow!("the TSBS store is closed"))
+	}
+
+	async fn series(&self, aspect: &str, host: &str) -> anyhow::Result<SeriesId> {
+		let selector = SeriesSelector::exact([("hostname", Some(host))])?;
+		self.store()?.resolve_series(aspect, &selector).await?.ok_or_else(|| anyhow::anyhow!("no series hostname={host} in {aspect}"))
+	}
+
+	/// [`tsbs::TsbsCpu::single_groupby`]'s question, answered by the store: each host's per-minute
+	/// MAX from `downsample_range_of`, merged across the hosts by bucket.
+	///
+	/// # Errors
+	///
+	/// As the reference, or if the store fails.
+	pub async fn single_groupby(&self, metrics: usize, hosts: &[&str], start_ns: i64, end_ns: i64) -> anyhow::Result<Vec<tsbs::MinuteMax>> {
+		anyhow::ensure!((1..=tsbs::CPU_METRICS.len()).contains(&metrics), "a single-groupby takes 1 to {} metrics, not {metrics}", tsbs::CPU_METRICS.len());
+		anyhow::ensure!(!hosts.is_empty(), "a single-groupby names at least one host");
+		anyhow::ensure!(start_ns < end_ns, "the window [{start_ns}, {end_ns}) is empty");
+		let mut buckets: BTreeMap<i64, Vec<Option<i64>>> = BTreeMap::new();
+		for host in hosts {
+			for (m, metric) in tsbs::CPU_METRICS[..metrics].iter().enumerate() {
+				let aspect = Self::aspect(metric);
+				let series = self.series(&aspect, host).await?;
+				// The store's range is inclusive; TSBS's window is half-open.
+				for bucket in self.store()?.downsample_range_of(&aspect, series, start_ns, end_ns - 1, Resolution::Minutes, &[Aggregation::Max]).await? {
+					let minute_ns = nanos(bucket.timestamp)?;
+					let max = bucket.values.get(Aggregation::Max.as_str()).ok_or_else(|| anyhow::anyhow!("{aspect} bucket {minute_ns} has no max"))?;
+					let max = max.to_i64().ok_or_else(|| anyhow::anyhow!("{aspect} bucket {minute_ns}: max {max} is not an i64"))?;
+					let slot = &mut buckets.entry(minute_ns).or_insert_with(|| vec![None; metrics])[m];
+					*slot = Some(slot.map_or(max, |s| s.max(max)));
+				}
+			}
+		}
+		buckets.into_iter().map(|(minute_ns, max)| Ok(tsbs::MinuteMax { minute_ns, max: max.into_iter().collect::<Option<Vec<i64>>>().ok_or_else(|| anyhow::anyhow!("bucket {minute_ns} has a metric with no rows"))? })).collect()
+	}
+
+	/// [`tsbs::TsbsCpu::lastpoint`]'s question, answered by the store: each host's latest
+	/// instant and its ten values, hosts in name order.
+	///
+	/// It reads each series' whole range and keeps the last row: correct, not yet the fast path.
+	///
+	/// # Errors
+	///
+	/// If the store fails, or a host's ten series disagree on their latest instant.
+	pub async fn lastpoint(&self) -> anyhow::Result<Vec<(String, tsbs::CpuReading)>> {
+		let mut out = Vec::with_capacity(self.hosts.len());
+		for host in &self.hosts {
+			let mut reading = tsbs::CpuReading { ts_ns: i64::MIN, values: [0; 10] };
+			for (m, metric) in tsbs::CPU_METRICS.iter().enumerate() {
+				let aspect = Self::aspect(metric);
+				let series = self.series(&aspect, host).await?;
+				let (ts, vs) = self.store()?.read_time_range_of(&aspect, series, i64::MIN, i64::MAX).await?;
+				let (Some(&last_ts), Some(Some(last_v))) = (ts.last(), vs.last()) else { anyhow::bail!("{aspect} hostname={host} has no rows") };
+				anyhow::ensure!(m == 0 || last_ts == reading.ts_ns, "{host}'s latest {metric} is at {last_ts}, not {}", reading.ts_ns);
+				reading.ts_ns = last_ts;
+				reading.values[m] = last_v.to_i64().ok_or_else(|| anyhow::anyhow!("{aspect} hostname={host}: {last_v} is not an i64"))?;
+			}
+			out.push((host.clone(), reading));
+		}
+		Ok(out)
+	}
+
+	/// The store's answer to one instance of `query`, for comparison with
+	/// [`tsbs::TsbsCpu::answer`].
+	///
+	/// # Errors
+	///
+	/// As [`Self::single_groupby`] and [`Self::lastpoint`].
+	pub async fn answer(&self, query: tsbs::TsbsQuery, instance: &tsbs::QueryInstance) -> anyhow::Result<tsbs::TsbsAnswer> {
+		match query {
+			tsbs::TsbsQuery::SingleGroupby { metrics, .. } => {
+				let hosts: Vec<&str> = instance.hosts.iter().map(String::as_str).collect();
+				Ok(tsbs::TsbsAnswer::Minutes(self.single_groupby(metrics, &hosts, instance.start_ns, instance.end_ns).await?))
+			}
+			tsbs::TsbsQuery::Lastpoint => Ok(tsbs::TsbsAnswer::Latest(self.lastpoint().await?)),
+		}
 	}
 }
 
@@ -300,5 +436,61 @@ impl Arm for WeftStore {
 
 	async fn downsample(&mut self, ds: &Dataset, _knots: Vec<splimes::Point>) -> anyhow::Result<Vec<BucketRow>> {
 		self.loaded()?.downsample(ds).await
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use rand::{RngExt as _, SeedableRng};
+	use rand_chacha::ChaCha8Rng;
+
+	use super::*;
+
+	/// `hosts` hosts with seeded readings every ten seconds for two hours from 2016-01-01, the
+	/// cadence `tsbs_generate_data --log-interval=10s` writes, including some values far enough
+	/// apart that a MAX taken over the wrong host or bucket shows.
+	fn generated(hosts: usize) -> tsbs::TsbsCpu {
+		let mut rng = ChaCha8Rng::seed_from_u64(341);
+		let mut cpu = tsbs::TsbsCpu::default();
+		for h in 0..hosts {
+			let readings = (0..720_i64).map(|step| tsbs::CpuReading { ts_ns: 1_451_606_400_000_000_000 + step * 10_000_000_000, values: std::array::from_fn(|_| rng.random_range(0..100) + if rng.random_range(0..50) == 0 { 1_000 } else { 0 }) }).collect();
+			cpu.hosts.insert(format!("host_{h}"), readings);
+		}
+		cpu
+	}
+
+	#[tokio::test]
+	async fn the_store_answers_every_tsbs_query_as_the_reference_does() {
+		let cpu = generated(10);
+		let weft = TsbsWeft::load(&cpu).await.expect("loads");
+		let t0 = 1_451_606_400_000_000_000_i64;
+		let eight = ["host_0", "host_1", "host_2", "host_3", "host_5", "host_6", "host_8", "host_9"];
+		for query in tsbs::TsbsQuery::ALL {
+			match query {
+				tsbs::TsbsQuery::SingleGroupby { metrics, hosts, hours } => {
+					// A window that starts and ends inside a minute, as TSBS's random windows do,
+					// clipped to the generated two hours for the 12-hour variants.
+					let start = t0 + 25_000_000_000;
+					let end = (start + i64::from(hours) * 3_600_000_000_000).min(t0 + 7_200_000_000_000) - 15_000_000_000;
+					let named = &eight[..hosts];
+					let want = cpu.single_groupby(metrics, named, start, end).expect("reference");
+					assert!(want.len() > 50, "{}: a real answer, not an empty one", query.name());
+					assert_eq!(weft.single_groupby(metrics, named, start, end).await.expect("store"), want, "{}", query.name());
+				}
+				tsbs::TsbsQuery::Lastpoint => {
+					let want: Vec<(String, tsbs::CpuReading)> = cpu.lastpoint().into_iter().map(|(h, r)| (h.to_string(), r.clone())).collect();
+					assert_eq!(weft.lastpoint().await.expect("store"), want);
+				}
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn a_wrong_host_or_metric_is_refused_not_answered_empty() {
+		let weft = TsbsWeft::load(&generated(2)).await.expect("loads");
+		assert!(weft.single_groupby(1, &["host_7"], 0, 1).await.expect_err("unknown host").to_string().contains("hostname=host_7"));
+		assert!(weft.single_groupby(11, &["host_0"], 0, 1).await.is_err());
+		assert!(weft.single_groupby(1, &["host_0"], 5, 5).await.is_err());
+		drop(weft);
 	}
 }
