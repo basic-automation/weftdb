@@ -9496,6 +9496,53 @@ legitimate counter-use — is the one CI enforces.
 - Timing first and checking later: a fast wrong answer is the failure this harness exists to catch.
 - Running TSBS's Go query generator in CI for the reference: the reference is twenty lines of Rust over data the tests already build, and the nightly does not carry a Go toolchain (2026-10-31).
 
+## 2026-11-22 — A doc comment that says a shipped feature is absent is its own defect (#860, TAG-12 residual)
+
+**Ambiguity.** `weft-bench/src/fan_out.rs` opened with "On `main` `git grep -l fan-out` matches only
+`DECISIONS.md`, `ROADMAP.md` and `docs/roadmap-notes.md` — there is **no measurement**", written before
+PR #809 landed the arm. The false half and the true half sit in one sentence, so the cheap move was to
+delete the sentence and the tidy move was to fold the fix into the next benchmark PR. Neither is right:
+deleting loses the true half, and folding makes a measurement diff harder to review while the falsehood
+keeps propagating in the meantime.
+
+**Choice.** Rewrote the module doc so both facts are stated separately and dated: the arm exists and is
+runnable (`--fan-out`; `run_fan_out_workload` at `weft-bench/src/main.rs:539`, flag parsed at `:1779`,
+dispatched at `:164`), and **no ladder number has ever been published** — `bench/claims.json` has no
+`fan_out` entry, so publishing one means a figure in `docs/reference.md` vouched by a registry entry that
+`tools/check_claims.py` lints in CI. Shipped as a docs-only slice.
+
+**Rationale.** A doc comment is a claim about the tree, and a false one makes the next agent's premise
+wrong — the same failure mode as a stale roadmap line (#851, #855), reached from the other direction:
+those roadmap lines had fallen behind the code, and this doc comment had fallen behind it too. Keeping the
+honest half explicit matters as much as removing the false half: the accurate statement is not "fan-out is
+missing" but "runnable and unmeasured", and that difference is what stops someone quoting a number that
+does not exist.
+
+**A related artifact found while appending.** `docs/roadmap-notes.md:844` on `main` carries a malformed
+heading: "## 2026-11-22 — Legacy ledger key digest widened from CRC-32 to 128 bits (#849, SEAL-HASH1) to
+128-bit SHA-256 prefix (#849)". It is the remains of a wrapped heading from the SEAL-HASH1 slice whose
+continuation was appended as a separate line and folded back into the heading. Repaired here by cutting
+the trailing fragment. Lesson for every future append-at-end slice: if a markdown heading must wrap, wrap
+it as prose **below** the heading, never as a continuation of it — a concatenated heredoc has no soft wrap.
+
+**Erratum, same slice.** My first cut of the replacement text said a published number "goes through
+`docs/benchmark-policy.md` and the baseline-control gate in `scripts/ci/check-baseline-control.py`" — wrong
+in precisely the way this slice exists to remove. That script compares the committed **OpenAPI** baseline
+digest against the base-ref copy (`--baseline compat/openapi/baseline/weftdb.json --digest-file
+compat/openapi/baseline/weftdb.json.sha256`), which is the FRE-18c contract gate and has nothing to do with
+benchmark figures; §3 of `docs/benchmark-policy.md` is a policy statement ("Every published number is ours,
+and reproducible"), not a publishing pipeline. The actual flow is a figure in `docs/reference.md` backed by a
+`bench/claims.json` entry (`schema: 1`; `id`, `figures`, `source`, `command`, `dataset`, `measured`,
+`reproducible_from_clone`, `artifact`) that `tools/check_claims.py` checks against the readme in CI. Caught
+by grepping the mechanism before anyone reviewed the PR. The lesson generalises to every citation this repo
+adds: name a gate only after reading what it gates, and re-read your own new sentence with the same scepticism
+the issue tells you to apply to the old one.
+
+**Not done.** No `ROADMAP.md` L127/L124 tick (a doc fix is not a measurement); no ladder run (needs the T7
+reference drive at L120, marked `*(owner)*`, and a local `cargo run`, which this host does not do); no
+`bench/claims.json` entry; no `weft-xbench` change (the nightly routine loop's lane, open PR #842); no
+`CHANGELOG.md` entry (nothing user-visible changed).
+
 ## 2026-11-22 — B-object is absent; the freeze blocks it; defer to post-1.0 (#363)
 
 **Context.** Issue #363 "B-object (Phase 4 · absent)" from the predecessor backlog asks whether

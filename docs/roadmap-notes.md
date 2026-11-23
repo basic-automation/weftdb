@@ -870,6 +870,7 @@ worker for this slice imported two unmerged files from PR #845's branch, which i
 became visible: a missing step and a duplicated file look identical from a diff of one branch.
 `OK: 13 test script(s) wired by 13 workflow(s)` against `main`.
 ## 2026-11-22 — Legacy ledger key digest widened from CRC-32 to 128 bits (#849, SEAL-HASH1) to 128-bit SHA-256 prefix (#849)
+## 2026-11-22 — Legacy ledger key digest widened from CRC-32 to a 128-bit SHA-256 prefix (#849, SEAL-HASH1)
 
 The key format changed from `legacy:{dataset_id}:{payload_crc:08x}:{n}` to
 `legacy:{dataset_id}:{payload_digest (32 hex)}:{n}`. The change is migration-free because the lookup
@@ -924,3 +925,18 @@ No box moved in this change.
 1. Run `--tsbs-queries` in a release build over `/mnt/weftbench/tsbs/cpu-only.lp` on a quiet host (`--reps 100` or more), and publish it as a report artifact. Only then can a TSBS timing be quoted.
 2. A per-series latest-row read in `SegmentStore` for `lastpoint`. First measure today's full-range `lastpoint` against a prototype that reads only the series' last segment.
 3. The other engines' TSBS SQL (TimescaleDB first, since the generator SQL is already read), each checked against `TsbsCpu`.
+
+## 2026-11-22 — The fan-out arm's doc comment said the arm did not exist (#860, TAG-12 residual, L127)
+
+`weft-bench/src/fan_out.rs` opened by asserting that on `main` fan-out appears only in prose documents and
+that "there is **no measurement**". PR #809 (issue #807, TAG-12 cut A) landed the arm, so the sentence
+described a tree that no longer exists. The doc now states that the arm is runnable (`--fan-out`; knobs in
+`FanOutParams`: `seed`, `series_steps` default 1/10/100/1000, `rows_per_series` 1000, `read_window_ns`
+1000 seconds) and that **no published number exists**: `bench/claims.json` has no `fan_out` entry, and
+a published number would need a figure in `docs/reference.md` backed by a `bench/claims.json` entry that
+`tools/check_claims.py` checks in CI.
+
+**L127 and L124 stay unchecked.** A doc correction is not a measurement: the ladder run still needs the T7
+reference drive (L120, `*(owner)*`) and a claims entry that satisfies §3 of `docs/benchmark-policy.md`. Repaired en route: the
+malformed heading at L844 of this file, a wrapped heading from the SEAL-HASH1 slice that had folded onto
+one line.
