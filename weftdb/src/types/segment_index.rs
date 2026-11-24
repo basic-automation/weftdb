@@ -67,6 +67,12 @@ pub struct SegmentIndexStore {
 	catalogs: SeriesCatalogs,
 }
 
+impl Drop for SegmentIndexStore {
+	fn drop(&mut self) {
+		crate::types::durable::control_plane::release(&self.db);
+	}
+}
+
 /// The composite index a series-bound prune names (Phase 4 tag pruning,
 /// `0007_series_time_index`): it seeks `(aspect, series_id)` and then the span, so the
 /// rows of the aspect's other series are never visited. Best effort, like
@@ -245,6 +251,7 @@ impl SegmentIndexStore {
 	async fn open_with(builder: Builder, path: &str) -> Result<Self> {
 		let db = builder.build().await?;
 		Self::configure(&db, path).await?;
+		crate::types::durable::control_plane::adopt(&db);
 		Ok(Self { db, spans: SpanBounds::default(), catalogs: SeriesCatalogs::default() })
 	}
 

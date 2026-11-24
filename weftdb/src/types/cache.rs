@@ -45,23 +45,64 @@ impl AnalysisResult {
 	}
 }
 
-#[derive(Debug, Clone)]
-pub struct Connection(pub TursoConnection);
+/// A connection holding one transaction. When it was checked out of a database's pool
+/// (see `database::conn_pool`), dropping it hands the connection back for the next
+/// transaction instead of closing it.
+pub struct Connection {
+	conn: TursoConnection,
+	pool: Option<std::sync::Arc<crate::types::database::conn_pool::Pool>>,
+	/// Set once a transaction on this connection failed; it is then closed, not pooled.
+	failed: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for Connection {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Connection").field("pooled", &self.pool.is_some()).finish_non_exhaustive()
+	}
+}
 
 impl Connection {
 	#[must_use]
 	pub const fn new(conn: TursoConnection) -> Self {
-		Self(conn)
+		Self { conn, pool: None, failed: std::sync::atomic::AtomicBool::new(false) }
+	}
+
+	pub(crate) const fn pooled(conn: TursoConnection, pool: Option<std::sync::Arc<crate::types::database::conn_pool::Pool>>) -> Self {
+		Self { conn, pool, failed: std::sync::atomic::AtomicBool::new(false) }
 	}
 
 	#[must_use]
 	pub const fn as_ref(&self) -> &TursoConnection {
-		&self.0
+		&self.conn
 	}
 
+	/// Close this connection when it drops instead of pooling it: a transaction on it
+	/// failed, and a fresh connection is the only state nobody has to reason about.
+	pub fn discard(&self) {
+		self.failed.store(true, std::sync::atomic::Ordering::Release);
+	}
+
+	/// The Turso connection itself; it leaves the pool for good.
 	#[must_use]
-	pub fn into_inner(self) -> TursoConnection {
-		self.0
+	pub fn into_inner(mut self) -> TursoConnection {
+		self.pool = None;
+		self.conn.clone()
+	}
+}
+
+impl std::ops::Deref for Connection {
+	type Target = TursoConnection;
+
+	fn deref(&self) -> &TursoConnection {
+		&self.conn
+	}
+}
+
+impl Drop for Connection {
+	fn drop(&mut self) {
+		if let Some(pool) = self.pool.take().filter(|_| !self.failed.load(std::sync::atomic::Ordering::Acquire)) {
+			pool.give_back(self.conn.clone());
+		}
 	}
 }
 
@@ -93,16 +134,6 @@ impl Cacheable for AnalysisResult {
 }
 
 impl Cacheable for Vec<Batch> {
-	fn as_any(&self) -> &dyn Any {
-		self
-	}
-
-	fn clone_box(&self) -> Box<dyn Cacheable> {
-		Box::new(self.clone())
-	}
-}
-
-impl Cacheable for Connection {
 	fn as_any(&self) -> &dyn Any {
 		self
 	}

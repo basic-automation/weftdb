@@ -8,6 +8,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-23
+
 ### Documentation
 
 - **CHRONO-INV, #791:** Inventory of `chrono` v0.4 dependency across the workspace — 9
@@ -33,6 +35,24 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Changed
 
+- **Correlations reference their pattern instead of copying its occurrences (breaking,
+  weftdb API).** A `Correlation` no longer holds an `occurrences` list:
+  `Correlation::new` drops that parameter and `Correlation::occurrences()` is removed.
+  The occurrences are the pattern's lossless log in the dictionary, resolved by
+  `pattern_id` through the new `Database::correlation_occurrences` (one load per
+  dictionary per call, pipeline dictionaries first, then every dictionary file).
+  Correlation writes no longer touch `correlation_occurrences`, so a pattern gaining
+  an occurrence writes nothing to its correlations, and `get_correlations` no longer
+  reads or parses per-occurrence JSON. This is why this release is 0.4.0.
+- **Copied occurrence rows are retired once per process per aspect.**
+  `Database::retire_correlation_occurrences` deletes `correlation_occurrences` rows
+  that are a prefix of the pattern's log (compared to the millisecond) and rows of
+  correlations that no longer exist; rows of a pattern no dictionary holds, or that do
+  not match, are kept and still read as a fallback. The table and its index stay.
+- **`replace_dictionary_patterns` never deletes a stored pattern.** It writes the
+  given patterns over the stored copies of the same ids and keeps the rest, so a
+  failed dictionary load followed by a write-back can no longer drop the patterns
+  correlations name.
 - **`url` is 2.5.9, not 2.5.8 (#857).** RustSec advisory RUSTSEC-2026-0592
   (`denial-of-service`) reports that `Url::origin()` handled a `blob:` URL by re-parsing its path as
   another URL and calling itself whatever the inner scheme was, with no depth limit: 10,000 `blob:`
@@ -3467,7 +3487,8 @@ before this release. A bare "0.1" in them means splimes 0.1.
   advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
   unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.
 
-[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.3.7...HEAD
+[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/basic-automation/weftdb/compare/v0.3.7...v0.4.0
 [0.3.7]: https://github.com/basic-automation/weftdb/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/basic-automation/weftdb/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/basic-automation/weftdb/compare/v0.3.4...v0.3.5

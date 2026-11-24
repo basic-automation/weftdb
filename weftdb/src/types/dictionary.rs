@@ -55,6 +55,13 @@ pub struct Dictionary {
 	learner: LearnedSimilarity,
 }
 
+/// Whether `pattern` already holds `occurrence`, compared by its natural key (aspect,
+/// resolution, size, database and time span), not by its pattern id, which each
+/// extraction draws fresh.
+fn contains_occurrence(pattern: &Pattern, occurrence: &crate::Occurrence) -> bool {
+	pattern.occurrence_log().contains_window(occurrence)
+}
+
 /// Similarity thresholds learned online, used when a dictionary has no variability
 /// constraints.
 ///
@@ -611,6 +618,14 @@ impl Dictionary {
 			return Ok(());
 		}
 
+		// A batch extracted again (the same window of the same aspect) gives occurrences
+		// the dictionary already holds; counting them again would double-count the window,
+		// not add information, so a pattern made only of such occurrences is dropped. The
+		// comparison ignores the occurrence's pattern id, which extraction draws fresh.
+		if !new_pattern.occurrence_log().is_empty() && new_pattern.occurrence_log().iter().all(|occurrence| self.patterns.iter().any(|p| contains_occurrence(p, &occurrence))) {
+			return Ok(());
+		}
+
 		// Step 2: Check similarity against ALL existing patterns using configured variability
 		// constraints, or, when none are configured, the learned thresholds.
 		let matching_indices = if self.constraints.variabilities.is_none() {
@@ -921,8 +936,12 @@ impl Dictionary {
 	pub fn merge_pattern_occurrences_at_index(&mut self, target_index: usize, source_pattern: &Pattern) -> Result<()> {
 		if let Some(target_pattern) = self.patterns.get_mut(target_index) {
 			// Add all occurrences from source pattern to target pattern
+			// An occurrence the target already holds (the same window, by natural key) is a
+			// double count, not a new manifestation, so it is not appended again.
 			for occurrence in source_pattern.occurrence_log().iter() {
-				target_pattern.add_occurrence(occurrence);
+				if !contains_occurrence(target_pattern, &occurrence) {
+					target_pattern.add_occurrence(occurrence);
+				}
 			}
 		}
 		Ok(())
@@ -1357,6 +1376,32 @@ mod tests {
 		assert_eq!(dictionary.patterns.len(), 1);
 		assert_eq!(dictionary.patterns[0].occurrences().len(), 2);
 		drop(dictionary);
+	}
+
+	/// A batch extracted again gives the same window under a fresh pattern id: importing
+	/// it neither appends its occurrence again nor adds a pattern, whether it merges into
+	/// the pattern it made the first time or matches nothing.
+	#[test]
+	fn reimporting_an_occurrence_does_not_count_it_twice() {
+		let mut dictionary = create_test_dictionary();
+		let first = create_test_pattern(vec![1.0, 2.0, 3.0, 2.0, 1.0]);
+		let window = first.first_occurrence().expect("an occurrence");
+		let again = |amplitudes: Vec<f64>| {
+			let mut pattern = create_test_pattern(amplitudes);
+			let id = pattern.id();
+			let occurrence = Occurrence::new(*window.aspect(), *window.resolution(), window.size(), window.database_info().clone(), id, *window.beginning(), *window.end());
+			pattern = Pattern::new(id, vec![occurrence], pattern.relatives().clone());
+			pattern
+		};
+		dictionary.import_pattern(first).unwrap();
+		dictionary.import_pattern(again(vec![1.0, 2.0, 3.0, 2.0, 1.0])).unwrap();
+		assert_eq!((dictionary.patterns.len(), dictionary.patterns[0].occurrence_count()), (1, 1), "a merged re-extraction adds nothing");
+		dictionary.import_pattern(again(vec![10.0, 20.0, 30.0, 20.0, 10.0])).unwrap();
+		assert_eq!(dictionary.patterns.len(), 1, "a re-extraction that matches nothing adds no pattern");
+
+		// A new window of the same shape is still a new occurrence.
+		dictionary.import_pattern(create_test_pattern(vec![1.0, 2.0, 3.0, 2.0, 1.0])).unwrap();
+		assert_eq!(dictionary.patterns[0].occurrence_count(), 2);
 	}
 
 	#[serial]

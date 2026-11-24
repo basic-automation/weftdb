@@ -1,6 +1,8 @@
 # Upgrade notes
 
-## v0.3.0 → v0.4.0 (future)
+## v0.3.x → v0.4.0
+
+See the [CHANGELOG](../CHANGELOG.md) for the full list of changes.
 
 ### Breaking changes
 
@@ -19,9 +21,11 @@
    you ask for the old shape. Nothing already stored moves, and an aspect's mode is still read
    back exactly as it was written. **Downgrade is the one-way part:** 0.3.7 and earlier do not
    know the `aspects.storage_mode` column, so they do not refuse a seal-backed aspect, they read
-   zero measurements from it. Neither the column nor seal-backed aspects have appeared in any
-   release, so a store built from a release is unaffected; anyone running `main` who needs to
-   stay rollable should pin `WEFT_LEGACY_DEFAULT_STORAGE=rows` before creating aspects.
+   zero measurements from it. 0.4.0 is the first release with the column and seal-backed
+   aspects, so every aspect a 0.4.0 store creates with the default setting is seal-backed and
+   cannot be read by 0.3.7 or earlier. Aspects created by 0.3.x are row-backed and stay so.
+   Anyone who needs to stay able to roll back to 0.3.x should set
+   `WEFT_LEGACY_DEFAULT_STORAGE=rows` before creating aspects on 0.4.0.
 
 ## v0.2.1 → v0.3.0
 

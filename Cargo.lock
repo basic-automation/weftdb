@@ -5645,7 +5645,7 @@ dependencies = [
 
 [[package]]
 name = "weft-line-protocol"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -5655,7 +5655,7 @@ dependencies = [
 
 [[package]]
 name = "weft-orchestration"
-version = "0.3.7"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bigdecimal",
@@ -5663,6 +5663,7 @@ dependencies = [
  "futures",
  "indexmap",
  "libc",
+ "mimalloc",
  "num_cpus",
  "rand 0.10.3",
  "rayon",
@@ -5682,7 +5683,7 @@ dependencies = [
 
 [[package]]
 name = "weft-physical-type"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "alp",
  "bigdecimal",
@@ -5709,7 +5710,7 @@ dependencies = [
 
 [[package]]
 name = "weft-server"
-version = "0.3.7"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -5775,7 +5776,7 @@ dependencies = [
 
 [[package]]
 name = "weftdb"
-version = "0.3.7"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",

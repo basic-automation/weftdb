@@ -23,6 +23,49 @@ pub static DATABASES: LazyLock<DatabaseMap> = LazyLock::new(|| Arc::new(Mutex::n
 // Add connection manager for Turso with connection pools
 static CONNECTION_DATABASES: LazyLock<Arc<Mutex<HashMap<String, turso::Database>>>> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
+/// A lock-free-to-wait-on mirror of [`CONNECTION_DATABASES`] for the hot path of
+/// `Database::get_*_db`. The map's async mutex is held across a whole cold open (file open,
+/// pragmas), so a getter for a file that is already open would otherwise queue behind the
+/// open of an unrelated one. Every insert into and removal from the map is mirrored here,
+/// inside the map's guard; a reader that races a removal gets a clone of a just-swept
+/// handle, which stays usable (Turso keeps the file open until the clone drops).
+static OPEN_LEGACY: LazyLock<std::sync::RwLock<HashMap<String, turso::Database>>> = LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+
+/// Paths whose table-creation DDL has committed in this process (recorded by
+/// [`Database::mark_wireframed`] after the caller's `commit_immediate`). A reopen after an
+/// idle close reports `was_new = false` for them (unless the file is gone), so it does not
+/// rerun the DDL. A path whose open or DDL failed is never recorded, so the next cold open
+/// reports `was_new = true` again and retries the DDL.
+static WIREFRAMED: LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+impl Database {
+	/// Records that `db_path`'s table-creation DDL committed, so a reopen after an idle close
+	/// does not rerun it. See [`WIREFRAMED`].
+	pub(crate) fn mark_wireframed(db_path: &str) {
+		WIREFRAMED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(db_path.to_string());
+	}
+}
+
+fn mirror_insert(path: &str, db: &turso::Database) {
+	OPEN_LEGACY.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(path.to_string(), db.clone());
+}
+
+fn mirror_remove(path: &str) {
+	OPEN_LEGACY.write().unwrap_or_else(std::sync::PoisonError::into_inner).remove(path);
+}
+
+/// The open database at `path` if the process-wide cache holds it, without waiting on the
+/// cache's async mutex. `None` also when an idle sweep is due, so the caller takes the slow
+/// path (`get_or_create_turso_database`), which runs it: sweeps run only from there.
+fn cached_legacy(path: &str) -> Option<turso::Database> {
+	if sweep_due(std::time::Instant::now()) {
+		return None;
+	}
+	let db = OPEN_LEGACY.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(path).cloned()?;
+	touch_cached(path);
+	Some(db)
+}
+
 /// When each cached handle in [`CONNECTION_DATABASES`] was last handed out, by path.
 /// Kept beside the map (same lock order: map first) so the map's type stays put.
 static LAST_USED: LazyLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
@@ -32,6 +75,18 @@ static LAST_USED: LazyLock<std::sync::Mutex<HashMap<String, std::time::Instant>>
 /// would hand the reopen that same live database (its registry is keyed by inode), so an
 /// unlinked empty log would orphan the commits that follow.
 static OPENED_ONCE: LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Metadata paths whose open-time [`Database::prune_metadata`] already ran in this process.
+/// The prune scans the whole queue and transaction log, and `existing()` is called per
+/// chunk of work, so running it on every open made reads grow with the queue. Once per
+/// path per process keeps the first open identical; [`Database::prune_unread_queues`]
+/// handles queues that age later. [`Database::close`] forgets the path.
+static PRUNED_ON_OPEN: LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Whether this open should run the prune: true the first time a path is seen.
+fn claim_open_prune(metadata_path: &str) -> bool {
+	PRUNED_ON_OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(metadata_path.to_string())
+}
 
 /// When the last idle sweep ran; sweeps are rate-limited to one per [`IDLE_SWEEP_EVERY`].
 static LAST_SWEEP: LazyLock<std::sync::Mutex<std::time::Instant>> = LazyLock::new(|| std::sync::Mutex::new(std::time::Instant::now()));
@@ -62,7 +117,14 @@ fn idle_close_from(raw: Option<&str>) -> Option<std::time::Duration> {
 }
 
 fn touch_cached(path: &str) {
-	LAST_USED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(path.to_string(), std::time::Instant::now());
+	let now = std::time::Instant::now();
+	let mut last_used = LAST_USED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+	// The hot path touches a path that is already there; skip the key allocation then.
+	if let Some(t) = last_used.get_mut(path) {
+		*t = now;
+	} else {
+		last_used.insert(path.to_string(), now);
+	}
 }
 
 /// Whether this cold open is the process's first open of `path` (and record it).
@@ -71,15 +133,36 @@ fn first_open_of(path: &str) -> bool {
 }
 
 /// Drop cached handles idle for longer than `after`, except `metadata.db` files, which
-/// every `Database` handle holds for its whole life anyway. Dropping a handle is safe
-/// while clones are still in use: Turso keeps the file open until the last clone drops,
-/// and a reopen in the meantime gets that same live database back. Returns how many
-/// handles were dropped.
+/// every `Database` handle holds for its whole life anyway, and files whose pool handed out
+/// a connection within `after`. Dropping a handle is safe while clones are still in use:
+/// Turso keeps the file open until the last clone drops, and a reopen in the meantime gets
+/// that same live database back (its registry is keyed by inode), under a new pool.
+/// Returns how many handles were dropped.
+///
+/// This cache is the only long-lived owner of a legacy aspect file: `Database::get_*_db`
+/// caches the file's path per handle, not a clone, and `Aspect` keeps no handles. So once
+/// the short-lived clones of in-flight work drop, the sweep frees the core database, its fd,
+/// its MVCC state and its buffer arena. Control-plane stores (catalog, segment index) own
+/// their databases and are not in this cache.
 fn sweep_idle(cache: &mut HashMap<String, turso::Database>, after: std::time::Duration, now: std::time::Instant) -> usize {
 	let mut last_used = LAST_USED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-	let idle: Vec<String> = cache.keys().filter(|path| !path.ends_with("metadata.db")).filter(|path| last_used.get(*path).is_none_or(|t| now.saturating_duration_since(*t) >= after)).cloned().collect();
+	let idle: Vec<String> = cache
+		.iter()
+		.filter(|(path, _)| !path.ends_with("metadata.db"))
+		.filter(|(path, _)| last_used.get(*path).is_none_or(|t| now.saturating_duration_since(*t) >= after))
+		// `LAST_USED` only sees lookups through this cache; most work runs on clones held
+		// elsewhere (the short-lived clones of in-flight work). Every transaction
+		// checks a connection out of the pool, so a recent checkout means the file is busy.
+		// Sweeping a busy file closed nothing (the clones keep it open) and only threw its
+		// pool away, so each later transaction opened a fresh cold connection.
+		.filter(|(_, db)| !conn_pool::used_within(db, conn_pool::Role::Legacy, after, now))
+		.map(|(path, _)| path.clone())
+		.collect();
 	for path in &idle {
-		cache.remove(path);
+		if let Some(db) = cache.remove(path) {
+			conn_pool::unregister(&db, conn_pool::Role::Legacy);
+		}
+		mirror_remove(path);
 		last_used.remove(path);
 	}
 	drop(last_used);
@@ -100,6 +183,11 @@ fn release_freed_heap() {
 	unsafe {
 		libc::malloc_trim(0);
 	}
+}
+
+/// Whether the rate-limited idle sweep is due (it runs on the next slow-path lookup).
+fn sweep_due(now: std::time::Instant) -> bool {
+	idle_close_after().is_some() && now.saturating_duration_since(*LAST_SWEEP.lock().unwrap_or_else(std::sync::PoisonError::into_inner)) >= IDLE_SWEEP_EVERY
 }
 
 fn maybe_sweep_idle(cache: &mut HashMap<String, turso::Database>) {
@@ -168,18 +256,26 @@ pub async fn clear_connection_cache_by_name(name: &str) {
 		let mut cache = CONNECTION_DATABASES.lock().await;
 		let keys: Vec<String> = cache.keys().filter(|path| path.contains(name)).cloned().collect();
 		for key in &keys {
-			cache.remove(key);
+			if let Some(db) = cache.remove(key) {
+				conn_pool::unregister(&db, conn_pool::Role::Legacy);
+			}
+			mirror_remove(key);
 		}
 		keys
 	};
 	// An explicit release means the caller holds no clones either, so the next open is a
 	// true cold open and runs the sidecar sweep again.
 	OPENED_ONCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|path| !removed.contains(path));
+	WIREFRAMED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|path| !removed.contains(path));
 	LAST_USED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|path, _| !removed.contains(path));
+	// A restart prunes on open again.
+	PRUNED_ON_OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|path| !path.contains(name));
 }
 
 pub mod config;
+pub(crate) mod conn_pool;
 pub mod connection;
+pub mod correlation_occurrences;
 mod creation;
 pub mod helpers;
 pub mod inputs;
@@ -302,7 +398,9 @@ impl DatabaseStructure for Database {
 				drop(conn);
 			}
 
+			conn_pool::register(&turso_db, conn_pool::Role::Legacy);
 			cache.insert(db_path.to_string(), turso_db.clone());
+			mirror_insert(db_path, &turso_db);
 			touch_cached(db_path);
 			drop(cache);
 			return Ok(turso_db);
@@ -311,9 +409,10 @@ impl DatabaseStructure for Database {
 		bail!("Database not found")
 	}
 
-	/// Get or create a Turso database with proper MVCC configuration and connection pooling
-	/// Returns (database, `was_newly_created`) - `was_newly_created` is true if the database
-	/// was just created, false if it was retrieved from cache
+	/// Get or create a Turso database with proper MVCC configuration and connection pooling.
+	/// Returns (database, `was_new`): `was_new` is true on a cold open of a file that is new or
+	/// whose DDL has not committed in this process. Callers that run DDL when `was_new` must
+	/// call `Database::mark_wireframed` after it commits.
 	async fn get_or_create_turso_database(db_path: &str) -> Result<(turso::Database, bool)> {
 		// Use a critical section to prevent race conditions during database creation
 		let mut cache = CONNECTION_DATABASES.lock().await;
@@ -325,6 +424,10 @@ impl DatabaseStructure for Database {
 			return Ok((turso_db.clone(), false)); // From cache, not newly created
 		}
 		first_open_of(db_path);
+		// A reopen after an idle close of a file whose DDL already ran here is not new: the
+		// tables are on disk. A file that is gone (deleted since) is new again.
+		let existed = Path::new(db_path).exists();
+		let was_new = !existed || !WIREFRAMED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(db_path);
 
 		// Create the database (file will be created if it doesn't exist)
 		// MVCC is now enabled via PRAGMA journal_mode in Turso 0.4.0+
@@ -336,10 +439,12 @@ impl DatabaseStructure for Database {
 		// Allow connection to fully close before returning
 		tokio::task::yield_now().await;
 
+		conn_pool::register(&turso_db, conn_pool::Role::Legacy);
 		cache.insert(db_path.to_string(), turso_db.clone());
+		mirror_insert(db_path, &turso_db);
 		touch_cached(db_path);
 		drop(cache);
-		Ok((turso_db, true)) // Newly created
+		Ok((turso_db, was_new))
 	}
 
 	async fn record_transaction(&self, message: &str) -> Result<TxId> {
@@ -740,8 +845,13 @@ impl DatabaseStructure for Database {
 		let database = Self { id: db_id, name: name.to_string(), metadata: metadata_turso_db, metadata_path: metadata_db_path.clone(), cache: Arc::new(Mutex::new(cache::DatabaseCache::new())), seal_store: Arc::new(Mutex::new(None)) };
 		// A store written before 0.3.3 can hold millions of rows that are now never written;
 		// pruning them is best effort and never blocks the open.
-		if let Err(e) = database.prune_metadata().await {
-			tracing::warn!("Pruning the metadata database failed; it is left as it was: {e}");
+		// Only on the first open of this file in the process: see [`PRUNED_ON_OPEN`].
+		if claim_open_prune(metadata_db_path) {
+			if let Err(e) = database.prune_metadata().await {
+				tracing::warn!("Pruning the metadata database failed; it is left as it was: {e}");
+				// Let the next open try again.
+				PRUNED_ON_OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(metadata_db_path.as_str());
+			}
 		}
 		Ok(database)
 	}
@@ -771,8 +881,12 @@ impl DatabaseStructure for Database {
 		let db_path = format!("{}/{}/metadata.db", Self::get_data_dir(), self.name);
 		{
 			let mut connection_databases = CONNECTION_DATABASES.lock().await;
-			connection_databases.remove(&db_path);
+			if let Some(db) = connection_databases.remove(&db_path) {
+				conn_pool::unregister(&db, conn_pool::Role::Legacy);
+			}
+			mirror_remove(&db_path);
 		}
+		PRUNED_ON_OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&db_path);
 
 		// Wait for database files to be actually released
 		self.wait_for_database_release().await?;
@@ -1365,22 +1479,13 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn get_measurement_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
-		// Build the measurements path directly from aspect_id
-		let cache_key = format!("measurements_db_{aspect_id}");
-
-		// Try cache first
-		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+		// Only the path is cached per handle; the open database lives in the process-wide cache
+		// alone, so the idle sweep can really close it (see `cached_legacy`).
+		let path = self.get_measurement_db_path(aspect_id).await?;
+		if let Some(db) = cached_legacy(&path) {
 			return Ok(db);
 		}
-
-		// Get aspect metadata (lightweight - no wireframing)
-		let mut aspect = self.get_aspect(aspect_id).await?;
-		let db = aspect.measurements().await?;
-
-		// Cache it
-		self.cache.lock().await.store(&cache_key, db.clone()).await;
-
-		Ok(db)
+		self.get_aspect(aspect_id).await?.measurements().await
 	}
 
 	async fn get_measurement_db_path(&self, aspect_id: &AspectId) -> Result<String> {
@@ -1396,14 +1501,13 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn get_unprocessed_batches_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
-		let cache_key = format!("unprocessed_batches_db_{aspect_id}");
-		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+		// Only the path is cached per handle; the open database lives in the process-wide cache
+		// alone, so the idle sweep can really close it (see `cached_legacy`).
+		let path = self.get_unprocessed_batches_db_path(aspect_id).await?;
+		if let Some(db) = cached_legacy(&path) {
 			return Ok(db);
 		}
-		let mut aspect = self.get_aspect(aspect_id).await?;
-		let db = aspect.unprocessed_batches().await?;
-		self.cache.lock().await.store(&cache_key, db.clone()).await;
-		Ok(db)
+		self.get_aspect(aspect_id).await?.unprocessed_batches().await
 	}
 
 	async fn get_unprocessed_batches_db_path(&self, aspect_id: &AspectId) -> Result<String> {
@@ -1419,14 +1523,13 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn get_processed_batches_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
-		let cache_key = format!("processed_batches_db_{aspect_id}");
-		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+		// Only the path is cached per handle; the open database lives in the process-wide cache
+		// alone, so the idle sweep can really close it (see `cached_legacy`).
+		let path = self.get_processed_batches_db_path(aspect_id).await?;
+		if let Some(db) = cached_legacy(&path) {
 			return Ok(db);
 		}
-		let mut aspect = self.get_aspect(aspect_id).await?;
-		let db = aspect.processed_batches().await?;
-		self.cache.lock().await.store(&cache_key, db.clone()).await;
-		Ok(db)
+		self.get_aspect(aspect_id).await?.processed_batches().await
 	}
 
 	async fn get_processed_batches_db_path(&self, aspect_id: &AspectId) -> Result<String> {
@@ -1442,15 +1545,13 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn get_patterns_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
-		let cache_key = format!("patterns_db_{aspect_id}");
-		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+		// Only the path is cached per handle; the open database lives in the process-wide cache
+		// alone, so the idle sweep can really close it (see `cached_legacy`).
+		let path = self.get_patterns_db_path(aspect_id).await?;
+		if let Some(db) = cached_legacy(&path) {
 			return Ok(db);
 		}
-		let mut aspect = self.get_aspect(aspect_id).await?;
-		let db = aspect.patterns().await?;
-		self.cache.lock().await.store(&cache_key, db.clone()).await;
-
-		Ok(db)
+		self.get_aspect(aspect_id).await?.patterns().await
 	}
 
 	async fn get_patterns_db_path(&self, aspect_id: &AspectId) -> Result<String> {
@@ -1466,14 +1567,13 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn get_events_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
-		let cache_key = format!("events_db_{aspect_id}");
-		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+		// Only the path is cached per handle; the open database lives in the process-wide cache
+		// alone, so the idle sweep can really close it (see `cached_legacy`).
+		let path = self.get_events_db_path(aspect_id).await?;
+		if let Some(db) = cached_legacy(&path) {
 			return Ok(db);
 		}
-		let mut aspect = self.get_aspect(aspect_id).await?;
-		let events_db = aspect.events().await?;
-		self.cache.lock().await.store(&cache_key, events_db.clone()).await;
-		Ok(events_db)
+		self.get_aspect(aspect_id).await?.events().await
 	}
 
 	async fn get_events_db_path(&self, aspect_id: &AspectId) -> Result<String> {
@@ -1489,14 +1589,13 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn get_unprocessed_events_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
-		let cache_key = format!("unprocessed_events_db_{aspect_id}");
-		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+		// Only the path is cached per handle; the open database lives in the process-wide cache
+		// alone, so the idle sweep can really close it (see `cached_legacy`).
+		let path = self.get_unprocessed_events_db_path(aspect_id).await?;
+		if let Some(db) = cached_legacy(&path) {
 			return Ok(db);
 		}
-		let mut aspect = self.get_aspect(aspect_id).await?;
-		let events_db = aspect.unprocessed_events().await?;
-		self.cache.lock().await.store(&cache_key, events_db.clone()).await;
-		Ok(events_db)
+		self.get_aspect(aspect_id).await?.unprocessed_events().await
 	}
 
 	async fn get_unprocessed_events_db_path(&self, aspect_id: &AspectId) -> Result<String> {
@@ -1512,14 +1611,13 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn get_processed_events_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
-		let cache_key = format!("processed_events_db_{aspect_id}");
-		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+		// Only the path is cached per handle; the open database lives in the process-wide cache
+		// alone, so the idle sweep can really close it (see `cached_legacy`).
+		let path = self.get_processed_events_db_path(aspect_id).await?;
+		if let Some(db) = cached_legacy(&path) {
 			return Ok(db);
 		}
-		let mut aspect = self.get_aspect(aspect_id).await?;
-		let events_db = aspect.processed_events().await?;
-		self.cache.lock().await.store(&cache_key, events_db.clone()).await;
-		Ok(events_db)
+		self.get_aspect(aspect_id).await?.processed_events().await
 	}
 
 	async fn get_processed_events_db_path(&self, aspect_id: &AspectId) -> Result<String> {
@@ -1535,14 +1633,13 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn get_correlations_db(&self, aspect_id: &AspectId) -> Result<turso::Database> {
-		let cache_key = format!("correlations_db_{aspect_id}");
-		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
+		// Only the path is cached per handle; the open database lives in the process-wide cache
+		// alone, so the idle sweep can really close it (see `cached_legacy`).
+		let path = self.get_correlations_db_path(aspect_id).await?;
+		if let Some(db) = cached_legacy(&path) {
 			return Ok(db);
 		}
-		let mut aspect = self.get_aspect(aspect_id).await?;
-		let db = aspect.correlations().await?;
-		self.cache.lock().await.store(&cache_key, db.clone()).await;
-		Ok(db)
+		self.get_aspect(aspect_id).await?.correlations().await
 	}
 
 	async fn get_correlations_db_path(&self, aspect_id: &AspectId) -> Result<String> {
@@ -1558,13 +1655,16 @@ impl DatabaseStructure for Database {
 	}
 
 	async fn get_dictionary_db(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<turso::Database> {
-		let cache_key = format!("dictionary_db_{aspect_id}_{dictionary_name}");
-		if let Some(db) = self.cache.lock().await.get::<turso::Database>(&cache_key).await {
-			return Ok(db);
+		let cache_key = format!("dictionary_db_path_{aspect_id}_{dictionary_name}");
+		if let Some(path) = self.cache.lock().await.get::<String>(&cache_key).await {
+			if let Some(db) = cached_legacy(&path) {
+				return Ok(db);
+			}
 		}
 		let mut aspect = self.get_aspect(aspect_id).await?;
 		let db = aspect.dictionary(dictionary_name).await?;
-		self.cache.lock().await.store(&cache_key, db.clone()).await;
+		let path = Self::aspect_dictionaries_db_path(&self.name, aspect.subject_name(), aspect.name(), dictionary_name)?;
+		self.cache.lock().await.store(&cache_key, path).await;
 		Ok(db)
 	}
 
@@ -2283,5 +2383,150 @@ mod idle_close_tests {
 		assert_eq!(idle_close_from(Some("0")), None);
 		assert_eq!(idle_close_from(Some(" 60 ")), Some(Duration::from_secs(60)));
 		assert_eq!(idle_close_from(Some("soon")), Some(Duration::from_secs(300)));
+	}
+
+	use super::{conn_pool, sweep_idle, CONNECTION_DATABASES};
+	use crate::{database::traits::Connection as _, Database, DatabaseStructure};
+
+	/// Sweep only `path`'s cache entry, so tests running beside this one keep theirs.
+	async fn sweep_one(path: &str, after: Duration) -> bool {
+		let mut cache = CONNECTION_DATABASES.lock().await;
+		let mut mine: std::collections::HashMap<String, turso::Database> = cache.remove(path).into_iter().map(|db| (path.to_string(), db)).collect();
+		let swept = sweep_idle(&mut mine, after, std::time::Instant::now()) == 1;
+		cache.extend(mine);
+		swept
+	}
+
+	async fn insert(db: &turso::Database, x: i64) -> anyhow::Result<()> {
+		let conn = Database::begin_concurrent(db, "idle", None).await?;
+		conn.as_ref().execute("INSERT INTO t VALUES (?1)", turso::params![x]).await?;
+		Database::commit_concurrent(&conn).await?;
+		Ok(())
+	}
+
+	async fn count(db: &turso::Database) -> anyhow::Result<i64> {
+		let conn = db.connect()?;
+		let mut rows = conn.query("SELECT COUNT(*) FROM t", ()).await?;
+		let row = rows.next().await?.ok_or_else(|| anyhow::anyhow!("no row"))?;
+		Ok(row.get::<i64>(0)?)
+	}
+
+	async fn open_with_table(path: &str) -> anyhow::Result<turso::Database> {
+		let (db, _) = Database::get_or_create_turso_database(path).await?;
+		let conn = Database::begin_immediate(&db).await?;
+		conn.as_ref().execute("CREATE TABLE IF NOT EXISTS t (x INTEGER)", ()).await?;
+		Database::commit_immediate(&conn).await?;
+		Ok(db)
+	}
+
+	/// A cold open whose DDL never committed reports `was_new` again after an idle sweep, so
+	/// the caller retries the DDL; once it is marked as wireframed, a reopen does not.
+	#[tokio::test]
+	async fn a_reopen_retries_ddl_until_it_is_marked_wireframed() -> anyhow::Result<()> {
+		let dir = tempfile::tempdir()?;
+		let path = dir.path().join("ddl.db").to_string_lossy().to_string();
+		let (db, was_new) = Database::get_or_create_turso_database(&path).await?;
+		assert!(was_new);
+		// The caller's DDL fails here: nothing is marked.
+		drop(db);
+		tokio::time::sleep(Duration::from_millis(300)).await;
+		assert!(sweep_one(&path, Duration::from_millis(200)).await);
+		assert!(std::path::Path::new(&path).exists());
+		let (db, was_new) = Database::get_or_create_turso_database(&path).await?;
+		assert!(was_new, "a file whose DDL never committed was reported as wireframed");
+		Database::mark_wireframed(&path);
+		drop(db);
+		tokio::time::sleep(Duration::from_millis(300)).await;
+		assert!(sweep_one(&path, Duration::from_millis(200)).await);
+		let (db, was_new) = Database::get_or_create_turso_database(&path).await?;
+		assert!(!was_new, "a wireframed file reran its DDL after an idle sweep");
+		drop(db);
+		super::clear_connection_cache_by_name(&path).await;
+		Ok(())
+	}
+
+	/// A file used only through a clone (never through the handle cache, as `DatabaseCache`
+	/// clones are) is busy, and the sweep must leave it and its pool alone. It used to be
+	/// swept on the first pass, and every later transaction opened a cold connection.
+	#[tokio::test]
+	async fn a_file_used_through_a_clone_is_not_swept() -> anyhow::Result<()> {
+		let dir = tempfile::tempdir()?;
+		let path = dir.path().join("busy.db").to_string_lossy().to_string();
+		let clone = open_with_table(&path).await?;
+		tokio::time::sleep(Duration::from_millis(300)).await;
+		for x in 0..20 {
+			insert(&clone, x).await?;
+		}
+		assert!(!sweep_one(&path, Duration::from_millis(200)).await, "a busy file was swept");
+		assert!(conn_pool::is_pooled(&clone, conn_pool::Role::Legacy), "the busy file lost its pool");
+		assert_eq!(conn_pool::idle_count(&clone, conn_pool::Role::Legacy), Some(1), "transactions did not share one connection");
+
+		tokio::time::sleep(Duration::from_millis(300)).await;
+		assert!(sweep_one(&path, Duration::from_millis(200)).await, "a genuinely idle file was kept");
+		assert!(!conn_pool::is_pooled(&clone, conn_pool::Role::Legacy));
+		super::clear_connection_cache_by_name(&path).await;
+		Ok(())
+	}
+
+	/// Reopening a swept file while an old clone is alive gives the same live database (no
+	/// second instance) with a working pool, and transactions on it reuse one connection.
+	#[tokio::test]
+	async fn a_reopen_after_a_sweep_shares_the_live_database_and_pools_again() -> anyhow::Result<()> {
+		let dir = tempfile::tempdir()?;
+		let path = dir.path().join("reopen.db").to_string_lossy().to_string();
+		let old = open_with_table(&path).await?;
+		insert(&old, 1).await?;
+		tokio::time::sleep(Duration::from_millis(300)).await;
+		assert!(sweep_one(&path, Duration::from_millis(200)).await);
+
+		let (new, _) = Database::get_or_create_turso_database(&path).await?;
+		assert!(conn_pool::is_pooled(&new, conn_pool::Role::Legacy), "the reopen is not pooled");
+		assert!(!conn_pool::is_pooled(&old, conn_pool::Role::Legacy), "the stale clone should have lost its pool");
+		for x in 2..52 {
+			insert(&new, x).await?;
+		}
+		assert_eq!(conn_pool::idle_count(&new, conn_pool::Role::Legacy), Some(1), "50 transactions after the reopen did not reuse one connection");
+		// One instance: a commit through either handle is visible through the other at once.
+		insert(&old, 100).await?;
+		assert_eq!(count(&new).await?, 52);
+		assert_eq!(count(&old).await?, 52);
+		drop(old);
+		super::clear_connection_cache_by_name(&path).await;
+		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod open_prune_tests {
+	use super::{claim_open_prune, Config, PRUNED_ON_OPEN};
+	use crate::{Database, DatabaseStructure};
+
+	fn claimed(path: &str) -> bool {
+		PRUNED_ON_OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(path)
+	}
+
+	#[test]
+	fn a_path_claims_the_open_prune_once() {
+		let path = "/nonexistent/open-prune-claim/metadata.db";
+		assert!(claim_open_prune(path));
+		assert!(!claim_open_prune(path));
+	}
+
+	#[tokio::test]
+	#[serial_test::serial]
+	async fn only_the_first_open_prunes_and_close_forgets_it() -> anyhow::Result<()> {
+		crate::types::database::config::use_temp_data_dir();
+		let name = format!("open_prune_{}", uuid::Uuid::new_v4().simple());
+		let db = Database::new(&name).await?;
+		let path = format!("{}/{name}/metadata.db", <Database as Config>::get_data_dir());
+		drop(Database::existing(&name).await?);
+		assert!(claimed(&path), "the first open did not prune");
+		// The second open finds the path claimed, so it skips the prune.
+		drop(Database::existing(&name).await?);
+		assert!(!claim_open_prune(&path));
+		db.close().await?;
+		drop(db);
+		assert!(!claimed(&path), "close kept the claim");
+		Ok(())
 	}
 }

@@ -142,6 +142,7 @@ impl AspectStructure for Aspect {
 			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 			trace!("Wireframed measurements tables for: {}", measurements_path);
+			Database::mark_wireframed(&measurements_path);
 		}
 		// Handles live in the process-wide cache only, so idle ones can close (see `close_idle_databases`).
 		let measurements: Option<TursoDatabase> = {
@@ -161,6 +162,7 @@ impl AspectStructure for Aspect {
 			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 			trace!("Wireframed batches tables for: {}", unprocessed_batches_path);
+			Database::mark_wireframed(&unprocessed_batches_path);
 		}
 		// Handles live in the process-wide cache only, so idle ones can close (see `close_idle_databases`).
 		let unprocessed_batches: Option<TursoDatabase> = {
@@ -181,6 +183,7 @@ impl AspectStructure for Aspect {
 			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 			trace!("Wireframed batches tables for: {}", processed_batches_path);
+			Database::mark_wireframed(&processed_batches_path);
 		}
 		// Handles live in the process-wide cache only, so idle ones can close (see `close_idle_databases`).
 		let processed_batches: Option<TursoDatabase> = {
@@ -200,6 +203,7 @@ impl AspectStructure for Aspect {
 			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 			trace!("Wireframed patterns tables for: {}", patterns_path);
+			Database::mark_wireframed(&patterns_path);
 		}
 		// Handles live in the process-wide cache only, so idle ones can close (see `close_idle_databases`).
 		let patterns: Option<TursoDatabase> = {
@@ -219,6 +223,7 @@ impl AspectStructure for Aspect {
 			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 			trace!("Wireframed unprocessed_events tables for: {}", unprocessed_events_path);
+			Database::mark_wireframed(&unprocessed_events_path);
 		}
 		// Handles live in the process-wide cache only, so idle ones can close (see `close_idle_databases`).
 		let unprocessed_events: Option<TursoDatabase> = {
@@ -238,6 +243,7 @@ impl AspectStructure for Aspect {
 			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 			trace!("Wireframed processed_events tables for: {}", processed_events_path);
+			Database::mark_wireframed(&processed_events_path);
 		}
 		// Handles live in the process-wide cache only, so idle ones can close (see `close_idle_databases`).
 		let processed_events: Option<TursoDatabase> = {
@@ -257,6 +263,7 @@ impl AspectStructure for Aspect {
 			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 			trace!("Wireframed correlations tables for: {}", correlations_path);
+			Database::mark_wireframed(&correlations_path);
 		}
 		// Handles live in the process-wide cache only, so idle ones can close (see `close_idle_databases`).
 		let correlations: Option<TursoDatabase> = {
@@ -276,6 +283,7 @@ impl AspectStructure for Aspect {
 			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
 			trace!("Wireframed pipeline tables for: {}", pipeline_path);
+			Database::mark_wireframed(&pipeline_path);
 		}
 		// Handles live in the process-wide cache only, so idle ones can close (see `close_idle_databases`).
 		let pipeline: Option<TursoDatabase> = {
@@ -485,6 +493,7 @@ impl AspectStructure for Aspect {
 			Self::wireframe_measurements_tables_direct(&schema_conn).await?;
 			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
+			Database::mark_wireframed(&self.measurements_path);
 		}
 
 		Ok(measurements)
@@ -539,6 +548,7 @@ impl AspectStructure for Aspect {
 			Self::wireframe_batches_tables_direct(&schema_conn).await?;
 			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
+			Database::mark_wireframed(&self.unprocessed_batches_path);
 		}
 
 		Ok(unprocessed_batches)
@@ -597,6 +607,7 @@ impl AspectStructure for Aspect {
 			Self::wireframe_batches_tables_direct(&schema_conn).await?;
 			Self::wireframe_extracted_batches_direct(&schema_conn).await?;
 			Database::commit_immediate(&schema_conn).await?;
+			Database::mark_wireframed(&self.processed_batches_path);
 		}
 
 		Ok(processed_batches)
@@ -626,6 +637,7 @@ impl AspectStructure for Aspect {
 			let schema_conn = Database::begin_immediate(&patterns).await?;
 			Self::wireframe_patterns_tables_direct(&schema_conn).await?;
 			Database::commit_immediate(&schema_conn).await?;
+			Database::mark_wireframed(&self.patterns_path);
 		}
 
 		Ok(patterns)
@@ -722,6 +734,7 @@ impl AspectStructure for Aspect {
 			let schema_conn = Database::begin_immediate(&events).await?;
 			Self::wireframe_events_tables_direct(&schema_conn).await?;
 			Database::commit_immediate(&schema_conn).await?;
+			Database::mark_wireframed(&self.unprocessed_events_path);
 		}
 
 		Ok(events)
@@ -751,6 +764,7 @@ impl AspectStructure for Aspect {
 			let schema_conn = Database::begin_immediate(&events).await?;
 			Self::wireframe_events_tables_direct(&schema_conn).await?;
 			Database::commit_immediate(&schema_conn).await?;
+			Database::mark_wireframed(&self.unprocessed_events_path);
 		}
 
 		Ok(events)
@@ -780,6 +794,7 @@ impl AspectStructure for Aspect {
 			let schema_conn = Database::begin_immediate(&events).await?;
 			Self::wireframe_events_tables_direct(&schema_conn).await?;
 			Database::commit_immediate(&schema_conn).await?;
+			Database::mark_wireframed(&self.processed_events_path);
 		}
 
 		Ok(events)
@@ -847,6 +862,7 @@ impl AspectStructure for Aspect {
 			Self::wireframe_correlations_tables_direct(&schema_conn).await?;
 			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
+			Database::mark_wireframed(&self.correlations_path);
 		}
 
 		Ok(correlations)
@@ -942,6 +958,7 @@ impl AspectStructure for Aspect {
 			let schema_conn = Database::begin_immediate(&turso_db).await?;
 			Self::wireframe_pipeline_tables_direct(&schema_conn).await?;
 			Database::commit_immediate(&schema_conn).await?;
+			Database::mark_wireframed(&self.pipeline_path);
 		}
 
 		Ok(turso_db)
@@ -1115,6 +1132,7 @@ impl AspectStructure for Aspect {
 			Self::wireframe_dictionary_tables_direct(&schema_conn).await?;
 			Database::commit_immediate(&schema_conn).await?;
 			drop(schema_conn);
+			Database::mark_wireframed(&dictionaries_db_path);
 		}
 
 		// Now use BEGIN CONCURRENT for data operations. The registration is written as
@@ -1161,6 +1179,7 @@ impl AspectStructure for Aspect {
 			let schema_conn = Database::begin_immediate(&dictionary_db).await?;
 			Self::wireframe_dictionary_tables_direct(&schema_conn).await?;
 			Database::commit_immediate(&schema_conn).await?;
+			Database::mark_wireframed(&dictionary_path);
 		}
 
 		// Also cache the path if not already there
@@ -1478,7 +1497,7 @@ impl Aspect {
 
 	#[instrument]
 	async fn wireframe_correlations_tables_direct(conn: &Connection) -> Result<()> {
-		// Note: No PRIMARY KEY on TEXT columns or indexes to support MVCC
+		// Note: No PRIMARY KEY on TEXT columns to support MVCC; the lookup indexes are created below
 		// Main correlations table
 		conn.as_ref()
 			.execute(
@@ -1540,6 +1559,15 @@ impl Aspect {
 				turso::params![],
 			)
 			.await?;
+
+		// Every correlation read looks rows up by correlation id; without these each lookup
+		// scanned the whole table, once per correlation (fanctl soak stall). Not UNIQUE:
+		// nothing has kept a correlation id from being inserted twice.
+		for (name, sql) in [("idx_correlations_id", "CREATE INDEX IF NOT EXISTS idx_correlations_id ON correlations(id)"), ("idx_correlation_error_rates_correlation", "CREATE INDEX IF NOT EXISTS idx_correlation_error_rates_correlation ON correlation_error_rates(correlation_id)"), ("idx_correlation_occurrences_correlation", "CREATE INDEX IF NOT EXISTS idx_correlation_occurrences_correlation ON correlation_occurrences(correlation_id, occurrence_index)")] {
+			if let Err(e) = conn.as_ref().execute(sql, turso::params![]).await {
+				tracing::warn!("Failed to create index {name}: {e}");
+			}
+		}
 
 		Ok(())
 	}
