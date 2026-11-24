@@ -666,19 +666,88 @@ pub static DEFAULT_ERROR_RATE: LazyLock<weftdb::Distance> = LazyLock::new(|| {
 /// aspect's queue, and [`signals_for`] copies out only that queue.
 static SIGNALS_QUEUE: LazyLock<Mutex<HashMap<AspectId, Signals>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Each (correlation, manifestation) pair whose historical signals were already generated
-/// into an aspect's queue, with the correlation's occurrence count and the manifestation's
-/// span at the time.
-type GeneratedHistorical = HashMap<(weftdb::CorrelationID, weftdb::ManifestationId), (usize, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>;
+/// A manifestation's last seen span (start, end) and the version it got when first seen so.
+type VersionedSpan = (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, u64);
+
+/// Which (correlation, manifestation) pairs already had their historical signals generated
+/// into an aspect's queue, held in memory linear in correlations plus manifestations.
+///
+/// A pair is generated again when its correlation's occurrence count or the
+/// manifestation's span changes. The earlier memo stored that basis per pair, which grew
+/// as correlations × manifestations. This one splits it:
+///
+/// - `spans`: per event, each manifestation's last seen span and the *version* it got
+///   when that span was first seen. A manifestation that is new (arriving late, backfilled,
+///   or re-identified after [`weftdb::fold_spans`] folds re-detected spans into their union)
+///   or whose span changed (still under way, widened) gets a fresh version from
+///   `next_version`; an unchanged one keeps its version.
+/// - `correlations`: per correlation, the occurrence count it was last generated against
+///   and its watermark, `next_version` at that moment.
+///
+/// The rule: a pair is generated iff the correlation's count differs from the recorded one
+/// (or it has none), or the manifestation's version is at or above the watermark. Every
+/// version below the watermark existed, with that span, when the correlation was last
+/// processed, and every manifestation of the event was generated then. So a version below
+/// the watermark is exactly a pair whose basis (count, span) is unchanged since it was
+/// generated. A late manifestation, however old its span, is versioned when first seen, so
+/// it lands at or above every watermark set before it was seen. Versions are taken from
+/// one counter per aspect, so they order across events.
+///
+/// The one divergence from the per-pair memo: a span that changes A to B and back to A
+/// while a correlation is skipped (its pattern unresolved) regenerates for it on return,
+/// where the per-pair memo would have matched A again.
+#[derive(Debug, Default)]
+struct GeneratedHistorical {
+	next_version: u64,
+	spans: HashMap<weftdb::EventID, HashMap<weftdb::ManifestationId, VersionedSpan>>,
+	correlations: HashMap<weftdb::CorrelationID, (usize, u64)>,
+}
+
+impl GeneratedHistorical {
+	/// Version `event`'s manifestations: new or re-spanned ones take a fresh version.
+	fn observe(&mut self, event: &weftdb::Event) {
+		let spans = self.spans.entry(event.id().clone()).or_default();
+		for manifestation in event.manifestations().values() {
+			let span = (*manifestation.start(), *manifestation.end());
+			match spans.get_mut(manifestation.id()) {
+				Some(entry) if (entry.0, entry.1) == span => {}
+				Some(entry) => {
+					*entry = (span.0, span.1, self.next_version);
+					self.next_version += 1;
+				}
+				None => {
+					spans.insert(manifestation.id().clone(), (span.0, span.1, self.next_version));
+					self.next_version += 1;
+				}
+			}
+		}
+	}
+
+	/// Drop memo of correlations not in `live`, and of events none of them names.
+	fn retain_live(&mut self, live: &std::collections::HashSet<&weftdb::CorrelationID>, live_events: &std::collections::HashSet<&weftdb::EventID>) {
+		self.correlations.retain(|id, _| live.contains(id));
+		self.spans.retain(|id, _| live_events.contains(id));
+	}
+
+	fn clear(&mut self) {
+		self.spans.clear();
+		self.correlations.clear();
+	}
+
+	/// Entries held, for the memory bound's tests.
+	#[cfg(test)]
+	fn correlation_entries(&self) -> usize {
+		self.correlations.len()
+	}
+}
 
 /// Per aspect, the pairs [`create_signals`] has already generated historical signals for.
 /// A historical signal predicts a manifestation that has already happened, so the
 /// [`filter_expired_signals`] pass that follows each generation resolves it at once;
 /// generating the same pair again every run (every correlation × every manifestation ×
-/// every occurrence) rebuilt and re-resolved the whole history each time. A pair is
-/// generated again when its correlation's occurrences or the manifestation's span change
-/// (a manifestation still under way widens). Kept beside the queue it
-/// describes and reset whenever that queue is (re)created, so a cleared queue is rebuilt.
+/// every occurrence) rebuilt and re-resolved the whole history each time. Kept beside the
+/// queue it describes and reset whenever that queue is (re)created, so a cleared queue is
+/// rebuilt. See [`GeneratedHistorical`] for the rule and its memory bound.
 static HISTORICAL_GENERATED: LazyLock<Mutex<HashMap<AspectId, GeneratedHistorical>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// A copy of `aspect_id`'s live signal queue (empty if it has none).
@@ -1339,11 +1408,16 @@ fn process_correlation_signals(signals: &mut Signals, correlation: &weftdb::Corr
 	let mut signals_count = 0usize;
 
 	if let Some(event) = events.iter().find(|e| e.id() == correlation.event_id()) {
+		generated.observe(event);
+		let watermark = match generated.correlations.insert(correlation.id().clone(), (occurrences.len(), generated.next_version)) {
+			Some((count, watermark)) if count == occurrences.len() => watermark,
+			_ => 0,
+		};
+		let versions = generated.spans.get(event.id());
 		// For each manifestation of the event, create signals based on pattern occurrences
 		for manifestation in event.manifestations().values() {
 			// Already generated against these occurrences and this span: still queued, or already resolved.
-			let basis = (occurrences.len(), *manifestation.start(), *manifestation.end());
-			if generated.insert((correlation.id().clone(), manifestation.id().clone()), basis) == Some(basis) {
+			if versions.and_then(|v| v.get(manifestation.id())).is_some_and(|&(_, _, version)| version < watermark) {
 				continue;
 			}
 			for occurrence in occurrences.as_vec() {
@@ -1456,7 +1530,8 @@ pub async fn create_signals(database: &Database, aspect_id: &AspectId) -> Result
 		generated.clear();
 	}
 	// Pairs of correlations that no longer exist will never be generated again.
-	generated.retain(|(correlation_id, _), _| live.contains(correlation_id));
+	let live_events: std::collections::HashSet<&weftdb::EventID> = correlations.iter().map(Correlation::event_id).collect();
+	generated.retain_live(&live, &live_events);
 	let mut signals_count = 0usize;
 	let mut unresolved = 0usize;
 	for correlation in &correlations {
@@ -3409,7 +3484,7 @@ mod tests {
 		let patterns: Vec<weftdb::Pattern> = db.get_dictionary_patterns(&aspect, "preamble").await?.try_collect().await?;
 		let events: Vec<Event> = Outputs::get_unprocessed_events(&db, &aspect).await?.try_collect().await?;
 		let mut expected = Signals::new();
-		let mut generated: GeneratedHistorical = HashMap::new();
+		let mut generated = GeneratedHistorical::default();
 		for correlation in &correlations {
 			let pattern = patterns.iter().find(|p| p.id() == *correlation.pattern_id()).expect("every correlation's pattern is stored");
 			let copy: weftdb::OccurrenceLog = pattern.occurrences().iter().map(|o| weftdb::Occurrence::new(*o.aspect(), *o.resolution(), o.size(), o.database_info().clone(), *o.pattern_id(), to_millis(*o.beginning()), to_millis(*o.end()))).collect();
@@ -3811,5 +3886,110 @@ mod signal_queue_tests {
 		assert_eq!(forward_manifestation_id(&correlation, at), forward_manifestation_id(&correlation, at));
 		assert_ne!(forward_manifestation_id(&correlation, at), forward_manifestation_id(&correlation, at + chrono::Duration::minutes(1)));
 		assert_ne!(forward_manifestation_id(&correlation, at), forward_manifestation_id(&CorrelationID::new(), at));
+	}
+}
+
+#[cfg(test)]
+mod historical_memo_tests {
+	use std::collections::HashMap;
+
+	use chrono::{DateTime, Duration, TimeZone, Utc};
+	use weftdb::{AspectId, Correlation, CorrelationKeys, DatabaseInfo, DictionaryId, Event, Manifestation, ManifestationId, Occurrence, OccurrenceLog, PatternID, Resolution, Signals, SubjectId};
+
+	use super::{process_correlation_signals, GeneratedHistorical};
+
+	fn at(hours: i64) -> DateTime<Utc> {
+		Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).single().expect("a valid base") + Duration::hours(hours)
+	}
+
+	fn add(event: &mut Event, dataset: uuid::Uuid, start: i64, end: i64) -> ManifestationId {
+		let id = ManifestationId::for_span(event.id(), dataset, at(start));
+		event.add_manifestation(Manifestation::with_id(id.clone(), dataset, at(start), at(end)));
+		id
+	}
+
+	fn correlation(event: &Event) -> Correlation {
+		let keys = CorrelationKeys { dictionary_id: DictionaryId::from_uuid(uuid::Uuid::new_v4()), subject_id: SubjectId::new(), aspect_id: AspectId::new(), pattern_id: PatternID::from_uuid(uuid::Uuid::new_v4()), event_id: event.id().clone() };
+		Correlation::new(None, keys, HashMap::new(), None)
+	}
+
+	/// One occurrence ending before every manifestation, so each generated pair gives
+	/// exactly three historical signals and no forward ones.
+	fn occurrences() -> OccurrenceLog {
+		vec![occurrence()].into()
+	}
+
+	fn occurrence() -> Occurrence {
+		Occurrence::new(AspectId::new(), Resolution::Hours, 4, DatabaseInfo::new("test".to_string(), "test_path".to_string()), PatternID::from_uuid(uuid::Uuid::new_v4()), at(-2), at(-1))
+	}
+
+	fn run(memo: &mut GeneratedHistorical, correlation: &Correlation, occurrences: &OccurrenceLog, event: &Event) -> usize {
+		let mut signals = Signals::new();
+		process_correlation_signals(&mut signals, correlation, occurrences, std::slice::from_ref(event), memo).expect("signals")
+	}
+
+	/// The memo keeps one entry per correlation however many closed manifestations pass,
+	/// and each run generates only the manifestation that is new.
+	#[test]
+	fn memo_stays_per_correlation_over_closed_manifestations() {
+		let dataset = uuid::Uuid::new_v4();
+		let mut event = Event::new(None, "crossing".into(), None, None);
+		let correlations: Vec<Correlation> = (0..4).map(|_| correlation(&event)).collect();
+		let log = occurrences();
+		let mut memo = GeneratedHistorical::default();
+		for hour in 0..300 {
+			add(&mut event, dataset, hour * 2, hour * 2 + 1);
+			for c in &correlations {
+				assert_eq!(run(&mut memo, c, &log, &event), 3, "run {hour} regenerated old pairs or missed the new one");
+			}
+		}
+		assert_eq!(memo.correlation_entries(), correlations.len());
+		assert_eq!(memo.spans.values().map(HashMap::len).sum::<usize>(), 300, "the span memo is per manifestation, not per pair");
+	}
+
+	/// A closed manifestation arriving late, older than every one already generated,
+	/// still gets its signals, once.
+	#[test]
+	fn late_manifestation_below_the_watermark_is_generated() {
+		let dataset = uuid::Uuid::new_v4();
+		let mut event = Event::new(None, "crossing".into(), None, None);
+		for hour in 10..20 {
+			add(&mut event, dataset, hour * 2, hour * 2 + 1);
+		}
+		let c = correlation(&event);
+		let log = occurrences();
+		let mut memo = GeneratedHistorical::default();
+		assert_eq!(run(&mut memo, &c, &log, &event), 30);
+		assert_eq!(run(&mut memo, &c, &log, &event), 0);
+		add(&mut event, dataset, 2, 3);
+		assert_eq!(run(&mut memo, &c, &log, &event), 3, "the backfilled manifestation was skipped");
+		assert_eq!(run(&mut memo, &c, &log, &event), 0);
+	}
+
+	/// A span that widens (same start, same id) and a span re-identified by a fold into an
+	/// earlier-starting union (new id) both regenerate; untouched ones do not.
+	#[test]
+	fn merged_or_widened_spans_regenerate() {
+		let dataset = uuid::Uuid::new_v4();
+		let mut event = Event::new(None, "crossing".into(), None, None);
+		add(&mut event, dataset, 1, 2);
+		let widened = add(&mut event, dataset, 5, 6);
+		let folded = add(&mut event, dataset, 10, 12);
+		let c = correlation(&event);
+		let log = occurrences();
+		let mut memo = GeneratedHistorical::default();
+		assert_eq!(run(&mut memo, &c, &log, &event), 9);
+
+		let mut manifestations = event.manifestations().clone();
+		manifestations.insert(widened.clone(), Manifestation::with_id(widened, dataset, at(5), at(8)));
+		manifestations.remove(&folded);
+		event.set_manifestations(manifestations);
+		add(&mut event, dataset, 9, 12);
+		assert_eq!(run(&mut memo, &c, &log, &event), 6, "the widened and the re-identified span must both regenerate");
+		assert_eq!(run(&mut memo, &c, &log, &event), 0);
+
+		// A change of the correlation's occurrences regenerates every pair, as before.
+		let grown: OccurrenceLog = vec![occurrence(), occurrence()].into();
+		assert_eq!(run(&mut memo, &c, &grown, &event), 18);
 	}
 }
