@@ -13,12 +13,11 @@ use std::{
 };
 
 use anyhow::Result;
-use futures::TryStreamExt;
 
 use crate::{
 	cache, types::{
 		database::{
-			legacy_metadata_write, traits::{connection::Connection as _ConnectionTrait, database_structure::DatabaseStructure, outputs::Outputs, pipeline::PipelineOutputs}
+			legacy_metadata_write, traits::{connection::Connection as _ConnectionTrait, database_structure::DatabaseStructure, pipeline::PipelineOutputs}
 		}, occurrence_codec::OccurrenceLog
 	}, AspectId, Correlation, CorrelationID, Database, Error, Occurrence, Pattern, PatternID
 };
@@ -118,9 +117,10 @@ impl CorrelationOccurrences {
 	/// Load `dictionary_name` and index the patterns in it that `wanted` names (all of them
 	/// when `wanted` is `None`), removing them from `wanted`.
 	async fn load(&mut self, database: &Database, aspect_id: &AspectId, dictionary_name: &str, mut wanted: Option<&mut HashSet<PatternID>>) -> Result<()> {
-		let patterns: Vec<Pattern> = Outputs::get_dictionary_patterns(database, aspect_id, dictionary_name).await?.try_collect().await?;
+		// Borrow the cached list and copy out only the wanted patterns.
+		let patterns = database.dictionary_patterns_shared(aspect_id, dictionary_name).await?;
 		self.dictionaries_loaded += 1;
-		for pattern in patterns {
+		for pattern in patterns.iter() {
 			let id = pattern.id();
 			if self.by_id.contains_key(&id) {
 				continue;
@@ -131,7 +131,7 @@ impl CorrelationOccurrences {
 				}
 			}
 			self.by_id.insert(id, self.patterns.len());
-			self.patterns.push(pattern);
+			self.patterns.push(pattern.clone());
 		}
 		Ok(())
 	}

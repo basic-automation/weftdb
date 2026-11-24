@@ -223,6 +223,16 @@ impl Cacheable for Vec<Pattern> {
 	}
 }
 
+impl Cacheable for Arc<[Pattern]> {
+	fn as_any(&self) -> &dyn Any {
+		self
+	}
+
+	fn clone_box(&self) -> Box<dyn Cacheable> {
+		Box::new(Self::clone(self))
+	}
+}
+
 impl Cacheable for crate::Correlation {
 	fn as_any(&self) -> &dyn Any {
 		self
