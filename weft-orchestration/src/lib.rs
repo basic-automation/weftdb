@@ -1593,6 +1593,9 @@ fn filter_queue_at(signals: &mut Signals, events: &[weftdb::Event], correlations
 	tracing::debug!(total = signals_to_remove.len(), historical = expired_historical, forward_looking = expired_forward, "Removing expired signals");
 
 	let (updated_correlations, removed_count) = remove_expired_signals(signals, correlations, signals_to_remove);
+	// The queue peaks when a run generates history and drops back once it resolves; let the
+	// capacity follow it down instead of holding the peak for the life of the process.
+	signals.shrink_if_sparse();
 	tracing::debug!(unique_correlations = updated_correlations.len(), "Corrections to write after the lock is released");
 
 	QueueFilterOutcome { initial_count, updated_correlations, removed_count, remaining_count: signals.len() }
