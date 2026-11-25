@@ -3214,7 +3214,7 @@ static QUEUE_CONSUMERS: std::sync::LazyLock<tokio::sync::Mutex<std::collections:
 static LAST_UNREAD_QUEUE_PRUNE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 /// How often a long-running ingest prunes the queues of aspects no pipeline reads, unless
-/// [`UNREAD_QUEUE_PRUNE_ENV`] sets another interval.
+/// `WEFT_UNREAD_PRUNE_SECS` sets another interval.
 pub const UNREAD_QUEUE_PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// The environment variable that sets, in whole seconds, how often a long-running ingest
