@@ -1333,30 +1333,26 @@ impl Database {
 	/// The pattern tables have no index on `pattern_id` (MVCC files keep none), so reading
 	/// pattern by pattern scanned every table once per pattern: the reads grew with the
 	/// pattern count times the file size, and once the file outgrew the connection's page
-	/// cache every one of those scans went back to disk. Patterns come out in
-	/// `SELECT DISTINCT id FROM patterns` order, each built exactly as
+	/// cache every one of those scans went back to disk. Patterns come out in the order of
+	/// their first `patterns` row, each built exactly as
 	/// [`Self::load_dictionary_pattern`] builds it; a pattern that does not load is logged
 	/// and skipped.
 	async fn load_all_dictionary_patterns(conn: &cache::Connection) -> Result<Vec<Pattern>> {
 		let db_err = |what: &str, e: turso::Error| Self::db_error(what, &e);
+		// Each id once, in the order of its first `patterns` row (rowid order: a plain scan
+		// of the table, which no index can serve), and that row's values, as `WHERE id = ?`
+		// returns it.
 		let mut ids: Vec<String> = Vec::new();
-		let mut rows = conn.as_ref().query("SELECT DISTINCT id FROM patterns", turso::params![]).await.map_err(|e| db_err("query patterns", e))?;
-		loop {
-			let Some(row) = rows.next().await.map_err(|e| db_err("get pattern row", e))? else { break };
-			ids.push(row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Pattern ID is not text".to_string()))?.clone());
-		}
-		drop(rows);
-
-		// The first `patterns` row of each id, as `WHERE id = ?` would return it.
 		let mut values: HashMap<String, [String; 7]> = HashMap::new();
 		let mut rows = conn.as_ref().query("SELECT id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value FROM patterns", turso::params![]).await.map_err(|e| db_err("query patterns", e))?;
 		loop {
 			let Some(row) = rows.next().await.map_err(|e| db_err("get pattern row", e))? else { break };
 			let text = |i: usize| -> Result<Option<String>> { Ok(row.get_value(i)?.as_text().cloned()) };
-			let Some(id) = text(0)? else { continue };
+			let id = text(0)?.ok_or_else(|| Error::DatabaseError("Pattern ID is not text".to_string()))?;
 			if values.contains_key(&id) {
 				continue;
 			}
+			ids.push(id.clone());
 			let mut v: [String; 7] = Default::default();
 			let mut ok = true;
 			for (k, slot) in v.iter_mut().enumerate() {
@@ -2229,11 +2225,37 @@ mod tests {
 			assert_eq!(&*cached, &*fresh, "the cached list differs from what the file holds");
 			assert_eq!(fresh.len(), 5);
 
+			// Saving the whole list again with one pattern changed rewrites only that one:
+			// the others keep their rows, so it alone moves to the end of the file.
+			let changed = Pattern::new(fresh[0].id(), fresh[0].occurrences().iter().cloned().chain(std::iter::once(Occurrence::new(aspect_id, splimes::Resolution::Seconds, 3, DatabaseInfo::new("t".to_string(), "t".to_string()), fresh[0].id(), now, now))).collect(), Vec::new());
+			let resaved: Vec<Pattern> = std::iter::once(changed.clone()).chain(fresh[1..].iter().cloned()).collect();
+			db.replace_dictionary_patterns(&aspect_id, "d", &resaved).await?;
+			let cached = db.cache.lock().await.get::<std::sync::Arc<[Pattern]>>(&key).await.expect("the save dropped the list");
+			*db.cache.lock().await = crate::DatabaseCache::new();
+			let reread = db.dictionary_patterns_shared(&aspect_id, "d").await?;
+			let expected: Vec<Pattern> = fresh[1..].iter().cloned().chain(std::iter::once(changed)).collect();
+			assert_eq!(&*reread, expected.as_slice(), "an unchanged pattern was written again");
+			assert_eq!(&*cached, &*reread);
+
+			// Each pattern table is indexed on its pattern id, so that a save's deletes and a
+			// one-pattern read do not scan the file.
+			let file = db.get_dictionary_db(&aspect_id, "d").await?;
+			let conn = file.connect()?;
+			let mut rows = conn.query("SELECT name FROM sqlite_schema WHERE type = 'index'", ()).await?;
+			let mut indexes = Vec::new();
+			while let Some(row) = rows.next().await? {
+				indexes.push(row.get_value(0)?.as_text().cloned().unwrap_or_default());
+			}
+			drop((rows, conn, file));
+			for name in ["idx_patterns_id", "idx_pattern_occurrences_pattern", "idx_pattern_occurrence_blobs_pattern", "idx_pattern_relatives_pattern"] {
+				assert!(indexes.iter().any(|i| i == name), "{name} missing from {indexes:?}");
+			}
+
 			// Saving one id twice is left to a read to rebuild.
 			let twice = vec![saved[1].clone(), saved[1].clone()];
 			db.replace_dictionary_patterns(&aspect_id, "d", &twice).await?;
 			assert!(db.cache.lock().await.get::<std::sync::Arc<[Pattern]>>(&key).await.is_none());
-			drop((cached, fresh));
+			drop((cached, fresh, reread));
 			db.close().await?;
 			drop(db);
 			Ok(())

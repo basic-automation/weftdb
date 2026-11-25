@@ -1634,6 +1634,9 @@ impl Inputs for Database {
 			}
 
 			Self::commit_concurrent(&conn).await?;
+			// A cached list of this dictionary no longer matches the file, and a save trusts
+			// the cached list to tell which patterns are already stored.
+			self.cache.lock().await.invalidate_generation(&Self::dictionary_patterns_cache_key(aspect_id, dictionary_name)).await;
 
 			let log = format!("Inserted pattern '{}' into dictionary '{}' for aspect {}", pattern.id(), dictionary_name, aspect_id);
 			let _ = self.record_transaction(&log).await?;
@@ -2497,8 +2500,7 @@ fn span_of(row: &turso::Row, first: usize) -> Result<Span> {
 
 impl Database {
 	/// The most pattern ids one `DELETE … IN (…)` of a dictionary save names: SQLite's
-	/// default bound on a statement's parameters, so a dictionary of up to this many
-	/// patterns clears each table in one scan.
+	/// default bound on a statement's parameters.
 	const DELETE_IDS_PER_STATEMENT: usize = 32_766;
 
 	/// Write `patterns` over the stored copies of the same ids in `dictionary_name` for
@@ -2520,8 +2522,11 @@ impl Database {
 	/// statement fails (the transaction is rolled back and the stored dictionary kept).
 	pub async fn replace_dictionary_patterns(&self, aspect_id: &AspectId, dictionary_name: &str, patterns: &[Pattern]) -> Result<TxId> {
 		let list_key = Self::dictionary_patterns_cache_key(aspect_id, dictionary_name);
-		// The cached list and its generation, taken before the transaction: the list the
-		// commit turns into `cached_after_save`, if no other writer intervenes.
+		// The cached list and its generation, taken before the transaction. The list is
+		// what the file holds (a save replaces it, see below), so a saved pattern equal to
+		// its cached copy is already stored as it is and is not written again: a pipeline
+		// saves its whole dictionary on every run, and rewriting every pattern made each
+		// save cost the whole file.
 		let before = {
 			let cache = self.cache.lock().await;
 			let generation = cache.generation(&list_key).await;
@@ -2529,27 +2534,39 @@ impl Database {
 			drop(cache);
 			list.map(|list| (generation, list))
 		};
+		let mut seen = std::collections::HashSet::with_capacity(patterns.len());
+		let unique = patterns.iter().all(|p| seen.insert(p.id()));
+		drop(seen);
+		let to_write: Vec<&Pattern> = match &before {
+			Some((_, stored)) if unique => {
+				let stored: std::collections::HashMap<PatternID, &Pattern> = stored.iter().map(|p| (p.id(), p)).collect();
+				patterns.iter().filter(|p| stored.get(&p.id()) != Some(p)).collect()
+			}
+			_ => patterns.iter().collect(),
+		};
+		let written = to_write.as_slice();
 		let tx_id = legacy_metadata_write(async move {
 			let tx_id = TxId::new();
 			let aspect = self.get_aspect(aspect_id).await?;
 			let db_name = &self.name;
 			let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name)?;
 			drop(aspect);
-			let (db, _was_new) = Self::get_or_create_turso_database(&db_path).await?;
+			let (db, was_new) = Self::get_or_create_turso_database(&db_path).await?;
+			if was_new {
+				// The first open in this process: a file from before the pattern id indexes
+				// gets them here, before the deletes below rely on them.
+				Aspect::ensure_dictionary_tables(&db).await?;
+				Self::mark_wireframed(&db_path);
+			}
 			let conn = Self::begin_concurrent(&db, db_name, Some(self.cache.clone())).await?;
 
 			let result: Result<()> = async {
 				// Only the patterns being written are cleared. A stored pattern missing from
 				// `patterns` is kept: correlations name their pattern and read its occurrences
 				// from here, so dropping it (a failed dictionary load hands in only the new
-				// patterns) would leave them with nothing.
-				//
-				// The tables have no index on the pattern id, so each statement scans its whole
-				// table, and a pipeline saves every pattern on every run: the ids go in as few
-				// statements as possible (an IN list is one lookup per row, in an ephemeral
-				// table). In chunks of 256 a save scanned each table once per 256 patterns, which
-				// for a dictionary of a few thousand is several times what reading it costs.
-				let ids: Vec<String> = patterns.iter().map(|p| p.id().to_string()).collect();
+				// patterns) would leave them with nothing. The ids go in as few statements as
+				// possible, each looked up in the pattern id indexes.
+				let ids: Vec<String> = written.iter().map(|p| p.id().to_string()).collect();
 				for chunk in ids.chunks(Self::DELETE_IDS_PER_STATEMENT) {
 					let placeholders = vec!["?"; chunk.len()].join(", ");
 					for (table, column) in [("pattern_relatives", "pattern_id"), ("pattern_occurrences", "pattern_id"), ("pattern_occurrence_blobs", "pattern_id"), ("patterns", "id")] {
@@ -2557,7 +2574,7 @@ impl Database {
 						conn.as_ref().execute(&sql, turso::params_from_iter(chunk.to_vec())).await.map_err(|e| anyhow::anyhow!("Failed to clear patterns of dictionary '{dictionary_name}': {e}"))?;
 					}
 				}
-				for pattern in patterns {
+				for pattern in written {
 					let id = pattern.id().to_string();
 					conn.as_ref().execute(r"INSERT INTO patterns (id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", turso::params![id.clone(), pattern.sum().to_string(), pattern.abs_sum().to_string(), pattern.max().to_string(), pattern.min().to_string(), pattern.abs_max().to_string(), pattern.avg().to_string(), pattern.abs_avg().to_string()]).await.map_err(|e| anyhow::anyhow!("Failed to insert pattern '{id}': {e}"))?;
 					if pattern.occurrence_count() > 0 {
@@ -2579,7 +2596,7 @@ impl Database {
 				return Err(e);
 			}
 			Self::commit_concurrent(&conn).await?;
-			let log = format!("Replaced dictionary '{dictionary_name}' for aspect {aspect_id} with {} patterns", patterns.len());
+			let log = format!("Replaced dictionary '{dictionary_name}' for aspect {aspect_id} with {} patterns ({} written)", patterns.len(), written.len());
 			let _ = self.record_transaction(&log).await?;
 			Ok(tx_id)
 		})
@@ -2587,36 +2604,31 @@ impl Database {
 
 		// Readers cache the dictionary and each pattern; what they hold is now stale. The
 		// list is replaced by what the file now holds rather than dropped: a pipeline saves
-		// its dictionary on every run and reads it on the next, and the pattern tables have
-		// no index, so a dropped list cost a scan of the whole file per run. That is O(file)
-		// reads per run and quadratic over a dictionary's life, and once the file outgrew the
-		// connection's page cache it all came from disk.
-		let after = before.and_then(|(generation, list)| Self::cached_after_save(&list, patterns).map(|after| (generation, after)));
+		// its dictionary on every run and reads it on the next, so a dropped list cost a read
+		// of the whole file per run, quadratic over a dictionary's life.
+		let after = before.filter(|_| unique).map(|(generation, list)| (generation, Self::cached_after_save(&list, written)));
 		let cache = self.cache.lock().await;
 		if let Some((generation, after)) = after {
 			cache.replace_if_generation(&list_key, generation, after).await;
 		} else {
 			cache.invalidate_generation(&list_key).await;
 		}
-		for pattern in patterns {
+		for pattern in written {
 			cache.invalidate(&format!("pattern_{}", pattern.id().as_uuid())).await;
 		}
 		drop(cache);
+		drop(to_write);
 		Ok(tx_id)
 	}
 
 	/// The pattern list a dictionary file holds after
-	/// [`replace_dictionary_patterns`](Self::replace_dictionary_patterns) wrote `saved` over
-	/// a file that held `stored`, in the order a fresh read returns it: the stored patterns
-	/// not in `saved` keep their place, and `saved` follows (its rows were deleted and
-	/// inserted again, after every kept row). `None` when `saved` names an id twice: the
-	/// file then holds one pattern built from both copies' rows, which only a read rebuilds.
-	fn cached_after_save(stored: &[Pattern], saved: &[Pattern]) -> Option<std::sync::Arc<[Pattern]>> {
-		let mut ids = std::collections::HashSet::with_capacity(saved.len());
-		if !saved.iter().all(|p| ids.insert(p.id())) {
-			return None;
-		}
-		Some(stored.iter().filter(|p| !ids.contains(&p.id())).chain(saved).cloned().collect())
+	/// [`replace_dictionary_patterns`](Self::replace_dictionary_patterns) wrote `written`
+	/// (no id twice) over a file that held `stored`, in the order a fresh read returns it:
+	/// the stored patterns not written keep their place, and `written` follows (its rows
+	/// were deleted and inserted again, after every kept row).
+	fn cached_after_save(stored: &[Pattern], written: &[&Pattern]) -> std::sync::Arc<[Pattern]> {
+		let ids: std::collections::HashSet<PatternID> = written.iter().map(|p| p.id()).collect();
+		stored.iter().filter(|p| !ids.contains(&p.id())).chain(written.iter().copied()).cloned().collect()
 	}
 
 	/// The cache key of an aspect's dictionary's pattern list. Every aspect can have a
