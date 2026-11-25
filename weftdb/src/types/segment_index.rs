@@ -635,6 +635,19 @@ impl SegmentIndexStore {
 		Self::collect(rows).await
 	}
 
+	/// The series' latest instant as the index records it: the largest `max_ts` among
+	/// `series`' index rows, or [`None`] when it has no non-empty segment (TAG-12, TSBS
+	/// `lastpoint`). [`read_latest_of`](crate::SegmentStore::read_latest_of) reads only that
+	/// instant instead of the whole series.
+	pub(crate) async fn series_latest_ts(&self, aspect: &str, series: crate::SeriesId) -> Result<Option<i64>> {
+		let conn = connect_reader(&self.db).await?;
+		let mut rows = conn.query("SELECT MAX(max_ts) FROM segment_index WHERE aspect = ? AND series_id = ?", turso::params![aspect.to_string(), integer_param(series.0)?]).await?;
+		Ok(match rows.next().await?.map(|row| row.get_value(0)).transpose()? {
+			Some(Value::Integer(latest)) => Some(latest),
+			_ => None,
+		})
+	}
+
 	/// [`load_index`](Self::load_index) over one series' rows only (TAG-8): the resident
 	/// index [`read_value_range_of`](crate::SegmentStore::read_value_range_of) prunes by value.
 	pub(crate) async fn load_series_index(&self, aspect: &str, series: crate::SeriesId) -> Result<SegmentIndex> {

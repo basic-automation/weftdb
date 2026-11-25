@@ -263,6 +263,47 @@ impl SegmentStore {
 		Ok((kept_ts, kept_values))
 	}
 
+	/// **Latest row** of `aspect` (TAG-12): [`read_latest_of`](Self::read_latest_of) of
+	/// [`SeriesId::UNTAGGED`](crate::SeriesId::UNTAGGED).
+	///
+	/// # Errors
+	///
+	/// As [`read_latest_of`](Self::read_latest_of).
+	pub async fn read_latest(&self, aspect: &str) -> Result<Option<(i64, Option<BigDecimal>)>> {
+		self.read_latest_of(aspect, crate::SeriesId::UNTAGGED).await
+	}
+
+	/// **Latest row of one series** (TAG-12, the TSBS `lastpoint` read): the row with the
+	/// greatest timestamp and its value, or [`None`] when the series has no rows. It equals
+	/// the last element of [`read_time_range_of`](Self::read_time_range_of) over the whole
+	/// series, newer-wins across overlapping segments and a newer null included, as that
+	/// read has it.
+	///
+	/// It reads one instant: the index gives the series' greatest `max_ts`, which is the
+	/// latest row's timestamp, and the range read over `[latest, latest]` opens only the
+	/// segments that hold it, decodes only that window and resolves them newer-wins. The
+	/// cost follows the segments at the series' end, not its length. If that instant reads
+	/// empty (its frame was skipped as suspect, or a concurrent purge or merge moved it)
+	/// the whole series is read instead, so the answer never depends on the shortcut.
+	///
+	/// The read applies no row expiry, like [`read_time_range_of`](Self::read_time_range_of).
+	///
+	/// # Errors
+	///
+	/// As [`read_time_range_of`](Self::read_time_range_of).
+	pub async fn read_latest_of(&self, aspect: &str, series: crate::SeriesId) -> Result<Option<(i64, Option<BigDecimal>)>> {
+		aspect_name::validate(aspect)?;
+		let Some(latest) = self.index.series_latest_ts(aspect, series).await? else {
+			return Ok(None);
+		};
+		let (ts, vs) = self.read_time_range_of(aspect, series, latest, latest).await?;
+		if let (Some(&t), Some(v)) = (ts.last(), vs.into_iter().next_back()) {
+			return Ok(Some((t, v)));
+		}
+		let (ts, vs) = self.read_time_range_of(aspect, series, i64::MIN, i64::MAX).await?;
+		Ok(ts.last().copied().zip(vs.into_iter().next_back()))
+	}
+
 	/// **Cross-segment downsample** — reduce `aspect`'s `[start, end]` rows into
 	/// grid-aligned buckets **without ever materializing the range**.
 	///

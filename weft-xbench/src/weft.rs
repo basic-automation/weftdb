@@ -247,7 +247,8 @@ impl TsbsWeft {
 	/// [`tsbs::TsbsCpu::lastpoint`]'s question, answered by the store: each host's latest
 	/// instant and its ten values, hosts in name order.
 	///
-	/// It reads each series' whole range and keeps the last row: correct, not yet the fast path.
+	/// Each series is answered by [`SegmentStore::read_latest_of`], which reads only the
+	/// series' latest instant, the way TSBS's generated `lastpoint` SQL takes one row per host.
 	///
 	/// # Errors
 	///
@@ -259,8 +260,7 @@ impl TsbsWeft {
 			for (m, metric) in tsbs::CPU_METRICS.iter().enumerate() {
 				let aspect = Self::aspect(metric);
 				let series = self.series(&aspect, host).await?;
-				let (ts, vs) = self.store()?.read_time_range_of(&aspect, series, i64::MIN, i64::MAX).await?;
-				let (Some(&last_ts), Some(Some(last_v))) = (ts.last(), vs.last()) else { anyhow::bail!("{aspect} hostname={host} has no rows") };
+				let Some((last_ts, Some(last_v))) = self.store()?.read_latest_of(&aspect, series).await? else { anyhow::bail!("{aspect} hostname={host} has no latest value") };
 				anyhow::ensure!(m == 0 || last_ts == reading.ts_ns, "{host}'s latest {metric} is at {last_ts}, not {}", reading.ts_ns);
 				reading.ts_ns = last_ts;
 				reading.values[m] = last_v.to_i64().ok_or_else(|| anyhow::anyhow!("{aspect} hostname={host}: {last_v} is not an i64"))?;
