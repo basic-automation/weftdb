@@ -224,7 +224,23 @@ impl TsbsWeft {
 	/// As the reference, or if the store fails.
 	pub async fn single_groupby(&self, metrics: usize, hosts: &[&str], start_ns: i64, end_ns: i64) -> anyhow::Result<Vec<tsbs::MinuteMax>> {
 		anyhow::ensure!((1..=tsbs::CPU_METRICS.len()).contains(&metrics), "a single-groupby takes 1 to {} metrics, not {metrics}", tsbs::CPU_METRICS.len());
-		anyhow::ensure!(!hosts.is_empty(), "a single-groupby names at least one host");
+		Ok(self.bucket_max(metrics, hosts, start_ns, end_ns, Resolution::Minutes).await?.into_iter().map(|(minute_ns, max)| tsbs::MinuteMax { minute_ns, max }).collect())
+	}
+
+	/// [`tsbs::TsbsCpu::cpu_max_all`]'s question, answered by the store: each host's per-hour MAX
+	/// of all ten metrics from `downsample_range_of`, merged across the hosts by bucket.
+	///
+	/// # Errors
+	///
+	/// As the reference, or if the store fails.
+	pub async fn cpu_max_all(&self, hosts: &[&str], start_ns: i64, end_ns: i64) -> anyhow::Result<Vec<tsbs::HourMax>> {
+		Ok(self.bucket_max(tsbs::CPU_METRICS.len(), hosts, start_ns, end_ns, Resolution::Hours).await?.into_iter().map(|(hour_ns, max)| tsbs::HourMax { hour_ns, max }).collect())
+	}
+
+	/// The MAX of each of the first `metrics` fields over `hosts` in `[start_ns, end_ns)`, per
+	/// `resolution` bucket, keyed by bucket start in nanoseconds.
+	async fn bucket_max(&self, metrics: usize, hosts: &[&str], start_ns: i64, end_ns: i64, resolution: Resolution) -> anyhow::Result<BTreeMap<i64, Vec<i64>>> {
+		anyhow::ensure!(!hosts.is_empty(), "a TSBS query names at least one host");
 		anyhow::ensure!(start_ns < end_ns, "the window [{start_ns}, {end_ns}) is empty");
 		let mut buckets: BTreeMap<i64, Vec<Option<i64>>> = BTreeMap::new();
 		for host in hosts {
@@ -232,16 +248,16 @@ impl TsbsWeft {
 				let aspect = Self::aspect(metric);
 				let series = self.series(&aspect, host).await?;
 				// The store's range is inclusive; TSBS's window is half-open.
-				for bucket in self.store()?.downsample_range_of(&aspect, series, start_ns, end_ns - 1, Resolution::Minutes, &[Aggregation::Max]).await? {
-					let minute_ns = nanos(bucket.timestamp)?;
-					let max = bucket.values.get(Aggregation::Max.as_str()).ok_or_else(|| anyhow::anyhow!("{aspect} bucket {minute_ns} has no max"))?;
-					let max = max.to_i64().ok_or_else(|| anyhow::anyhow!("{aspect} bucket {minute_ns}: max {max} is not an i64"))?;
-					let slot = &mut buckets.entry(minute_ns).or_insert_with(|| vec![None; metrics])[m];
+				for bucket in self.store()?.downsample_range_of(&aspect, series, start_ns, end_ns - 1, resolution, &[Aggregation::Max]).await? {
+					let bucket_ns = nanos(bucket.timestamp)?;
+					let max = bucket.values.get(Aggregation::Max.as_str()).ok_or_else(|| anyhow::anyhow!("{aspect} bucket {bucket_ns} has no max"))?;
+					let max = max.to_i64().ok_or_else(|| anyhow::anyhow!("{aspect} bucket {bucket_ns}: max {max} is not an i64"))?;
+					let slot = &mut buckets.entry(bucket_ns).or_insert_with(|| vec![None; metrics])[m];
 					*slot = Some(slot.map_or(max, |s| s.max(max)));
 				}
 			}
 		}
-		buckets.into_iter().map(|(minute_ns, max)| Ok(tsbs::MinuteMax { minute_ns, max: max.into_iter().collect::<Option<Vec<i64>>>().ok_or_else(|| anyhow::anyhow!("bucket {minute_ns} has a metric with no rows"))? })).collect()
+		buckets.into_iter().map(|(bucket_ns, max)| Ok((bucket_ns, max.into_iter().collect::<Option<Vec<i64>>>().ok_or_else(|| anyhow::anyhow!("bucket {bucket_ns} has a metric with no rows"))?))).collect()
 	}
 
 	/// [`tsbs::TsbsCpu::lastpoint`]'s question, answered by the store: each host's latest
@@ -281,6 +297,10 @@ impl TsbsWeft {
 			tsbs::TsbsQuery::SingleGroupby { metrics, .. } => {
 				let hosts: Vec<&str> = instance.hosts.iter().map(String::as_str).collect();
 				Ok(tsbs::TsbsAnswer::Minutes(self.single_groupby(metrics, &hosts, instance.start_ns, instance.end_ns).await?))
+			}
+			tsbs::TsbsQuery::CpuMaxAll { .. } => {
+				let hosts: Vec<&str> = instance.hosts.iter().map(String::as_str).collect();
+				Ok(tsbs::TsbsAnswer::Hours(self.cpu_max_all(&hosts, instance.start_ns, instance.end_ns).await?))
 			}
 			tsbs::TsbsQuery::Lastpoint => Ok(tsbs::TsbsAnswer::Latest(self.lastpoint().await?)),
 		}
@@ -476,6 +496,16 @@ mod tests {
 					let want = cpu.single_groupby(metrics, named, start, end).expect("reference");
 					assert!(want.len() > 50, "{}: a real answer, not an empty one", query.name());
 					assert_eq!(weft.single_groupby(metrics, named, start, end).await.expect("store"), want, "{}", query.name());
+				}
+				tsbs::TsbsQuery::CpuMaxAll { hosts, hours } => {
+					// Starting inside the first hour and ending past the generated two hours: two
+					// hourly buckets, the first partial.
+					let start = t0 + 25_000_000_000;
+					let end = (start + i64::from(hours) * 3_600_000_000_000).min(t0 + 7_200_000_000_000 + 1_800_000_000_000) - 15_000_000_000;
+					let named = &eight[..hosts];
+					let want = cpu.cpu_max_all(named, start, end).expect("reference");
+					assert_eq!(want.len(), 2, "{}: the generated two hours are two hourly buckets", query.name());
+					assert_eq!(weft.cpu_max_all(named, start, end).await.expect("store"), want, "{}", query.name());
 				}
 				tsbs::TsbsQuery::Lastpoint => {
 					let want: Vec<(String, tsbs::CpuReading)> = cpu.lastpoint().into_iter().map(|(h, r)| (h.to_string(), r.clone())).collect();
