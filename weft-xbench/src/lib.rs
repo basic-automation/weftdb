@@ -1154,7 +1154,7 @@ mod tests {
 				r.values[0] += 1;
 			}
 		}
-		let queries = [tsbs::TsbsQuery::SingleGroupby { metrics: 1, hosts: 1, hours: 1 }, tsbs::TsbsQuery::CpuMaxAll { hosts: 1, hours: tsbs::MAX_ALL_HOURS }, tsbs::TsbsQuery::Lastpoint];
+		let queries = [tsbs::TsbsQuery::SingleGroupby { metrics: 1, hosts: 1, hours: 1 }, tsbs::TsbsQuery::CpuMaxAll { hosts: 1, hours: tsbs::MAX_ALL_HOURS }, tsbs::TsbsQuery::HighCpu { hosts: 1, hours: tsbs::HIGH_CPU_HOURS }, tsbs::TsbsQuery::Lastpoint];
 		let results = run_tsbs_queries_against(&loaded, &reference, &queries, 2, 7).await.expect("runs");
 		for r in &results {
 			assert!(!r.passed && r.mismatches == 2, "{}: passed {} with {} mismatches", r.query, r.passed, r.mismatches);

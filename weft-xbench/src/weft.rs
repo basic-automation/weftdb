@@ -237,6 +237,50 @@ impl TsbsWeft {
 		Ok(self.bucket_max(tsbs::CPU_METRICS.len(), hosts, start_ns, end_ns, Resolution::Hours).await?.into_iter().map(|(hour_ns, max)| tsbs::HourMax { hour_ns, max }).collect())
 	}
 
+	/// [`tsbs::TsbsCpu::high_cpu`]'s question, answered by the store: each host's `usage_user`
+	/// rows in the window from `read_time_range_of`, kept where above
+	/// [`tsbs::HIGH_CPU_ABOVE`], then the other nine fields at those instants from
+	/// `read_points_of`, in batches the store's point-batch cap admits. Hosts in name order.
+	///
+	/// # Errors
+	///
+	/// As the reference, if the store fails, or if a field has no value at a matched instant.
+	pub async fn high_cpu(&self, hosts: &[&str], start_ns: i64, end_ns: i64) -> anyhow::Result<Vec<(String, tsbs::CpuReading)>> {
+		anyhow::ensure!(!hosts.is_empty(), "a TSBS query names at least one host");
+		anyhow::ensure!(start_ns < end_ns, "the window [{start_ns}, {end_ns}) is empty");
+		let mut sorted = hosts.to_vec();
+		sorted.sort_unstable();
+		let above = BigDecimal::from(tsbs::HIGH_CPU_ABOVE);
+		let mut rows = Vec::new();
+		for host in sorted {
+			let user = Self::aspect(tsbs::CPU_METRICS[0]);
+			let series = self.series(&user, host).await?;
+			// The store's range is inclusive; TSBS's window is half-open.
+			let (ts, vs) = self.store()?.read_time_range_of(&user, series, start_ns, end_ns - 1).await?;
+			let mut hits: Vec<tsbs::CpuReading> = Vec::new();
+			for (t, v) in ts.into_iter().zip(vs) {
+				if let Some(v) = v.filter(|v| *v > above) {
+					let mut values = [0; 10];
+					values[0] = v.to_i64().ok_or_else(|| anyhow::anyhow!("{user} hostname={host}: {v} is not an i64"))?;
+					hits.push(tsbs::CpuReading { ts_ns: t, values });
+				}
+			}
+			let instants: Vec<i64> = hits.iter().map(|r| r.ts_ns).collect();
+			for (m, metric) in tsbs::CPU_METRICS.iter().enumerate().skip(1) {
+				let aspect = Self::aspect(metric);
+				let series = self.series(&aspect, host).await?;
+				for (chunk, at) in instants.chunks(weftdb::DEFAULT_MAX_POINT_BATCH).zip(hits.chunks_mut(weftdb::DEFAULT_MAX_POINT_BATCH)) {
+					for (value, reading) in self.store()?.read_points_of(&aspect, series, chunk).await?.into_iter().zip(at) {
+						let value = value.ok_or_else(|| anyhow::anyhow!("{aspect} hostname={host} has no value at {}", reading.ts_ns))?;
+						reading.values[m] = value.to_i64().ok_or_else(|| anyhow::anyhow!("{aspect} hostname={host}: {value} is not an i64"))?;
+					}
+				}
+			}
+			rows.extend(hits.into_iter().map(|r| (host.to_string(), r)));
+		}
+		Ok(rows)
+	}
+
 	/// The MAX of each of the first `metrics` fields over `hosts` in `[start_ns, end_ns)`, per
 	/// `resolution` bucket, keyed by bucket start in nanoseconds.
 	async fn bucket_max(&self, metrics: usize, hosts: &[&str], start_ns: i64, end_ns: i64, resolution: Resolution) -> anyhow::Result<BTreeMap<i64, Vec<i64>>> {
@@ -301,6 +345,10 @@ impl TsbsWeft {
 			tsbs::TsbsQuery::CpuMaxAll { .. } => {
 				let hosts: Vec<&str> = instance.hosts.iter().map(String::as_str).collect();
 				Ok(tsbs::TsbsAnswer::Hours(self.cpu_max_all(&hosts, instance.start_ns, instance.end_ns).await?))
+			}
+			tsbs::TsbsQuery::HighCpu { .. } => {
+				let hosts: Vec<&str> = instance.hosts.iter().map(String::as_str).collect();
+				Ok(tsbs::TsbsAnswer::Readings(self.high_cpu(&hosts, instance.start_ns, instance.end_ns).await?))
 			}
 			tsbs::TsbsQuery::Lastpoint => Ok(tsbs::TsbsAnswer::Latest(self.lastpoint().await?)),
 		}
@@ -506,6 +554,16 @@ mod tests {
 					let want = cpu.cpu_max_all(named, start, end).expect("reference");
 					assert_eq!(want.len(), 2, "{}: the generated two hours are two hourly buckets", query.name());
 					assert_eq!(weft.cpu_max_all(named, start, end).await.expect("store"), want, "{}", query.name());
+				}
+				tsbs::TsbsQuery::HighCpu { hosts, .. } => {
+					// The generated two hours, cut inside a reading's ten seconds at both ends;
+					// `high-cpu-all` names every host.
+					let (start, end) = (t0 + 25_000_000_000, t0 + 7_200_000_000_000 - 15_000_000_000);
+					let all: Vec<&str> = cpu.hosts.keys().map(String::as_str).collect();
+					let named: Vec<&str> = if hosts == 0 { all } else { eight[..hosts].to_vec() };
+					let want = cpu.high_cpu(&named, start, end).expect("reference");
+					assert!(want.len() > 20, "{}: a real answer, not an empty one ({} rows)", query.name(), want.len());
+					assert_eq!(weft.high_cpu(&named, start, end).await.expect("store"), want, "{}", query.name());
 				}
 				tsbs::TsbsQuery::Lastpoint => {
 					let want: Vec<(String, tsbs::CpuReading)> = cpu.lastpoint().into_iter().map(|(h, r)| (h.to_string(), r.clone())).collect();

@@ -17,7 +17,7 @@
 //! arm is, and without `--iotdb` (an Apache `IoTDB` REST service) the `IoTDB` arm is. The process exits 1 when any result fails its correctness gate, after writing the report.
 //!
 //! `--tsbs-queries` (with `--tsbs`) also loads every host's ten `cpu` fields, over the whole file,
-//! into a tagged WeftDB store and times its answers to TSBS's `single-groupby`, `cpu-max-all` and `lastpoint` queries, `--reps` seeded
+//! into a tagged WeftDB store and times its answers to TSBS's `single-groupby`, `cpu-max-all`, `high-cpu` and `lastpoint` queries, `--reps` seeded
 //! instances of each, every answer gated against an in-memory reference (TAG-12, #341); see
 //! [`weft_xbench::run_tsbs_queries`].
 //!
