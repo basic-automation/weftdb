@@ -842,6 +842,7 @@ impl Inputs for Database {
 		let db_path = self.get_unprocessed_batches_db_path(aspect_id).await?;
 		let processed = self.get_processed_batches_db(aspect_id).await?.connect()?;
 		self.queue_batch_unless_known(aspect_id, batch, &db, &db_path, &processed).await?;
+		self.mark_batching_started(aspect_id).await?;
 		Ok(tx_id)
 	}
 
@@ -880,6 +881,12 @@ impl Inputs for Database {
 		}
 		if skipped > 0 {
 			tracing::debug!("Skipped {skipped} of {total} unprocessed batches for aspect {aspect_id}: already queued, processed or extracted");
+		}
+		// Written after the batches commit, so a crash in between leaves the aspect looking
+		// unbatched and costs one extra full rebuild (which the dedupe absorbs), never a
+		// marker without its batches.
+		if total > 0 {
+			self.mark_batching_started(aspect_id).await?;
 		}
 		Ok(tx_ids)
 	}
@@ -955,6 +962,8 @@ impl Inputs for Database {
 			}
 
 			Self::commit_concurrent(&conn).await?;
+			// A cleared aspect starts over: its next consumer run is a first run.
+			self.reset_batching_started(aspect_id).await?;
 			let log = format!("Cleared all unprocessed batches for aspect {aspect_id}");
 			self.record_transaction(&log).await
 		})

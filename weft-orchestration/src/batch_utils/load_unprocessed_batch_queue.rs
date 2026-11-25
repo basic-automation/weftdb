@@ -19,6 +19,11 @@ use crate::{Batch, BatchedMeasurement};
 ///
 /// This indicates a fresh start where all measurements should be processed.
 ///
+/// An aspect whose batching marker is set ([`Database::batching_started`]) is never on
+/// its first run, whatever the queues hold: extraction drains both batch tables, so
+/// empty tables do not mean nothing was ever batched, and treating them so rebuilt every
+/// window of the whole history on each run.
+///
 /// For a seal-backed aspect the queue is always empty (slice D-S20: its
 /// ingest feeds the seal store's change log instead), so the pending-work
 /// term is the change log's: no pending changes, and no batches either
@@ -31,7 +36,7 @@ pub async fn is_first_run(database: &Database, aspect_id: &AspectId) -> Result<b
 	let unprocessed_count = database.count_unprocessed_batches(aspect_id).await?;
 	let processed_count = database.count_processed_batches(aspect_id).await?;
 
-	Ok(unbatched_count == 0 && unprocessed_count == 0 && processed_count == 0)
+	Ok(unbatched_count == 0 && unprocessed_count == 0 && processed_count == 0 && !database.batching_started(aspect_id).await?)
 }
 
 /// Builds incremental sliding-window batches only for measurements that haven't been batched yet.
@@ -258,8 +263,10 @@ pub async fn build_incremental_from_change_log(database: &Database, aspect: &Asp
 	// No batches yet is a first run however the aspect's rows arrived —
 	// including rows sealed before D-S20, which have no change rows: the
 	// full rebuild batches every stored row, which is everything the log
-	// names, so the rows it read are acknowledged behind it.
-	let no_batches_yet = database.count_unprocessed_batches(aspect).await? == 0 && database.count_processed_batches(aspect).await? == 0;
+	// names, so the rows it read are acknowledged behind it. Empty batch
+	// tables alone are not "no batches yet": extraction drains them, so an
+	// aspect with its batching marker set has been batched before.
+	let no_batches_yet = database.count_unprocessed_batches(aspect).await? == 0 && database.count_processed_batches(aspect).await? == 0 && !database.batching_started(aspect).await?;
 	if changes.is_empty() && !no_batches_yet {
 		info!("No seal changes, nothing to process");
 		return Ok(());

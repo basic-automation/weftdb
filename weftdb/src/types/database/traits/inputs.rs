@@ -239,6 +239,9 @@ pub trait Inputs {
 	/// Capture multiple unprocessed batches for a given aspect, skipping, as
 	/// [`insert_unprocessed_batch`](Self::insert_unprocessed_batch) does, every batch that
 	/// is already queued, processed, or extracted (and repeats within `batches`).
+	///
+	/// A non-empty call also records the aspect's batching marker
+	/// ([`Database::batching_started`](crate::Database::batching_started)).
 	async fn batch_insert_unprocessed_batches(&self, aspect_id: &AspectId, batches: Vec<Batch>) -> Result<Vec<TxId>>;
 
 	// Capture a chunk of batches - works for both processed and unprocessed batches
@@ -252,6 +255,10 @@ pub trait Inputs {
 	async fn bulk_remove_unprocessed_batches(&self, aspect_id: &AspectId, batch_ids: &[BatchId]) -> Result<()>;
 
 	/// clear all unprocessed batches for a given aspect
+	///
+	/// Also resets the aspect's batching marker
+	/// ([`Database::batching_started`](crate::Database::batching_started)), so the batch
+	/// consumer's next run rebuilds from the whole history.
 	async fn clear_unprocessed_batches(&self, aspect_id: &AspectId) -> Result<TxId>;
 
 	/// cleanup unprocessed batches older than the specified timestamp for a given aspect

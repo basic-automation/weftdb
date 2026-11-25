@@ -272,6 +272,7 @@ pub async fn clear_connection_cache_by_name(name: &str) {
 	PRUNED_ON_OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|path| !path.contains(name));
 }
 
+mod batching_marker;
 pub mod config;
 pub(crate) mod conn_pool;
 pub mod connection;
@@ -398,7 +399,7 @@ impl DatabaseStructure for Database {
 				drop(conn);
 			}
 
-			conn_pool::register(&turso_db, conn_pool::Role::Legacy);
+			conn_pool::register_with_cache(&turso_db, conn_pool::Role::Legacy, conn_pool::cache_kib_for_path(db_path));
 			cache.insert(db_path.to_string(), turso_db.clone());
 			mirror_insert(db_path, &turso_db);
 			touch_cached(db_path);
@@ -439,7 +440,7 @@ impl DatabaseStructure for Database {
 		// Allow connection to fully close before returning
 		tokio::task::yield_now().await;
 
-		conn_pool::register(&turso_db, conn_pool::Role::Legacy);
+		conn_pool::register_with_cache(&turso_db, conn_pool::Role::Legacy, conn_pool::cache_kib_for_path(db_path));
 		cache.insert(db_path.to_string(), turso_db.clone());
 		mirror_insert(db_path, &turso_db);
 		touch_cached(db_path);
