@@ -8,7 +8,26 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-11-23
+## [0.4.0] - 2026-11-25
+
+### Fixed (memory growth in long-running processes)
+
+- **Historical-signal memo** grows with correlations plus manifestations instead of their product.
+- **Signal queues** release spare map capacity after expiry.
+- **Dictionaries** are cached once as a shared list, read in one scan per table, kept cached across
+  saves, and a save rewrites only changed patterns. Pattern tables gain a `pattern_id` index
+  (added on first open; one scan).
+- **Pipeline prepare** no longer rebuilds a drained aspect's batches from its whole history on
+  every run; a durable per-aspect batching marker records the first full build.
+- **Unread-queue prune** keeps going past a chunk that loses a write conflict, retries it, and
+  reports every failed aspect.
+- **Page caches** are 2 MiB per Turso connection, 8 MiB for the root `metadata.db`.
+- **Read cache** is bounded by bytes with LRU eviction and eager expiry; a replaced dictionary's old
+  list can no longer be cached after the replace.
+- New Tuning variables: `WEFT_UNREAD_PRUNE_SECS`, `WEFT_CONN_CACHE_KIB`, `WEFT_METADATA_CACHE_KIB`,
+  `WEFT_CACHE_MAX_MB`. `WEFT_POOL_MAX_IDLE=1` is raised to 2.
+- 72-virtual-hour fanctl soak: anon growth 1.5 MB/vh against 4.8 on 0.4.0-pre, 251 MB against 422 MB
+  at 60-71 vh, reads 1.42x.
 
 ### Documentation
 
