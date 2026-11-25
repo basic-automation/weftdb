@@ -2496,6 +2496,11 @@ fn span_of(row: &turso::Row, first: usize) -> Result<Span> {
 }
 
 impl Database {
+	/// The most pattern ids one `DELETE … IN (…)` of a dictionary save names: SQLite's
+	/// default bound on a statement's parameters, so a dictionary of up to this many
+	/// patterns clears each table in one scan.
+	const DELETE_IDS_PER_STATEMENT: usize = 32_766;
+
 	/// Write `patterns` over the stored copies of the same ids in `dictionary_name` for
 	/// `aspect_id`, in one transaction. A stored pattern whose id is not in `patterns` is
 	/// kept (insert or update only, never delete).
@@ -2538,8 +2543,14 @@ impl Database {
 				// `patterns` is kept: correlations name their pattern and read its occurrences
 				// from here, so dropping it (a failed dictionary load hands in only the new
 				// patterns) would leave them with nothing.
+				//
+				// The tables have no index on the pattern id, so each statement scans its whole
+				// table, and a pipeline saves every pattern on every run: the ids go in as few
+				// statements as possible (an IN list is one lookup per row, in an ephemeral
+				// table). In chunks of 256 a save scanned each table once per 256 patterns, which
+				// for a dictionary of a few thousand is several times what reading it costs.
 				let ids: Vec<String> = patterns.iter().map(|p| p.id().to_string()).collect();
-				for chunk in ids.chunks(256) {
+				for chunk in ids.chunks(Self::DELETE_IDS_PER_STATEMENT) {
 					let placeholders = vec!["?"; chunk.len()].join(", ");
 					for (table, column) in [("pattern_relatives", "pattern_id"), ("pattern_occurrences", "pattern_id"), ("pattern_occurrence_blobs", "pattern_id"), ("patterns", "id")] {
 						let sql = format!("DELETE FROM {table} WHERE {column} IN ({placeholders})");

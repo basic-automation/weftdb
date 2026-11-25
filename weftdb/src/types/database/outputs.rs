@@ -2239,6 +2239,31 @@ mod tests {
 			Ok(())
 		}
 
+		/// A save of more patterns than an old 256-id chunk clears every stored copy in its
+		/// one statement per table: saving the same patterns again leaves one copy of each.
+		#[tokio::test]
+		#[serial_test::serial]
+		async fn a_large_save_replaces_every_stored_copy() -> anyhow::Result<()> {
+			crate::types::database::config::use_temp_data_dir();
+			let name = format!("dictionary_large_save_{}", uuid::Uuid::new_v4().simple());
+			let db = Database::new(&name).await?;
+			let subject = db.observe_subject("s").await?;
+			let aspect = db.track_aspect(&subject.id(), "a", &splimes::Resolution::Seconds, None).await?;
+			let aspect_id = aspect.id();
+			aspect.new_dictionary("d", "", &DictionaryConstraints::default()).await?;
+			drop(aspect);
+			let saved: Vec<Pattern> = (0..600).map(|_| pattern(aspect_id)).collect();
+			db.replace_dictionary_patterns(&aspect_id, "d", &saved).await?;
+			db.replace_dictionary_patterns(&aspect_id, "d", &saved).await?;
+			*db.cache.lock().await = crate::DatabaseCache::new();
+			let read = db.dictionary_patterns_shared(&aspect_id, "d").await?;
+			assert_eq!(&*read, saved.as_slice(), "a pattern was stored twice or lost");
+			drop(read);
+			db.close().await?;
+			drop(db);
+			Ok(())
+		}
+
 		/// The whole-dictionary read (one scan per pattern table) builds every pattern exactly
 		/// as the one-pattern read does: occurrences, relatives in index order, and order.
 		#[tokio::test]
