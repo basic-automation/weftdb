@@ -510,7 +510,8 @@ impl DatabaseCache {
 
 	/// [`store`](Self::store) `value` under `cache_key` unless the key was invalidated with
 	/// [`invalidate_generation`](Self::invalidate_generation) since the reader took
-	/// `generation`. Returns whether it stored the value.
+	/// `generation`. Returns whether the generation still matched; a value heavier than the
+	/// whole byte budget is then still left out, as [`store`](Self::store) leaves it out.
 	pub async fn store_if_generation<T: Cacheable>(&self, cache_key: &str, generation: u64, value: T) -> bool {
 		let mut cache = self.cache.write().await;
 		// Holding `cache` keeps an `invalidate_generation` from running between this check

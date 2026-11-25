@@ -2557,7 +2557,7 @@ impl Database {
 
 		// Readers cache the dictionary and each pattern; what they hold is now stale.
 		let cache = self.cache.lock().await;
-		cache.invalidate(&Self::dictionary_patterns_cache_key(aspect_id, dictionary_name)).await;
+		cache.invalidate_generation(&Self::dictionary_patterns_cache_key(aspect_id, dictionary_name)).await;
 		for pattern in patterns {
 			cache.invalidate(&format!("pattern_{}", pattern.id().as_uuid())).await;
 		}

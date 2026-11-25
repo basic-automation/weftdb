@@ -1322,9 +1322,15 @@ impl Database {
 	/// dictionary is saved); callers borrow it instead of holding their own copy.
 	pub(crate) async fn dictionary_patterns_shared(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Arc<[Pattern]>> {
 		let cache_key = Self::dictionary_patterns_cache_key(aspect_id, dictionary_name);
-		if let Some(cached) = self.cache.lock().await.get::<Arc<[Pattern]>>(&cache_key).await {
-			return Ok(cached);
-		}
+		// Taken before the read, so a replace that commits meanwhile keeps this read's
+		// (possibly older) list out of the cache; see `DatabaseCache::generation`.
+		let generation = {
+			let cache = self.cache.lock().await;
+			if let Some(cached) = cache.get::<Arc<[Pattern]>>(&cache_key).await {
+				return Ok(cached);
+			}
+			cache.generation(&cache_key).await
+		};
 		let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
 		let conn: cache::Connection = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
 		drop(db);
@@ -1334,7 +1340,7 @@ impl Database {
 		let patterns: Arc<[Pattern]> = patterns.into();
 		// An empty list is not cached, as before: the dictionary may not be saved yet.
 		if !patterns.is_empty() {
-			self.cache.lock().await.store(&cache_key, Arc::clone(&patterns)).await;
+			self.cache.lock().await.store_if_generation(&cache_key, generation, Arc::clone(&patterns)).await;
 		}
 		Ok(patterns)
 	}
