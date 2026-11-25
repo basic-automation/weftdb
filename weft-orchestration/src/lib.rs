@@ -4068,8 +4068,10 @@ mod historical_memo_tests {
 						}
 					}
 					assert_eq!(run(&mut memo, c, &log, &event), expected, "seed {seed} step {step} correlation {index}");
+					drop(log);
 				}
 			}
+			drop(logs);
 		}
 	}
 }
