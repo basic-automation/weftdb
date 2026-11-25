@@ -9588,3 +9588,16 @@ the crate path.
 **Rejected.** Reusing one instance for every rep (it would time a cache, not TSBS's workload); TSBS's `--prewarm-queries` cold/warm pair (no cold hook is wired to this phase yet); timing the reference (it is the gate, not an engine).
 
 **Not decided here.** `lastpoint` reads every series' whole range, because `SegmentStore` has no per-series latest-row read (`read.rs` exposes range, point and downsample reads; `aspect_stats` has an aspect-wide time range only). TSBS's TimescaleDB `lastpoint` is a `LATERAL … ORDER BY time DESC LIMIT 1` per tag set. Whether WeftDB gets a latest-row read is an engine change and needs a benchmark behind it, so it is a ROADMAP sub-item, not part of this phase.
+
+## 2026-11-25 — What the per-series latest-row read returns, and how it finds the row (TAG-12, #341)
+
+**Ambiguous.** The sub-item asks for "a per-series latest-row read in `SegmentStore`" for TSBS `lastpoint`. It does not say whether a newer null at the latest instant is the answer or is skipped to the latest present value, how the row is located, or whether the read adds to the `weftdb` public surface while the freeze (#238) is open.
+
+**Chosen.**
+
+- **It equals the last row of `read_time_range_of` over the whole series**, a newer null included, so it returns `Option<(i64, Option<BigDecimal>)>`. A caller that wants the latest *present* value sees the null and decides. `TsbsWeft::lastpoint` treats a null as an error, since TSBS's `cpu` rows have no nulls.
+- **It reads `[MAX(max_ts), MAX(max_ts)]` through `read_time_range_of`**, so pruning, the windowed decode, newer-wins and the suspect-frame policy are the range read's own, not a second copy. If that instant reads empty, it reads the whole series, so a stale or skipped bound never changes the answer.
+- **Additive API during the freeze.** Two new methods; no existing signature changes. This follows the 2026-11-22 precedent for the ILP writer (#866).
+
+**Rejected.** (a) Decoding only the newest-sealed segment: an older segment can reach past it, and the mutant test fails that case. (b) The tail from the latest segment's *start*, `[MAX(min_ts), i64::MAX]`: correct, but it decodes a whole one-segment series, and the bench showed no gain there. (c) A resident last-value cache, as InfluxDB 3 has: a memory cost under ROB-14's budget, for a read the index already serves.
+

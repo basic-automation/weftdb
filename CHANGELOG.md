@@ -8,6 +8,15 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **`SegmentStore::read_latest_of` and `read_latest` (TAG-12, #341).** The latest row of one
+  series (or of series 0) and its value, equal to the last row of a whole-series
+  `read_time_range_of`, newer-wins across overlapping segments and a newer null included. It
+  reads only the series' latest instant instead of every row, and falls back to the whole
+  series if that instant reads empty. `weft-xbench`'s TSBS `lastpoint` now uses it. A new
+  `weftdb/benches/latest_read.rs` compares it with the whole-series read.
+
 ## [0.4.0] - 2026-11-23
 
 ### Documentation
