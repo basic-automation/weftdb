@@ -2514,6 +2514,16 @@ impl Database {
 	/// When the dictionary name cannot name a file, its database cannot be opened, or a
 	/// statement fails (the transaction is rolled back and the stored dictionary kept).
 	pub async fn replace_dictionary_patterns(&self, aspect_id: &AspectId, dictionary_name: &str, patterns: &[Pattern]) -> Result<TxId> {
+		let list_key = Self::dictionary_patterns_cache_key(aspect_id, dictionary_name);
+		// The cached list and its generation, taken before the transaction: the list the
+		// commit turns into `cached_after_save`, if no other writer intervenes.
+		let before = {
+			let cache = self.cache.lock().await;
+			let generation = cache.generation(&list_key).await;
+			let list = cache.get::<std::sync::Arc<[Pattern]>>(&list_key).await;
+			drop(cache);
+			list.map(|list| (generation, list))
+		};
 		let tx_id = legacy_metadata_write(async move {
 			let tx_id = TxId::new();
 			let aspect = self.get_aspect(aspect_id).await?;
@@ -2564,14 +2574,38 @@ impl Database {
 		})
 		.await?;
 
-		// Readers cache the dictionary and each pattern; what they hold is now stale.
+		// Readers cache the dictionary and each pattern; what they hold is now stale. The
+		// list is replaced by what the file now holds rather than dropped: a pipeline saves
+		// its dictionary on every run and reads it on the next, and the pattern tables have
+		// no index, so a dropped list cost a scan of the whole file per run. That is O(file)
+		// reads per run and quadratic over a dictionary's life, and once the file outgrew the
+		// connection's page cache it all came from disk.
+		let after = before.and_then(|(generation, list)| Self::cached_after_save(&list, patterns).map(|after| (generation, after)));
 		let cache = self.cache.lock().await;
-		cache.invalidate_generation(&Self::dictionary_patterns_cache_key(aspect_id, dictionary_name)).await;
+		if let Some((generation, after)) = after {
+			cache.replace_if_generation(&list_key, generation, after).await;
+		} else {
+			cache.invalidate_generation(&list_key).await;
+		}
 		for pattern in patterns {
 			cache.invalidate(&format!("pattern_{}", pattern.id().as_uuid())).await;
 		}
 		drop(cache);
 		Ok(tx_id)
+	}
+
+	/// The pattern list a dictionary file holds after
+	/// [`replace_dictionary_patterns`](Self::replace_dictionary_patterns) wrote `saved` over
+	/// a file that held `stored`, in the order a fresh read returns it: the stored patterns
+	/// not in `saved` keep their place, and `saved` follows (its rows were deleted and
+	/// inserted again, after every kept row). `None` when `saved` names an id twice: the
+	/// file then holds one pattern built from both copies' rows, which only a read rebuilds.
+	fn cached_after_save(stored: &[Pattern], saved: &[Pattern]) -> Option<std::sync::Arc<[Pattern]>> {
+		let mut ids = std::collections::HashSet::with_capacity(saved.len());
+		if !saved.iter().all(|p| ids.insert(p.id())) {
+			return None;
+		}
+		Some(stored.iter().filter(|p| !ids.contains(&p.id())).chain(saved).cloned().collect())
 	}
 
 	/// The cache key of an aspect's dictionary's pattern list. Every aspect can have a

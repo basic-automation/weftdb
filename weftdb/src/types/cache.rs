@@ -523,6 +523,28 @@ impl DatabaseCache {
 		true
 	}
 
+	/// A writer's [`invalidate_generation`](Self::invalidate_generation) that also caches
+	/// the value it committed, when it can vouch for it: `value` is stored only if no
+	/// other writer invalidated `cache_key` since the writer took `generation` (before its
+	/// transaction). Either way the generation moves on, so a reader whose snapshot
+	/// predates the commit still does not store, and a writer that committed meanwhile
+	/// and has yet to invalidate removes this value when it does. Returns whether `value`
+	/// was stored (a value heavier than the whole byte budget is still left out).
+	pub async fn replace_if_generation<T: Cacheable>(&self, cache_key: &str, generation: u64, value: T) -> bool {
+		let mut cache = self.cache.write().await;
+		let mut generations = self.generations.write().await;
+		let current = generations.entry(cache_key.to_string()).or_insert(0);
+		let unchanged = *current == generation;
+		*current = current.wrapping_add(1);
+		drop(generations);
+		cache.remove(cache_key);
+		if unchanged {
+			self.insert(&mut cache, cache_key, Box::new(value));
+		}
+		drop(cache);
+		unchanged
+	}
+
 	fn evict_lru(cache: &mut Entries) {
 		let evict_count = cache.map.len() / 10;
 		if evict_count == 0 {
@@ -570,6 +592,25 @@ mod tests {
 		assert!(cache.store_if_generation("key", next, "new".to_string()).await, "a reader after the write stores");
 		assert_eq!(cache.get::<String>("key").await.as_deref(), Some("new"));
 		assert!(cache.store_if_generation("other", cache.generation("other").await, "x".to_string()).await, "a key never invalidated is at generation 0");
+	}
+
+	/// A writer caches what it committed only when no other writer invalidated the key
+	/// since it began, and in both cases a reader from before the commit cannot store.
+	#[tokio::test]
+	async fn a_writer_caches_its_value_only_from_an_unchanged_generation() {
+		let cache = DatabaseCache::new();
+		let writer = cache.generation("key").await;
+		let reader = cache.generation("key").await;
+		assert!(cache.replace_if_generation("key", writer, "mine".to_string()).await);
+		assert_eq!(cache.get::<String>("key").await.as_deref(), Some("mine"));
+		assert!(!cache.store_if_generation("key", reader, "old".to_string()).await, "a reader from before the commit stored");
+		assert_eq!(cache.get::<String>("key").await.as_deref(), Some("mine"));
+
+		let slow = cache.generation("key").await;
+		cache.invalidate_generation("key").await; // another writer
+		assert!(!cache.replace_if_generation("key", slow, "stale".to_string()).await);
+		assert_eq!(cache.get::<String>("key").await, None, "a writer that raced another cached its value");
+		assert_eq!(cache.generation("key").await, slow.wrapping_add(2), "the replace did not move the generation on");
 	}
 
 	/// A value that says how heavy it is.
