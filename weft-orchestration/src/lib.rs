@@ -1409,10 +1409,14 @@ fn process_correlation_signals(signals: &mut Signals, correlation: &weftdb::Corr
 
 	if let Some(event) = events.iter().find(|e| e.id() == correlation.event_id()) {
 		generated.observe(event);
-		let watermark = match generated.correlations.insert(correlation.id().clone(), (occurrences.len(), generated.next_version)) {
-			Some((count, watermark)) if count == occurrences.len() => watermark,
+		// The new record is written only once every pair below has been generated: a
+		// failure part way through must leave the remaining pairs to be generated next run,
+		// not mark them done under the new watermark.
+		let watermark = match generated.correlations.get(correlation.id()) {
+			Some(&(count, watermark)) if count == occurrences.len() => watermark,
 			_ => 0,
 		};
+		let record = (occurrences.len(), generated.next_version);
 		let versions = generated.spans.get(event.id());
 		// For each manifestation of the event, create signals based on pattern occurrences
 		for manifestation in event.manifestations().values() {
@@ -1449,6 +1453,7 @@ fn process_correlation_signals(signals: &mut Signals, correlation: &weftdb::Corr
 				}
 			}
 		}
+		generated.correlations.insert(correlation.id().clone(), record);
 
 		// Forward-looking signals: use minimum historical distance
 		let latest_manifestation = event.manifestations().values().map(|m| *m.end()).max();
@@ -3994,5 +3999,77 @@ mod historical_memo_tests {
 		// A change of the correlation's occurrences regenerates every pair, as before.
 		let grown: OccurrenceLog = vec![occurrence(), occurrence()].into();
 		assert_eq!(run(&mut memo, &c, &grown, &event), 18);
+	}
+
+	/// Differential check against the per-pair memo this replaced: over a random history of
+	/// new, widened, re-added and removed manifestations, growing occurrence logs and
+	/// correlations skipped on some runs, both generate exactly the same pairs. Spans never
+	/// return to an earlier value here, the one documented divergence.
+	#[test]
+	fn matches_the_per_pair_memo() {
+		type Basis = (usize, DateTime<Utc>, DateTime<Utc>);
+		for seed in 1..=20u64 {
+			let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+			let mut next = move |bound: u64| {
+				state ^= state << 13;
+				state ^= state >> 7;
+				state ^= state << 17;
+				state % bound
+			};
+			let dataset = uuid::Uuid::new_v4();
+			let mut event = Event::new(None, "crossing".into(), None, None);
+			let correlations: Vec<Correlation> = (0..3).map(|_| correlation(&event)).collect();
+			let mut logs: Vec<Vec<Occurrence>> = correlations.iter().map(|_| vec![occurrence()]).collect();
+			let mut memo = GeneratedHistorical::default();
+			let mut per_pair: HashMap<(weftdb::CorrelationID, ManifestationId), Basis> = HashMap::new();
+			let mut end = 1_000i64;
+			for step in 0..200 {
+				match next(5) {
+					0 | 1 => {
+						end += 1;
+						let start = i64::try_from(next(500)).expect("small");
+						add(&mut event, dataset, start, end);
+					}
+					2 => {
+						let ids: Vec<ManifestationId> = event.manifestations().keys().cloned().collect();
+						if !ids.is_empty() {
+							let id = ids[usize::try_from(next(u64::try_from(ids.len()).expect("small"))).expect("small")].clone();
+							let start = *event.manifestations()[&id].start();
+							end += 1;
+							let mut manifestations = event.manifestations().clone();
+							manifestations.insert(id.clone(), Manifestation::with_id(id, dataset, start, at(end)));
+							event.set_manifestations(manifestations);
+						}
+					}
+					3 => {
+						let ids: Vec<ManifestationId> = event.manifestations().keys().cloned().collect();
+						if !ids.is_empty() {
+							let id = ids[usize::try_from(next(u64::try_from(ids.len()).expect("small"))).expect("small")].clone();
+							let mut manifestations = event.manifestations().clone();
+							manifestations.remove(&id);
+							event.set_manifestations(manifestations);
+						}
+					}
+					_ => {
+						let which = usize::try_from(next(u64::try_from(logs.len()).expect("small"))).expect("small");
+						logs[which].push(occurrence());
+					}
+				}
+				for (index, c) in correlations.iter().enumerate() {
+					if next(4) == 0 {
+						continue; // unresolved this run
+					}
+					let log: OccurrenceLog = logs[index].clone().into();
+					let mut expected = 0usize;
+					for manifestation in event.manifestations().values() {
+						let basis = (log.len(), *manifestation.start(), *manifestation.end());
+						if per_pair.insert((c.id().clone(), manifestation.id().clone()), basis) != Some(basis) {
+							expected += 3 * log.len();
+						}
+					}
+					assert_eq!(run(&mut memo, c, &log, &event), expected, "seed {seed} step {step} correlation {index}");
+				}
+			}
+		}
 	}
 }
