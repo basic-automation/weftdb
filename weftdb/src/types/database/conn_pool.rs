@@ -30,6 +30,33 @@ use std::{
 /// `WEFT_POOL_MAX_IDLE` overrides it; `0` turns pooling off.
 const DEFAULT_MAX_IDLE: usize = 4;
 
+/// Page cache each new connection gets by default, in KiB (`PRAGMA cache_size=-2048`, 512
+/// pages of 4 KiB). Turso 0.8.1 gives every connection its own page cache of 2000 pages
+/// (8 MB at 4 KiB pages), and with up to [`DEFAULT_MAX_IDLE`] idle connections per file and
+/// role across a few hundred files, those caches were the largest heap growth in the fanctl
+/// soak. A small cache only costs rereads of pages the OS page cache still holds.
+/// `WEFT_CONN_CACHE_KIB` overrides it; Turso keeps at least 200 pages whatever is asked.
+const DEFAULT_CONN_CACHE_KIB: u32 = 2048;
+
+static CONN_CACHE_KIB: LazyLock<u32> = LazyLock::new(|| std::env::var("WEFT_CONN_CACHE_KIB").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_CONN_CACHE_KIB));
+
+/// A new connection to `db` with its page cache cut to [`CONN_CACHE_KIB`]. `cache_size` is
+/// per connection, so it has to be set on each one. Failing to set it keeps Turso's default
+/// cache rather than failing the caller.
+async fn connect(db: &turso::Database) -> turso::Result<turso::Connection> {
+	let conn = db.connect()?;
+	// A query, drained, rather than `execute`, in case the pragma answers with a row.
+	let set = async {
+		let mut rows = conn.query(format!("PRAGMA cache_size=-{}", *CONN_CACHE_KIB), ()).await?;
+		while rows.next().await?.is_some() {}
+		turso::Result::Ok(())
+	};
+	if let Err(e) = set.await {
+		tracing::debug!("[conn_pool] PRAGMA cache_size failed, keeping Turso's default: {e}");
+	}
+	Ok(conn)
+}
+
 static MAX_IDLE: LazyLock<usize> = LazyLock::new(|| std::env::var("WEFT_POOL_MAX_IDLE").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_MAX_IDLE));
 
 pub struct Pool {
@@ -140,14 +167,16 @@ pub fn unregister(db: &turso::Database, role: Role) {
 /// A `role` connection to `db`: an idle pooled one when there is one, otherwise a new one.
 /// The pool comes back with it when `db` is pooled for `role`, so the connection can be
 /// returned to it.
-pub fn checkout(db: &turso::Database, role: Role) -> turso::Result<(turso::Connection, Option<Arc<Pool>>)> {
+///
+/// A new connection gets the page cache size [`CONN_CACHE_KIB`] asks for.
+pub async fn checkout(db: &turso::Database, role: Role) -> turso::Result<(turso::Connection, Option<Arc<Pool>>)> {
 	let pool = POOLS.lock().unwrap_or_else(PoisonError::into_inner).get(&(identity(db), role)).map(|(_, pool)| pool.clone());
-	let Some(pool) = pool else { return Ok((db.connect()?, None)) };
+	let Some(pool) = pool else { return Ok((connect(db).await?, None)) };
 	pool.last_checkout.store(stamp(std::time::Instant::now()), std::sync::atomic::Ordering::Relaxed);
 	let idle = pool.idle.lock().unwrap_or_else(PoisonError::into_inner).pop();
 	let conn = match idle {
 		Some(conn) => conn,
-		None => db.connect()?,
+		None => connect(db).await?,
 	};
 	Ok((conn, Some(pool)))
 }
@@ -162,6 +191,17 @@ pub fn idle_count(db: &turso::Database, role: Role) -> Option<usize> {
 mod tests {
 	use super::*;
 	use crate::{cache, database::traits::Connection as _, Database};
+
+	#[tokio::test]
+	async fn a_new_connection_gets_the_small_page_cache() {
+		let dir = tempfile::tempdir().expect("a temp dir");
+		let db = turso::Builder::new_local(dir.path().join("c.db").to_str().expect("utf-8")).build().await.expect("opens");
+		let (conn, pool) = checkout(&db, Role::Legacy).await.expect("connects");
+		assert!(pool.is_none(), "an unregistered database is not pooled");
+		let mut rows = conn.query("PRAGMA cache_size", ()).await.expect("queries");
+		let row = rows.next().await.expect("reads").expect("a row");
+		assert_eq!(row.get::<i64>(0).expect("an integer"), -i64::from(*CONN_CACHE_KIB), "the pragma reached the connection");
+	}
 
 	#[tokio::test]
 	async fn a_finished_transaction_returns_its_connection_and_an_open_one_does_not() {
