@@ -1,5 +1,5 @@
 use std::{
-	any::Any, collections::HashMap, fmt::Debug, sync::Arc, time::{Duration, Instant}
+	any::Any, collections::HashMap, fmt::Debug, sync::{Arc, LazyLock}, time::{Duration, Instant}
 };
 
 use bigdecimal::BigDecimal;
@@ -110,6 +110,20 @@ impl Drop for Connection {
 pub trait Cacheable: Send + Sync + 'static {
 	fn as_any(&self) -> &dyn Any;
 	fn clone_box(&self) -> Box<dyn Cacheable>;
+
+	/// Roughly how many bytes the value holds, which [`DatabaseCache`] charges against
+	/// its byte budget. Small fixed-size values keep the default.
+	fn weight(&self) -> usize {
+		SMALL_ENTRY_WEIGHT
+	}
+}
+
+/// What a small value without its own [`Cacheable::weight`] is charged.
+const SMALL_ENTRY_WEIGHT: usize = 256;
+
+/// The bytes a list of `len` `T`s holds, before anything its items point to.
+const fn list_weight<T>(len: usize) -> usize {
+	SMALL_ENTRY_WEIGHT + len * std::mem::size_of::<T>()
 }
 
 // Implement Cacheable for your types
@@ -120,6 +134,10 @@ impl Cacheable for Vec<Measurement> {
 
 	fn clone_box(&self) -> Box<dyn Cacheable> {
 		Box::new(self.clone())
+	}
+
+	fn weight(&self) -> usize {
+		list_weight::<Measurement>(self.len())
 	}
 }
 
@@ -140,6 +158,10 @@ impl Cacheable for Vec<Batch> {
 
 	fn clone_box(&self) -> Box<dyn Cacheable> {
 		Box::new(self.clone())
+	}
+
+	fn weight(&self) -> usize {
+		list_weight::<Batch>(self.len())
 	}
 }
 
@@ -201,6 +223,10 @@ impl Cacheable for Vec<Event> {
 	fn clone_box(&self) -> Box<dyn Cacheable> {
 		Box::new(self.clone())
 	}
+
+	fn weight(&self) -> usize {
+		list_weight::<Event>(self.len())
+	}
 }
 
 impl Cacheable for Pattern {
@@ -210,6 +236,10 @@ impl Cacheable for Pattern {
 
 	fn clone_box(&self) -> Box<dyn Cacheable> {
 		Box::new(self.clone())
+	}
+
+	fn weight(&self) -> usize {
+		self.approx_heap_bytes()
 	}
 }
 
@@ -221,6 +251,10 @@ impl Cacheable for Vec<Pattern> {
 	fn clone_box(&self) -> Box<dyn Cacheable> {
 		Box::new(self.clone())
 	}
+
+	fn weight(&self) -> usize {
+		SMALL_ENTRY_WEIGHT + self.iter().map(Pattern::approx_heap_bytes).sum::<usize>()
+	}
 }
 
 impl Cacheable for Arc<[Pattern]> {
@@ -230,6 +264,10 @@ impl Cacheable for Arc<[Pattern]> {
 
 	fn clone_box(&self) -> Box<dyn Cacheable> {
 		Box::new(Self::clone(self))
+	}
+
+	fn weight(&self) -> usize {
+		SMALL_ENTRY_WEIGHT + self.iter().map(Pattern::approx_heap_bytes).sum::<usize>()
 	}
 }
 
@@ -251,6 +289,10 @@ impl Cacheable for Vec<crate::Correlation> {
 	fn clone_box(&self) -> Box<dyn Cacheable> {
 		Box::new(self.clone())
 	}
+
+	fn weight(&self) -> usize {
+		list_weight::<crate::Correlation>(self.len())
+	}
 }
 
 impl Cacheable for crate::DictionaryMetadata {
@@ -271,11 +313,17 @@ impl Cacheable for Vec<crate::DictionaryMetadata> {
 	fn clone_box(&self) -> Box<dyn Cacheable> {
 		Box::new(self.clone())
 	}
+
+	fn weight(&self) -> usize {
+		list_weight::<crate::DictionaryMetadata>(self.len())
+	}
 }
 
 // Internal trait object wrapper
 struct CacheableEntry {
 	data: Box<dyn Cacheable>,
+	/// `data.weight()` when it was stored, so removing it gives back what it was charged.
+	weight: usize,
 	created_at: Instant,
 	access_count: u64,
 	last_accessed: Instant,
@@ -283,14 +331,15 @@ struct CacheableEntry {
 
 impl Debug for CacheableEntry {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("CacheableEntry").field("created_at", &self.created_at).field("access_count", &self.access_count).field("last_accessed", &self.last_accessed).finish_non_exhaustive()
+		f.debug_struct("CacheableEntry").field("weight", &self.weight).field("created_at", &self.created_at).field("access_count", &self.access_count).field("last_accessed", &self.last_accessed).finish_non_exhaustive()
 	}
 }
 
 impl CacheableEntry {
 	fn new(data: Box<dyn Cacheable>) -> Self {
 		let now = Instant::now();
-		Self { data, created_at: now, access_count: 1, last_accessed: now }
+		let weight = data.weight();
+		Self { data, weight, created_at: now, access_count: 1, last_accessed: now }
 	}
 
 	fn access(&mut self) -> &dyn Cacheable {
@@ -304,21 +353,68 @@ impl CacheableEntry {
 	}
 }
 
+/// The entries and the bytes they are charged, kept together under one lock.
+#[derive(Debug, Default)]
+struct Entries {
+	map: HashMap<String, CacheableEntry>,
+	bytes: usize,
+}
+
+impl Entries {
+	fn remove(&mut self, key: &str) {
+		if let Some(entry) = self.map.remove(key) {
+			self.bytes -= entry.weight;
+		}
+	}
+
+	fn retain_unexpired(&mut self, ttl: Duration) {
+		let mut freed = 0;
+		self.map.retain(|_, entry| {
+			let keep = !entry.is_expired(ttl);
+			if !keep {
+				freed += entry.weight;
+			}
+			keep
+		});
+		self.bytes -= freed;
+	}
+}
+
+/// The default byte budget of a [`DatabaseCache`], in MiB; `WEFT_CACHE_MAX_MB` overrides it.
+const DEFAULT_CACHE_MAX_MB: usize = 256;
+
+static CACHE_MAX_BYTES: LazyLock<usize> = LazyLock::new(|| std::env::var("WEFT_CACHE_MAX_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(DEFAULT_CACHE_MAX_MB).saturating_mul(1024 * 1024));
+
+/// Values read back from a database, kept for a while so the next read skips the query.
+///
+/// Bounded three ways: by entry count, by the bytes the entries hold
+/// ([`Cacheable::weight`], at most `WEFT_CACHE_MAX_MB`), and by age. Every store first
+/// drops expired entries, then the least recently used ones until the new value fits; a
+/// value heavier than the whole budget is not cached at all. A dictionary's pattern list
+/// with every occurrence log is the heavy case: it is a copy of what is on disk, so
+/// leaving it out only costs a reread.
 #[derive(Debug)]
 pub struct DatabaseCache {
-	cache: Arc<RwLock<HashMap<String, CacheableEntry>>>,
+	cache: Arc<RwLock<Entries>>,
 	/// How many times each key was invalidated through
 	/// [`invalidate_generation`](Self::invalidate_generation); see
 	/// [`generation`](Self::generation). Only keys a writer replaces have one, so it stays
 	/// small. Always locked after `cache`, never before.
 	generations: Arc<RwLock<HashMap<String, u64>>>,
 	max_entries: usize,
+	max_bytes: usize,
 	ttl: Duration,
 }
 
 impl DatabaseCache {
 	#[must_use]
 	pub fn new() -> Self {
+		Self::with_max_bytes(*CACHE_MAX_BYTES)
+	}
+
+	/// A cache holding at most `max_bytes` of values (by [`Cacheable::weight`]).
+	#[must_use]
+	pub fn with_max_bytes(max_bytes: usize) -> Self {
 		// Memory only: `System::new_all` also walks every process and thread in `/proc`,
 		// and a database is opened once per `analyze_range` chunk, so that walk ran for
 		// every chunk an analytics pipeline read (#145).
@@ -329,7 +425,12 @@ impl DatabaseCache {
 		let adjusted_max_entries = available_gb * 100;
 		let ttl = Duration::from_secs(600);
 
-		Self { cache: Arc::new(RwLock::new(HashMap::new())), generations: Arc::new(RwLock::new(HashMap::new())), max_entries: adjusted_max_entries, ttl }
+		Self { cache: Arc::new(RwLock::new(Entries::default())), generations: Arc::new(RwLock::new(HashMap::new())), max_entries: adjusted_max_entries, max_bytes, ttl }
+	}
+
+	/// The bytes the cached values are charged.
+	pub async fn bytes(&self) -> usize {
+		self.cache.read().await.bytes
 	}
 
 	/// Get a value from cache with type checking
@@ -337,7 +438,7 @@ impl DatabaseCache {
 		let mut cache = self.cache.write().await;
 
 		// Check if entry exists and is expired
-		let is_expired = cache.get(cache_key).is_some_and(|entry| entry.is_expired(self.ttl));
+		let is_expired = cache.map.get(cache_key).is_some_and(|entry| entry.is_expired(self.ttl));
 
 		if is_expired {
 			cache.remove(cache_key);
@@ -345,7 +446,7 @@ impl DatabaseCache {
 		}
 
 		// Access and return the entry if it exists
-		cache.get_mut(cache_key).and_then(|entry| {
+		cache.map.get_mut(cache_key).and_then(|entry| {
 			let data = entry.access();
 			data.as_any().downcast_ref::<T>().cloned()
 		})
@@ -354,12 +455,32 @@ impl DatabaseCache {
 	/// Store a value in cache
 	pub async fn store<T: Cacheable>(&self, cache_key: &str, value: T) {
 		let mut cache = self.cache.write().await;
+		self.insert(&mut cache, cache_key, Box::new(value));
+	}
 
-		if cache.len() >= self.max_entries {
-			Self::evict_lru(&mut cache);
+	/// Put `value` under `cache_key`, making room for it first; see [`DatabaseCache`].
+	fn insert(&self, cache: &mut Entries, cache_key: &str, value: Box<dyn Cacheable>) {
+		cache.remove(cache_key);
+		cache.retain_unexpired(self.ttl);
+		let entry = CacheableEntry::new(value);
+		if entry.weight > self.max_bytes {
+			return;
 		}
-
-		cache.insert(cache_key.to_string(), CacheableEntry::new(Box::new(value)));
+		if cache.map.len() >= self.max_entries {
+			Self::evict_lru(cache);
+		}
+		if cache.bytes + entry.weight > self.max_bytes {
+			let mut by_age: Vec<(Instant, String)> = cache.map.iter().map(|(k, e)| (e.last_accessed, k.clone())).collect();
+			by_age.sort_unstable();
+			for (_, key) in by_age {
+				if cache.bytes + entry.weight <= self.max_bytes {
+					break;
+				}
+				cache.remove(&key);
+			}
+		}
+		cache.bytes += entry.weight;
+		cache.map.insert(cache_key.to_string(), entry);
 	}
 
 	pub async fn invalidate(&self, cache_key: &str) {
@@ -397,20 +518,17 @@ impl DatabaseCache {
 		if self.generations.read().await.get(cache_key).copied().unwrap_or(0) != generation {
 			return false;
 		}
-		if cache.len() >= self.max_entries {
-			Self::evict_lru(&mut cache);
-		}
-		cache.insert(cache_key.to_string(), CacheableEntry::new(Box::new(value)));
+		self.insert(&mut cache, cache_key, Box::new(value));
 		true
 	}
 
-	fn evict_lru(cache: &mut HashMap<String, CacheableEntry>) {
-		let evict_count = cache.len() / 10;
+	fn evict_lru(cache: &mut Entries) {
+		let evict_count = cache.map.len() / 10;
 		if evict_count == 0 {
 			return;
 		}
 
-		let mut entries: Vec<(String, Instant)> = cache.iter().map(|(k, entry)| (k.clone(), entry.last_accessed)).collect();
+		let mut entries: Vec<(String, Instant)> = cache.map.iter().map(|(k, entry)| (k.clone(), entry.last_accessed)).collect();
 		entries.sort_by_key(|&(_, time)| time);
 
 		for (key, _) in entries.into_iter().take(evict_count) {
@@ -419,8 +537,7 @@ impl DatabaseCache {
 	}
 
 	pub async fn cleanup_expired(&self) {
-		let mut cache = self.cache.write().await;
-		cache.retain(|_, entry| !entry.is_expired(self.ttl));
+		self.cache.write().await.retain_unexpired(self.ttl);
 	}
 }
 
@@ -452,5 +569,52 @@ mod tests {
 		assert!(cache.store_if_generation("key", next, "new".to_string()).await, "a reader after the write stores");
 		assert_eq!(cache.get::<String>("key").await.as_deref(), Some("new"));
 		assert!(cache.store_if_generation("other", cache.generation("other").await, "x".to_string()).await, "a key never invalidated is at generation 0");
+	}
+
+	/// A value that says how heavy it is.
+	#[derive(Clone)]
+	struct Blob(usize);
+
+	impl Cacheable for Blob {
+		fn as_any(&self) -> &dyn Any {
+			self
+		}
+
+		fn clone_box(&self) -> Box<dyn Cacheable> {
+			Box::new(self.clone())
+		}
+
+		fn weight(&self) -> usize {
+			self.0
+		}
+	}
+
+	/// Values are charged by their weight; storing past the byte budget evicts the least
+	/// recently used values, and one heavier than the whole budget is not kept.
+	#[tokio::test]
+	async fn the_byte_budget_evicts_least_recently_used_values() {
+		let cache = DatabaseCache::with_max_bytes(300);
+		cache.store("a", Blob(100)).await;
+		cache.store("b", Blob(100)).await;
+		cache.store("c", Blob(100)).await;
+		assert_eq!(cache.bytes().await, 300);
+		assert!(cache.get::<Blob>("a").await.is_some(), "touch a so b is the oldest");
+		cache.store("d", Blob(100)).await;
+		assert!(cache.get::<Blob>("b").await.is_none(), "b was evicted");
+		for key in ["a", "c", "d"] {
+			assert!(cache.get::<Blob>(key).await.is_some(), "{key} stays");
+		}
+		assert_eq!(cache.bytes().await, 300);
+
+		cache.store("huge", Blob(301)).await;
+		assert!(cache.get::<Blob>("huge").await.is_none(), "a value over the budget is not cached");
+		assert_eq!(cache.bytes().await, 300, "nor does it evict anything");
+
+		cache.store("a", Blob(10)).await;
+		cache.invalidate("c").await;
+		assert_eq!(cache.bytes().await, 110, "replacing and invalidating give back what they were charged");
+		cache.store("e", Blob(250)).await;
+		assert!(cache.get::<Blob>("e").await.is_some());
+		assert!(cache.bytes().await <= 300, "older values made room for e");
 	}
 }

@@ -2074,6 +2074,37 @@ mod tests {
 			drop(db);
 			Ok(())
 		}
+
+		/// A dictionary heavier than the cache's byte budget is not kept resident: every
+		/// read loads it again from disk, and the patterns are the same as a cached read's.
+		#[tokio::test]
+		#[serial_test::serial]
+		async fn a_dictionary_over_the_cache_budget_is_reread_unchanged() -> anyhow::Result<()> {
+			crate::types::database::config::use_temp_data_dir();
+			let name = format!("dictionary_budget_{}", uuid::Uuid::new_v4().simple());
+			let db = Database::new(&name).await?;
+			let subject = db.observe_subject("s").await?;
+			let aspect = db.track_aspect(&subject.id(), "a", &splimes::Resolution::Seconds, None).await?;
+			let aspect_id = aspect.id();
+			aspect.new_dictionary("d", "", &DictionaryConstraints::default()).await?;
+			drop(aspect);
+			let saved: Vec<Pattern> = (0..3).map(|_| pattern(aspect_id)).collect();
+			db.replace_dictionary_patterns(&aspect_id, "d", &saved).await?;
+			let cached = db.dictionary_patterns_shared(&aspect_id, "d").await?;
+
+			let list_weight = crate::Cacheable::weight(&cached);
+			*db.cache.lock().await = crate::DatabaseCache::with_max_bytes(list_weight - 1);
+			let first = db.dictionary_patterns_shared(&aspect_id, "d").await?;
+			let second = db.dictionary_patterns_shared(&aspect_id, "d").await?;
+			assert!(!std::sync::Arc::ptr_eq(&first, &second), "the list was cached over budget");
+			assert!(db.cache.lock().await.bytes().await < list_weight, "the list is not resident");
+			assert_eq!(&*first, &*cached);
+			assert_eq!(&*second, &*cached);
+			drop((cached, first, second));
+			db.close().await?;
+			drop(db);
+			Ok(())
+		}
 	}
 
 	mod correlation_reads {
