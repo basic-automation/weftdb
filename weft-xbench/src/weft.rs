@@ -281,6 +281,39 @@ impl TsbsWeft {
 		Ok(rows)
 	}
 
+	/// [`tsbs::TsbsCpu::groupby_orderby_limit`]'s question, answered by the store: every host's
+	/// per-minute MAX of `usage_user` from `downsample_range_of`, merged across the hosts, the
+	/// [`tsbs::ORDERBY_LIMIT`] latest buckets before `end_ns`, newest first.
+	///
+	/// The query has no lower bound. It first reduces only the [`tsbs::ORDERBY_LIMIT`] minutes
+	/// before `end_ns`, and doubles the reach while fewer buckets than that come back, until it
+	/// reaches the aspect's first stored instant (`aspect_metadata`'s time range); any bucket
+	/// outside the reach is older than every bucket in it, so the answer is the same as reducing
+	/// everything before `end_ns`.
+	///
+	/// # Errors
+	///
+	/// If the store fails.
+	pub async fn groupby_orderby_limit(&self, end_ns: i64) -> anyhow::Result<Vec<tsbs::MinuteMax>> {
+		let minute = 60_000_000_000_i64;
+		let user = Self::aspect(tsbs::CPU_METRICS[0]);
+		let Some((first_ns, _)) = self.store()?.aspect_metadata(&user).await?.time_range else { return Ok(Vec::new()) };
+		if end_ns <= first_ns {
+			return Ok(Vec::new());
+		}
+		let last_minute = (end_ns - 1).div_euclid(minute) * minute;
+		let hosts: Vec<&str> = self.hosts.iter().map(String::as_str).collect();
+		let mut reach = i64::try_from(tsbs::ORDERBY_LIMIT).unwrap_or(i64::MAX).saturating_sub(1);
+		loop {
+			let start = reach.checked_mul(minute).and_then(|back| last_minute.checked_sub(back)).map_or(first_ns, |lo| lo.max(first_ns));
+			let buckets = self.bucket_max(1, &hosts, start, end_ns, Resolution::Minutes).await?;
+			if buckets.len() >= tsbs::ORDERBY_LIMIT || start == first_ns {
+				return Ok(buckets.into_iter().rev().take(tsbs::ORDERBY_LIMIT).map(|(minute_ns, max)| tsbs::MinuteMax { minute_ns, max }).collect());
+			}
+			reach = reach.saturating_mul(2);
+		}
+	}
+
 	/// The MAX of each of the first `metrics` fields over `hosts` in `[start_ns, end_ns)`, per
 	/// `resolution` bucket, keyed by bucket start in nanoseconds.
 	async fn bucket_max(&self, metrics: usize, hosts: &[&str], start_ns: i64, end_ns: i64, resolution: Resolution) -> anyhow::Result<BTreeMap<i64, Vec<i64>>> {
@@ -350,6 +383,7 @@ impl TsbsWeft {
 				let hosts: Vec<&str> = instance.hosts.iter().map(String::as_str).collect();
 				Ok(tsbs::TsbsAnswer::Readings(self.high_cpu(&hosts, instance.start_ns, instance.end_ns).await?))
 			}
+			tsbs::TsbsQuery::GroupbyOrderbyLimit => Ok(tsbs::TsbsAnswer::Minutes(self.groupby_orderby_limit(instance.end_ns).await?)),
 			tsbs::TsbsQuery::Lastpoint => Ok(tsbs::TsbsAnswer::Latest(self.lastpoint().await?)),
 		}
 	}
@@ -555,6 +589,16 @@ mod tests {
 					assert_eq!(want.len(), 2, "{}: the generated two hours are two hourly buckets", query.name());
 					assert_eq!(weft.cpu_max_all(named, start, end).await.expect("store"), want, "{}", query.name());
 				}
+				tsbs::TsbsQuery::GroupbyOrderbyLimit => {
+					// Inside a minute, in the middle, at the generated end, and before the first
+					// five minutes are complete (the reach has to widen to the data's start).
+					for end in [t0 + 3_600_000_000_000 + 25_000_000_000, t0 + 7_200_000_000_000, t0 + 7_200_000_000_000 + 600_000_000_000, t0 + 150_000_000_000, t0 + 1] {
+						let want = cpu.groupby_orderby_limit(end);
+						assert_eq!(weft.groupby_orderby_limit(end).await.expect("store"), want, "end {end}");
+					}
+					assert_eq!(cpu.groupby_orderby_limit(t0 + 7_200_000_000_000).len(), 5);
+					assert_eq!(cpu.groupby_orderby_limit(t0 + 150_000_000_000).len(), 3, "minutes 0, 1 and part of 2");
+				}
 				tsbs::TsbsQuery::HighCpu { hosts, .. } => {
 					// The generated two hours, cut inside a reading's ten seconds at both ends;
 					// `high-cpu-all` names every host.
@@ -571,6 +615,23 @@ mod tests {
 				}
 			}
 		}
+	}
+
+	#[tokio::test]
+	async fn groupby_orderby_limit_reaches_past_a_gap_to_five_minutes() {
+		let t0 = 1_451_606_400_000_000_000_i64;
+		let minute = 60_000_000_000_i64;
+		let mut cpu = tsbs::TsbsCpu::default();
+		// Minutes 0 to 5, then nothing until minute 200: the five latest buckets before minute
+		// 201 are 200, 5, 4, 3 and 2, so the first five-minute reach finds one and has to widen.
+		let at = |m: i64, v: i64| tsbs::CpuReading { ts_ns: t0 + m * minute, values: [v; 10] };
+		cpu.hosts.insert("host_0".into(), (0..6).map(|m| at(m, m)).chain([at(200, 7)]).collect());
+		cpu.hosts.insert("host_1".into(), vec![at(3, 50)]);
+		let weft = TsbsWeft::load(&cpu).await.expect("loads");
+		let want = cpu.groupby_orderby_limit(t0 + 201 * minute);
+		assert_eq!(want.iter().map(|r| ((r.minute_ns - t0) / minute, r.max[0])).collect::<Vec<_>>(), [(200, 7), (5, 5), (4, 4), (3, 50), (2, 2)]);
+		assert_eq!(weft.groupby_orderby_limit(t0 + 201 * minute).await.expect("store"), want);
+		assert_eq!(weft.groupby_orderby_limit(t0).await.expect("store"), cpu.groupby_orderby_limit(t0), "nothing before the first instant");
 	}
 
 	#[tokio::test]
