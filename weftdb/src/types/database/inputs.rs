@@ -3213,8 +3213,37 @@ static QUEUE_CONSUMERS: std::sync::LazyLock<tokio::sync::Mutex<std::collections:
 /// When the last background prune of unread queues started.
 static LAST_UNREAD_QUEUE_PRUNE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
-/// How often a long-running ingest prunes the queues of aspects no pipeline reads.
+/// How often a long-running ingest prunes the queues of aspects no pipeline reads, unless
+/// [`UNREAD_QUEUE_PRUNE_ENV`] sets another interval.
 pub const UNREAD_QUEUE_PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The environment variable that sets, in whole seconds, how often a long-running ingest
+/// prunes unread queues. Unset, zero or not a number: [`UNREAD_QUEUE_PRUNE_EVERY`].
+const UNREAD_QUEUE_PRUNE_ENV: &str = "WEFT_UNREAD_PRUNE_SECS";
+
+/// The most queue entries one prune transaction deletes. Small, like a dequeue chunk, so a
+/// chunk that loses an MVCC conflict to an enqueue retries little, and no transaction holds
+/// a large write set.
+const UNREAD_PRUNE_CHUNK: usize = 5_000;
+
+/// The unread-queue prune interval, from [`UNREAD_QUEUE_PRUNE_ENV`], read once per process.
+fn unread_queue_prune_every() -> std::time::Duration {
+	static EVERY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+	*EVERY.get_or_init(|| {
+		let raw = std::env::var(UNREAD_QUEUE_PRUNE_ENV).ok();
+		let every = parse_unread_queue_prune_every(raw.as_deref());
+		if raw.is_some_and(|raw| raw.trim().parse::<u64>().ok() != Some(every.as_secs())) {
+			tracing::warn!("{UNREAD_QUEUE_PRUNE_ENV} is not a positive number of seconds; pruning unread queues every {} s", UNREAD_QUEUE_PRUNE_EVERY.as_secs());
+		}
+		every
+	})
+}
+
+/// The interval a raw [`UNREAD_QUEUE_PRUNE_ENV`] value sets: a positive whole number of
+/// seconds, else the default.
+fn parse_unread_queue_prune_every(raw: Option<&str>) -> std::time::Duration {
+	raw.and_then(|raw| raw.trim().parse::<u64>().ok()).filter(|&secs| secs > 0).map_or(UNREAD_QUEUE_PRUNE_EVERY, std::time::Duration::from_secs)
+}
 
 /// Record that a consumer reads `aspect_id`'s queue. Every queue read calls this before it
 /// reads, so [`Database::prune_unread_queues`] never removes entries a consumer relies on.
@@ -3279,7 +3308,7 @@ impl Database {
 	}
 
 	/// Start a background [`prune_unread_queues`](Self::prune_unread_queues) when the last
-	/// one is at least [`UNREAD_QUEUE_PRUNE_EVERY`] old. Called after every enqueue, so a
+	/// one is at least [`unread_queue_prune_every`] old. Called after every enqueue, so a
 	/// long-running ingest keeps the queues of aspects nothing reads bounded.
 	fn maybe_prune_unread_queues(&self) {
 		{
@@ -3290,7 +3319,7 @@ impl Database {
 					*last = Some(std::time::Instant::now());
 					return;
 				}
-				Some(at) if at.elapsed() < UNREAD_QUEUE_PRUNE_EVERY => return,
+				Some(at) if at.elapsed() < unread_queue_prune_every() => return,
 				Some(_) => *last = Some(std::time::Instant::now()),
 			}
 		}
@@ -3341,26 +3370,60 @@ impl Database {
 			ids
 		};
 		let mut removed = 0;
+		let mut failed: Vec<(AspectId, anyhow::Error)> = Vec::new();
 		for aspect_id in aspects.into_iter().filter(|aspect| !consumers.contains(aspect)) {
 			// An aspect whose rows are gone fails its batch count; leave its entries.
 			if matches!(self.queue_has_consumer_from_batches(&aspect_id).await, Ok(false)) {
-				removed += self.delete_all_queue_entries(&aspect_id).await?;
+				// One aspect's failure does not leave the others' backlogs for another
+				// interval: every chunk has committed or rolled back by now, so go on.
+				let (n, result) = self.delete_all_queue_entries(&aspect_id).await;
+				removed += n;
+				if let Err(e) = result {
+					failed.push((aspect_id, e));
+				}
 			}
 		}
 		drop(consumers);
 		if removed > 0 {
 			tracing::info!(removed, "Pruned the queue entries of aspects no pipeline reads");
 		}
-		Ok(removed)
+		match failed.len() {
+			0 => Ok(removed),
+			n => {
+				let detail: Vec<String> = failed.iter().map(|(aspect, e)| format!("{aspect}: {e:#}")).collect();
+				Err(anyhow::anyhow!("Pruning the queues of {n} unread aspects failed after {removed} entries were removed: {}", detail.join("; ")))
+			}
+		}
 	}
 
-	async fn delete_all_queue_entries(&self, aspect_id: &AspectId) -> Result<u64> {
+	/// Delete `aspect_id`'s queue entries, [`UNREAD_PRUNE_CHUNK`] per transaction,
+	/// and return how many were removed and whether it finished. A chunk that loses an MVCC
+	/// conflict to an enqueue (ingest re-queues timestamps after their rows commit) is
+	/// rolled back and retried on a fresh snapshot, up to [`QUEUE_WRITE_ATTEMPTS`] times.
+	async fn delete_all_queue_entries(&self, aspect_id: &AspectId) -> (u64, Result<()>) {
+		// Only entries queued before this started: one queued while it runs is a capture
+		// that landed after the prune, as if it had come just after, and chasing those
+		// would never end under a steady ingest.
+		let cut = chrono::Utc::now().timestamp_millis();
+		let sql = format!("DELETE FROM unbatched_measurements WHERE rowid IN (SELECT rowid FROM unbatched_measurements WHERE aspect_id = ? AND queued_at <= {cut} LIMIT {UNREAD_PRUNE_CHUNK})");
+		let aspect = aspect_id.as_uuid().to_string();
 		let mut removed = 0;
 		loop {
-			let n = self.delete_metadata_rows("DELETE FROM unbatched_measurements WHERE rowid IN (SELECT rowid FROM unbatched_measurements WHERE aspect_id = ? LIMIT 20000)", turso::params![aspect_id.as_uuid().to_string()]).await?;
+			let mut attempt = 1;
+			let n = loop {
+				match self.delete_metadata_rows(&sql, turso::params![aspect.clone()]).await {
+					Ok(n) => break n,
+					Err(e) if attempt < QUEUE_WRITE_ATTEMPTS && is_transient_mvcc_error(&e) => {
+						tracing::debug!(%aspect_id, "Pruning an unread queue lost an MVCC conflict (attempt {attempt} of {QUEUE_WRITE_ATTEMPTS}), retrying: {e:#}");
+						tokio::time::sleep(queue_write_backoff(attempt)).await;
+						attempt += 1;
+					}
+					Err(e) => return (removed, Err(e)),
+				}
+			};
 			removed += n;
 			if n == 0 {
-				return Ok(removed);
+				return (removed, Ok(()));
 			}
 		}
 	}
@@ -3379,10 +3442,25 @@ impl Database {
 				}
 				Err(e) => {
 					Self::rollback_after_error(&conn).await;
-					Err(anyhow::anyhow!("Failed to prune metadata rows: {e}"))
+					// Keep the Turso error in the chain, so a conflict reads as transient.
+					Err(anyhow::Error::new(e).context("Failed to prune metadata rows"))
 				}
 			}
 		})
 		.await
+	}
+}
+
+#[cfg(test)]
+mod unread_prune_interval_tests {
+	use super::{parse_unread_queue_prune_every, UNREAD_QUEUE_PRUNE_EVERY};
+
+	#[test]
+	fn the_unread_prune_interval_takes_positive_seconds_and_defaults_otherwise() {
+		assert_eq!(parse_unread_queue_prune_every(None), UNREAD_QUEUE_PRUNE_EVERY);
+		assert_eq!(parse_unread_queue_prune_every(Some(" 120 ")), std::time::Duration::from_secs(120));
+		for bad in ["0", "", "-5", "1h", "1.5"] {
+			assert_eq!(parse_unread_queue_prune_every(Some(bad)), UNREAD_QUEUE_PRUNE_EVERY, "{bad:?} falls back to the default");
+		}
 	}
 }

@@ -1679,6 +1679,58 @@ async fn unread_queues_are_pruned_and_read_ones_are_kept() -> Result<()> {
 	Ok(())
 }
 
+/// **Regression (fanctl soak, 0.4.0):** a prune of a large backlog across many aspects,
+/// with ingest re-queuing the same timestamps while it runs, removes every unread aspect's
+/// queue. It used to return at the first delete chunk that lost an MVCC conflict to an
+/// enqueue, leaving the remaining aspects' backlogs in place until the next interval.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unread_queue_prune_survives_concurrent_enqueues() -> Result<()> {
+	const ASPECTS: usize = 13;
+	const BACKLOG: i64 = 6_000;
+	let (_temp, db, subject, first) = setup_test_database().await?;
+	let mut aspects = vec![first.id()];
+	for i in 1..ASPECTS {
+		aspects.push(db.track_aspect(&subject.id(), &format!("aspect_{i}"), &Resolution::Milliseconds, None).await?.id());
+	}
+	let base = Utc.with_ymd_and_hms(2026, 11, 6, 0, 0, 0).unwrap();
+	let backlog: Vec<DateTime<Utc>> = (0..BACKLOG).map(|i| base + Duration::milliseconds(i)).collect();
+	for aspect in &aspects {
+		db.enqueue_unbatched_measurements(aspect, &backlog).await?;
+	}
+
+	// Ingest keeps re-queuing (upserting) timestamps the prune is deleting, in every aspect.
+	let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let writer = {
+		let (db, aspects, stop) = (db.clone(), aspects.clone(), stop.clone());
+		tokio::spawn(async move {
+			// As ingest does: queue each new capture, then queue it again once its row
+			// has committed.
+			let mut i: i64 = 0;
+			while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+				let aspect = aspects[usize::try_from(i).expect("non-negative") % ASPECTS];
+				let at = [base + Duration::milliseconds(BACKLOG + i)];
+				let _ = db.enqueue_unbatched_measurements(&aspect, &at).await;
+				let _ = db.enqueue_unbatched_measurements(&aspect, &at).await;
+				i += 1;
+				tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+			}
+		})
+	};
+	let pruned = db.prune_unread_queues().await;
+	stop.store(true, std::sync::atomic::Ordering::Relaxed);
+	writer.await?;
+	let pruned = pruned.context("the prune failed")?;
+	assert!(pruned >= u64::try_from(BACKLOG)? * u64::try_from(ASPECTS)?, "only {pruned} entries were pruned");
+
+	// What ingest queued during the prune may remain, but none of the backlog.
+	for aspect in &aspects {
+		let left = raw_metadata_count(&db, &format!("SELECT COUNT(*) FROM unbatched_measurements WHERE aspect_id = '{}' AND data_timestamp < {}", aspect.as_uuid(), (base + Duration::milliseconds(BACKLOG)).timestamp_millis())).await?;
+		assert_eq!(left, 0, "aspect {aspect} kept {left} of its {BACKLOG} backlog entries");
+	}
+	Ok(())
+}
+
 /// Opening a store written before the fix prunes the rows that are no longer written.
 #[serial]
 #[tokio::test]

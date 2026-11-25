@@ -204,6 +204,7 @@ pub const VARS: &[VarSpec] = &[
 	VarSpec { name: "WEFT_TEST_TXN_CHILD_INDEX", tier: Tier::Test, summary: "Set only in the child process that dies inside an `IndexTxn`: the index database it opens.", accepts: "a file path", default: "unset", read_by: "weftdb/types/index_txn.rs (test child)" },
 	VarSpec { name: "WEFT_TLS_CERT_FILE", tier: Tier::Stable, summary: "The PEM certificate chain the TLS listener presents (SEC-5). Set with `WEFT_TLS_KEY_FILE`; naming one without the other stops the server from starting.", accepts: "a path to a PEM file holding the certificate chain", default: "unset: no TLS — the listener is plaintext and the C8 gate applies", read_by: "weft-server/tls.rs, read in startup/config.rs" },
 	VarSpec { name: "WEFT_TLS_KEY_FILE", tier: Tier::Stable, summary: "The PEM private key matching `WEFT_TLS_CERT_FILE` (SEC-5). Never logged, never served; read once at startup.", accepts: "a path to a PEM file holding the private key", default: "unset: no TLS — the listener is plaintext and the C8 gate applies", read_by: "weft-server/tls.rs, read in startup/config.rs" },
+	VarSpec { name: "WEFT_UNREAD_PRUNE_SECS", tier: Tier::Tuning, summary: "How often a long-running ingest prunes the queue entries of aspects no pipeline reads, so their backlog does not grow without bound.", accepts: "a positive whole number of seconds", default: "3600 (`UNREAD_QUEUE_PRUNE_EVERY` in inputs.rs); unset, zero or malformed uses 3600", read_by: "weftdb/types/database/inputs.rs (`unread_queue_prune_every`)" },
 	VarSpec { name: "WEFT_UPDATE_GOLDENS", tier: Tier::Test, summary: "Re-record the committed byte goldens from what this build writes, instead of failing when the bytes differ. No shipped binary reads it.", accepts: "any value means rewrite the fixture file", default: "unset: a golden test compares bytes and fails on a difference", read_by: "weft-physical-type/tests/golden/harness.rs, weftdb/tests/golden_sidecar.rs" },
 	VarSpec { name: "WEFT_VERBOSE", tier: Tier::Test, summary: "Not WeftDB's own: it is `splimes`' verbose-logging switch. WeftDB's benchmarks clear it so a dependency's chatter cannot distort the timings they are measuring.", accepts: "any value turns the dependency's verbose output on", default: "unset (and deliberately removed at the top of the benchmarks that care about timings)", read_by: "weftdb/benches (cleared); read by the splimes dependency" },
 	VarSpec { name: "WEFT_WIDEN_BENCH_POINTS", tier: Tier::Test, summary: "How many points the JSON widening benchmark converts, so a smoke run can shrink it. No shipped binary reads it.", accepts: "a positive whole number", default: "500000 (also when unparsable)", read_by: "weft-server/benches/json_widening.rs" },
@@ -543,7 +544,7 @@ mod tests {
 				assert!(!value.trim().is_empty(), "{} describes its {field} as empty", spec.name);
 			}
 		}
-		assert_eq!(VARS.len(), 123, "the registry's size is asserted so an entry added or dropped is a deliberate act");
+		assert_eq!(VARS.len(), 124, "the registry's size is asserted so an entry added or dropped is a deliberate act");
 	}
 
 	/// The registry's whole point: it cannot drift from the code. A name read but not
