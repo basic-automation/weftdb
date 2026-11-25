@@ -9601,3 +9601,15 @@ the crate path.
 
 **Rejected.** (a) Decoding only the newest-sealed segment: an older segment can reach past it, and the mutant test fails that case. (b) The tail from the latest segment's *start*, `[MAX(min_ts), i64::MAX]`: correct, but it decodes a whole one-segment series, and the bench showed no gain there. (c) A resident last-value cache, as InfluxDB 3 has: a memory cost under ROB-14's budget, for a read the index already serves.
 
+## 2026-11-25 — How `weft-xbench` answers TSBS's `cpu-max-all`, `high-cpu` and `groupby-orderby-limit` (TAG-12, #341)
+
+**Ambiguous.** TSBS defines these queries as SQL, not as answers, and three points the SQL leaves open had to be settled to compare answers.
+
+**Chosen.**
+
+- **`high-cpu` rows are compared in host-name, then time order.** TSBS's `SELECT *` has no `ORDER BY`, so no engine order is wrong; both sides sort before comparing. The store side reads `usage_user` over the window, keeps rows above 90, then reads the other nine fields at those instants with `read_points_of`, chunked to `DEFAULT_MAX_POINT_BATCH`. A missing value at a matched instant is an error, not a hole.
+- **`groupby-orderby-limit` has no lower time bound**, so the store side reduces the five minutes before the end first, and doubles the reach while fewer than five buckets come back, stopping at the aspect's first stored instant (`aspect_metadata`'s time range). A dense tail costs one five-minute reduce; any bucket outside the reach is older than every bucket in it, so the answer equals reducing everything before the end.
+- **`cpu-max-all-32-24` is named but not in `TsbsQuery::ALL`.** It needs 32 hosts, the reference file has 10, and `instances` refuses more hosts than the data holds. It stays an open ROADMAP sub-item.
+
+**Not decided here.** `double-groupby-*` is an `avg`. An exact comparison needs either a rational mean on both sides or a stated tolerance for the store's `Avg`. That is a precision decision (locked constraint 4), so this run left it open rather than pick a tolerance.
+

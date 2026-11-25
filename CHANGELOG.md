@@ -16,6 +16,10 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   reads only the series' latest instant instead of every row, and falls back to the whole
   series if that instant reads empty. `weft-xbench`'s TSBS `lastpoint` now uses it. A new
   `weftdb/benches/latest_read.rs` compares it with the whole-series read.
+- **`weft-xbench --tsbs-queries` answers five more TSBS queries (TAG-12, #341):**
+  `cpu-max-all-1`, `cpu-max-all-8`, `high-cpu-1`, `high-cpu-all` and
+  `groupby-orderby-limit`. Each is gated against the in-memory reference, like the
+  `single-groupby` variants and `lastpoint`.
 
 ## [0.4.0] - 2026-11-23
 

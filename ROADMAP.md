@@ -136,6 +136,9 @@ The phase also cleared the remaining loose ends. The stale README status was fix
       - [ ] Run `cargo bench -p weftdb --bench latest_read` on a quiet host and record the figures (with a `bench/claims.json` entry if a doc quotes one)
     - [ ] The other engines' TSBS SQL (TSBS's own per-engine generators), each checked against the reference
     - [ ] `double-groupby-*`, `high-cpu-*`, `cpu-max-all-*` and `groupby-orderby-limit`
+      - [x] `cpu-max-all-1`, `cpu-max-all-8`, `high-cpu-1`, `high-cpu-all` and `groupby-orderby-limit`, gated against the reference in the timed phase (2026-11-25, `routine/weftdb-2026-11-25`: `TsbsCpu::{cpu_max_all, high_cpu, groupby_orderby_limit}` and `TsbsWeft`'s answers, defined from TSBS's TimescaleDB generator; a mutant per query fails its tests; a debug run over `/mnt/weftbench/tsbs/cpu-only.lp` passes all twelve queries on a busy host, timings unpublished)
+      - [ ] `double-groupby-1`, `-5` and `-all` (an `avg` per host and hour: settle how a mean is compared exactly first)
+      - [ ] `cpu-max-all-32-24` (32 hosts: needs a TSBS file with at least 32 hosts; the reference file has 10)
   - [ ] Tagged fixtures and freeze docs
 - [x] **ROB-24** Limits and overload evidence; frozen configuration documentation
 - [x] **SOA-15** part 2: TTL lane
