@@ -953,6 +953,23 @@ A debug `--tsbs-queries --reps 5` run over the reference file passed all twelve 
 2. `double-groupby-*`: decide how a mean is compared (an exact rational `sum / count` on both sides, or the store's `avg` against a stated tolerance) before adding it.
 3. The other engines' TSBS SQL, TimescaleDB first, each checked against `TsbsCpu`.
 
+## 2026-11-27 — Routine: TSBS `double-groupby-*` with an exact mean (TAG-12, #341)
+
+**What landed.** `weft-xbench --tsbs-queries` now answers `double-groupby-1`, `-5` and `-all`, so it covers fifteen TSBS query types. The definition was re-read from TSBS `master`. In [`databases/timescaledb/devops.go`](https://github.com/timescale/tsbs/blob/master/cmd/tsbs_generate_queries/databases/timescaledb/devops.go), `GroupByTimeAndPrimaryTag` computes `avg(metric)` per `time_bucket('3600 seconds')` and `hostname`, with `time >= start AND time < end`, `ORDER BY hour, hostname`, and no host filter. The window is `DoubleGroupByDuration`, 12 h ([`uses/devops/common.go`](https://github.com/timescale/tsbs/blob/master/cmd/tsbs_generate_queries/uses/devops/common.go)). [`main.go`](https://github.com/timescale/tsbs/blob/master/cmd/tsbs_generate_queries/main.go) registers 1, 5 and all ten metrics. A mean is compared as the exact rational sum / count, and the store's own `avg` must equal that sum ÷ count as `bigdecimal` divides (`DECISIONS.md` 2026-11-27). This stacks on the open PR #898.
+
+**Research: what other engines' `avg` returns over integer columns** (read 2026-11-27). This decides how their `double-groupby` answers can be gated later.
+- PostgreSQL, and so TimescaleDB: [aggregate functions](https://www.postgresql.org/docs/current/functions-aggregate.html) list `avg(smallint|integer|bigint) → numeric` and `avg(real|double precision) → double precision`. `numeric` is exact up to 16383 fractional digits ([numeric types](https://www.postgresql.org/docs/current/datatype-numeric.html)), but a division still ends at a chosen scale, so a non-terminating mean like 7/3 comes back rounded.
+- ClickHouse: [`avg`](https://clickhouse.com/docs/sql-reference/aggregate-functions/reference/avg) returns `Float64` for any numeric input.
+- QuestDB: [`avg`](https://questdb.com/docs/reference/function/aggregation/) returns `double`.
+- **So**: no engine returns the mean as an exact rational. Gating their `avg` against the reference would need a tolerance. Gating `sum(x)` and `count(*)`, asked beside TSBS's `avg`, needs none, and that is the recommendation for the other-engine sub-item. Not verified here: the column type TSBS's own TimescaleDB loader creates for the `usage_*` fields. If those columns are `double precision`, PostgreSQL's `sum` is a float too, and exactness has to be argued from the integer magnitudes.
+
+**Runtime check (not a benchmark).** A debug build was run as `weft-xbench --scales tiny --reps 5 --load-reps 1 --tsbs /mnt/weftbench/tsbs/cpu-only.lp --tsbs-queries`, with `TMPDIR` in the run's scratch dir. It loaded 10 hosts and 604,810 readings, and all fifteen query types passed their gate on all 5 instances with 0 mismatches. Each `double-groupby` instance returned 130 rows: a 12-hour window that starts mid-hour touches 13 hourly buckets, times 10 hosts. The run exited 0 and wrote a v9 `xbench.json`, and its temporary stores were removed. The load average was 9–13 and the build was unoptimised, so no timing is quoted. Evidence: `/mnt/deepmem/Development/weftdb-routine/runs/20261127-025727/` (`xbench-tsbs.log`, `xbench-tsbs/`).
+
+**Next (tomorrow).**
+1. On a quiet host: `cargo bench -p weftdb --bench latest_read`, then the release-build `--tsbs-queries` run over `/mnt/weftbench/tsbs/cpu-only.lp` (now fifteen queries), published as a report artifact.
+2. The other engines' TSBS SQL, TimescaleDB first. Read TSBS's TimescaleDB loader for the column types first, then gate `double-groupby` on `sum` and `count`.
+3. `cpu-max-all-32-24` still needs a TSBS file with 32 hosts or more (`tsbs_generate_data --scale=32`).
+
 ## 2026-11-22 — The fan-out arm's doc comment said the arm did not exist (#860, TAG-12 residual, L127)
 
 `weft-bench/src/fan_out.rs` opened by asserting that on `main` fan-out appears only in prose documents and

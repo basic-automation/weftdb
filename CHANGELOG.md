@@ -20,6 +20,10 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `cpu-max-all-1`, `cpu-max-all-8`, `high-cpu-1`, `high-cpu-all` and
   `groupby-orderby-limit`. Each is gated against the in-memory reference, like the
   `single-groupby` variants and `lastpoint`.
+- **`weft-xbench --tsbs-queries` answers TSBS `double-groupby-1`, `-5` and `-all` (TAG-12,
+  #341):** the mean of 1, 5 or all ten CPU fields per hour and host, over every host and 12
+  hours. Answers carry each mean as an exact sum and row count, so the gate compares means
+  with no tolerance; the store's own `avg` must equal that sum divided by that count.
 
 ## [0.4.0] - 2026-11-23
 

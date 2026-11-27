@@ -9613,3 +9613,13 @@ the crate path.
 
 **Not decided here.** `double-groupby-*` is an `avg`. An exact comparison needs either a rational mean on both sides or a stated tolerance for the store's `Avg`. That is a precision decision (locked constraint 4), so this run left it open rather than pick a tolerance.
 
+## 2026-11-27 — How `weft-xbench` compares TSBS's `double-groupby` means exactly (TAG-12, #341)
+
+**Ambiguous.** `double-groupby-*` is an `avg` per hour and host. A mean of integers is usually not a terminating decimal (7 / 3), so "the store's answer equals the reference" needed a rule. The 2026-11-25 entry named two options (an exact rational on both sides, or the store's `Avg` against a stated tolerance) and left the choice open.
+
+**Chosen.** The exact rational, with no tolerance. A row is `HostHourMean { hour_ns, host, count, sum }`, with one `i128` sum per metric. Two answers are equal when every count and every sum are equal, which is exactly when every mean is. The store side asks `downsample_range_of` for `Sum` and `Avg`. It refuses a `Sum` that is not an integer and a host whose metrics disagree on a bucket's count. It also refuses an `Avg` that is not `Sum / count` as `bigdecimal` divides. So the store's `Avg` is still checked: it must equal BigDecimal division (which `weft-reduce`'s `avg_like_bigdecimal` is already pinned to), not merely come close. This is the strictest reading of locked constraint 4, not a relaxation of it.
+
+**Rejected.** A tolerance on the decimal mean. Any figure would have been arbitrary, and it would let a wrong `Avg` within the tolerance pass.
+
+**Consequence for other engines.** TimescaleDB/PostgreSQL's `avg(integer)` returns a rounded `numeric`, and ClickHouse's and QuestDB's `avg` return a float (sources in `docs/roadmap-notes.md`, 2026-11-27). None of those can match the rational exactly, so the other-engine half should ask each engine for `sum(x)` and `count(*)` beside TSBS's `avg` and gate on those.
+
