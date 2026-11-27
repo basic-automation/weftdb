@@ -172,6 +172,10 @@ impl Drop for TsbsWeft {
 	}
 }
 
+/// A `double-groupby` answer while it is read: per (hour, host), the bucket's row count and each
+/// metric's SUM once that metric has been read.
+type HourSums<'a> = BTreeMap<(i64, &'a str), (u64, Vec<Option<i128>>)>;
+
 impl TsbsWeft {
 	/// The aspect a CPU metric is stored under.
 	#[must_use]
@@ -281,6 +285,51 @@ impl TsbsWeft {
 		Ok(rows)
 	}
 
+	/// [`tsbs::TsbsCpu::double_groupby`]'s question, answered by the store: each host's per-hour
+	/// SUM and AVG of each metric from `downsample_range_of`, with the bucket's row count.
+	///
+	/// The answer carries the exact SUM and count, so it equals the reference exactly when every
+	/// mean does. The store's own AVG is not dropped on the way: each one must equal the SUM
+	/// divided by the count as `bigdecimal` divides, or the answer is an error, so a wrong AVG
+	/// fails the query rather than hiding behind a right SUM.
+	///
+	/// # Errors
+	///
+	/// As the reference, if the store fails, if a SUM is not an integer, if a host's metrics
+	/// disagree on a bucket's count, or if an AVG is not SUM ÷ count.
+	pub async fn double_groupby(&self, metrics: usize, hosts: &[&str], start_ns: i64, end_ns: i64) -> anyhow::Result<Vec<tsbs::HostHourMean>> {
+		anyhow::ensure!((1..=tsbs::CPU_METRICS.len()).contains(&metrics), "a double-groupby takes 1 to {} metrics, not {metrics}", tsbs::CPU_METRICS.len());
+		anyhow::ensure!(!hosts.is_empty(), "a TSBS query names at least one host");
+		anyhow::ensure!(start_ns < end_ns, "the window [{start_ns}, {end_ns}) is empty");
+		let aggregations = [Aggregation::Sum, Aggregation::Avg];
+		let mut rows: HourSums<'_> = BTreeMap::new();
+		for host in hosts {
+			for (m, metric) in tsbs::CPU_METRICS[..metrics].iter().enumerate() {
+				let aspect = Self::aspect(metric);
+				let series = self.series(&aspect, host).await?;
+				// The store's range is inclusive; TSBS's window is half-open.
+				for bucket in self.store()?.downsample_range_of(&aspect, series, start_ns, end_ns - 1, Resolution::Hours, &aggregations).await? {
+					let hour_ns = nanos(bucket.timestamp)?;
+					let count = u64::try_from(bucket.count)?;
+					let value = |a: Aggregation| bucket.values.get(a.as_str()).ok_or_else(|| anyhow::anyhow!("{aspect} hostname={host} bucket {hour_ns} has no {}", a.as_str()));
+					let (sum, avg) = (value(Aggregation::Sum)?, value(Aggregation::Avg)?);
+					anyhow::ensure!(sum.is_integer(), "{aspect} hostname={host} bucket {hour_ns}: sum {sum} is not an integer");
+					anyhow::ensure!(*avg == sum / BigDecimal::from(count), "{aspect} hostname={host} bucket {hour_ns}: avg {avg} is not sum {sum} / count {count}");
+					let sum = sum.to_i128().ok_or_else(|| anyhow::anyhow!("{aspect} hostname={host} bucket {hour_ns}: sum {sum} is not an i128"))?;
+					let (seen, sums) = rows.entry((hour_ns, host)).or_insert_with(|| (count, vec![None; metrics]));
+					anyhow::ensure!(*seen == count, "hostname={host} bucket {hour_ns}: {metric} has {count} rows and an earlier metric {seen}");
+					sums[m] = Some(sum);
+				}
+			}
+		}
+		rows.into_iter()
+			.map(|((hour_ns, host), (count, sums))| {
+				let sum = sums.into_iter().collect::<Option<Vec<i128>>>().ok_or_else(|| anyhow::anyhow!("hostname={host} bucket {hour_ns} has a metric with no rows"))?;
+				Ok(tsbs::HostHourMean { hour_ns, host: host.to_string(), count, sum })
+			})
+			.collect()
+	}
+
 	/// [`tsbs::TsbsCpu::groupby_orderby_limit`]'s question, answered by the store: every host's
 	/// per-minute MAX of `usage_user` from `downsample_range_of`, merged across the hosts, the
 	/// [`tsbs::ORDERBY_LIMIT`] latest buckets before `end_ns`, newest first.
@@ -382,6 +431,10 @@ impl TsbsWeft {
 			tsbs::TsbsQuery::HighCpu { .. } => {
 				let hosts: Vec<&str> = instance.hosts.iter().map(String::as_str).collect();
 				Ok(tsbs::TsbsAnswer::Readings(self.high_cpu(&hosts, instance.start_ns, instance.end_ns).await?))
+			}
+			tsbs::TsbsQuery::DoubleGroupby { metrics, .. } => {
+				let hosts: Vec<&str> = instance.hosts.iter().map(String::as_str).collect();
+				Ok(tsbs::TsbsAnswer::HostHours(self.double_groupby(metrics, &hosts, instance.start_ns, instance.end_ns).await?))
 			}
 			tsbs::TsbsQuery::GroupbyOrderbyLimit => Ok(tsbs::TsbsAnswer::Minutes(self.groupby_orderby_limit(instance.end_ns).await?)),
 			tsbs::TsbsQuery::Lastpoint => Ok(tsbs::TsbsAnswer::Latest(self.lastpoint().await?)),
@@ -608,6 +661,21 @@ mod tests {
 					let want = cpu.high_cpu(&named, start, end).expect("reference");
 					assert!(want.len() > 20, "{}: a real answer, not an empty one ({} rows)", query.name(), want.len());
 					assert_eq!(weft.high_cpu(&named, start, end).await.expect("store"), want, "{}", query.name());
+				}
+				tsbs::TsbsQuery::DoubleGroupby { metrics, .. } => {
+					// Every host, the generated two hours cut inside a reading at both ends: two
+					// partial hourly buckets per host.
+					let (start, end) = (t0 + 25_000_000_000, t0 + 7_200_000_000_000 - 15_000_000_000);
+					let all: Vec<&str> = cpu.hosts.keys().map(String::as_str).collect();
+					let want = cpu.double_groupby(metrics, &all, start, end).expect("reference");
+					assert_eq!(want.len(), 2 * all.len(), "{}: two hours of every host", query.name());
+					assert!(want.iter().any(|r| r.means().iter().any(|m| !m.is_integer())), "{}: some mean is not a whole number", query.name());
+					assert_eq!(weft.double_groupby(metrics, &all, start, end).await.expect("store"), want, "{}", query.name());
+					// An hour-aligned window whose end is a reading's instant: half-open, so that
+					// reading opens no second bucket.
+					let aligned = cpu.double_groupby(metrics, &all, t0, t0 + 3_600_000_000_000).expect("reference");
+					assert_eq!(aligned.len(), all.len(), "{}: one hour of every host", query.name());
+					assert_eq!(weft.double_groupby(metrics, &all, t0, t0 + 3_600_000_000_000).await.expect("store"), aligned, "{}", query.name());
 				}
 				tsbs::TsbsQuery::Lastpoint => {
 					let want: Vec<(String, tsbs::CpuReading)> = cpu.lastpoint().into_iter().map(|(h, r)| (h.to_string(), r.clone())).collect();
