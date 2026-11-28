@@ -34,6 +34,9 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   #341):** the mean of 1, 5 or all ten CPU fields per hour and host, over every host and 12
   hours. Answers carry each mean as an exact sum and row count, so the gate compares means
   with no tolerance; the store's own `avg` must equal that sum divided by that count.
+### Fixed
+
+- **process_batches, #862:** `Batches::process_batches` now delegates to `Batch::process`, adding the missing `relative_analysis` step so the dead batch-collection producer behaves like the live path.
 
 ## [0.4.0] - 2026-11-23
 
@@ -534,7 +537,7 @@ origin/main
 - **The per-point analysis model was audited, and it is not wired end-to-end (#362).**
   `docs/research/per-point-analysis-wiring.md` records four breaks, each with call-site
   evidence: `Batch::process()` runs only inside `weft-orchestration`'s pipeline and two
-  `weftdb` tests, and `BatchCollection::process_batches()` has no callers at all;
+  `weftdb` tests, and `Batches::process_batches()` has no callers at all;
   `BatchedMeasurement::new` fixes `analysis: None` and both read-side batch constructors build
   measurements only through it, so nothing an earlier pass computed survives a re-read;
   `weft-server` contains no "analysis" token and `analyze_point`/`analyze_range` have no
