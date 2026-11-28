@@ -10,6 +10,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Documentation
 
+- **The B-analysis wiring audit corrected in place (#362).** Two claims in
+  `docs/research/per-point-analysis-wiring.md` were false and are retracted in a dated
+  `## Correction (2026-11-22)` section: per-point `analysis` *is* persisted
+  (`weftdb/src/types/database/inputs.rs:993` writes it, `outputs.rs:1721` reads it back), and the
+  producer *does* run on a live path (`weft-orchestration/src/pipeline.rs:747,849`). The
+  surviving defects are filed as #862 (re-titled to what was verified), #892 and #893.
+
 - **B-poll / B-retry / B-register audit (#361).** `docs/research/client-poll-retry-register-audit.md` published: all three backlog items are either already present (retry-for-503) or not needed (polling daemon, source registration). No behaviour changed. Phase label reconciled to Phase&nbsp;23.
 
 ### Changed

@@ -9364,3 +9364,40 @@ before anyone starts. The loop did not claim either.
 
 **Needs human.** #873 needs the public-surface decision (an `Arc<Database>` or a `&Database` facade)
 while the #238 freeze is open.
+
+## 2026-11-22 — Retracting two claims in my own B-analysis audit (#362)
+
+I published `docs/research/per-point-analysis-wiring.md` on 2026-11-22 and filed #862/#863
+from it. Two of its four "breaks" were wrong, and a follow-up question about the fallback in
+`weft-orchestration/src/pipeline.rs` forced the re-check.
+
+**Wrong:** (a) "`analysis` is never stored, and every read clears it" — the field has no serde
+attribute that would drop it (`rg -n '#\[serde' weftdb/src/types/batches/` returns one line,
+`batch.rs:65`), the processed-batch write serialises the whole measurement vector at
+`weftdb/src/types/database/inputs.rs:993` and the read deserialises it at
+`weftdb/src/types/database/outputs.rs:1721`; (b) "`Batch::process()` has exactly four call
+sites, none on a product path" — `build_processed_batch_queue`
+(`weft-orchestration/src/lib.rs:773`) is called from the production `Pipeline` at
+`weft-orchestration/src/pipeline.rs:747` and `:849`. Also imprecise: "`trend_analysis()` was
+commented out" — no such function exists anywhere; `weftdb/src/types/batches/batch.rs:303-304`
+is a comment above an unrelated function.
+
+**Wrong in the audit's own supporting evidence:** it quoted `#[serde(skip)]` at
+`weftdb/src/types/batches/batched_measurements/mod.rs:14-15`. No revision of that file
+contains that attribute. An escalation to a stronger model repeated the quote, which is the
+lesson: a confident citation is not evidence, and re-reading the file beat re-asking.
+
+**What I chose:** keep the audit as published, mark Breaks 1 and 2 withdrawn in place with a
+dated `## Correction (2026-11-22)` section stating the verified facts and the surviving defect
+list. Rewriting the body would have destroyed the record of a bad audit, which is the part
+with instructional value. Re-titled #862 to what was actually verified
+(`BatchCollection::process_batches` is dead and skips the relative step the live path performs)
+rather than leaving it asserting the withdrawn persistence claim, and filed #893 for the
+raw-maxima relatives in `build_patterns_queue`'s fallback, with #892 covering the wider finding that no shipped binary reaches the crate at all — a separate maths disagreement with
+`relative_analysis` (`weftdb/src/types/batches/batch.rs:355`).
+
+**Method lesson, recorded because it recurs:** the call-site list came from a grep piped
+through `head -20`, so the pipeline hits fell off the end, and the persistence claim came from
+counting how often a type name appeared near a constructor instead of following the write and
+read paths. For any "is X reachable / is X persisted" question the gate is the serialisation
+call and the deserialisation call, quoted with file and line.
