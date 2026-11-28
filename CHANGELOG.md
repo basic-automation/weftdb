@@ -8,6 +8,16 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Documentation
+
+- **ILP docs and runnable examples (#869).** `docs/ingest-line-protocol.md`
+  published: the ingest-side reference covering the line record model,
+  `LineRecord::to_ilp()` writing, `parse`/`parse_points` reading, escaping rules
+  with both documented carve-outs (control characters, NaN equality), and the
+  `POST …/ilp` HTTP routes with their query parameters. The crate README and
+  `weft-client/README.md` link to the new page. Crate-level doctests added to
+  `weft-line-protocol/src/lib.rs` covering the build-write-parse round trip and
+  both carve-outs. No behaviour change, no new public items.
 ### Fixed
 
 - **process_batches, #862:** `BatchCollection::process_batches` now delegates to `Batch::process`, adding the missing `relative_analysis` step so the dead batch-collection producer behaves like the live path.
@@ -19,6 +29,14 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - **CHRONO-INV, #791:** Inventory of `chrono` v0.4 dependency across the workspace — 9
   consuming crates, 272 call sites, migration feasibility assessment.
   See `docs/research/chrono-inventory.md`.
+
+- **The B-analysis wiring audit corrected in place (#362).** Two claims in
+  `docs/research/per-point-analysis-wiring.md` were false and are retracted in a dated
+  `## Correction (2026-11-22)` section: per-point `analysis` *is* persisted
+  (`weftdb/src/types/database/inputs.rs:993` writes it, `outputs.rs:1721` reads it back), and the
+  producer *does* run on a live path (`weft-orchestration/src/pipeline.rs:747,849`). The
+  surviving defects are filed as #862 (re-titled to what was verified), #892 and #893.
+
 - **B-poll / B-retry / B-register audit (#361).** `docs/research/client-poll-retry-register-audit.md` published: all three backlog items are either already present (retry-for-503) or not needed (polling daemon, source registration). No behaviour changed. Phase label reconciled to Phase&nbsp;23.
 - **REST facade audit (#360).** Audited what the WeftDB HTTP API (the REST facade) still does not
   expose from the `weftdb` library. Produced `docs/research/rest-facade-audit.md` with a route

@@ -25,6 +25,8 @@ let grid = client.interpolate(&Interpolate::new(points).spline(Spline::Linear)).
   CSV, Arrow or Parquet), catalog, ingest (JSON points, Line Protocol, CSV, Parquet, with
   `Idempotency-Key`), stored reads (pages, cursor-following `Stream`s, single instants,
   columnar ranges, stored downsample), maintenance, backup and the benchmark runs.
+  See [`docs/ingest-line-protocol.md`](../docs/ingest-line-protocol.md) for the full ILP
+  reference.
 - **No floats in the store by accident.** `f64` does not implement `StoredValue`, so
   `write_points("p", [(1, 1.25_f64)], …)` does not compile.
 - **One error type** carrying the server's whole envelope: `code`, `details`, `limit`,
