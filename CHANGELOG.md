@@ -53,6 +53,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   producer *does* run on a live path (`weft-orchestration/src/pipeline.rs:747,849`). The
   surviving defects are filed as #862 (re-titled to what was verified), #892 and #893.
 
+- **The same audit named two types that do not exist (#362).** `BatchCollection` and
+  `DatabaseOutputs` are phantoms. The batch-collection type is `Batches`
+  (`weftdb/src/types/batches/mod.rs:16`, `process_batches` at `:176`), and the query-time pair is
+  `analyze_point`/`analyze_range` on the `Outputs` trait
+  (`weftdb/src/types/database/traits/outputs.rs:12`), implemented for `Database`
+  (`weftdb/src/types/database/outputs.rs:34`). The names are corrected throughout
+  `docs/research/per-point-analysis-wiring.md`, which adds a dated `### Correction (2026-11-28)`
+  section listing both phantoms and re-basing three `weft-orchestration/src/lib.rs` anchors
+  (`773→797`, `795→819`, `872,887→896,911`); #862 is re-titled to match. Documentation only: no
+  behaviour change, and the `ROADMAP.md` verification line stays unchecked.
+
 - **B-poll / B-retry / B-register audit (#361).** `docs/research/client-poll-retry-register-audit.md` published: all three backlog items are either already present (retry-for-503) or not needed (polling daemon, source registration). No behaviour changed. Phase label reconciled to Phase&nbsp;23.
 - **REST facade audit (#360).** Audited what the WeftDB HTTP API (the REST facade) still does not
   expose from the `weftdb` library. Produced `docs/research/rest-facade-audit.md` with a route
@@ -537,7 +548,7 @@ origin/main
 - **The per-point analysis model was audited, and it is not wired end-to-end (#362).**
   `docs/research/per-point-analysis-wiring.md` records four breaks, each with call-site
   evidence: `Batch::process()` runs only inside `weft-orchestration`'s pipeline and two
-  `weftdb` tests, and `Batches::process_batches()` has no callers at all;
+  `weftdb` tests, and `Batches::process_batches()` (the batch-collection type is named `Batches`) has no callers at all;
   `BatchedMeasurement::new` fixes `analysis: None` and both read-side batch constructors build
   measurements only through it, so nothing an earlier pass computed survives a re-read;
   `weft-server` contains no "analysis" token and `analyze_point`/`analyze_range` have no

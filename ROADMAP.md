@@ -329,7 +329,7 @@ The changes up to this point ship first as **v0.4.0** (breaking weftdb API chang
 - [ ] Per-stage audit trail
 - [ ] **B-windows** Sliding/overlapping + event-centered windows, horizon fan-out, min-density validation
 - [ ] **B-sim** Full variability-metric matrix, fixed-point dedup, occurrence-distance constraint
-- [ ] **B-analysis** Verify the per-point analysis model is wired end-to-end — audited 2026-11-22 and corrected the same day: **not wired** (the dead batch-collection entry point `BatchCollection::process_batches()` skips the relative step the live path performs, the `trend` half has no producer, and neither half has a server surface; `analysis` itself **is** persisted and read back, contrary to the first audit); defects filed as #862/#863/#892/#893, findings and correction in `docs/research/per-point-analysis-wiring.md`
+- [ ] **B-analysis** Verify the per-point analysis model is wired end-to-end — audited 2026-11-22 and corrected the same day: **not wired** (the dead batch-collection entry point `Batches::process_batches()` skips the relative step the live path performs, the `trend` half has no producer, and neither half has a server surface; `analysis` itself **is** persisted and read back, contrary to the first audit); defects filed as #862/#863/#892/#893, findings and correction in `docs/research/per-point-analysis-wiring.md`
 - [ ] **B-snapshot** Pipeline state-snapshot audit trail
 - [ ] **B-object** Schemaless object/annotation store beside numeric aspects (audit 2026-11-22: docs/research/object-store-audit.md — **does not exist**; freeze blocks it; defer to post-1.0; box stays open by design)
 
