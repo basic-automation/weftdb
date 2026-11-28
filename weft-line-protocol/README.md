@@ -12,7 +12,13 @@ anything that already speaks it — Telegraf, sensors, exporters — without tak
 vendor dependency.
 
 Parses measurements, tag sets, field sets and timestamps into neutral records, or
-directly into [`splimes`](https://crates.io/crates/splimes) points.
+directly into [`splimes`](https://crates.io/crates/splimes) points. The crate also
+provides [`LineRecord::to_ilp()`] to serialise records back into wire form.
+
+See [`docs/ingest-line-protocol.md`](../docs/ingest-line-protocol.md) for the
+full ingest-side reference: the type model, how to build and write records, how
+to parse text, the escaping rules with the two documented carve-outs, and which
+HTTP routes accept ILP.
 
 ```toml
 [dependencies]
