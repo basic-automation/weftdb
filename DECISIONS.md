@@ -9658,4 +9658,3 @@ call and the deserialisation call, quoted with file and line.
 **Rejected.** A tolerance on the decimal mean. Any figure would have been arbitrary, and it would let a wrong `Avg` within the tolerance pass.
 
 **Consequence for other engines.** TimescaleDB/PostgreSQL's `avg(integer)` returns a rounded `numeric`, and ClickHouse's and QuestDB's `avg` return a float (sources in `docs/roadmap-notes.md`, 2026-11-27). None of those can match the rational exactly, so the other-engine half should ask each engine for `sum(x)` and `count(*)` beside TSBS's `avg` and gate on those.
-

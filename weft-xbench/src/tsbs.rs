@@ -436,8 +436,6 @@ impl TsbsCpu {
 				// `high-cpu-all` and `double-groupby` name no host filter: every host.
 				let hosts = if matches!(query, TsbsQuery::HighCpu { hosts: 0, .. } | TsbsQuery::DoubleGroupby { .. }) { names.len() } else { hosts };
 				anyhow::ensure!(hosts <= names.len(), "{} names {hosts} hosts and the data holds {}", query.name(), names.len());
-				// `high-cpu-all` names no host filter: every host.
-				let hosts = if matches!(query, TsbsQuery::HighCpu { hosts: 0, .. }) { names.len() } else { hosts };
 				let window = i64::from(hours).saturating_mul(3_600_000_000_000);
 				let upper = end.saturating_sub(window);
 				anyhow::ensure!(upper > first, "{} needs a {hours}-hour window and the data spans {} s", query.name(), (end - first) / 1_000_000_000);
