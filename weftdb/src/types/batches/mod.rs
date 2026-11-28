@@ -176,12 +176,7 @@ impl Batches {
 	pub fn process_batches(&mut self) -> Result<()> {
 		let result: Result<Vec<()>> =
 			self.0.par_iter_mut()
-				.map(|batch| {
-					batch.level_transform()?;
-					batch.transpose_origin()?;
-					batch.simplify_transformation()?;
-					Ok(())
-				})
+				.map(|batch| batch.process())
 				.collect();
 		result?;
 		Ok(())

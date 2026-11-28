@@ -8,6 +8,10 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **process_batches, #862:** `BatchCollection::process_batches` now delegates to `Batch::process`, adding the missing `relative_analysis` step so the dead batch-collection producer behaves like the live path.
+
 ## [0.4.0] - 2026-11-23
 
 ### Documentation
