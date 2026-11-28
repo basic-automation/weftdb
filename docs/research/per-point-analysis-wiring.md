@@ -25,11 +25,12 @@ all of Break 2.
    (`weftdb/src/types/batches/batch.rs:355`) sets it per measurement at `batch.rs:400-402`,
    called from `Batch::process()` (`weftdb/src/types/batches/batch.rs:447-453`), which also
    runs `level_transform`, `transpose_origin` and `simplify_transformation`. The batch
-   collection offers `BatchCollection::process_batches()`
+   collection type is `Batches`, which offers `Batches::process_batches()`
    (`weftdb/src/types/batches/mod.rs:176`).
-3. **The query-time pair.** `DatabaseOutputs::analyze_point` and `analyze_range`
-   (`weftdb/src/types/database/traits/outputs.rs:39,41`, implemented at
-   `weftdb/src/types/database/outputs.rs:293,433`) interpolate a point or a stream of points
+3. **The query-time pair.** `analyze_point` and `analyze_range` on the `Outputs` trait
+   (`weftdb/src/types/database/traits/outputs.rs:12`, methods at `:39,41`), implemented for
+   `Database` at `weftdb/src/types/database/outputs.rs:34` (methods at `:293,433`), interpolate
+   a point or a stream of points
    at a resolution, caching an `AnalysisResult` (`weftdb/src/types/cache.rs:14`, key built at
    `outputs.rs:298-299`, stored at `outputs.rs:422-423`). It is called "point analysis" in
    the source, but it never touches `Analysis`: it returns `splimes::Point` values.
@@ -45,7 +46,7 @@ back out of the measurements it is working on at
 <!-- PARTLY WITHDRAWN 2026-11-22: the entry point `build_processed_batch_queue` is called
 from the production `Pipeline` at `weft-orchestration/src/pipeline.rs:747,849`, so the call
 site at `weft-orchestration/src/lib.rs:795` is not test-only. What remains true is that the
-*batch-collection* entry point, `BatchCollection::process_batches()`, is dead. -->
+*batch-collection* entry point, `Batches::process_batches()`, is dead. -->
 
 <!-- SUPERSEDED: the list below was produced from a `head -20`-truncated grep and missed
 call sites; the corrected list is in "Correction (2026-11-22)". Kept as written because the
@@ -57,7 +58,7 @@ follow-up issues quote it. -->
 - `weft-orchestration/src/debug_batch_test.rs:62`;
 - `weftdb/tests/db_tests.rs:1133,1177,1230`.
 
-`BatchCollection::process_batches()` has **zero** call sites. No ingest path, no server
+`Batches::process_batches()` has **zero** call sites. No ingest path, no server
 handler and no client call reaches either.
 
 ## Break 2 — it is never stored, and every read clears it
@@ -69,15 +70,15 @@ handler and no client call reaches either.
 `BatchedMeasurement::new` fixes `analysis: None`
 (`weftdb/src/types/batches/batched_measurements/mod.rs:22-24`), and both read-side batch
 constructors build every measurement through it:
-`weftdb/src/types/batches/mod.rs:82` (`BatchCollection::new`) and `:138`
-(`new_with_limited_data`) — `window.iter().map(|p| BatchedMeasurement::new(p.clone()))`.
+`weftdb/src/types/batches/mod.rs:82` (inside `Batches::new`, defined at `:52`) and `:138`
+(inside `Batches::new_with_limited_data`, defined at `:100`) — `window.iter().map(|p| BatchedMeasurement::new(p.clone()))`.
 
 `BatchedMeasurement` appears in five files under `weftdb/src`: `types/batches/mod.rs`,
 `types/batches/batched_measurements/mod.rs`, `types/batches/batch.rs`,
 `types/database/outputs.rs`, `types/mod.rs`. None of them is on the write path, and the
 segment layout has no trend or relative column, so a re-read cannot restore what a previous
 pass computed. The practical consequence is that
-`weft-orchestration/src/lib.rs:872,887` sees `Some` only for batches that
+`weft-orchestration/src/lib.rs:896,911` sees `Some` only for batches that
 `batch.process()` enriched earlier in the same pass: an analysis run that reads a batch back,
 or a second pass over stored data, silently sees `None` and falls through the `?`.
 
@@ -136,13 +137,13 @@ re-check against `origin/main` (`fb881ee`) shows, with the command that shows it
    (`outputs.rs:709`) and `get_processed_batches` (`outputs.rs:753`). So Break 2's "never stored" and "every read
    clears it" are both false. The `measurements` column *is* where the numbers live.
 2. **The producer runs on a live path.** `build_processed_batch_queue`
-   (`weft-orchestration/src/lib.rs:773`, which is where the `batch.process()` call at
-   `lib.rs:795` lives) is called from the production `Pipeline` at
+   (`weft-orchestration/src/lib.rs:797`, which is where the `batch.process()` call at
+   `lib.rs:819` lives) is called from the production `Pipeline` at
    `weft-orchestration/src/pipeline.rs:747` and `:849`; `Pipeline` is re-exported at
    `weft-orchestration/src/lib.rs:457` and `weft-bench` depends on the crate
    (`weft-bench/Cargo.toml:36`), as does the crate's own doctest (`lib.rs:267,279`). So the
    call site this document listed as "the analytics pipeline, in memory" is not test-only —
-   it is the product's analytics path. What *is* dead is `BatchCollection::process_batches()`.
+   it is the product's analytics path. What *is* dead is `Batches::process_batches()`.
    The first version also under-counted: the grep was piped through `head -20`.
 3. **`trend_analysis` does not exist**, so the commented-out call at
    `weftdb/src/types/batches/batch.rs:303-304` is a comment above an unrelated function, not
@@ -150,15 +151,15 @@ re-check against `origin/main` (`fb881ee`) shows, with the command that shows it
 
 What survives, restated as the real defect list (and what #862 now says):
 
-- `BatchCollection::process_batches()` (`weftdb/src/types/batches/mod.rs:176`) has zero call
+- `Batches::process_batches()` (`weftdb/src/types/batches/mod.rs:176`) has zero call
   sites, and the body it would run omits `relative_analysis()` — so the dead entry point
   computes *less* than the live one, and a caller switching to it would silently lose
   relatives. That is #862.
-- `weft-orchestration/src/lib.rs:795` discards the result: `let _ = batch.process();`, so a
+- `weft-orchestration/src/lib.rs:819` discards the result: `let _ = batch.process();`, so a
   failed transform is thrown away, not logged. The list of steps it can fail through is
   `level_transform` → `relative_analysis` → `transpose_origin` → `simplify_transformation`
   (`weftdb/src/types/batches/batch.rs:447-453`) — #862.
-- `weft-orchestration/src/lib.rs:872,887` read `measurement.analysis()?.relative()`, so the
+- `weft-orchestration/src/lib.rs:896,911` read `measurement.analysis()?.relative()`, so the
   detectors do depend on the field being carried through, and on the same pass having
   produced it: a persisted `analysis` is only as fresh as the run that wrote it.
 - `Analysis::trend` still has no producer anywhere: `set_trend`/`set_trend_from`
@@ -171,6 +172,41 @@ What survives, restated as the real defect list (and what #862 now says):
   dependency, and the public `analyze_point`/`analyze_range` pair is not HTTP-reachable —
   Break 3 is correct as written.
 
+### Correction (2026-11-28) — two type names in this document were phantoms
+
+A fifth class of error, caught by checking every backticked identifier against the source
+instead of against memory: **`BatchCollection` and `DatabaseOutputs` do not exist**.
+
+| Written here | Real name | Where |
+| --- | --- | --- |
+| `BatchCollection::process_batches()` | `Batches::process_batches()` | `weftdb/src/types/batches/mod.rs:16` (`pub struct Batches(Vec<Batch>)`), method at `:176` |
+| `BatchCollection::new` | `Batches::new` (async) | `weftdb/src/types/batches/mod.rs:52`; the measurement construction the audit cites at `:82` sits inside it |
+| `DatabaseOutputs::analyze_point` | `analyze_point`/`analyze_range` on the `Outputs` trait, implemented for `Database` | `weftdb/src/types/database/traits/outputs.rs:12` (methods `:39,41`), impl at `weftdb/src/types/database/outputs.rs:34` (methods `:293,433`) |
+
+`rg -w BatchCollection weftdb/src weft-orchestration/src weft-server/src -g '*.rs'` and the same
+query for `DatabaseOutputs` return nothing. Both names were invented from prose — "the batch
+collection", "the database outputs object" — and every prose use of *batch collection* in this
+document means the `Batches` type.
+
+Anchors were re-based against `origin/main` (`9519a3e`) in the same pass. Those moved because
+other PRs landed, not because the audit was wrong:
+
+| Was | Now |
+| --- | --- |
+| `weft-orchestration/src/lib.rs:773` (`build_processed_batch_queue`) | `:797` |
+| `weft-orchestration/src/lib.rs:795` (`let _ = batch.process();`) | `:819` |
+| `weft-orchestration/src/lib.rs:872,887` (`analysis()?.relative()`) | `:896,911` |
+
+The withdrawal comments and the `## Correction (2026-11-22)` section had their type names
+fixed but kept their original anchor numbers, with one rule: a stale anchor is findable, a
+phantom type name is not. The `DECISIONS.md` entries that quote
+`BatchCollection::process_batches` (`:9242`, and the re-titling note at `:9618`) are
+append-only history and are left exactly as written; this section is the annotation.
+
+**Lesson for future audits:** a `file:line` anchor is checked by opening the file; a type name
+is checked by grepping it. Both checks are one command, and neither one happened here for the
+names.
+
 ## What "wired" would take, in rough cost order
 
 
@@ -179,7 +215,7 @@ What survives, restated as the real defect list (and what #862 now says):
    it means restoring `trend_analysis` behind a cost gate — the comment says it was dropped
    for `O(n²)`, which is a claim worth re-measuring rather than accepting.
 2. **Make the producer reachable.** Call `process()` (or the relative step alone) on the
-   path that serves analysis, or in `BatchCollection::new`, and decide the cost: relative
+   path that serves analysis, or in `Batches::new`, and decide the cost: relative
    analysis is one pass over the batch plus a max/min scan, so recomputing on read is
    cheaper than storing it would be.
 3. **Then persist, or recompute.** Persisting means a column or batch-metadata field in the
@@ -193,7 +229,7 @@ What survives, restated as the real defect list (and what #862 now says):
 ## Follow-ups filed
 
 - #862: first written from the withdrawn Break 2 ("not persisted, reads clear it"), now
-  re-titled to what was actually verified: `BatchCollection::process_batches` is dead and
+  re-titled to what was actually verified: `Batches::process_batches` is dead and
   skips the relative step the live path performs.
 - #893: `build_patterns_queue`'s fallback relatives use raw maxima where
   `relative_analysis` normalises by the batch range.
