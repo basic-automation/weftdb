@@ -1147,14 +1147,14 @@ mod tests {
 	async fn the_tsbs_query_gate_fails_an_answer_that_differs_from_the_reference() {
 		let loaded = tsbs_cpu(9);
 		let mut reference = loaded.clone();
-		// Every host's every reading is one higher in the reference: every MAX and every latest
-		// value differs, so every instance must count as a mismatch.
+		// Every host's every reading is one higher in the reference: every MAX, every mean and
+		// every latest value differs, so every instance must count as a mismatch.
 		for readings in reference.hosts.values_mut() {
 			for r in readings {
 				r.values[0] += 1;
 			}
 		}
-		let queries = [tsbs::TsbsQuery::SingleGroupby { metrics: 1, hosts: 1, hours: 1 }, tsbs::TsbsQuery::Lastpoint];
+		let queries = [tsbs::TsbsQuery::SingleGroupby { metrics: 1, hosts: 1, hours: 1 }, tsbs::TsbsQuery::CpuMaxAll { hosts: 1, hours: tsbs::MAX_ALL_HOURS }, tsbs::TsbsQuery::HighCpu { hosts: 1, hours: tsbs::HIGH_CPU_HOURS }, tsbs::TsbsQuery::GroupbyOrderbyLimit, tsbs::TsbsQuery::DoubleGroupby { metrics: 1, hours: tsbs::DOUBLE_GROUPBY_HOURS }, tsbs::TsbsQuery::Lastpoint];
 		let results = run_tsbs_queries_against(&loaded, &reference, &queries, 2, 7).await.expect("runs");
 		for r in &results {
 			assert!(!r.passed && r.mismatches == 2, "{}: passed {} with {} mismatches", r.query, r.passed, r.mismatches);

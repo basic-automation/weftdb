@@ -8,6 +8,36 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Documentation
+
+- **ILP docs and runnable examples (#869).** `docs/ingest-line-protocol.md`
+  published: the ingest-side reference covering the line record model,
+  `LineRecord::to_ilp()` writing, `parse`/`parse_points` reading, escaping rules
+  with both documented carve-outs (control characters, NaN equality), and the
+  `POST …/ilp` HTTP routes with their query parameters. The crate README and
+  `weft-client/README.md` link to the new page. Crate-level doctests added to
+  `weft-line-protocol/src/lib.rs` covering the build-write-parse round trip and
+  both carve-outs. No behaviour change, no new public items.
+### Added
+
+- **`SegmentStore::read_latest_of` and `read_latest` (TAG-12, #341).** The latest row of one
+  series (or of series 0) and its value, equal to the last row of a whole-series
+  `read_time_range_of`, newer-wins across overlapping segments and a newer null included. It
+  reads only the series' latest instant instead of every row, and falls back to the whole
+  series if that instant reads empty. `weft-xbench`'s TSBS `lastpoint` now uses it. A new
+  `weftdb/benches/latest_read.rs` compares it with the whole-series read.
+- **`weft-xbench --tsbs-queries` answers five more TSBS queries (TAG-12, #341):**
+  `cpu-max-all-1`, `cpu-max-all-8`, `high-cpu-1`, `high-cpu-all` and
+  `groupby-orderby-limit`. Each is gated against the in-memory reference, like the
+  `single-groupby` variants and `lastpoint`.
+- **`weft-xbench --tsbs-queries` answers TSBS `double-groupby-1`, `-5` and `-all` (TAG-12,
+  #341):** the mean of 1, 5 or all ten CPU fields per hour and host, over every host and 12
+  hours. Answers carry each mean as an exact sum and row count, so the gate compares means
+  with no tolerance; the store's own `avg` must equal that sum divided by that count.
+### Fixed
+
+- **process_batches, #862:** `Batches::process_batches` now delegates to `Batch::process`, adding the missing `relative_analysis` step so the dead batch-collection producer behaves like the live path.
+
 ## [0.4.0] - 2026-11-23
 
 ### Documentation

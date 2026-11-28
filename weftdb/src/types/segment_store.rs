@@ -9093,6 +9093,10 @@ mod cancel_tests;
 #[cfg(test)]
 mod overlap_read_tests;
 
+/// TAG-12: the per-series latest-row read equals the whole-series range read's last row.
+#[cfg(test)]
+mod latest_read_tests;
+
 /// ROB-22: the suspect frame policy reaches the store and the interactive read path honours it.
 #[cfg(test)]
 mod suspect_frame_policy_tests;
