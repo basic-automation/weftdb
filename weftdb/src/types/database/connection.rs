@@ -64,7 +64,7 @@ impl Connection for Database {
 		// (or is new) and goes back when the returned `cache::Connection` drops. Opening a
 		// new connection per transaction leaked ~600 B each under Turso's MVCC (see
 		// `conn_pool`).
-		let (conn, pool) = super::conn_pool::checkout(turso_db, super::conn_pool::Role::Legacy)?;
+		let (conn, pool) = super::conn_pool::checkout(turso_db, super::conn_pool::Role::Legacy).await?;
 
 		// BEGIN CONCURRENT allows multiple concurrent write transactions with MVCC
 		// Retry with exponential backoff on transient errors
@@ -124,8 +124,8 @@ impl Connection for Database {
 		conn.execute("PRAGMA temp_store=memory", turso::params![]).await.ok();
 		conn.execute("PRAGMA wal_autocheckpoint=1000", turso::params![]).await.ok(); // Better WAL handling for large writes
 
-		// No `PRAGMA cache_size` here either: it is per connection too, so it never reached the
-		// connections that do the work.
+		// No `PRAGMA cache_size` here either: it is per connection too, so `conn_pool` sets it
+		// on every connection it opens (`WEFT_CONN_CACHE_KIB`).
 
 		// Turso keeps every row version that is in the `-log` but not yet checkpointed in
 		// memory (about 3 bytes of RSS per log byte), and only checkpoints a database once its
@@ -145,7 +145,7 @@ impl Connection for Database {
 	/// DDL operations are not compatible with BEGIN CONCURRENT in MVCC mode.
 	/// This uses BEGIN IMMEDIATE which acquires a write lock but allows schema changes.
 	async fn begin_immediate(turso_db: &turso::Database) -> Result<cache::Connection> {
-		let (conn, pool) = super::conn_pool::checkout(turso_db, super::conn_pool::Role::Legacy)?;
+		let (conn, pool) = super::conn_pool::checkout(turso_db, super::conn_pool::Role::Legacy).await?;
 
 		// BEGIN IMMEDIATE acquires a write lock immediately, suitable for DDL
 		// Retry with exponential backoff on transient errors
@@ -181,7 +181,7 @@ impl Connection for Database {
 	async fn checkpoint_wal_passive(turso_db: &turso::Database) -> Result<()> {
 		let start = std::time::Instant::now();
 		tracing::debug!("[checkpoint_wal_passive] Starting PASSIVE checkpoint...");
-		let (conn, pool) = super::conn_pool::checkout(turso_db, super::conn_pool::Role::Legacy)?;
+		let (conn, pool) = super::conn_pool::checkout(turso_db, super::conn_pool::Role::Legacy).await?;
 		let conn = cache::Connection::pooled(conn, pool);
 		let conn = conn.as_ref();
 

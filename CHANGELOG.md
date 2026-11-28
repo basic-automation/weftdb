@@ -8,6 +8,8 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-28
+
 ### Documentation
 
 - **ILP docs and runnable examples (#869).** `docs/ingest-line-protocol.md`
@@ -18,6 +20,7 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   `weft-client/README.md` link to the new page. Crate-level doctests added to
   `weft-line-protocol/src/lib.rs` covering the build-write-parse round trip and
   both carve-outs. No behaviour change, no new public items.
+
 ### Added
 
 - **`SegmentStore::read_latest_of` and `read_latest` (TAG-12, #341).** The latest row of one
@@ -34,11 +37,29 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   #341):** the mean of 1, 5 or all ten CPU fields per hour and host, over every host and 12
   hours. Answers carry each mean as an exact sum and row count, so the gate compares means
   with no tolerance; the store's own `avg` must equal that sum divided by that count.
+
 ### Fixed
 
 - **process_batches, #862:** `Batches::process_batches` now delegates to `Batch::process`, adding the missing `relative_analysis` step so the dead batch-collection producer behaves like the live path.
 
-## [0.4.0] - 2026-11-23
+### Fixed (memory growth in long-running processes)
+
+- **Historical-signal memo** grows with correlations plus manifestations instead of their product.
+- **Signal queues** release spare map capacity after expiry.
+- **Dictionaries** are cached once as a shared list, read in one scan per table, kept cached across
+  saves, and a save rewrites only changed patterns. Pattern tables gain a `pattern_id` index
+  (added on first open; one scan).
+- **Pipeline prepare** no longer rebuilds a drained aspect's batches from its whole history on
+  every run; a durable per-aspect batching marker records the first full build.
+- **Unread-queue prune** keeps going past a chunk that loses a write conflict, retries it, and
+  reports every failed aspect.
+- **Page caches** are 2 MiB per Turso connection, 8 MiB for the root `metadata.db`.
+- **Read cache** is bounded by bytes with LRU eviction and eager expiry; a replaced dictionary's old
+  list can no longer be cached after the replace.
+- New Tuning variables: `WEFT_UNREAD_PRUNE_SECS`, `WEFT_CONN_CACHE_KIB`, `WEFT_METADATA_CACHE_KIB`,
+  `WEFT_CACHE_MAX_MB`. `WEFT_POOL_MAX_IDLE=1` is raised to 2.
+- 72-virtual-hour fanctl soak: anon growth 1.5 MB/vh against 4.8 on 0.4.0-pre, 251 MB against 422 MB
+  at 60-71 vh, reads 1.42x.
 
 ### Documentation
 

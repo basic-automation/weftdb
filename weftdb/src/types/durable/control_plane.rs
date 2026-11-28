@@ -75,7 +75,7 @@ pub const READ_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 ///
 /// Connecting, or (on Apple targets) setting the pragma.
 pub async fn connect(db: &turso::Database) -> turso::Result<crate::cache::Connection> {
-	let (conn, pool) = crate::types::database::conn_pool::checkout(db, crate::types::database::conn_pool::Role::Writer)?;
+	let (conn, pool) = crate::types::database::conn_pool::checkout(db, crate::types::database::conn_pool::Role::Writer).await?;
 	// A pooled connection is a writer already; this only restates it, so nothing a holder
 	// set can make a later write wait on a lock instead of seeing `Busy`.
 	if pool.is_some() {
@@ -101,7 +101,7 @@ pub async fn connect(db: &turso::Database) -> turso::Result<crate::cache::Connec
 ///
 /// As [`connect`], or setting the busy timeout.
 pub async fn connect_reader(db: &turso::Database) -> turso::Result<crate::cache::Connection> {
-	let (conn, pool) = crate::types::database::conn_pool::checkout(db, crate::types::database::conn_pool::Role::Reader)?;
+	let (conn, pool) = crate::types::database::conn_pool::checkout(db, crate::types::database::conn_pool::Role::Reader).await?;
 	let conn = crate::cache::Connection::pooled(conn, pool);
 	#[cfg(target_vendor = "apple")]
 	{

@@ -1666,7 +1666,7 @@ impl Aspect {
 
 	#[instrument]
 	async fn wireframe_dictionary_tables_direct(conn: &Connection) -> Result<()> {
-		// Note: No PRIMARY KEY on TEXT columns or indexes to support MVCC
+		// Note: No PRIMARY KEY on TEXT columns (MVCC)
 		Self::create_dictionary_metadata_table(conn).await?;
 		Self::create_dictionary_constraints_table(conn).await?;
 		Self::create_dictionary_variabilities_table(conn).await?;
@@ -1674,7 +1674,23 @@ impl Aspect {
 		Self::create_patterns_table(conn).await?;
 		Self::create_pattern_occurrences_table(conn).await?;
 		Self::create_pattern_relatives_table(conn).await?;
+		Self::create_pattern_id_indexes(conn).await;
 		Ok(())
+	}
+
+	/// Index every pattern table on its pattern id. A dictionary save deletes the rows of
+	/// the patterns it writes, and a one-pattern read selects them; without these each
+	/// statement scanned its whole table, so a save cost the whole file however few
+	/// patterns it changed (fanctl soak: reads grew with the square of time once the file
+	/// outgrew the connection's page cache). Not UNIQUE: files from before the save
+	/// replaced patterns hold an id more than once. A file that cannot take an index still
+	/// works, by scanning.
+	async fn create_pattern_id_indexes(conn: &Connection) {
+		for (name, sql) in [("idx_patterns_id", "CREATE INDEX IF NOT EXISTS idx_patterns_id ON patterns(id)"), ("idx_pattern_occurrences_pattern", "CREATE INDEX IF NOT EXISTS idx_pattern_occurrences_pattern ON pattern_occurrences(pattern_id)"), ("idx_pattern_occurrence_blobs_pattern", "CREATE INDEX IF NOT EXISTS idx_pattern_occurrence_blobs_pattern ON pattern_occurrence_blobs(pattern_id)"), ("idx_pattern_relatives_pattern", "CREATE INDEX IF NOT EXISTS idx_pattern_relatives_pattern ON pattern_relatives(pattern_id)")] {
+			if let Err(e) = conn.as_ref().execute(sql, turso::params![]).await {
+				tracing::warn!("Failed to create index {name}: {e}");
+			}
+		}
 	}
 
 	async fn create_dictionary_metadata_table(conn: &Connection) -> Result<()> {

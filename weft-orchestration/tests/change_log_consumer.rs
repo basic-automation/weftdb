@@ -84,3 +84,50 @@ async fn a_seal_backed_aspect_is_batched_from_its_change_log() -> Result<()> {
 	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
 	Ok(())
 }
+
+/// Extraction drains both batch tables, so empty tables after a run do not
+/// mean the aspect was never batched. The consumer used to treat them so and
+/// rebuilt every window of the whole history on each run (the fanctl soak's
+/// prepare step grew about 3 MB of transient heap per virtual hour from it);
+/// the batching marker keeps those runs incremental, and clearing the batches
+/// resets it.
+#[serial]
+#[tokio::test]
+async fn a_drained_aspect_is_not_rebuilt_from_its_whole_history() -> Result<()> {
+	let dir = tempfile::tempdir()?;
+	std::env::set_var("WEFT_DATA_DIR", dir.path().to_str().unwrap());
+	std::env::set_var("WEFT_LEGACY_DEFAULT_STORAGE", "segments");
+	let name = format!("drained_{}", Uuid::new_v4().simple());
+	let db = Database::new(&name).await?;
+	let subject = db.observe_subject("subject").await?;
+	let aspect = db.track_aspect(&subject.id(), "aspect", &Resolution::Minutes, None).await?.id();
+	assert!(!db.batching_started(&aspect).await?, "a new aspect has not been batched");
+	assert!(weft_orchestration::batch_utils::is_first_run(&db, &aspect).await?);
+
+	db.batch_capture_measurements(aspect, DatasetId::new(), minutes(0..12)).await?;
+	build_incremental_unprocessed_queue(&db, &aspect, &Resolution::Minutes, &Spline::Linear, BATCH_SIZE).await?;
+	assert_eq!(db.count_unprocessed_batches(&aspect).await?, 8);
+	assert!(db.batching_started(&aspect).await?, "storing the first batches sets the marker");
+
+	// Drain the batches the way consumption does, without a clear.
+	db.cleanup_unprocessed_batches(&aspect, Utc::now() + Duration::hours(1)).await?;
+	assert_eq!((db.count_unprocessed_batches(&aspect).await?, db.count_processed_batches(&aspect).await?), (0, 0));
+	assert!(!weft_orchestration::batch_utils::is_first_run(&db, &aspect).await?, "empty tables on a batched aspect are not a first run");
+	build_incremental_unprocessed_queue(&db, &aspect, &Resolution::Minutes, &Spline::Linear, BATCH_SIZE).await?;
+	assert_eq!(db.count_unprocessed_batches(&aspect).await?, 0, "with nothing new, the run rebuilds nothing");
+
+	// New data is batched incrementally: only the windows its span flags.
+	db.batch_capture_measurements(aspect, DatasetId::new(), minutes(12..20)).await?;
+	build_incremental_unprocessed_queue(&db, &aspect, &Resolution::Minutes, &Spline::Linear, BATCH_SIZE).await?;
+	assert_eq!(db.count_unprocessed_batches(&aspect).await?, 7, "the 7 windows the new span flags, not all 16 of the history");
+
+	// Clearing is an explicit reset: the next run is a first run again.
+	db.clear_unprocessed_batches(&aspect).await?;
+	assert!(!db.batching_started(&aspect).await?, "a clear resets the marker");
+	build_incremental_unprocessed_queue(&db, &aspect, &Resolution::Minutes, &Spline::Linear, BATCH_SIZE).await?;
+	assert_eq!(db.count_unprocessed_batches(&aspect).await?, 16, "after a clear the whole history is rebuilt: 20 points make 16 windows");
+	assert!(db.batching_started(&aspect).await?);
+
+	std::env::remove_var("WEFT_LEGACY_DEFAULT_STORAGE");
+	Ok(())
+}

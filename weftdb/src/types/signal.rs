@@ -480,6 +480,21 @@ impl Signals {
 		self.0.remove(&(correlation_id.clone(), manifestation_id.clone(), signal_type.clone()))
 	}
 
+	/// Release capacity left by a burst: when the map holds more than four times the
+	/// slots it uses, shrink it to twice its length. The 2x headroom keeps steady
+	/// churn from reallocating every run.
+	pub fn shrink_if_sparse(&mut self) {
+		if self.0.capacity() > self.0.len().saturating_mul(4) {
+			self.0.shrink_to(self.0.len().saturating_mul(2));
+		}
+	}
+
+	/// Capacity of the backing map.
+	#[must_use]
+	pub fn capacity(&self) -> usize {
+		self.0.capacity()
+	}
+
 	/// Keep only the signals whose correlation `keep` accepts; returns how many were dropped.
 	pub fn retain_correlations(&mut self, mut keep: impl FnMut(&CorrelationID) -> bool) -> usize {
 		let before = self.0.len();
@@ -1023,5 +1038,37 @@ mod tests {
 		// Truncated toward zero in both directions.
 		assert_eq!(units_between(Resolution::Minutes, &at(119, 0), &at(0, 0)).unwrap(), 1);
 		assert_eq!(units_between(Resolution::Minutes, &at(0, 0), &at(119, 0)).unwrap(), -1);
+	}
+}
+
+#[cfg(test)]
+mod capacity_tests {
+	use bigdecimal::BigDecimal;
+	use chrono::Utc;
+	use splimes::Resolution;
+
+	use super::{Signal, SignalType, Signals};
+	use crate::{CorrelationID, Distance, EventID, ManifestationId};
+
+	/// After a burst drains, the queue gives back its peak capacity, keeping 2x headroom.
+	#[test]
+	fn drained_queue_shrinks() {
+		let mut signals = Signals::new();
+		let correlation = CorrelationID::new();
+		for _ in 0..10_000 {
+			signals.insert(Signal::new(correlation.clone(), ManifestationId::new(), EventID::new(), Utc::now(), SignalType::PredictStart, Distance::new(BigDecimal::from(1), Resolution::Hours)));
+		}
+		let keep = CorrelationID::new();
+		for _ in 0..10 {
+			signals.insert(Signal::new(keep.clone(), ManifestationId::new(), EventID::new(), Utc::now(), SignalType::PredictStart, Distance::new(BigDecimal::from(1), Resolution::Hours)));
+		}
+		signals.retain_correlations(|id| *id == keep);
+		assert!(signals.capacity() >= 10_000);
+		signals.shrink_if_sparse();
+		assert_eq!(signals.len(), 10);
+		assert!(signals.capacity() <= 4 * 10, "capacity {} kept after shrinking", signals.capacity());
+		let before = signals.capacity();
+		signals.shrink_if_sparse();
+		assert_eq!(signals.capacity(), before, "a dense queue is left alone");
 	}
 }

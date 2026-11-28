@@ -842,6 +842,7 @@ impl Inputs for Database {
 		let db_path = self.get_unprocessed_batches_db_path(aspect_id).await?;
 		let processed = self.get_processed_batches_db(aspect_id).await?.connect()?;
 		self.queue_batch_unless_known(aspect_id, batch, &db, &db_path, &processed).await?;
+		self.mark_batching_started(aspect_id).await?;
 		Ok(tx_id)
 	}
 
@@ -880,6 +881,12 @@ impl Inputs for Database {
 		}
 		if skipped > 0 {
 			tracing::debug!("Skipped {skipped} of {total} unprocessed batches for aspect {aspect_id}: already queued, processed or extracted");
+		}
+		// Written after the batches commit, so a crash in between leaves the aspect looking
+		// unbatched and costs one extra full rebuild (which the dedupe absorbs), never a
+		// marker without its batches.
+		if total > 0 {
+			self.mark_batching_started(aspect_id).await?;
 		}
 		Ok(tx_ids)
 	}
@@ -955,6 +962,8 @@ impl Inputs for Database {
 			}
 
 			Self::commit_concurrent(&conn).await?;
+			// A cleared aspect starts over: its next consumer run is a first run.
+			self.reset_batching_started(aspect_id).await?;
 			let log = format!("Cleared all unprocessed batches for aspect {aspect_id}");
 			self.record_transaction(&log).await
 		})
@@ -1625,6 +1634,9 @@ impl Inputs for Database {
 			}
 
 			Self::commit_concurrent(&conn).await?;
+			// A cached list of this dictionary no longer matches the file, and a save trusts
+			// the cached list to tell which patterns are already stored.
+			self.cache.lock().await.invalidate_generation(&Self::dictionary_patterns_cache_key(aspect_id, dictionary_name)).await;
 
 			let log = format!("Inserted pattern '{}' into dictionary '{}' for aspect {}", pattern.id(), dictionary_name, aspect_id);
 			let _ = self.record_transaction(&log).await?;
@@ -2487,6 +2499,10 @@ fn span_of(row: &turso::Row, first: usize) -> Result<Span> {
 }
 
 impl Database {
+	/// The most pattern ids one `DELETE … IN (…)` of a dictionary save names: SQLite's
+	/// default bound on a statement's parameters.
+	const DELETE_IDS_PER_STATEMENT: usize = 32_766;
+
 	/// Write `patterns` over the stored copies of the same ids in `dictionary_name` for
 	/// `aspect_id`, in one transaction. A stored pattern whose id is not in `patterns` is
 	/// kept (insert or update only, never delete).
@@ -2505,29 +2521,60 @@ impl Database {
 	/// When the dictionary name cannot name a file, its database cannot be opened, or a
 	/// statement fails (the transaction is rolled back and the stored dictionary kept).
 	pub async fn replace_dictionary_patterns(&self, aspect_id: &AspectId, dictionary_name: &str, patterns: &[Pattern]) -> Result<TxId> {
+		let list_key = Self::dictionary_patterns_cache_key(aspect_id, dictionary_name);
+		// The cached list and its generation, taken before the transaction. The list is
+		// what the file holds (a save replaces it, see below), so a saved pattern equal to
+		// its cached copy is already stored as it is and is not written again: a pipeline
+		// saves its whole dictionary on every run, and rewriting every pattern made each
+		// save cost the whole file.
+		let before = {
+			let cache = self.cache.lock().await;
+			let generation = cache.generation(&list_key).await;
+			let list = cache.get::<std::sync::Arc<[Pattern]>>(&list_key).await;
+			drop(cache);
+			list.map(|list| (generation, list))
+		};
+		let mut seen = std::collections::HashSet::with_capacity(patterns.len());
+		let unique = patterns.iter().all(|p| seen.insert(p.id()));
+		drop(seen);
+		let to_write: Vec<&Pattern> = match &before {
+			Some((_, stored)) if unique => {
+				let stored: std::collections::HashMap<PatternID, &Pattern> = stored.iter().map(|p| (p.id(), p)).collect();
+				patterns.iter().filter(|p| stored.get(&p.id()) != Some(p)).collect()
+			}
+			_ => patterns.iter().collect(),
+		};
+		let written = to_write.as_slice();
 		let tx_id = legacy_metadata_write(async move {
 			let tx_id = TxId::new();
 			let aspect = self.get_aspect(aspect_id).await?;
 			let db_name = &self.name;
 			let db_path = Self::aspect_dictionaries_db_path(db_name.as_str(), aspect.subject_name(), aspect.name(), dictionary_name)?;
 			drop(aspect);
-			let (db, _was_new) = Self::get_or_create_turso_database(&db_path).await?;
+			let (db, was_new) = Self::get_or_create_turso_database(&db_path).await?;
+			if was_new {
+				// The first open in this process: a file from before the pattern id indexes
+				// gets them here, before the deletes below rely on them.
+				Aspect::ensure_dictionary_tables(&db).await?;
+				Self::mark_wireframed(&db_path);
+			}
 			let conn = Self::begin_concurrent(&db, db_name, Some(self.cache.clone())).await?;
 
 			let result: Result<()> = async {
 				// Only the patterns being written are cleared. A stored pattern missing from
 				// `patterns` is kept: correlations name their pattern and read its occurrences
 				// from here, so dropping it (a failed dictionary load hands in only the new
-				// patterns) would leave them with nothing.
-				let ids: Vec<String> = patterns.iter().map(|p| p.id().to_string()).collect();
-				for chunk in ids.chunks(256) {
+				// patterns) would leave them with nothing. The ids go in as few statements as
+				// possible, each looked up in the pattern id indexes.
+				let ids: Vec<String> = written.iter().map(|p| p.id().to_string()).collect();
+				for chunk in ids.chunks(Self::DELETE_IDS_PER_STATEMENT) {
 					let placeholders = vec!["?"; chunk.len()].join(", ");
 					for (table, column) in [("pattern_relatives", "pattern_id"), ("pattern_occurrences", "pattern_id"), ("pattern_occurrence_blobs", "pattern_id"), ("patterns", "id")] {
 						let sql = format!("DELETE FROM {table} WHERE {column} IN ({placeholders})");
 						conn.as_ref().execute(&sql, turso::params_from_iter(chunk.to_vec())).await.map_err(|e| anyhow::anyhow!("Failed to clear patterns of dictionary '{dictionary_name}': {e}"))?;
 					}
 				}
-				for pattern in patterns {
+				for pattern in written {
 					let id = pattern.id().to_string();
 					conn.as_ref().execute(r"INSERT INTO patterns (id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", turso::params![id.clone(), pattern.sum().to_string(), pattern.abs_sum().to_string(), pattern.max().to_string(), pattern.min().to_string(), pattern.abs_max().to_string(), pattern.avg().to_string(), pattern.abs_avg().to_string()]).await.map_err(|e| anyhow::anyhow!("Failed to insert pattern '{id}': {e}"))?;
 					if pattern.occurrence_count() > 0 {
@@ -2549,20 +2596,39 @@ impl Database {
 				return Err(e);
 			}
 			Self::commit_concurrent(&conn).await?;
-			let log = format!("Replaced dictionary '{dictionary_name}' for aspect {aspect_id} with {} patterns", patterns.len());
+			let log = format!("Replaced dictionary '{dictionary_name}' for aspect {aspect_id} with {} patterns ({} written)", patterns.len(), written.len());
 			let _ = self.record_transaction(&log).await?;
 			Ok(tx_id)
 		})
 		.await?;
 
-		// Readers cache the dictionary and each pattern; what they hold is now stale.
+		// Readers cache the dictionary and each pattern; what they hold is now stale. The
+		// list is replaced by what the file now holds rather than dropped: a pipeline saves
+		// its dictionary on every run and reads it on the next, so a dropped list cost a read
+		// of the whole file per run, quadratic over a dictionary's life.
+		let after = before.filter(|_| unique).map(|(generation, list)| (generation, Self::cached_after_save(&list, written)));
 		let cache = self.cache.lock().await;
-		cache.invalidate(&Self::dictionary_patterns_cache_key(aspect_id, dictionary_name)).await;
-		for pattern in patterns {
+		if let Some((generation, after)) = after {
+			cache.replace_if_generation(&list_key, generation, after).await;
+		} else {
+			cache.invalidate_generation(&list_key).await;
+		}
+		for pattern in written {
 			cache.invalidate(&format!("pattern_{}", pattern.id().as_uuid())).await;
 		}
 		drop(cache);
+		drop(to_write);
 		Ok(tx_id)
+	}
+
+	/// The pattern list a dictionary file holds after
+	/// [`replace_dictionary_patterns`](Self::replace_dictionary_patterns) wrote `written`
+	/// (no id twice) over a file that held `stored`, in the order a fresh read returns it:
+	/// the stored patterns not written keep their place, and `written` follows (its rows
+	/// were deleted and inserted again, after every kept row).
+	fn cached_after_save(stored: &[Pattern], written: &[&Pattern]) -> std::sync::Arc<[Pattern]> {
+		let ids: std::collections::HashSet<PatternID> = written.iter().map(|p| p.id()).collect();
+		stored.iter().filter(|p| !ids.contains(&p.id())).chain(written.iter().copied()).cloned().collect()
 	}
 
 	/// The cache key of an aspect's dictionary's pattern list. Every aspect can have a
@@ -3213,8 +3279,37 @@ static QUEUE_CONSUMERS: std::sync::LazyLock<tokio::sync::Mutex<std::collections:
 /// When the last background prune of unread queues started.
 static LAST_UNREAD_QUEUE_PRUNE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
-/// How often a long-running ingest prunes the queues of aspects no pipeline reads.
+/// How often a long-running ingest prunes the queues of aspects no pipeline reads, unless
+/// `WEFT_UNREAD_PRUNE_SECS` sets another interval.
 pub const UNREAD_QUEUE_PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The environment variable that sets, in whole seconds, how often a long-running ingest
+/// prunes unread queues. Unset, zero or not a number: [`UNREAD_QUEUE_PRUNE_EVERY`].
+const UNREAD_QUEUE_PRUNE_ENV: &str = "WEFT_UNREAD_PRUNE_SECS";
+
+/// The most queue entries one prune transaction deletes. Small, like a dequeue chunk, so a
+/// chunk that loses an MVCC conflict to an enqueue retries little, and no transaction holds
+/// a large write set.
+const UNREAD_PRUNE_CHUNK: usize = 5_000;
+
+/// The unread-queue prune interval, from [`UNREAD_QUEUE_PRUNE_ENV`], read once per process.
+fn unread_queue_prune_every() -> std::time::Duration {
+	static EVERY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+	*EVERY.get_or_init(|| {
+		let raw = std::env::var(UNREAD_QUEUE_PRUNE_ENV).ok();
+		let every = parse_unread_queue_prune_every(raw.as_deref());
+		if raw.is_some_and(|raw| raw.trim().parse::<u64>().ok() != Some(every.as_secs())) {
+			tracing::warn!("{UNREAD_QUEUE_PRUNE_ENV} is not a positive number of seconds; pruning unread queues every {} s", UNREAD_QUEUE_PRUNE_EVERY.as_secs());
+		}
+		every
+	})
+}
+
+/// The interval a raw [`UNREAD_QUEUE_PRUNE_ENV`] value sets: a positive whole number of
+/// seconds, else the default.
+fn parse_unread_queue_prune_every(raw: Option<&str>) -> std::time::Duration {
+	raw.and_then(|raw| raw.trim().parse::<u64>().ok()).filter(|&secs| secs > 0).map_or(UNREAD_QUEUE_PRUNE_EVERY, std::time::Duration::from_secs)
+}
 
 /// Record that a consumer reads `aspect_id`'s queue. Every queue read calls this before it
 /// reads, so [`Database::prune_unread_queues`] never removes entries a consumer relies on.
@@ -3279,7 +3374,7 @@ impl Database {
 	}
 
 	/// Start a background [`prune_unread_queues`](Self::prune_unread_queues) when the last
-	/// one is at least [`UNREAD_QUEUE_PRUNE_EVERY`] old. Called after every enqueue, so a
+	/// one is at least [`unread_queue_prune_every`] old. Called after every enqueue, so a
 	/// long-running ingest keeps the queues of aspects nothing reads bounded.
 	fn maybe_prune_unread_queues(&self) {
 		{
@@ -3290,7 +3385,7 @@ impl Database {
 					*last = Some(std::time::Instant::now());
 					return;
 				}
-				Some(at) if at.elapsed() < UNREAD_QUEUE_PRUNE_EVERY => return,
+				Some(at) if at.elapsed() < unread_queue_prune_every() => return,
 				Some(_) => *last = Some(std::time::Instant::now()),
 			}
 		}
@@ -3341,26 +3436,60 @@ impl Database {
 			ids
 		};
 		let mut removed = 0;
+		let mut failed: Vec<(AspectId, anyhow::Error)> = Vec::new();
 		for aspect_id in aspects.into_iter().filter(|aspect| !consumers.contains(aspect)) {
 			// An aspect whose rows are gone fails its batch count; leave its entries.
 			if matches!(self.queue_has_consumer_from_batches(&aspect_id).await, Ok(false)) {
-				removed += self.delete_all_queue_entries(&aspect_id).await?;
+				// One aspect's failure does not leave the others' backlogs for another
+				// interval: every chunk has committed or rolled back by now, so go on.
+				let (n, result) = self.delete_all_queue_entries(&aspect_id).await;
+				removed += n;
+				if let Err(e) = result {
+					failed.push((aspect_id, e));
+				}
 			}
 		}
 		drop(consumers);
 		if removed > 0 {
 			tracing::info!(removed, "Pruned the queue entries of aspects no pipeline reads");
 		}
-		Ok(removed)
+		match failed.len() {
+			0 => Ok(removed),
+			n => {
+				let detail: Vec<String> = failed.iter().map(|(aspect, e)| format!("{aspect}: {e:#}")).collect();
+				Err(anyhow::anyhow!("Pruning the queues of {n} unread aspects failed after {removed} entries were removed: {}", detail.join("; ")))
+			}
+		}
 	}
 
-	async fn delete_all_queue_entries(&self, aspect_id: &AspectId) -> Result<u64> {
+	/// Delete `aspect_id`'s queue entries, [`UNREAD_PRUNE_CHUNK`] per transaction,
+	/// and return how many were removed and whether it finished. A chunk that loses an MVCC
+	/// conflict to an enqueue (ingest re-queues timestamps after their rows commit) is
+	/// rolled back and retried on a fresh snapshot, up to [`QUEUE_WRITE_ATTEMPTS`] times.
+	async fn delete_all_queue_entries(&self, aspect_id: &AspectId) -> (u64, Result<()>) {
+		// Only entries queued before this started: one queued while it runs is a capture
+		// that landed after the prune, as if it had come just after, and chasing those
+		// would never end under a steady ingest.
+		let cut = chrono::Utc::now().timestamp_millis();
+		let sql = format!("DELETE FROM unbatched_measurements WHERE rowid IN (SELECT rowid FROM unbatched_measurements WHERE aspect_id = ? AND queued_at <= {cut} LIMIT {UNREAD_PRUNE_CHUNK})");
+		let aspect = aspect_id.as_uuid().to_string();
 		let mut removed = 0;
 		loop {
-			let n = self.delete_metadata_rows("DELETE FROM unbatched_measurements WHERE rowid IN (SELECT rowid FROM unbatched_measurements WHERE aspect_id = ? LIMIT 20000)", turso::params![aspect_id.as_uuid().to_string()]).await?;
+			let mut attempt = 1;
+			let n = loop {
+				match self.delete_metadata_rows(&sql, turso::params![aspect.clone()]).await {
+					Ok(n) => break n,
+					Err(e) if attempt < QUEUE_WRITE_ATTEMPTS && is_transient_mvcc_error(&e) => {
+						tracing::debug!(%aspect_id, "Pruning an unread queue lost an MVCC conflict (attempt {attempt} of {QUEUE_WRITE_ATTEMPTS}), retrying: {e:#}");
+						tokio::time::sleep(queue_write_backoff(attempt)).await;
+						attempt += 1;
+					}
+					Err(e) => return (removed, Err(e)),
+				}
+			};
 			removed += n;
 			if n == 0 {
-				return Ok(removed);
+				return (removed, Ok(()));
 			}
 		}
 	}
@@ -3379,10 +3508,25 @@ impl Database {
 				}
 				Err(e) => {
 					Self::rollback_after_error(&conn).await;
-					Err(anyhow::anyhow!("Failed to prune metadata rows: {e}"))
+					// Keep the Turso error in the chain, so a conflict reads as transient.
+					Err(anyhow::Error::new(e).context("Failed to prune metadata rows"))
 				}
 			}
 		})
 		.await
+	}
+}
+
+#[cfg(test)]
+mod unread_prune_interval_tests {
+	use super::{parse_unread_queue_prune_every, UNREAD_QUEUE_PRUNE_EVERY};
+
+	#[test]
+	fn the_unread_prune_interval_takes_positive_seconds_and_defaults_otherwise() {
+		assert_eq!(parse_unread_queue_prune_every(None), UNREAD_QUEUE_PRUNE_EVERY);
+		assert_eq!(parse_unread_queue_prune_every(Some(" 120 ")), std::time::Duration::from_secs(120));
+		for bad in ["0", "", "-5", "1h", "1.5"] {
+			assert_eq!(parse_unread_queue_prune_every(Some(bad)), UNREAD_QUEUE_PRUNE_EVERY, "{bad:?} falls back to the default");
+		}
 	}
 }

@@ -111,6 +111,20 @@ impl Pattern {
 		self.occurrences.as_vec()
 	}
 
+	/// An upper bound on the heap bytes this pattern holds: its compact occurrence log, the
+	/// expanded copy [`occurrences`](Self::occurrences) may materialize, and its relatives
+	/// and amplitudes. [`DatabaseCache`](crate::DatabaseCache) charges cached patterns by it.
+	#[must_use]
+	pub const fn approx_heap_bytes(&self) -> usize {
+		// A `DatabaseInfo` holds strings; 64 bytes each is a generous allowance.
+		const PER_OCCURRENCE_HEAP: usize = 64;
+		const PER_DECIMAL_HEAP: usize = 32;
+		let occurrences = self.occurrences.compact_bytes() + self.occurrences.len() * (std::mem::size_of::<Occurrence>() + PER_OCCURRENCE_HEAP);
+		let relatives = self.relatives.capacity() * (std::mem::size_of::<Relative>() + 4 * PER_DECIMAL_HEAP);
+		let amplitudes = self.amplitudes.capacity() * (std::mem::size_of::<BigDecimal>() + PER_DECIMAL_HEAP);
+		std::mem::size_of::<Self>() + occurrences + relatives + amplitudes
+	}
+
 	/// The compact occurrence list.
 	#[must_use]
 	pub const fn occurrence_log(&self) -> &OccurrenceLog {

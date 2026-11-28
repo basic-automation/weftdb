@@ -1,4 +1,4 @@
-use std::{collections::HashMap, pin::Pin, str::FromStr};
+use std::{collections::HashMap, pin::Pin, str::FromStr, sync::Arc};
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
@@ -811,145 +811,15 @@ impl crate::types::database::traits::outputs::Outputs for Database {
 		if let Some(pattern) = self.cache.lock().await.get::<Pattern>(&cache_key).await {
 			return Ok(pattern);
 		}
-
-		// Get from database
-		let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
-		let conn: cache::Connection = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
-		let query_sql = r"
-                        SELECT id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value
-                        FROM patterns 
-                        WHERE id = ?
-                ";
-
-		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![pattern_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query pattern: {e}")))?;
-		Self::commit_concurrent(&conn).await?;
-
-		let next_row = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern row: {e}")))?;
-		if let Some(row) = next_row {
-			let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Pattern ID is not text".to_string()))?.clone();
-			let sum_value_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Sum value is not text".to_string()))?.clone();
-			let abs_sum_value_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Abs sum value is not text".to_string()))?.clone();
-			let max_value_str = row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Max value is not text".to_string()))?.clone();
-			let min_value_str = row.get_value(4)?.as_text().ok_or_else(|| Error::DatabaseError("Min value is not text".to_string()))?.clone();
-			let abs_max_value_str = row.get_value(5)?.as_text().ok_or_else(|| Error::DatabaseError("Abs max value is not text".to_string()))?.clone();
-			let avg_value_str = row.get_value(6)?.as_text().ok_or_else(|| Error::DatabaseError("Avg value is not text".to_string()))?.clone();
-			let abs_avg_value_str = row.get_value(7)?.as_text().ok_or_else(|| Error::DatabaseError("Abs avg value is not text".to_string()))?.clone();
-
-			let id = PatternID::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for pattern ID: {e}")))?);
-			let _sum_value = BigDecimal::from_str(&sum_value_str).map_err(|e| Error::DatabaseError(format!("Invalid sum value format: {e}")))?;
-			let _abs_sum_value = BigDecimal::from_str(&abs_sum_value_str).map_err(|e| Error::DatabaseError(format!("Invalid abs sum value format: {e}")))?;
-			let _max_value = BigDecimal::from_str(&max_value_str).map_err(|e| Error::DatabaseError(format!("Invalid max value format: {e}")))?;
-			let _min_value = BigDecimal::from_str(&min_value_str).map_err(|e| Error::DatabaseError(format!("Invalid min value format: {e}")))?;
-			let _abs_max_value = BigDecimal::from_str(&abs_max_value_str).map_err(|e| Error::DatabaseError(format!("Invalid abs max value format: {e}")))?;
-			let _avg_value = BigDecimal::from_str(&avg_value_str).map_err(|e| Error::DatabaseError(format!("Invalid avg value format: {e}")))?;
-			let _abs_avg_value = BigDecimal::from_str(&abs_avg_value_str).map_err(|e| Error::DatabaseError(format!("Invalid abs avg value format: {e}")))?;
-
-			// Get occurrences from pattern_occurrences table
-			let occurrences_query_sql = r"
-                                SELECT pattern_id, aspect_id, resolution, size, database_info, beginning_timestamp, end_timestamp
-                                FROM pattern_occurrences
-                                WHERE pattern_id = ?
-                        ";
-			let mut occ_rows: turso::Rows = conn.as_ref().query(occurrences_query_sql, turso::params![pattern_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query pattern occurrences: {e}")))?;
-			let mut occurrences: Vec<Occurrence> = Vec::new();
-			loop {
-				let Some(occ_row) = occ_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern occurrence row: {e}")))? else {
-					break;
-				};
-				// Column indices: 0=pattern_id, 1=aspect_id, 2=resolution, 3=size, 4=database_info, 5=beginning_timestamp, 6=end_timestamp
-				let occ_pattern_id_str = occ_row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Pattern ID is not text".to_string()))?.clone();
-				let occ_aspect_id_str = occ_row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Aspect ID is not text".to_string()))?.clone();
-				let occ_resolution_str = occ_row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Resolution is not text".to_string()))?.clone();
-				let occ_size: usize = usize::try_from(*occ_row.get_value(3)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Size is not integer".to_string()))?).map_err(|e| Error::DatabaseError(format!("Occurrence size out of range: {e}")))?;
-				let occ_database_info_str = occ_row.get_value(4)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Database Info is not text".to_string()))?.clone();
-				let occ_beginning_timestamp_millis: i64 = *occ_row.get_value(5)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Beginning Timestamp is not integer".to_string()))?;
-				let occ_end_timestamp_millis: i64 = *occ_row.get_value(6)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence End Timestamp is not integer".to_string()))?;
-
-				let occ_pattern_id = PatternID::from_uuid(Uuid::parse_str(&occ_pattern_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for occurrence Pattern ID: {e}")))?);
-				let occ_aspect_id = AspectId::from_str(&occ_aspect_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for occurrence Aspect ID: {e}")))?;
-				let occ_resolution = Resolution::from_str(&occ_resolution_str).map_err(|e| Error::DatabaseError(format!("Invalid resolution format: {e}")))?;
-				let occ_database_info: DatabaseInfo = serde_json::from_str(&occ_database_info_str).map_err(|e| Error::DatabaseError(format!("Failed to parse occurrence database info JSON: {e}")))?;
-				let occ_beginning_timestamp = DateTime::from_timestamp_millis(occ_beginning_timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid beginning timestamp".to_string()))?;
-				let occ_end_timestamp = DateTime::from_timestamp_millis(occ_end_timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid end timestamp".to_string()))?;
-
-				let occurrence = Occurrence::new(occ_aspect_id, occ_resolution, occ_size, occ_database_info, occ_pattern_id, occ_beginning_timestamp, occ_end_timestamp);
-				occurrences.push(occurrence);
-			}
-
-			// Then the compact lists (see `occurrence_codec`), in the order they were saved.
-			// A dictionary file from before the codec has no such table; that is no error.
-			if let Ok(mut blob_rows) = conn.as_ref().query(r"SELECT codec, payload FROM pattern_occurrence_blobs WHERE pattern_id = ? ORDER BY id ASC", turso::params![pattern_id.as_uuid().to_string()]).await {
-				loop {
-					let next = blob_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern occurrence list: {e}")))?;
-					let Some(blob_row) = next else { break };
-					let codec = *blob_row.get_value(0)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence codec is not integer".to_string()))?;
-					if codec != crate::types::occurrence_codec::CODEC_V1 {
-						return Err(Error::DatabaseError(format!("Unknown occurrence codec {codec} for pattern {pattern_id}")).into());
-					}
-					let payload = blob_row.get_value(1)?.as_blob().ok_or_else(|| Error::DatabaseError("Occurrence payload is not a blob".to_string()))?.clone();
-					occurrences.extend(crate::types::occurrence_codec::decode(&payload).map_err(|e| Error::DatabaseError(format!("Corrupt occurrence list for pattern {pattern_id}: {e:#}")))?);
-				}
-			}
-
-			// Get relatives from pattern_relatives table
-			let relatives_query_sql = r"
-                                SELECT pattern_id, relative_index, relative_value
-                                FROM pattern_relatives
-                                WHERE pattern_id = ?
-                                ORDER BY relative_index ASC
-                        ";
-
-			let mut rel_rows: turso::Rows = conn.as_ref().query(relatives_query_sql, turso::params![pattern_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query pattern relatives: {e}")))?;
-			let mut relatives: Vec<Relative> = Vec::new();
-			loop {
-				let Some(rel_row) = rel_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern relative row: {e}")))? else {
-					break;
-				};
-				let _rel_pattern_id_str = rel_row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Pattern ID is not text".to_string()))?.clone();
-				let _rel_relative_index: usize = usize::try_from(*rel_row.get_value(1)?.as_integer().ok_or_else(|| Error::DatabaseError("Relative Index is not integer".to_string()))?).map_err(|e| Error::DatabaseError(format!("Relative index out of range: {e}")))?;
-				let rel_value_json = rel_row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Value is not text".to_string()))?.clone();
-
-				let relative: Relative = serde_json::from_str(&rel_value_json).map_err(|e| Error::DatabaseError(format!("Failed to parse relative JSON: {e}")))?;
-				relatives.push(relative);
-			}
-
-			let pattern = Pattern::new(id, occurrences, relatives);
-
-			// Cache the pattern
-			self.cache.lock().await.store(&cache_key, pattern.clone()).await;
-
-			Ok(pattern)
-		} else {
-			Err(anyhow::anyhow!("Pattern with ID {pattern_id} not found"))
-		}
+		let pattern = self.load_dictionary_pattern(aspect_id, dictionary_name, pattern_id).await?;
+		self.cache.lock().await.store(&cache_key, pattern.clone()).await;
+		Ok(pattern)
 	}
 
 	async fn get_dictionary_patterns(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Pin<Box<dyn Stream<Item = Result<Pattern>> + Send + 'static>>> {
-		// Check cache first
-		let cache_key = Self::dictionary_patterns_cache_key(aspect_id, dictionary_name);
-		if let Some(cached_patterns) = self.cache.lock().await.get::<Vec<Pattern>>(&cache_key).await {
-			// Convert cached patterns to stream
-			let pattern_stream = futures::stream::iter(cached_patterns.into_iter().map(Ok));
-			return Ok(Box::pin(pattern_stream));
-		}
-
-		// Get from database
-		let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
-		let conn: cache::Connection = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
-		drop(db);
-		let query_sql = r"
-                        SELECT DISTINCT id
-                        FROM patterns 
-                ";
-		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![]).await.map_err(|e| Error::DatabaseError(format!("Failed to query patterns: {e}")))?;
-		// Collect all patterns first to avoid async issues in the stream
-		let patterns = self.collect_pattern_rows(&mut rows, aspect_id, dictionary_name).await?;
-		Self::commit_concurrent(&conn).await?;
-		// Cache the results for future queries
-		self.cache_nonempty(&cache_key, &patterns).await;
-		// Convert to stream
-		let pattern_stream = futures::stream::iter(patterns.into_iter().map(Ok));
-		Ok(Box::pin(pattern_stream))
+		// Each reader clones a pattern only as the stream yields it; the list itself is
+		// the one shared copy the cache holds.
+		Ok(Box::pin(shared_pattern_stream(self.dictionary_patterns_shared(aspect_id, dictionary_name).await?)))
 	}
 
 	//
@@ -1339,35 +1209,272 @@ impl Database {
 		Ok(batches)
 	}
 
-	/// The full pattern (occurrences and relatives) behind each pattern id `rows` holds;
-	/// a pattern that does not load is logged and skipped.
-	async fn collect_pattern_rows(&self, rows: &mut turso::Rows, aspect_id: &AspectId, dictionary_name: &str) -> Result<Vec<Pattern>> {
-		let mut patterns = Vec::new();
+	/// Reads one pattern (occurrences and relatives) from its dictionary file, without
+	/// touching the cache.
+	async fn load_dictionary_pattern(&self, aspect_id: &AspectId, dictionary_name: &str, pattern_id: &PatternID) -> Result<Pattern> {
+		let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
+		let conn: cache::Connection = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
+		let query_sql = r"
+                        SELECT id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value
+                        FROM patterns 
+                        WHERE id = ?
+                ";
+
+		let mut rows: turso::Rows = conn.as_ref().query(query_sql, turso::params![pattern_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query pattern: {e}")))?;
+		Self::commit_concurrent(&conn).await?;
+
+		let next_row = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern row: {e}")))?;
+		if let Some(row) = next_row {
+			let id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Pattern ID is not text".to_string()))?.clone();
+			let sum_value_str = row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Sum value is not text".to_string()))?.clone();
+			let abs_sum_value_str = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Abs sum value is not text".to_string()))?.clone();
+			let max_value_str = row.get_value(3)?.as_text().ok_or_else(|| Error::DatabaseError("Max value is not text".to_string()))?.clone();
+			let min_value_str = row.get_value(4)?.as_text().ok_or_else(|| Error::DatabaseError("Min value is not text".to_string()))?.clone();
+			let abs_max_value_str = row.get_value(5)?.as_text().ok_or_else(|| Error::DatabaseError("Abs max value is not text".to_string()))?.clone();
+			let avg_value_str = row.get_value(6)?.as_text().ok_or_else(|| Error::DatabaseError("Avg value is not text".to_string()))?.clone();
+			let abs_avg_value_str = row.get_value(7)?.as_text().ok_or_else(|| Error::DatabaseError("Abs avg value is not text".to_string()))?.clone();
+
+			let id = PatternID::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for pattern ID: {e}")))?);
+			let _sum_value = BigDecimal::from_str(&sum_value_str).map_err(|e| Error::DatabaseError(format!("Invalid sum value format: {e}")))?;
+			let _abs_sum_value = BigDecimal::from_str(&abs_sum_value_str).map_err(|e| Error::DatabaseError(format!("Invalid abs sum value format: {e}")))?;
+			let _max_value = BigDecimal::from_str(&max_value_str).map_err(|e| Error::DatabaseError(format!("Invalid max value format: {e}")))?;
+			let _min_value = BigDecimal::from_str(&min_value_str).map_err(|e| Error::DatabaseError(format!("Invalid min value format: {e}")))?;
+			let _abs_max_value = BigDecimal::from_str(&abs_max_value_str).map_err(|e| Error::DatabaseError(format!("Invalid abs max value format: {e}")))?;
+			let _avg_value = BigDecimal::from_str(&avg_value_str).map_err(|e| Error::DatabaseError(format!("Invalid avg value format: {e}")))?;
+			let _abs_avg_value = BigDecimal::from_str(&abs_avg_value_str).map_err(|e| Error::DatabaseError(format!("Invalid abs avg value format: {e}")))?;
+
+			// Get occurrences from pattern_occurrences table
+			let occurrences_query_sql = r"
+                                SELECT pattern_id, aspect_id, resolution, size, database_info, beginning_timestamp, end_timestamp
+                                FROM pattern_occurrences
+                                WHERE pattern_id = ?
+                        ";
+			let mut occ_rows: turso::Rows = conn.as_ref().query(occurrences_query_sql, turso::params![pattern_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query pattern occurrences: {e}")))?;
+			let mut occurrences: Vec<Occurrence> = Vec::new();
+			loop {
+				let Some(occ_row) = occ_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern occurrence row: {e}")))? else {
+					break;
+				};
+				occurrences.push(Self::parse_pattern_occurrence_row(&occ_row)?);
+			}
+
+			// Then the compact lists (see `occurrence_codec`), in the order they were saved.
+			// A dictionary file from before the codec has no such table; that is no error.
+			if let Ok(mut blob_rows) = conn.as_ref().query(r"SELECT codec, payload FROM pattern_occurrence_blobs WHERE pattern_id = ? ORDER BY id ASC", turso::params![pattern_id.as_uuid().to_string()]).await {
+				loop {
+					let next = blob_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern occurrence list: {e}")))?;
+					let Some(blob_row) = next else { break };
+					let codec = *blob_row.get_value(0)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence codec is not integer".to_string()))?;
+					if codec != crate::types::occurrence_codec::CODEC_V1 {
+						return Err(Error::DatabaseError(format!("Unknown occurrence codec {codec} for pattern {pattern_id}")).into());
+					}
+					let payload = blob_row.get_value(1)?.as_blob().ok_or_else(|| Error::DatabaseError("Occurrence payload is not a blob".to_string()))?.clone();
+					occurrences.extend(crate::types::occurrence_codec::decode(&payload).map_err(|e| Error::DatabaseError(format!("Corrupt occurrence list for pattern {pattern_id}: {e:#}")))?);
+				}
+			}
+
+			// Get relatives from pattern_relatives table
+			let relatives_query_sql = r"
+                                SELECT pattern_id, relative_index, relative_value
+                                FROM pattern_relatives
+                                WHERE pattern_id = ?
+                                ORDER BY relative_index ASC
+                        ";
+
+			let mut rel_rows: turso::Rows = conn.as_ref().query(relatives_query_sql, turso::params![pattern_id.as_uuid().to_string()]).await.map_err(|e| Error::DatabaseError(format!("Failed to query pattern relatives: {e}")))?;
+			let mut relatives: Vec<Relative> = Vec::new();
+			loop {
+				let Some(rel_row) = rel_rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern relative row: {e}")))? else {
+					break;
+				};
+				let _rel_pattern_id_str = rel_row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Pattern ID is not text".to_string()))?.clone();
+				let _rel_relative_index: usize = usize::try_from(*rel_row.get_value(1)?.as_integer().ok_or_else(|| Error::DatabaseError("Relative Index is not integer".to_string()))?).map_err(|e| Error::DatabaseError(format!("Relative index out of range: {e}")))?;
+				let rel_value_json = rel_row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Value is not text".to_string()))?.clone();
+
+				let relative: Relative = serde_json::from_str(&rel_value_json).map_err(|e| Error::DatabaseError(format!("Failed to parse relative JSON: {e}")))?;
+				relatives.push(relative);
+			}
+
+			Ok(Pattern::new(id, occurrences, relatives))
+		} else {
+			Err(anyhow::anyhow!("Pattern with ID {pattern_id} not found"))
+		}
+	}
+
+	/// Every pattern of a dictionary as one shared list. The list is cached once (until the
+	/// dictionary is saved); callers borrow it instead of holding their own copy.
+	pub(crate) async fn dictionary_patterns_shared(&self, aspect_id: &AspectId, dictionary_name: &str) -> Result<Arc<[Pattern]>> {
+		let cache_key = Self::dictionary_patterns_cache_key(aspect_id, dictionary_name);
+		// Taken before the read, so a replace that commits meanwhile keeps this read's
+		// (possibly older) list out of the cache; see `DatabaseCache::generation`.
+		let generation = {
+			let cache = self.cache.lock().await;
+			if let Some(cached) = cache.get::<Arc<[Pattern]>>(&cache_key).await {
+				return Ok(cached);
+			}
+			cache.generation(&cache_key).await
+		};
+		let db = self.get_dictionary_db(aspect_id, dictionary_name).await?;
+		let conn: cache::Connection = Self::begin_concurrent(&db, dictionary_name, Some(self.cache.clone())).await?;
+		drop(db);
+		let patterns = Self::load_all_dictionary_patterns(&conn).await;
+		Self::commit_concurrent(&conn).await?;
+		let patterns = patterns?;
+		let patterns: Arc<[Pattern]> = patterns.into();
+		// An empty list is not cached, as before: the dictionary may not be saved yet.
+		if !patterns.is_empty() {
+			self.cache.lock().await.store_if_generation(&cache_key, generation, Arc::clone(&patterns)).await;
+		}
+		Ok(patterns)
+	}
+
+	/// Every pattern of a dictionary file, read with one scan of each pattern table.
+	///
+	/// The pattern tables have no index on `pattern_id` (MVCC files keep none), so reading
+	/// pattern by pattern scanned every table once per pattern: the reads grew with the
+	/// pattern count times the file size, and once the file outgrew the connection's page
+	/// cache every one of those scans went back to disk. Patterns come out in the order of
+	/// their first `patterns` row, each built exactly as
+	/// [`Self::load_dictionary_pattern`] builds it; a pattern that does not load is logged
+	/// and skipped.
+	async fn load_all_dictionary_patterns(conn: &cache::Connection) -> Result<Vec<Pattern>> {
+		let db_err = |what: &str, e: turso::Error| Self::db_error(what, &e);
+		// Each id once, in the order of its first `patterns` row (rowid order: a plain scan
+		// of the table, which no index can serve), and that row's values, as `WHERE id = ?`
+		// returns it.
+		let mut ids: Vec<String> = Vec::new();
+		let mut values: HashMap<String, [String; 7]> = HashMap::new();
+		let mut rows = conn.as_ref().query("SELECT id, sum_value, abs_sum_value, max_value, min_value, abs_max_value, avg_value, abs_avg_value FROM patterns", turso::params![]).await.map_err(|e| db_err("query patterns", e))?;
 		loop {
-			let Some(row) = rows.next().await.map_err(|e| Error::DatabaseError(format!("Failed to get pattern row: {e}")))? else {
-				break;
-			};
-			let pattern_id_str = row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Pattern ID is not text".to_string()))?.clone();
-			let pattern_id = PatternID::from_uuid(Uuid::parse_str(&pattern_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for pattern ID: {e}")))?);
-			// Use get_dictionary_pattern to get the full pattern with occurrences and relatives
-			if let Ok(pattern) = crate::types::database::traits::Outputs::get_dictionary_pattern(self, aspect_id, dictionary_name, &pattern_id).await {
-				patterns.push(pattern);
-			} else {
-				// Log error but continue processing other patterns
-				tracing::warn!("Failed to parse pattern row for ID {pattern_id_str}");
+			let Some(row) = rows.next().await.map_err(|e| db_err("get pattern row", e))? else { break };
+			let text = |i: usize| -> Result<Option<String>> { Ok(row.get_value(i)?.as_text().cloned()) };
+			let id = text(0)?.ok_or_else(|| Error::DatabaseError("Pattern ID is not text".to_string()))?;
+			if values.contains_key(&id) {
+				continue;
+			}
+			ids.push(id.clone());
+			let mut v: [String; 7] = Default::default();
+			let mut ok = true;
+			for (k, slot) in v.iter_mut().enumerate() {
+				let value = text(k + 1)?;
+				if let Some(t) = value {
+					*slot = t;
+				} else {
+					ok = false;
+				}
+			}
+			// A non-text value makes the per-pattern load fail; an empty entry marks it.
+			values.insert(id, if ok { v } else { Default::default() });
+		}
+		drop(rows);
+
+		let mut occurrences: HashMap<String, Result<Vec<Occurrence>>> = HashMap::new();
+		let mut rows = conn.as_ref().query("SELECT pattern_id, aspect_id, resolution, size, database_info, beginning_timestamp, end_timestamp FROM pattern_occurrences", turso::params![]).await.map_err(|e| db_err("query pattern occurrences", e))?;
+		loop {
+			let Some(row) = rows.next().await.map_err(|e| db_err("get pattern occurrence row", e))? else { break };
+			let Some(pid) = row.get_value(0)?.as_text().cloned() else { continue };
+			let entry = occurrences.entry(pid).or_insert_with(|| Ok(Vec::new()));
+			if let Ok(list) = entry {
+				match Self::parse_pattern_occurrence_row(&row) {
+					Ok(o) => list.push(o),
+					Err(e) => *entry = Err(e),
+				}
+			}
+		}
+		drop(rows);
+
+		// Compact lists, in saved (`id`) order per pattern. A file from before the codec
+		// has no such table; that is no error.
+		let mut blobs: HashMap<String, Vec<(i64, i64, Vec<u8>)>> = HashMap::new();
+		if let Ok(mut rows) = conn.as_ref().query("SELECT pattern_id, id, codec, payload FROM pattern_occurrence_blobs", turso::params![]).await {
+			loop {
+				let Some(row) = rows.next().await.map_err(|e| db_err("get pattern occurrence list", e))? else { break };
+				let Some(pid) = row.get_value(0)?.as_text().cloned() else { continue };
+				let id = *row.get_value(1)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence list id is not integer".to_string()))?;
+				let codec = *row.get_value(2)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence codec is not integer".to_string()))?;
+				let payload = row.get_value(3)?.as_blob().ok_or_else(|| Error::DatabaseError("Occurrence payload is not a blob".to_string()))?.clone();
+				blobs.entry(pid).or_default().push((id, codec, payload));
+			}
+		}
+
+		let mut relatives = Self::scan_pattern_relatives(conn).await?;
+
+		let mut patterns = Vec::with_capacity(ids.len());
+		for id_str in ids {
+			let built = (|| -> Result<Pattern> {
+				let v = values.remove(&id_str).ok_or_else(|| anyhow::anyhow!("Pattern with ID {id_str} not found"))?;
+				let id = PatternID::from_uuid(Uuid::parse_str(&id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for pattern ID: {e}")))?);
+				for value in &v {
+					BigDecimal::from_str(value).map_err(|e| Error::DatabaseError(format!("Invalid pattern value format: {e}")))?;
+				}
+				let mut list = occurrences.remove(&id_str).unwrap_or_else(|| Ok(Vec::new()))?;
+				let mut lists = blobs.remove(&id_str).unwrap_or_default();
+				lists.sort_by_key(|(id, _, _)| *id);
+				for (_, codec, payload) in lists {
+					if codec != crate::types::occurrence_codec::CODEC_V1 {
+						return Err(Error::DatabaseError(format!("Unknown occurrence codec {codec} for pattern {id}")).into());
+					}
+					list.extend(crate::types::occurrence_codec::decode(&payload).map_err(|e| Error::DatabaseError(format!("Corrupt occurrence list for pattern {id}: {e:#}")))?);
+				}
+				let mut rels = relatives.remove(&id_str).unwrap_or_else(|| Ok(Vec::new()))?;
+				rels.sort_by_key(|(index, _)| *index);
+				Ok(Pattern::new(id, list, rels.into_iter().map(|(_, r)| r).collect()))
+			})();
+			match built {
+				Ok(p) => patterns.push(p),
+				Err(e) => tracing::warn!("Failed to parse pattern row for ID {id_str}: {e:#}"),
 			}
 		}
 		Ok(patterns)
 	}
 
-	/// Cache `items` under `cache_key` unless there are none to cache.
-	async fn cache_nonempty<T: Clone + Sync>(&self, cache_key: &str, items: &[T])
-	where
-		Vec<T>: cache::Cacheable,
-	{
-		if !items.is_empty() {
-			self.cache.lock().await.store(cache_key, items.to_vec()).await;
+	/// Every `pattern_relatives` row, grouped by pattern in `relative_index` order once
+	/// sorted; a pattern with a row that does not parse maps to that error.
+	async fn scan_pattern_relatives(conn: &cache::Connection) -> Result<HashMap<String, Result<Vec<(i64, Relative)>>>> {
+		let mut relatives: HashMap<String, Result<Vec<(i64, Relative)>>> = HashMap::new();
+		let mut rows = conn.as_ref().query("SELECT pattern_id, relative_index, relative_value FROM pattern_relatives", turso::params![]).await.map_err(|e| Self::db_error("query pattern relatives", &e))?;
+		loop {
+			let Some(row) = rows.next().await.map_err(|e| Self::db_error("get pattern relative row", &e))? else { break };
+			let Some(pid) = row.get_value(0)?.as_text().cloned() else { continue };
+			let entry = relatives.entry(pid).or_insert_with(|| Ok(Vec::new()));
+			if let Ok(list) = entry {
+				let parsed = (|| -> Result<(i64, Relative)> {
+					let index = *row.get_value(1)?.as_integer().ok_or_else(|| Error::DatabaseError("Relative Index is not integer".to_string()))?;
+					usize::try_from(index).map_err(|e| Error::DatabaseError(format!("Relative index out of range: {e}")))?;
+					let json = row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Relative Value is not text".to_string()))?.clone();
+					Ok((index, serde_json::from_str(&json).map_err(|e| Error::DatabaseError(format!("Failed to parse relative JSON: {e}")))?))
+				})();
+				match parsed {
+					Ok(r) => list.push(r),
+					Err(e) => *entry = Err(e),
+				}
+			}
 		}
+		drop(rows);
+		Ok(relatives)
+	}
+
+	fn db_error(what: &str, e: &turso::Error) -> Error {
+		Error::DatabaseError(format!("Failed to {what}: {e}"))
+	}
+
+	/// One `pattern_occurrences` row (`pattern_id, aspect_id, resolution, size,
+	/// database_info, beginning_timestamp, end_timestamp`) as an [`Occurrence`].
+	fn parse_pattern_occurrence_row(occ_row: &turso::Row) -> Result<Occurrence> {
+		let occ_pattern_id_str = occ_row.get_value(0)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Pattern ID is not text".to_string()))?.clone();
+		let occ_aspect_id_str = occ_row.get_value(1)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Aspect ID is not text".to_string()))?.clone();
+		let occ_resolution_str = occ_row.get_value(2)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Resolution is not text".to_string()))?.clone();
+		let occ_size: usize = usize::try_from(*occ_row.get_value(3)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Size is not integer".to_string()))?).map_err(|e| Error::DatabaseError(format!("Occurrence size out of range: {e}")))?;
+		let occ_database_info_str = occ_row.get_value(4)?.as_text().ok_or_else(|| Error::DatabaseError("Occurrence Database Info is not text".to_string()))?.clone();
+		let occ_beginning_timestamp_millis: i64 = *occ_row.get_value(5)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence Beginning Timestamp is not integer".to_string()))?;
+		let occ_end_timestamp_millis: i64 = *occ_row.get_value(6)?.as_integer().ok_or_else(|| Error::DatabaseError("Occurrence End Timestamp is not integer".to_string()))?;
+		let occ_pattern_id = PatternID::from_uuid(Uuid::parse_str(&occ_pattern_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for occurrence Pattern ID: {e}")))?);
+		let occ_aspect_id = AspectId::from_str(&occ_aspect_id_str).map_err(|e| Error::InvalidIdError(format!("Invalid UUID format for occurrence Aspect ID: {e}")))?;
+		let occ_resolution = Resolution::from_str(&occ_resolution_str).map_err(|e| Error::DatabaseError(format!("Invalid resolution format: {e}")))?;
+		let occ_database_info: DatabaseInfo = serde_json::from_str(&occ_database_info_str).map_err(|e| Error::DatabaseError(format!("Failed to parse occurrence database info JSON: {e}")))?;
+		let occ_beginning_timestamp = DateTime::from_timestamp_millis(occ_beginning_timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid beginning timestamp".to_string()))?;
+		let occ_end_timestamp = DateTime::from_timestamp_millis(occ_end_timestamp_millis).ok_or_else(|| Error::DatabaseError("Invalid end timestamp".to_string()))?;
+		Ok(Occurrence::new(occ_aspect_id, occ_resolution, occ_size, occ_database_info, occ_pattern_id, occ_beginning_timestamp, occ_end_timestamp))
 	}
 
 	/// Inner implementation of `fetch_measurements_for_range` without retry
@@ -1978,6 +2085,12 @@ struct RegistrationTables {
 	variabilities: bool,
 }
 
+/// A stream that clones each pattern of `patterns` only as it is yielded.
+fn shared_pattern_stream(patterns: Arc<[Pattern]>) -> impl Stream<Item = Result<Pattern>> + Send + 'static {
+	let len = patterns.len();
+	futures::stream::iter((0..len).map(move |i| Ok(patterns[i].clone())))
+}
+
 #[cfg(test)]
 mod tests {
 	use turso::Value;
@@ -2025,6 +2138,224 @@ mod tests {
 		assert_eq!(err.to_string(), "Database error: Invalid interpolation format: invalid bounds factor -1: must be finite and not negative");
 		assert!(Database::parse_stored_steps(&Value::Integer(-1), &text("Cubic")).is_err());
 		assert!(Database::parse_stored_steps(&Value::Integer(10), &Value::Null).is_err());
+	}
+
+	mod dictionary_reads {
+		use futures::TryStreamExt;
+
+		use crate::{
+			database::traits::{AspectStructure, DatabaseStructure, Outputs}, Database, DatabaseInfo, DictionaryConstraints, Occurrence, Pattern, PatternID
+		};
+
+		fn pattern(aspect_id: crate::AspectId) -> Pattern {
+			let id = PatternID::from_uuid(uuid::Uuid::new_v4());
+			let now = chrono::Utc::now();
+			Pattern::new(id, vec![Occurrence::new(aspect_id, splimes::Resolution::Seconds, 3, DatabaseInfo::new("t".to_string(), "t".to_string()), id, now, now)], Vec::new())
+		}
+
+		/// A dictionary's patterns are cached once, as one shared list: reading them does
+		/// not also cache each pattern, every reader shares the same list, and a save
+		/// drops it so the next read sees the new patterns.
+		#[tokio::test]
+		#[serial_test::serial]
+		async fn a_dictionary_is_cached_as_one_shared_list() -> anyhow::Result<()> {
+			crate::types::database::config::use_temp_data_dir();
+			let name = format!("dictionary_reads_{}", uuid::Uuid::new_v4().simple());
+			let db = Database::new(&name).await?;
+			let subject = db.observe_subject("s").await?;
+			let aspect = db.track_aspect(&subject.id(), "a", &splimes::Resolution::Seconds, None).await?;
+			let aspect_id = aspect.id();
+			aspect.new_dictionary("d", "", &DictionaryConstraints::default()).await?;
+			drop(aspect);
+			let saved: Vec<Pattern> = (0..3).map(|_| pattern(aspect_id)).collect();
+			db.replace_dictionary_patterns(&aspect_id, "d", &saved).await?;
+
+			let first = db.dictionary_patterns_shared(&aspect_id, "d").await?;
+			let second = db.dictionary_patterns_shared(&aspect_id, "d").await?;
+			assert!(std::sync::Arc::ptr_eq(&first, &second), "each read built its own list");
+			assert_eq!(first.len(), saved.len());
+			for p in &saved {
+				assert!(db.cache.lock().await.get::<Pattern>(&format!("pattern_{}", p.id().as_uuid())).await.is_none(), "the list read cached a second copy of a pattern");
+			}
+			let streamed: Vec<Pattern> = db.get_dictionary_patterns(&aspect_id, "d").await?.try_collect().await?;
+			assert_eq!(streamed.as_slice(), &*first);
+
+			let grown: Vec<Pattern> = saved.iter().cloned().chain(std::iter::once(pattern(aspect_id))).collect();
+			db.replace_dictionary_patterns(&aspect_id, "d", &grown).await?;
+			let after = db.dictionary_patterns_shared(&aspect_id, "d").await?;
+			assert!(!std::sync::Arc::ptr_eq(&first, &after), "the save left the old list cached");
+			assert_eq!(after.len(), grown.len());
+			drop((first, second, after));
+			db.close().await?;
+			drop(db);
+			Ok(())
+		}
+
+		/// A save leaves the list a fresh read would build in the cache, so the pipeline's
+		/// next read (every run saves, then reads) does not scan the whole file again. Saved
+		/// patterns replace their stored copies and move after the patterns kept.
+		#[tokio::test]
+		#[serial_test::serial]
+		async fn a_save_caches_the_list_a_fresh_read_builds() -> anyhow::Result<()> {
+			crate::types::database::config::use_temp_data_dir();
+			let name = format!("dictionary_write_through_{}", uuid::Uuid::new_v4().simple());
+			let db = Database::new(&name).await?;
+			let subject = db.observe_subject("s").await?;
+			let aspect = db.track_aspect(&subject.id(), "a", &splimes::Resolution::Seconds, None).await?;
+			let aspect_id = aspect.id();
+			aspect.new_dictionary("d", "", &DictionaryConstraints::default()).await?;
+			drop(aspect);
+			let key = Database::dictionary_patterns_cache_key(&aspect_id, "d");
+			let stored: Vec<Pattern> = (0..4).map(|_| pattern(aspect_id)).collect();
+			db.replace_dictionary_patterns(&aspect_id, "d", &stored).await?;
+			assert!(db.cache.lock().await.get::<std::sync::Arc<[Pattern]>>(&key).await.is_none(), "a save with no list cached cannot vouch for the file");
+			drop(db.dictionary_patterns_shared(&aspect_id, "d").await?);
+
+			// The second pattern grows an occurrence; a new one joins; the rest are kept.
+			let id = stored[1].id();
+			let now = chrono::Utc::now();
+			let occurrences = stored[1].occurrences().iter().cloned().chain(std::iter::once(Occurrence::new(aspect_id, splimes::Resolution::Seconds, 3, DatabaseInfo::new("t".to_string(), "t".to_string()), id, now, now))).collect();
+			let saved = vec![Pattern::new(id, occurrences, Vec::new()), pattern(aspect_id)];
+			drop(stored);
+			db.replace_dictionary_patterns(&aspect_id, "d", &saved).await?;
+			let cached = db.cache.lock().await.get::<std::sync::Arc<[Pattern]>>(&key).await.expect("the save dropped the list instead of replacing it");
+
+			*db.cache.lock().await = crate::DatabaseCache::new();
+			let fresh = db.dictionary_patterns_shared(&aspect_id, "d").await?;
+			assert_eq!(&*cached, &*fresh, "the cached list differs from what the file holds");
+			assert_eq!(fresh.len(), 5);
+
+			// Saving the whole list again with one pattern changed rewrites only that one:
+			// the others keep their rows, so it alone moves to the end of the file.
+			let changed = Pattern::new(fresh[0].id(), fresh[0].occurrences().iter().cloned().chain(std::iter::once(Occurrence::new(aspect_id, splimes::Resolution::Seconds, 3, DatabaseInfo::new("t".to_string(), "t".to_string()), fresh[0].id(), now, now))).collect(), Vec::new());
+			let resaved: Vec<Pattern> = std::iter::once(changed.clone()).chain(fresh[1..].iter().cloned()).collect();
+			db.replace_dictionary_patterns(&aspect_id, "d", &resaved).await?;
+			let cached = db.cache.lock().await.get::<std::sync::Arc<[Pattern]>>(&key).await.expect("the save dropped the list");
+			*db.cache.lock().await = crate::DatabaseCache::new();
+			let reread = db.dictionary_patterns_shared(&aspect_id, "d").await?;
+			let expected: Vec<Pattern> = fresh[1..].iter().cloned().chain(std::iter::once(changed)).collect();
+			assert_eq!(&*reread, expected.as_slice(), "an unchanged pattern was written again");
+			assert_eq!(&*cached, &*reread);
+
+			// Each pattern table is indexed on its pattern id, so that a save's deletes and a
+			// one-pattern read do not scan the file.
+			let file = db.get_dictionary_db(&aspect_id, "d").await?;
+			let conn = file.connect()?;
+			let mut rows = conn.query("SELECT name FROM sqlite_schema WHERE type = 'index'", ()).await?;
+			let mut indexes = Vec::new();
+			while let Some(row) = rows.next().await? {
+				indexes.push(row.get_value(0)?.as_text().cloned().unwrap_or_default());
+			}
+			drop((rows, conn, file));
+			for name in ["idx_patterns_id", "idx_pattern_occurrences_pattern", "idx_pattern_occurrence_blobs_pattern", "idx_pattern_relatives_pattern"] {
+				assert!(indexes.iter().any(|i| i == name), "{name} missing from {indexes:?}");
+			}
+
+			// Saving one id twice is left to a read to rebuild.
+			let twice = vec![saved[1].clone(), saved[1].clone()];
+			db.replace_dictionary_patterns(&aspect_id, "d", &twice).await?;
+			assert!(db.cache.lock().await.get::<std::sync::Arc<[Pattern]>>(&key).await.is_none());
+			drop((cached, fresh, reread));
+			db.close().await?;
+			drop(db);
+			Ok(())
+		}
+
+		/// A save of more patterns than an old 256-id chunk clears every stored copy in its
+		/// one statement per table: saving the same patterns again leaves one copy of each.
+		#[tokio::test]
+		#[serial_test::serial]
+		async fn a_large_save_replaces_every_stored_copy() -> anyhow::Result<()> {
+			crate::types::database::config::use_temp_data_dir();
+			let name = format!("dictionary_large_save_{}", uuid::Uuid::new_v4().simple());
+			let db = Database::new(&name).await?;
+			let subject = db.observe_subject("s").await?;
+			let aspect = db.track_aspect(&subject.id(), "a", &splimes::Resolution::Seconds, None).await?;
+			let aspect_id = aspect.id();
+			aspect.new_dictionary("d", "", &DictionaryConstraints::default()).await?;
+			drop(aspect);
+			let saved: Vec<Pattern> = (0..600).map(|_| pattern(aspect_id)).collect();
+			db.replace_dictionary_patterns(&aspect_id, "d", &saved).await?;
+			db.replace_dictionary_patterns(&aspect_id, "d", &saved).await?;
+			*db.cache.lock().await = crate::DatabaseCache::new();
+			let read = db.dictionary_patterns_shared(&aspect_id, "d").await?;
+			assert_eq!(&*read, saved.as_slice(), "a pattern was stored twice or lost");
+			drop(read);
+			db.close().await?;
+			drop(db);
+			Ok(())
+		}
+
+		/// The whole-dictionary read (one scan per pattern table) builds every pattern exactly
+		/// as the one-pattern read does: occurrences, relatives in index order, and order.
+		#[tokio::test]
+		#[serial_test::serial]
+		async fn the_whole_dictionary_read_matches_the_per_pattern_read() -> anyhow::Result<()> {
+			use bigdecimal::BigDecimal;
+			crate::types::database::config::use_temp_data_dir();
+			let name = format!("dictionary_bulk_{}", uuid::Uuid::new_v4().simple());
+			let db = Database::new(&name).await?;
+			let subject = db.observe_subject("s").await?;
+			let aspect = db.track_aspect(&subject.id(), "a", &splimes::Resolution::Seconds, None).await?;
+			let aspect_id = aspect.id();
+			aspect.new_dictionary("d", "", &DictionaryConstraints::default()).await?;
+			drop(aspect);
+			let saved: Vec<Pattern> = (0..5_i64)
+				.map(|n| {
+					let id = PatternID::from_uuid(uuid::Uuid::new_v4());
+					let at = |s: i64| chrono::DateTime::from_timestamp(1_700_000_000 + s, 0).expect("valid time");
+					let occurrences = (0..=n).map(|k| Occurrence::new(aspect_id, splimes::Resolution::Seconds, 3, DatabaseInfo::new("t".to_string(), "t".to_string()), id, at(k), at(k + 3))).collect();
+					let relatives = (0..3_i64).map(|k| crate::Relative::new(crate::MeasurementVector::new(BigDecimal::from(k), BigDecimal::from(n * 10 + k)), BigDecimal::from(2), BigDecimal::from(n))).collect();
+					Pattern::new(id, occurrences, relatives)
+				})
+				.collect();
+			db.replace_dictionary_patterns(&aspect_id, "d", &saved).await?;
+
+			let bulk = db.dictionary_patterns_shared(&aspect_id, "d").await?;
+			assert_eq!(bulk.len(), saved.len());
+			for p in bulk.iter() {
+				let one = db.load_dictionary_pattern(&aspect_id, "d", &p.id()).await?;
+				assert_eq!(p, &one, "the bulk read built a pattern differently");
+				let original = saved.iter().find(|s| s.id() == p.id()).expect("a saved pattern");
+				assert_eq!(p.occurrences().len(), original.occurrences().len());
+				assert_eq!(p.relatives(), original.relatives());
+			}
+			drop(bulk);
+			db.close().await?;
+			drop(db);
+			Ok(())
+		}
+
+		/// A dictionary heavier than the cache's byte budget is not kept resident: every
+		/// read loads it again from disk, and the patterns are the same as a cached read's.
+		#[tokio::test]
+		#[serial_test::serial]
+		async fn a_dictionary_over_the_cache_budget_is_reread_unchanged() -> anyhow::Result<()> {
+			crate::types::database::config::use_temp_data_dir();
+			let name = format!("dictionary_budget_{}", uuid::Uuid::new_v4().simple());
+			let db = Database::new(&name).await?;
+			let subject = db.observe_subject("s").await?;
+			let aspect = db.track_aspect(&subject.id(), "a", &splimes::Resolution::Seconds, None).await?;
+			let aspect_id = aspect.id();
+			aspect.new_dictionary("d", "", &DictionaryConstraints::default()).await?;
+			drop(aspect);
+			let saved: Vec<Pattern> = (0..3).map(|_| pattern(aspect_id)).collect();
+			db.replace_dictionary_patterns(&aspect_id, "d", &saved).await?;
+			let cached = db.dictionary_patterns_shared(&aspect_id, "d").await?;
+
+			let list_weight = crate::Cacheable::weight(&cached);
+			*db.cache.lock().await = crate::DatabaseCache::with_max_bytes(list_weight - 1);
+			let first = db.dictionary_patterns_shared(&aspect_id, "d").await?;
+			let second = db.dictionary_patterns_shared(&aspect_id, "d").await?;
+			assert!(!std::sync::Arc::ptr_eq(&first, &second), "the list was cached over budget");
+			assert!(db.cache.lock().await.bytes().await < list_weight, "the list is not resident");
+			assert_eq!(&*first, &*cached);
+			assert_eq!(&*second, &*cached);
+			drop((cached, first, second));
+			db.close().await?;
+			drop(db);
+			Ok(())
+		}
 	}
 
 	mod correlation_reads {
