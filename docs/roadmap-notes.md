@@ -929,6 +929,33 @@ No box moved in this change.
 2. A per-series latest-row read in `SegmentStore` for `lastpoint`. First measure today's full-range `lastpoint` against a prototype that reads only the series' last segment.
 3. The other engines' TSBS SQL (TimescaleDB first, since the generator SQL is already read), each checked against `TsbsCpu`.
 
+## Routine 2026-11-25 — a per-series latest-row read for TSBS `lastpoint` (TAG-12, #341)
+
+**The read.** `SegmentStore::read_latest_of(aspect, series)` (and `read_latest` for series 0) asks the index for the series' greatest `max_ts` (`SegmentIndexStore::series_latest_ts`, one `SELECT MAX(max_ts)`), then runs the ordinary `read_time_range_of` over `[latest, latest]`. That prunes to the segments holding that instant, decodes only its window and resolves them newer-wins, so the answer is the whole-series read's last row by construction, a newer null included. If the instant reads empty (a suspect frame skipped under `WEFT_SUSPECT_FRAME_POLICY=skip`, or a concurrent purge or merge), it reads the whole series instead. `weft-xbench`'s `TsbsWeft::lastpoint` now calls it.
+
+**The first cut was wider.** It read `[MAX(min_ts), i64::MAX]`, the tail from the start of the latest-starting segment. That is also correct, but on a one-segment series it decodes everything, and the bench showed no gain there. The `[max_ts, max_ts]` window gains at every split.
+
+**Tests.** `weftdb/src/types/segment_store/latest_read_tests.rs` has six cases, each checked against the whole-series read: empty and unknown series, eight sequential segments, a later seal at the latest instant, a newer null at it, an older segment reaching past a later seal, and tagged series answered independently. A mutant that decodes only the newest-sealed segment fails the older-segment case. The fallback is not exercised by a test: no case corrupts the latest frame under the skip policy.
+
+**Bench (not a claim).** `weftdb/benches/latest_read.rs` compares the read with today's whole-series read over 200,000 rows sealed as 1, 8 and 64 segments. On this run's host (load average 12–14, other lanes building) the latest read was faster at every split. A loaded host's figures are noise, so none is published here (the routine's rule; `docs/benchmark-policy.md` governs what a published figure must carry). The logs stay in the run's scratch dir. The quiet-host run is a ROADMAP sub-item.
+
+**Research: how two engines in the competitive set answer "latest row per key".**
+- QuestDB, [`LATEST ON … PARTITION BY`](https://questdb.com/docs/query/sql/latest-on/) (read 2026-11-25): with one `SYMBOL` partition column the scan stops once every distinct symbol has its latest row. With several `SYMBOL` columns it stops only after every possible combination is found, which often means the whole table. With any non-`SYMBOL` column it scans the table, or the `WHERE` time range, and the page warns this slows at hundreds of millions of rows. WeftDB's per-series read is the single-key case: the catalog knows the series up front, and each answer costs one index query plus the segments at the series' end.
+- InfluxDB 3 Core, [Last Value Cache](https://docs.influxdata.com/influxdb3/core/admin/last-value-cache/) (read 2026-11-25): an explicitly created in-memory cache of the last N values per key-column combination, filled from history when it is created and queried through the `last_cache()` SQL function (not InfluxQL). Rows are key cardinality × N, and the page warns against high-cardinality keys. It is flushed when the server stops, and the page contradicts itself on whether a restart reloads it. WeftDB needs no cache for `lastpoint`: the index already holds each segment's `max_ts`. A resident cache would be a separate decision with its own memory budget (ROB-14), and nothing here argues for one yet.
+
+**Five more TSBS query types.** The run went on to `cpu-max-all-1`/`-8`, `high-cpu-1`/`-all` and `groupby-orderby-limit`. Each definition was read from TSBS `master`'s TimescaleDB generator ([`databases/timescaledb/devops.go`](https://github.com/timescale/tsbs/blob/master/cmd/tsbs_generate_queries/databases/timescaledb/devops.go), [`uses/devops/common.go`](https://github.com/timescale/tsbs/blob/master/cmd/tsbs_generate_queries/uses/devops/common.go), [`main.go`](https://github.com/timescale/tsbs/blob/master/cmd/tsbs_generate_queries/main.go)):
+- `MaxAllCPU`: `max()` of all ten fields per `time_bucket('3600 seconds')`, `hostname IN (…)`, `time >= start AND time < end`, `ORDER BY hour`. The window is `MaxAllDuration`, 8 h, except `cpu-max-all-32-24`, which `main.go` registers with 24 h. Its label still says 8 h.
+- `HighCPUForHosts`: `SELECT * … WHERE usage_user > 90.0` over `HighCPUDuration` (12 h), with no `ORDER BY` and no `LIMIT`. `high-cpu-all` omits the host filter.
+- `GroupByOrderByLimit`: `max(usage_user)` per minute, `WHERE time < end` only, `ORDER BY minute DESC LIMIT 5`. The end is `MustRandWindow(time.Hour).End()`.
+- `GroupByTimeAndPrimaryTag` (`double-groupby-1`/`-5`/`-all`): `avg()` per hour and host over 12 h. Its doc comment says "a day", but the code draws 12 h.
+
+A debug `--tsbs-queries --reps 5` run over the reference file passed all twelve queries on every instance (load average 27–48, so no timing is quoted). Evidence: `/mnt/deepmem/Development/weftdb-routine/runs/20261125-025723/xbench-tsbs-4/`.
+
+**Next (tomorrow).**
+1. On a quiet host: `cargo bench -p weftdb --bench latest_read`, then the release-build `--tsbs-queries` run over `/mnt/weftbench/tsbs/cpu-only.lp` (now twelve queries). Both are ROADMAP sub-items.
+2. `double-groupby-*`: decide how a mean is compared (an exact rational `sum / count` on both sides, or the store's `avg` against a stated tolerance) before adding it.
+3. The other engines' TSBS SQL, TimescaleDB first, each checked against `TsbsCpu`.
+
 ## 2026-11-22 — The fan-out arm's doc comment said the arm did not exist (#860, TAG-12 residual, L127)
 
 `weft-bench/src/fan_out.rs` opened by asserting that on `main` fan-out appears only in prose documents and

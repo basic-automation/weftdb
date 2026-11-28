@@ -132,8 +132,13 @@ The phase also cleared the remaining loose ends. The stale README status was fix
       - [x] The phase and its gate: `--tsbs-queries` times `--reps` seeded instances of each of the seven queries over the whole file, gates every answer against the reference, and reports them as schema v9's `tsbs_queries` (2026-11-23, `routine/weftdb-2026-11-23`: `weft_xbench::run_tsbs_queries`, `TsbsCpu::instances`; a mutated-reference test fails the gate on every instance; a debug run over `/mnt/weftbench/tsbs/cpu-only.lp` passes all seven on a busy host, timings unpublished)
       - [ ] A release-build run over the full file on a quiet host, published as a report artifact
     - [ ] A per-series latest-row read in `SegmentStore`, so `lastpoint` stops reading every series whole (TSBS's TimescaleDB `lastpoint` is a `LATERAL … ORDER BY time DESC LIMIT 1` per host); benchmark it against today's full-range read first
+      - [x] The read, its bench, and `lastpoint` on it (2026-11-25, `routine/weftdb-2026-11-25`: `SegmentStore::read_latest_of` reads only the instant the index gives as the series' greatest `max_ts`, newer-wins, and falls back to the whole series if that instant reads empty; six tests pin it equal to the whole-series read's last row, and a "newest segment only" mutant fails one; `weftdb/benches/latest_read.rs` compares it with the whole-series read at 1, 8 and 64 segments; `TsbsWeft::lastpoint` uses it. Measured on a loaded host only, so no figure is published)
+      - [ ] Run `cargo bench -p weftdb --bench latest_read` on a quiet host and record the figures (with a `bench/claims.json` entry if a doc quotes one)
     - [ ] The other engines' TSBS SQL (TSBS's own per-engine generators), each checked against the reference
     - [ ] `double-groupby-*`, `high-cpu-*`, `cpu-max-all-*` and `groupby-orderby-limit`
+      - [x] `cpu-max-all-1`, `cpu-max-all-8`, `high-cpu-1`, `high-cpu-all` and `groupby-orderby-limit`, gated against the reference in the timed phase (2026-11-25, `routine/weftdb-2026-11-25`: `TsbsCpu::{cpu_max_all, high_cpu, groupby_orderby_limit}` and `TsbsWeft`'s answers, defined from TSBS's TimescaleDB generator; a mutant per query fails its tests; a debug run over `/mnt/weftbench/tsbs/cpu-only.lp` passes all twelve queries on a busy host, timings unpublished)
+      - [ ] `double-groupby-1`, `-5` and `-all` (an `avg` per host and hour: settle how a mean is compared exactly first)
+      - [ ] `cpu-max-all-32-24` (32 hosts: needs a TSBS file with at least 32 hosts; the reference file has 10)
   - [ ] Tagged fixtures and freeze docs
 - [x] **ROB-24** Limits and overload evidence; frozen configuration documentation
 - [x] **SOA-15** part 2: TTL lane

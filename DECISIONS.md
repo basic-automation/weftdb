@@ -9625,3 +9625,26 @@ through `head -20`, so the pipeline hits fell off the end, and the persistence c
 counting how often a type name appeared near a constructor instead of following the write and
 read paths. For any "is X reachable / is X persisted" question the gate is the serialisation
 call and the deserialisation call, quoted with file and line.
+## 2026-11-25 — What the per-series latest-row read returns, and how it finds the row (TAG-12, #341)
+
+**Ambiguous.** The sub-item asks for "a per-series latest-row read in `SegmentStore`" for TSBS `lastpoint`. It does not say whether a newer null at the latest instant is the answer or is skipped to the latest present value, how the row is located, or whether the read adds to the `weftdb` public surface while the freeze (#238) is open.
+
+**Chosen.**
+
+- **It equals the last row of `read_time_range_of` over the whole series**, a newer null included, so it returns `Option<(i64, Option<BigDecimal>)>`. A caller that wants the latest *present* value sees the null and decides. `TsbsWeft::lastpoint` treats a null as an error, since TSBS's `cpu` rows have no nulls.
+- **It reads `[MAX(max_ts), MAX(max_ts)]` through `read_time_range_of`**, so pruning, the windowed decode, newer-wins and the suspect-frame policy are the range read's own, not a second copy. If that instant reads empty, it reads the whole series, so a stale or skipped bound never changes the answer.
+- **Additive API during the freeze.** Two new methods; no existing signature changes. This follows the 2026-11-22 precedent for the ILP writer (#866).
+
+**Rejected.** (a) Decoding only the newest-sealed segment: an older segment can reach past it, and the mutant test fails that case. (b) The tail from the latest segment's *start*, `[MAX(min_ts), i64::MAX]`: correct, but it decodes a whole one-segment series, and the bench showed no gain there. (c) A resident last-value cache, as InfluxDB 3 has: a memory cost under ROB-14's budget, for a read the index already serves.
+
+## 2026-11-25 — How `weft-xbench` answers TSBS's `cpu-max-all`, `high-cpu` and `groupby-orderby-limit` (TAG-12, #341)
+
+**Ambiguous.** TSBS defines these queries as SQL, not as answers, and three points the SQL leaves open had to be settled to compare answers.
+
+**Chosen.**
+
+- **`high-cpu` rows are compared in host-name, then time order.** TSBS's `SELECT *` has no `ORDER BY`, so no engine order is wrong; both sides sort before comparing. The store side reads `usage_user` over the window, keeps rows above 90, then reads the other nine fields at those instants with `read_points_of`, chunked to `DEFAULT_MAX_POINT_BATCH`. A missing value at a matched instant is an error, not a hole.
+- **`groupby-orderby-limit` has no lower time bound**, so the store side reduces the five minutes before the end first, and doubles the reach while fewer than five buckets come back, stopping at the aspect's first stored instant (`aspect_metadata`'s time range). A dense tail costs one five-minute reduce; any bucket outside the reach is older than every bucket in it, so the answer equals reducing everything before the end.
+- **`cpu-max-all-32-24` is named but not in `TsbsQuery::ALL`.** It needs 32 hosts, the reference file has 10, and `instances` refuses more hosts than the data holds. It stays an open ROADMAP sub-item.
+
+**Not decided here.** `double-groupby-*` is an `avg`. An exact comparison needs either a rational mean on both sides or a stated tolerance for the store's `Avg`. That is a precision decision (locked constraint 4), so this run left it open rather than pick a tolerance.

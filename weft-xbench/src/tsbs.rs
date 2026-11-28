@@ -112,6 +112,21 @@ pub const CPU_METRICS: [&str; 10] = ["usage_user", "usage_system", "usage_idle",
 /// Nanoseconds in the one-minute bucket a `single-groupby` groups by.
 const MINUTE_NS: i64 = 60_000_000_000;
 
+/// One hour in nanoseconds: `cpu-max-all`'s bucket (`time_bucket('3600 seconds', time)`).
+const HOUR_NS: i64 = 3_600_000_000_000;
+
+/// `cpu-max-all`'s window in hours: TSBS's `MaxAllDuration` (`uses/devops/common.go`).
+pub const MAX_ALL_HOURS: u32 = 8;
+
+/// `high-cpu`'s window in hours: TSBS's `HighCPUDuration` (`uses/devops/common.go`).
+pub const HIGH_CPU_HOURS: u32 = 12;
+
+/// `high-cpu`'s threshold: `usage_user > 90.0`.
+pub const HIGH_CPU_ABOVE: i64 = 90;
+
+/// `groupby-orderby-limit`'s `LIMIT`.
+pub const ORDERBY_LIMIT: usize = 5;
+
 /// One `cpu` line: its instant and its ten fields in [`CPU_METRICS`] order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuReading {
@@ -147,8 +162,39 @@ pub enum TsbsQuery {
 		/// The window, in hours.
 		hours: u32,
 	},
+	/// `cpu-max-all-<hosts>`: the MAX of all ten CPU fields over `hosts` hosts, per one-hour
+	/// bucket, over `hours` hours (TSBS's `MaxAllCPU`; its generator registers 1 and 8 hosts over
+	/// `MaxAllDuration`, eight hours, and 32 hosts over 24 hours as `cpu-max-all-32-24`).
+	CpuMaxAll {
+		/// How many hosts the query names.
+		hosts: usize,
+		/// The window, in hours.
+		hours: u32,
+	},
+	/// `high-cpu-<hosts>`: every reading of `hosts` hosts (all of them when `hosts` is 0,
+	/// `high-cpu-all`) whose `usage_user` is above 90, over `hours` hours (TSBS's
+	/// `HighCPUForHosts`, a `SELECT *` over `HighCPUDuration`, twelve hours).
+	HighCpu {
+		/// How many hosts the query names; 0 is every host.
+		hosts: usize,
+		/// The window, in hours.
+		hours: u32,
+	},
+	/// `groupby-orderby-limit`: the MAX of `usage_user` over every host, per one-minute bucket,
+	/// for the five latest buckets before a random instant (TSBS's `GroupByOrderByLimit`: no
+	/// lower time bound, `ORDER BY minute DESC LIMIT 5`).
+	GroupbyOrderbyLimit,
 	/// `lastpoint`: the latest reading of every host.
 	Lastpoint,
+}
+
+/// One row of a `cpu-max-all` answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HourMax {
+	/// The bucket's start, in nanoseconds since the Unix epoch, a multiple of one hour.
+	pub hour_ns: i64,
+	/// The MAX of each of the ten [`CPU_METRICS`] over the bucket's rows of the named hosts.
+	pub max: Vec<i64>,
 }
 
 /// One row of a `single-groupby` answer.
@@ -163,14 +209,22 @@ pub struct MinuteMax {
 impl TsbsQuery {
 	/// The query types TSBS defines that this module answers, for `single-groupby` only the
 	/// variants TSBS's own generator registers (`1-1-1`, `1-1-12`, `1-8-1`, `5-1-1`, `5-1-12`,
-	/// `5-8-1`), then `lastpoint`.
-	pub const ALL: [Self; 7] = [Self::SingleGroupby { metrics: 1, hosts: 1, hours: 1 }, Self::SingleGroupby { metrics: 1, hosts: 1, hours: 12 }, Self::SingleGroupby { metrics: 1, hosts: 8, hours: 1 }, Self::SingleGroupby { metrics: 5, hosts: 1, hours: 1 }, Self::SingleGroupby { metrics: 5, hosts: 1, hours: 12 }, Self::SingleGroupby { metrics: 5, hosts: 8, hours: 1 }, Self::Lastpoint];
+	/// `5-8-1`), then `cpu-max-all-1` and `cpu-max-all-8`, then `high-cpu-1` and `high-cpu-all`,
+	/// then `groupby-orderby-limit`, then `lastpoint`. `cpu-max-all-32-24` is left out: it names
+	/// 32 hosts, and the reference file holds ten.
+	pub const ALL: [Self; 12] = [Self::SingleGroupby { metrics: 1, hosts: 1, hours: 1 }, Self::SingleGroupby { metrics: 1, hosts: 1, hours: 12 }, Self::SingleGroupby { metrics: 1, hosts: 8, hours: 1 }, Self::SingleGroupby { metrics: 5, hosts: 1, hours: 1 }, Self::SingleGroupby { metrics: 5, hosts: 1, hours: 12 }, Self::SingleGroupby { metrics: 5, hosts: 8, hours: 1 }, Self::CpuMaxAll { hosts: 1, hours: MAX_ALL_HOURS }, Self::CpuMaxAll { hosts: 8, hours: MAX_ALL_HOURS }, Self::HighCpu { hosts: 1, hours: HIGH_CPU_HOURS }, Self::HighCpu { hosts: 0, hours: HIGH_CPU_HOURS }, Self::GroupbyOrderbyLimit, Self::Lastpoint];
 
 	/// The `--query-type` name.
 	#[must_use]
 	pub fn name(self) -> String {
 		match self {
 			Self::SingleGroupby { metrics, hosts, hours } => format!("single-groupby-{metrics}-{hosts}-{hours}"),
+			Self::CpuMaxAll { hosts, hours: MAX_ALL_HOURS } => format!("cpu-max-all-{hosts}"),
+			Self::CpuMaxAll { hosts, hours } => format!("cpu-max-all-{hosts}-{hours}"),
+			Self::HighCpu { hosts: 0, hours: HIGH_CPU_HOURS } => "high-cpu-all".to_string(),
+			Self::HighCpu { hosts, hours: HIGH_CPU_HOURS } => format!("high-cpu-{hosts}"),
+			Self::HighCpu { hosts, hours } => format!("high-cpu-{hosts}-{hours}h"),
+			Self::GroupbyOrderbyLimit => "groupby-orderby-limit".to_string(),
 			Self::Lastpoint => "lastpoint".to_string(),
 		}
 	}
@@ -210,21 +264,67 @@ impl TsbsCpu {
 	/// `metrics` of 0 or more than ten, an empty or unknown host, or an empty window.
 	pub fn single_groupby(&self, metrics: usize, hosts: &[&str], start_ns: i64, end_ns: i64) -> anyhow::Result<Vec<MinuteMax>> {
 		anyhow::ensure!((1..=CPU_METRICS.len()).contains(&metrics), "a single-groupby takes 1 to {} metrics, not {metrics}", CPU_METRICS.len());
-		anyhow::ensure!(!hosts.is_empty(), "a single-groupby names at least one host");
+		Ok(self.bucket_max(metrics, hosts, start_ns, end_ns, MINUTE_NS)?.into_iter().map(|(minute_ns, max)| MinuteMax { minute_ns, max }).collect())
+	}
+
+	/// `cpu-max-all`'s answer: for each one-hour bucket in `[start_ns, end_ns)` that holds a
+	/// reading of one of `hosts`, the MAX of each of the ten [`CPU_METRICS`], in bucket order.
+	/// Buckets with no reading are absent.
+	///
+	/// # Errors
+	///
+	/// An empty or unknown host, or an empty window.
+	pub fn cpu_max_all(&self, hosts: &[&str], start_ns: i64, end_ns: i64) -> anyhow::Result<Vec<HourMax>> {
+		Ok(self.bucket_max(CPU_METRICS.len(), hosts, start_ns, end_ns, HOUR_NS)?.into_iter().map(|(hour_ns, max)| HourMax { hour_ns, max }).collect())
+	}
+
+	/// `high-cpu`'s answer: every reading of `hosts` in `[start_ns, end_ns)` whose `usage_user` is
+	/// above [`HIGH_CPU_ABOVE`], all ten fields, ordered by host name then time. TSBS's SQL has no
+	/// `ORDER BY`, so this order is the comparison's, not the engine's.
+	///
+	/// # Errors
+	///
+	/// An empty or unknown host, or an empty window.
+	pub fn high_cpu(&self, hosts: &[&str], start_ns: i64, end_ns: i64) -> anyhow::Result<Vec<(String, CpuReading)>> {
+		anyhow::ensure!(!hosts.is_empty(), "a TSBS query names at least one host");
+		anyhow::ensure!(start_ns < end_ns, "the window [{start_ns}, {end_ns}) is empty");
+		let mut sorted = hosts.to_vec();
+		sorted.sort_unstable();
+		let mut rows = Vec::new();
+		for host in sorted {
+			let readings = self.hosts.get(host).ok_or_else(|| anyhow::anyhow!("no host {host:?} in the TSBS data"))?;
+			let first = readings.partition_point(|r| r.ts_ns < start_ns);
+			rows.extend(readings[first..].iter().take_while(|r| r.ts_ns < end_ns).filter(|r| r.values[0] > HIGH_CPU_ABOVE).map(|r| (host.to_string(), r.clone())));
+		}
+		Ok(rows)
+	}
+
+	/// `groupby-orderby-limit`'s answer: the MAX of `usage_user` over every host's readings before
+	/// `end_ns`, per one-minute bucket, the [`ORDERBY_LIMIT`] latest buckets, newest first.
+	#[must_use]
+	pub fn groupby_orderby_limit(&self, end_ns: i64) -> Vec<MinuteMax> {
+		let hosts: Vec<&str> = self.hosts.keys().map(String::as_str).collect();
+		self.bucket_max(1, &hosts, i64::MIN, end_ns, MINUTE_NS).map_or_else(|_| Vec::new(), |buckets| buckets.into_iter().rev().take(ORDERBY_LIMIT).map(|(minute_ns, max)| MinuteMax { minute_ns, max }).collect())
+	}
+
+	/// The MAX of each of the first `metrics` fields over `hosts`' readings in `[start_ns, end_ns)`,
+	/// per epoch-aligned bucket of `width_ns`, keyed by bucket start.
+	fn bucket_max(&self, metrics: usize, hosts: &[&str], start_ns: i64, end_ns: i64, width_ns: i64) -> anyhow::Result<BTreeMap<i64, Vec<i64>>> {
+		anyhow::ensure!(!hosts.is_empty(), "a TSBS query names at least one host");
 		anyhow::ensure!(start_ns < end_ns, "the window [{start_ns}, {end_ns}) is empty");
 		let mut buckets: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
 		for host in hosts {
 			let readings = self.hosts.get(*host).ok_or_else(|| anyhow::anyhow!("no host {host:?} in the TSBS data"))?;
 			let first = readings.partition_point(|r| r.ts_ns < start_ns);
 			for reading in readings[first..].iter().take_while(|r| r.ts_ns < end_ns) {
-				let minute_ns = reading.ts_ns.div_euclid(MINUTE_NS) * MINUTE_NS;
-				let max = buckets.entry(minute_ns).or_insert_with(|| reading.values[..metrics].to_vec());
+				let bucket_ns = reading.ts_ns.div_euclid(width_ns) * width_ns;
+				let max = buckets.entry(bucket_ns).or_insert_with(|| reading.values[..metrics].to_vec());
 				for (m, v) in max.iter_mut().zip(&reading.values[..metrics]) {
 					*m = (*m).max(*v);
 				}
 			}
 		}
-		Ok(buckets.into_iter().map(|(minute_ns, max)| MinuteMax { minute_ns, max }).collect())
+		Ok(buckets)
 	}
 
 	/// `lastpoint`'s answer: every host's latest reading, hosts in byte order of their names.
@@ -261,8 +361,10 @@ impl TsbsCpu {
 		let names: Vec<&String> = self.hosts.keys().collect();
 		let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
 		match query {
-			TsbsQuery::SingleGroupby { hosts, hours, .. } => {
+			TsbsQuery::SingleGroupby { hosts, hours, .. } | TsbsQuery::CpuMaxAll { hosts, hours } | TsbsQuery::HighCpu { hosts, hours } => {
 				anyhow::ensure!(hosts <= names.len(), "{} names {hosts} hosts and the data holds {}", query.name(), names.len());
+				// `high-cpu-all` names no host filter: every host.
+				let hosts = if matches!(query, TsbsQuery::HighCpu { hosts: 0, .. }) { names.len() } else { hosts };
 				let window = i64::from(hours).saturating_mul(3_600_000_000_000);
 				let upper = end.saturating_sub(window);
 				anyhow::ensure!(upper > first, "{} needs a {hours}-hour window and the data spans {} s", query.name(), (end - first) / 1_000_000_000);
@@ -273,6 +375,15 @@ impl TsbsCpu {
 						QueryInstance { hosts: picked, start_ns, end_ns: start_ns + window }
 					})
 					.collect())
+			}
+			TsbsQuery::GroupbyOrderbyLimit => {
+				// The end of a random one-hour window (`MustRandWindow(time.Hour).End()`); the
+				// query has no lower bound, so the instance's start is the data's first instant.
+				let window = 3_600_000_000_000_i64;
+				let upper = end.saturating_sub(window);
+				anyhow::ensure!(upper > first, "{} needs a 1-hour window and the data spans {} s", query.name(), (end - first) / 1_000_000_000);
+				let hosts: Vec<String> = names.into_iter().cloned().collect();
+				Ok((0..count).map(|_| QueryInstance { hosts: hosts.clone(), start_ns: first, end_ns: first + rng.random_range(0..upper - first) + window }).collect())
 			}
 			TsbsQuery::Lastpoint => Ok(vec![QueryInstance { hosts: names.into_iter().cloned().collect(), start_ns: first, end_ns: end }; count]),
 		}
@@ -289,6 +400,15 @@ impl TsbsCpu {
 				let hosts: Vec<&str> = instance.hosts.iter().map(String::as_str).collect();
 				Ok(TsbsAnswer::Minutes(self.single_groupby(metrics, &hosts, instance.start_ns, instance.end_ns)?))
 			}
+			TsbsQuery::CpuMaxAll { .. } => {
+				let hosts: Vec<&str> = instance.hosts.iter().map(String::as_str).collect();
+				Ok(TsbsAnswer::Hours(self.cpu_max_all(&hosts, instance.start_ns, instance.end_ns)?))
+			}
+			TsbsQuery::HighCpu { .. } => {
+				let hosts: Vec<&str> = instance.hosts.iter().map(String::as_str).collect();
+				Ok(TsbsAnswer::Readings(self.high_cpu(&hosts, instance.start_ns, instance.end_ns)?))
+			}
+			TsbsQuery::GroupbyOrderbyLimit => Ok(TsbsAnswer::Minutes(self.groupby_orderby_limit(instance.end_ns))),
 			TsbsQuery::Lastpoint => Ok(TsbsAnswer::Latest(self.lastpoint().into_iter().map(|(h, r)| (h.to_string(), r.clone())).collect())),
 		}
 	}
@@ -311,6 +431,10 @@ pub struct QueryInstance {
 pub enum TsbsAnswer {
 	/// A `single-groupby`: one row per one-minute bucket.
 	Minutes(Vec<MinuteMax>),
+	/// A `cpu-max-all`: one row per one-hour bucket.
+	Hours(Vec<HourMax>),
+	/// A `high-cpu`: the matching readings, by host name then time.
+	Readings(Vec<(String, CpuReading)>),
 	/// A `lastpoint`: one row per host, in name order.
 	Latest(Vec<(String, CpuReading)>),
 }
@@ -321,7 +445,8 @@ impl TsbsAnswer {
 	pub const fn rows(&self) -> usize {
 		match self {
 			Self::Minutes(rows) => rows.len(),
-			Self::Latest(rows) => rows.len(),
+			Self::Hours(rows) => rows.len(),
+			Self::Readings(rows) | Self::Latest(rows) => rows.len(),
 		}
 	}
 }
@@ -476,6 +601,66 @@ cpu,hostname=host_1,region=us-west-1 usage_user=83i,usage_system=12i 14516064200
 	}
 
 	#[test]
+	fn cpu_max_all_is_the_per_hour_max_of_every_metric_over_the_named_hosts() {
+		let t0 = 1_451_606_400_000_000_000_i64;
+		let mut cpu = TsbsCpu::default();
+		// Two hosts, a reading every twenty minutes for three hours; metric m of host h at step s
+		// is 100 * h + 10 * m + s, so host_1 dominates and the last step in each hour is the MAX.
+		for h in 0..2_i64 {
+			let readings = (0..9_i64).map(|s| CpuReading { ts_ns: t0 + s * 20 * MINUTE_NS, values: std::array::from_fn(|m| 100 * h + 10 * i64::try_from(m).expect("small") + s) }).collect();
+			cpu.hosts.insert(format!("host_{h}"), readings);
+		}
+		let both = cpu.cpu_max_all(&["host_0", "host_1"], t0, t0 + 3 * HOUR_NS).expect("answers");
+		assert_eq!(both.iter().map(|r| r.hour_ns).collect::<Vec<_>>(), [t0, t0 + HOUR_NS, t0 + 2 * HOUR_NS]);
+		assert_eq!(both[0].max, (0..10).map(|m| 100 + 10 * m + 2).collect::<Vec<_>>());
+		assert_eq!(both[2].max.len(), 10, "all ten metrics");
+		// Half-open and cut inside an hour: steps 1 and 2 of the first hour, then step 3 alone.
+		let cut = cpu.cpu_max_all(&["host_0"], t0 + 1, t0 + HOUR_NS + 1).expect("answers");
+		assert_eq!(cut.iter().map(|r| (r.hour_ns, r.max[0])).collect::<Vec<_>>(), [(t0, 2), (t0 + HOUR_NS, 3)]);
+		assert!(cpu.cpu_max_all(&["host_9"], t0, t0 + HOUR_NS).is_err(), "an unknown host is refused");
+		let drawn = cpu.instances(TsbsQuery::CpuMaxAll { hosts: 2, hours: 1 }, 2, 7).expect("draws");
+		assert!(drawn.iter().all(|i| i.hosts.len() == 2 && i.end_ns - i.start_ns == HOUR_NS));
+		assert!(cpu.instances(TsbsQuery::CpuMaxAll { hosts: 1, hours: MAX_ALL_HOURS }, 1, 7).expect_err("too short").to_string().contains("8-hour window"));
+	}
+
+	#[test]
+	fn high_cpu_is_every_reading_above_ninety_by_host_then_time() {
+		let t0 = 1_451_606_400_000_000_000_i64;
+		let mut cpu = TsbsCpu::default();
+		// usage_user of host h at step s is 85 + 3 * s + h, so step 2 is the first above 90 on both.
+		for h in 0..2_i64 {
+			let readings = (0..5_i64).map(|s| CpuReading { ts_ns: t0 + s * MINUTE_NS, values: std::array::from_fn(|m| if m == 0 { 85 + 3 * s + h } else { i64::try_from(m).expect("small") }) }).collect();
+			cpu.hosts.insert(format!("host_{h}"), readings);
+		}
+		let got = |hosts: &[&str], start: i64, end: i64| cpu.high_cpu(hosts, start, end).expect("answers").into_iter().map(|(h, r)| (h, (r.ts_ns - t0) / MINUTE_NS, r.values[0])).collect::<Vec<_>>();
+		let host = |h: &str| h.to_string();
+		// Hosts in name order whatever order they are named in; 88 and 89 are not above 90.
+		assert_eq!(got(&["host_1", "host_0"], t0, t0 + 5 * MINUTE_NS), [(host("host_0"), 2, 91), (host("host_0"), 3, 94), (host("host_0"), 4, 97), (host("host_1"), 2, 92), (host("host_1"), 3, 95), (host("host_1"), 4, 98)]);
+		// Half-open: the reading at the end instant is out.
+		assert_eq!(got(&["host_0"], t0, t0 + 3 * MINUTE_NS), [(host("host_0"), 2, 91)]);
+		assert!(cpu.high_cpu(&["host_0"], t0, t0 + 2 * MINUTE_NS).expect("answers").is_empty(), "nothing above 90, no row");
+		assert_eq!(cpu.high_cpu(&["host_0"], t0, t0 + 5 * MINUTE_NS).expect("answers")[0].1.values[9], 9, "all ten fields");
+		assert!(cpu.high_cpu(&["host_9"], t0, t0 + MINUTE_NS).is_err());
+	}
+
+	#[test]
+	fn groupby_orderby_limit_is_the_five_latest_minutes_before_the_end_newest_first() {
+		let t0 = 1_451_606_400_000_000_000_i64;
+		let mut cpu = TsbsCpu::default();
+		// host_0 reads every 30 s for ten minutes, usage_user = step; host_1 reads once a minute,
+		// usage_user = 100 in minutes 3 and 7 only, so it wins those buckets.
+		cpu.hosts.insert("host_0".into(), (0..20_i64).map(|s| CpuReading { ts_ns: t0 + s * 30_000_000_000, values: std::array::from_fn(|m| if m == 0 { s } else { 0 }) }).collect());
+		cpu.hosts.insert("host_1".into(), (0..10_i64).map(|s| CpuReading { ts_ns: t0 + s * MINUTE_NS, values: std::array::from_fn(|m| if m == 0 && (s == 3 || s == 7) { 100 } else { 0 }) }).collect());
+		let got = |end: i64| cpu.groupby_orderby_limit(end).into_iter().map(|r| ((r.minute_ns - t0) / MINUTE_NS, r.max[0])).collect::<Vec<_>>();
+		assert_eq!(got(t0 + 10 * MINUTE_NS), [(9, 19), (8, 17), (7, 100), (6, 13), (5, 11)]);
+		// The end is exclusive and may cut a minute: before t0 + 8 min + 30 s, minute 8 holds step 16 only.
+		assert_eq!(got(t0 + 8 * MINUTE_NS + 30_000_000_000), [(8, 16), (7, 100), (6, 13), (5, 11), (4, 9)]);
+		// Fewer than five minutes before the end: all of them.
+		assert_eq!(got(t0 + 2 * MINUTE_NS), [(1, 3), (0, 1)]);
+		assert_eq!(got(t0), Vec::<(i64, i64)>::new(), "nothing before the first reading");
+	}
+
+	#[test]
 	fn single_groupby_refuses_a_question_it_cannot_answer() {
 		let cpu = load_cpu_from_reader(cpu_sample().as_bytes(), 3600).expect("reads");
 		assert!(cpu.single_groupby(0, &["host_0"], 0, 1).is_err());
@@ -540,6 +725,11 @@ cpu,hostname=host_1,region=us-west-1 usage_user=83i,usage_system=12i 14516064200
 		}
 		assert_eq!(TsbsQuery::ALL[0].name(), "single-groupby-1-1-1");
 		assert_eq!(TsbsQuery::ALL[5].name(), "single-groupby-5-8-1");
+		assert_eq!((TsbsQuery::ALL[6].name().as_str(), TsbsQuery::ALL[7].name().as_str()), ("cpu-max-all-1", "cpu-max-all-8"));
+		assert_eq!(TsbsQuery::CpuMaxAll { hosts: 32, hours: 24 }.name(), "cpu-max-all-32-24");
+		assert!(TsbsQuery::parse("cpu-max-all-32-24").is_err(), "not in ALL: the reference file holds ten hosts");
+		assert_eq!((TsbsQuery::ALL[8].name().as_str(), TsbsQuery::ALL[9].name().as_str()), ("high-cpu-1", "high-cpu-all"));
+		assert_eq!(TsbsQuery::ALL[10].name(), "groupby-orderby-limit");
 		assert!(TsbsQuery::parse("double-groupby-1").expect_err("not yet").to_string().contains("supported: single-groupby-1-1-1"));
 	}
 
