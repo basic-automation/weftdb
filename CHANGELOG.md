@@ -53,6 +53,10 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   every run; a durable per-aspect batching marker records the first full build.
 - **Unread-queue prune** keeps going past a chunk that loses a write conflict, retries it, and
   reports every failed aspect.
+- **Pooled connections keep their temp database in memory** (`PRAGMA temp_store=MEMORY`). With
+  Turso's file temp store, each new connection left an entry in Turso's process-wide database
+  registry that was never removed and kept the dead database allocated: the largest growing
+  allocation in a 144-virtual-hour soak.
 - **Page caches** are 2 MiB per Turso connection, 8 MiB for the root `metadata.db`.
 - **Read cache** is bounded by bytes with LRU eviction and eager expiry; a replaced dictionary's old
   list can no longer be cached after the replace.

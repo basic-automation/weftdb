@@ -70,22 +70,36 @@ pub fn cache_kib_for_path(path: &str) -> u32 {
 	}
 }
 
-/// A new connection to `db` with its page cache set to `kib`. `cache_size` is per
-/// connection, so it has to be set on each one. Failing to set it keeps Turso's default
-/// cache rather than failing the caller.
+/// A new connection to `db` with its page cache set to `kib` and its temp store in memory.
+/// Both pragmas are per connection, so each one gets them. Failing to set one keeps
+/// Turso's default rather than failing the caller.
+///
+/// `temp_store = MEMORY` stops a leak in Turso 0.8.1. A connection's first transaction
+/// opens a temp database. With the default file temp store that is a fresh file in a new
+/// temp directory, and Turso's process-wide database registry keeps an entry for it, keyed
+/// by inode, that is never removed. The entry's `Weak<Database>` keeps the dead database's
+/// allocation alive, so every connection the pool ever opened stayed in memory: in the
+/// 144-virtual-hour fanctl soak this was the largest growing allocation, about 0.4 MB per
+/// virtual hour. In-memory temp databases bypass the registry and are freed with their
+/// connection.
 async fn connect(db: &turso::Database, kib: u32) -> turso::Result<turso::Connection> {
 	let conn = db.connect()?;
-	// A query, drained, rather than `execute`, in case the pragma answers with a row.
-	let set = async {
-		let mut rows = conn.query(format!("PRAGMA cache_size=-{kib}"), ()).await?;
-		while rows.next().await?.is_some() {}
-		turso::Result::Ok(())
-	};
-	if let Err(e) = set.await {
-		tracing::debug!("[conn_pool] PRAGMA cache_size failed, keeping Turso's default: {e}");
+	for pragma in [format!("PRAGMA cache_size=-{kib}"), TEMP_STORE_MEMORY.to_string()] {
+		// A query, drained, rather than `execute`, in case the pragma answers with a row.
+		let set = async {
+			let mut rows = conn.query(pragma.as_str(), ()).await?;
+			while rows.next().await?.is_some() {}
+			turso::Result::Ok(())
+		};
+		if let Err(e) = set.await {
+			tracing::debug!("[conn_pool] {pragma} failed, keeping Turso's default: {e}");
+		}
 	}
 	Ok(conn)
 }
+
+/// Keeps each pooled connection's temp database in memory; see [`connect`].
+const TEMP_STORE_MEMORY: &str = "PRAGMA temp_store=MEMORY";
 
 static MAX_IDLE: LazyLock<usize> = LazyLock::new(|| max_idle_from(std::env::var("WEFT_POOL_MAX_IDLE").ok().as_deref()));
 
@@ -259,6 +273,26 @@ mod tests {
 		let mut rows = conn.query("PRAGMA cache_size", ()).await.expect("queries");
 		let row = rows.next().await.expect("reads").expect("a row");
 		assert_eq!(row.get::<i64>(0).expect("an integer"), -i64::from(*CONN_CACHE_KIB), "the pragma reached the connection");
+	}
+
+	#[tokio::test]
+	async fn a_new_connection_keeps_its_temp_database_in_memory() {
+		let dir = tempfile::tempdir().expect("a temp dir");
+		let db = turso::Builder::new_local(dir.path().join("t.db").to_str().expect("utf-8")).build().await.expect("opens");
+		let setup = db.connect().expect("connects");
+		setup.execute("PRAGMA journal_mode=experimental_mvcc", ()).await.ok();
+		setup.execute("CREATE TABLE t (x INTEGER)", ()).await.expect("creates");
+		drop(setup);
+		for _ in 0..3 {
+			let (conn, _) = checkout(&db, Role::Legacy).await.expect("connects");
+			let mut rows = conn.query("PRAGMA temp_store", ()).await.expect("queries");
+			let store = rows.next().await.expect("reads").expect("a row").get::<i64>(0).expect("an integer");
+			drop(rows);
+			assert_eq!(store, 2, "MEMORY, so Turso's registry never gets a temp-file entry it would keep forever");
+			conn.execute("BEGIN CONCURRENT", ()).await.expect("begins");
+			conn.execute("INSERT INTO t VALUES (1)", ()).await.expect("inserts");
+			conn.execute("COMMIT", ()).await.expect("commits");
+		}
 	}
 
 	async fn cache_size(conn: &turso::Connection) -> i64 {
