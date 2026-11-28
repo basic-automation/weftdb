@@ -126,11 +126,21 @@ The phase also cleared the remaining loose ends. The stale README status was fix
   - [x] Tagged `kill-compaction` and `corrupt-segment` cells (2026-11-17, `routine/weftdb-2026-11-17`: `kill-compaction-tagged` (every series exact after a SIGKILLed compaction, `fsck` clean, rerun exact) and `corrupt-segment-tagged` (served rows are their own series' values, losses are quarantined, at most one series loses rows); each fails a wrong-series mutant through the CLI. The matrix is six cells, and its CI runtime with the three tagged cells is not yet measured)
   - [ ] Fan-out benchmark (one tagged write or read across many series) *(2026-11-22: the arm itself landed — `weft-bench/src/fan_out.rs` behind `--fan-out`, wired at `weft-bench/src/main.rs:539`, PR #809 merged 2026-11-19 — but there is no ladder run, no `bench/claims.json` entry and no report, and the arm's module doc still says "there is no measurement"; a ladder run belongs on the reference drive at the line above, so this stays open)*
   - [ ] TSBS tag-grouped query suite in `weft-xbench` (`--tsbs` reads only `host_0` today; `single-groupby-*`, `double-groupby-*`, `lastpoint`, `high-cpu-*` group by `hostname`)
+    - [x] Every host's ten `cpu` fields loaded, and the six `single-groupby-*` variants and `lastpoint` answered in process as the reference (2026-11-21, `routine/weftdb-2026-11-21`: `weft-xbench/src/tsbs.rs` `load_cpu`, `TsbsCpu`, `TsbsQuery`; one-minute buckets as TSBS's generated SQL has them, not the README's "every 5 mins")
+    - [x] WeftDB answers the same seven queries from a store tagged by `hostname`, equal to the reference (2026-11-21, `routine/weftdb-2026-11-21`: `weft-xbench/src/weft.rs` `TsbsWeft`; a test over 10 hosts × 720 readings, and an inclusive-end mutant fails it. Not timed; `lastpoint` reads each series whole)
+    - [ ] A timed `weft-xbench` TSBS-query phase with the reference gate in the report, over the full TSBS file on a quiet host
+      - [x] The phase and its gate: `--tsbs-queries` times `--reps` seeded instances of each of the seven queries over the whole file, gates every answer against the reference, and reports them as schema v9's `tsbs_queries` (2026-11-23, `routine/weftdb-2026-11-23`: `weft_xbench::run_tsbs_queries`, `TsbsCpu::instances`; a mutated-reference test fails the gate on every instance; a debug run over `/mnt/weftbench/tsbs/cpu-only.lp` passes all seven on a busy host, timings unpublished)
+      - [ ] A release-build run over the full file on a quiet host, published as a report artifact
+    - [ ] A per-series latest-row read in `SegmentStore`, so `lastpoint` stops reading every series whole (TSBS's TimescaleDB `lastpoint` is a `LATERAL … ORDER BY time DESC LIMIT 1` per host); benchmark it against today's full-range read first
+    - [ ] The other engines' TSBS SQL (TSBS's own per-engine generators), each checked against the reference
+    - [ ] `double-groupby-*`, `high-cpu-*`, `cpu-max-all-*` and `groupby-orderby-limit`
   - [ ] Tagged fixtures and freeze docs
 - [x] **ROB-24** Limits and overload evidence; frozen configuration documentation
 - [x] **SOA-15** part 2: TTL lane
 
 ## Phase 14 — Beta tag (was W11)
+
+The changes up to this point ship first as **v0.4.0** (breaking weftdb API change in #897); the beta tag comes after it.
 
 - [ ] Approve and push the **v1.0.0-beta.1** tag on FRE-9b's merge *(owner)*
 - [x] **FRE-16** CI compatibility gates: OpenAPI breaking-change check, fixture guard, golden coverage
@@ -191,7 +201,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 
 - [ ] **B-conn** Vendor-neutral connector trait + registry
 - [ ] **B-ilp** ILP/Influx interop connector crate — audited 2026-11-22 (#359, `docs/research/ilp-interop-audit.md`): inbound interop is real (own parser crate, four HTTP ILP endpoints, `write_ilp` in both SDKs, precision mapping), outbound is absent (no InfluxDB client in `Cargo.lock`, no ILP writer, no connector trait, no UDP); prerequisite #358 (B-conn trait) is filed and unassigned, follow-ups #866 writer / #867 connector crate / #868 round-trip suite / #869 docs + examples.
-- [ ] **B-rest** REST facade remainder
+- [ ] **B-rest** REST facade remainder — audited 2026-11-22 (#360, `docs/research/rest-facade-audit.md`): the facade covers 74 routes across 10 scopes, and the library work it still does not expose is filed as #878 row-TTL expire / #879 manual segment split / #880 metadata repair + rollup backfill / #881 series resolution + tag lookup; the `interpolate_range_f64` optimization is deliberately library-only.
 - [ ] **B-resilience** Write retry, size-tiered write selector, interpolation window extension
 - [ ] **B-conncache** Complete the cached-connection migration — audited 2026-11-22 (PR #870, `docs/research/cached-connection-audit.md`): the process-wide `CONNECTION_DATABASES` cache and its idle sweep exist and already cover the sub-aspect databases; what is left is a read-only cache for rows-mode opens (#871), calling `close_idle_databases` from the server loop (#872), and a per-path `Database` singleton (#873). Left unchecked on purpose — #871/#872 sit in the owner's `p12/fanctl-correlation-growth` connection-reuse lane (`docs/roadmap-notes.md:767`) and #873 changes public surface while the #238 freeze is open
 - [ ] Grafana → Prometheus remote write/read (if monitoring) → R/Arrow workflows
@@ -316,7 +326,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
 - [ ] **B-sim** Full variability-metric matrix, fixed-point dedup, occurrence-distance constraint
 - [ ] **B-analysis** Verify the per-point analysis model is wired end-to-end — audited 2026-11-22 and corrected the same day: **not wired** (the dead batch-collection entry point `BatchCollection::process_batches()` skips the relative step the live path performs, the `trend` half has no producer, and neither half has a server surface; `analysis` itself **is** persisted and read back, contrary to the first audit); defects filed as #862/#863/#892/#893, findings and correction in `docs/research/per-point-analysis-wiring.md`
 - [ ] **B-snapshot** Pipeline state-snapshot audit trail
-- [ ] **B-object** Schemaless object/annotation store beside numeric aspects
+- [ ] **B-object** Schemaless object/annotation store beside numeric aspects (audit 2026-11-22: docs/research/object-store-audit.md — **does not exist**; freeze blocks it; defer to post-1.0; box stays open by design)
 
 ## Phase 29 — SQL surface
 

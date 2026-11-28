@@ -266,6 +266,31 @@
 
 mod types;
 
+/// Opt this process out of transparent huge pages (Linux; a no-op elsewhere). Call it first
+/// thing in `main`, before the allocator has mapped much.
+///
+/// A host with THP set to `always` backs freshly touched heap with whole 2 MB pages, and
+/// WeftDB keeps many small Turso databases open, each with its own pager and its pooled
+/// connections: on such a host every open database costs about 2 MB more than it uses.
+/// fanctl's soak (4 sensors, 2 virtual hours) started at 612 MB and ended at 742 MB with
+/// THP; opted out it started at 38 MB and ended at 123 MB. A program that wants huge pages
+/// regardless (say, one large in-memory index) can skip this; like the global allocator,
+/// it is the binary's choice, so the library never makes it on its own.
+///
+/// # Errors
+///
+/// The `prctl` failing, which leaves the process as it was.
+pub fn opt_out_of_transparent_huge_pages() -> std::io::Result<()> {
+	#[cfg(target_os = "linux")]
+	{
+		// SAFETY: PR_SET_THP_DISABLE takes plain integer arguments and touches no memory.
+		if unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0) } != 0 {
+			return Err(std::io::Error::last_os_error());
+		}
+	}
+	Ok(())
+}
+
 // Export all public types from the types module
 // Re-export types from splimes that are commonly used
 pub use splimes::{Point, Resolution, Spline};

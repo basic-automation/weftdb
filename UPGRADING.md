@@ -12,6 +12,51 @@ release pins that every compatibility gate checks are in
 
 ---
 
+## Correlations without copied occurrences (v0.3.x → v0.4.0)
+
+From v0.4.0 a correlation names its pattern and reads the pattern's occurrences from the
+dictionary; it no longer stores a copy in the aspect's `correlations.db`
+(`correlation_occurrences` table).
+
+### What the code does
+
+- No correlation write adds rows to `correlation_occurrences`.
+- The first time a process correlates an aspect, `retire_correlation_occurrences`
+  deletes the copied rows the dictionary already holds (the stored list is a prefix of
+  the pattern's log, compared to the millisecond) and rows of correlations that no
+  longer exist. It runs in chunks of 256 correlations, each its own transaction, and can
+  be interrupted and re-run. It logs `deleted`, `kept_orphan`, `kept_mismatch` and
+  `dangling` counts.
+- Rows of a correlation whose pattern no dictionary holds, or that do not match the
+  pattern, are kept and read as that correlation's occurrences. Nothing writes them
+  again.
+- The table, its DDL and its index are kept. The file does not shrink until a
+  checkpoint or `VACUUM` reuses the freed pages.
+
+### Library API
+
+`Correlation::new` loses its `occurrences` parameter and `Correlation::occurrences()` is
+removed; use `Database::correlation_occurrences(aspect_id, &correlations)` and
+`CorrelationOccurrences::get`. A `Correlation` serialized by v0.4.0 has no `occurrences`
+field and does not deserialize in older weftdb; older JSON with the field still
+deserializes.
+
+### What happens when an older binary opens the store
+
+It reads empty occurrence lists for correlations whose rows were retired, sees them as
+changed and writes full copies again when it next correlates; a signal step that runs
+before that correlation step finds no occurrences for them. Returning to v0.4.0 retires
+the copies again on its first correlation run.
+
+## New aspects are seal-backed by default (v0.3.x → v0.4.0, #768)
+
+With `WEFT_LEGACY_DEFAULT_STORAGE` unset, an aspect created by v0.4.0 stores its
+measurements in the `.weftseg` seal store, not in its `measurements.db`. Existing aspects
+keep their mode. **Rollback:** v0.3.7 and earlier do not know `aspects.storage_mode`, so they
+read zero measurements from a seal-backed aspect instead of refusing it. A deployment that
+must stay able to roll back to 0.3.x should set `WEFT_LEGACY_DEFAULT_STORAGE=rows` before it
+creates aspects on v0.4.0. See [docs/upgrade-notes.md](docs/upgrade-notes.md).
+
 ## Duplicate timestamps on seal-backed aspects (#802, SEAL-DUP)
 
 Aspect storage mode differences: **rows mode** stores every row at every timestamp; a

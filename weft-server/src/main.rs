@@ -38,6 +38,11 @@ mod startup;
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> anyhow::Result<()> {
+	// Huge pages cost about 2 MB per open database on a THP=always host
+	// (`weftdb::opt_out_of_transparent_huge_pages`); a failure only leaves them on.
+	if let Err(error) = weftdb::opt_out_of_transparent_huge_pages() {
+		eprintln!("could not opt out of transparent huge pages: {error}");
+	}
 	// The runtime's shape is read before anything async can run — the
 	// runtime must exist before even the strict-configuration phase
 	// inside `startup` can execute — so a malformed `WEFT_WORKER_THREADS`

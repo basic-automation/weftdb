@@ -25,6 +25,7 @@ async fn commit_or_rollback(conn: &cache::Connection) -> Result<()> {
 	match conn.as_ref().execute("COMMIT", turso::params![]).await {
 		Ok(_) => Ok(()),
 		Err(e) => {
+			conn.discard();
 			let _ = conn.as_ref().execute("ROLLBACK", turso::params![]).await;
 			let message = format!("Commit failed; the transaction was rolled back: {e}");
 			Err(anyhow::Error::new(e).context(message))
@@ -44,6 +45,7 @@ impl Database {
 	/// conflicted and can be retried. (Propagating the rollback's error with `?` reported
 	/// every such conflict as `Rollback failed: …`.)
 	pub(crate) async fn rollback_after_error(conn: &cache::Connection) {
+		conn.discard();
 		if let Err(rollback) = Self::rollback_concurrent(conn).await {
 			tracing::warn!(error = %rollback, "Rolling back after a failed statement failed; returning the statement's error");
 		}
@@ -58,9 +60,11 @@ impl Connection for Database {
 	///
 	/// Uses BEGIN CONCURRENT which requires MVCC to be enabled on the database (via `PRAGMA journal_mode=experimental_mvcc`)
 	async fn begin_concurrent(turso_db: &turso::Database, _cache_key: &str, _cache: Option<Arc<Mutex<DatabaseCache>>>) -> Result<cache::Connection> {
-		// Always create a new connection for each transaction to avoid conflicts
-		// Connection caching at the transaction level causes issues with concurrent writes
-		let conn = turso_db.connect()?;
+		// A connection serves one transaction at a time: it comes out of the database's pool
+		// (or is new) and goes back when the returned `cache::Connection` drops. Opening a
+		// new connection per transaction leaked ~600 B each under Turso's MVCC (see
+		// `conn_pool`).
+		let (conn, pool) = super::conn_pool::checkout(turso_db, super::conn_pool::Role::Legacy)?;
 
 		// BEGIN CONCURRENT allows multiple concurrent write transactions with MVCC
 		// Retry with exponential backoff on transient errors
@@ -88,8 +92,7 @@ impl Connection for Database {
 			}
 		}
 
-		// Wrap in our Connection type (no caching - each transaction gets its own connection)
-		let cached_conn = cache::Connection::new(conn);
+		let cached_conn = cache::Connection::pooled(conn, pool);
 
 		Ok(cached_conn)
 	}
@@ -142,7 +145,7 @@ impl Connection for Database {
 	/// DDL operations are not compatible with BEGIN CONCURRENT in MVCC mode.
 	/// This uses BEGIN IMMEDIATE which acquires a write lock but allows schema changes.
 	async fn begin_immediate(turso_db: &turso::Database) -> Result<cache::Connection> {
-		let conn = turso_db.connect()?;
+		let (conn, pool) = super::conn_pool::checkout(turso_db, super::conn_pool::Role::Legacy)?;
 
 		// BEGIN IMMEDIATE acquires a write lock immediately, suitable for DDL
 		// Retry with exponential backoff on transient errors
@@ -164,8 +167,7 @@ impl Connection for Database {
 			}
 		}
 
-		let cached_conn = cache::Connection::new(conn);
-		Ok(cached_conn)
+		Ok(cache::Connection::pooled(conn, pool))
 	}
 
 	/// Commit an immediate transaction
@@ -179,7 +181,9 @@ impl Connection for Database {
 	async fn checkpoint_wal_passive(turso_db: &turso::Database) -> Result<()> {
 		let start = std::time::Instant::now();
 		tracing::debug!("[checkpoint_wal_passive] Starting PASSIVE checkpoint...");
-		let conn = turso_db.connect()?;
+		let (conn, pool) = super::conn_pool::checkout(turso_db, super::conn_pool::Role::Legacy)?;
+		let conn = cache::Connection::pooled(conn, pool);
+		let conn = conn.as_ref();
 
 		// PASSIVE mode: checkpoint without blocking
 		// Does not wait for readers/writers to finish

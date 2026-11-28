@@ -45,6 +45,21 @@ pub fn data_dir() -> String {
 	std::env::var("WEFT_DATA_DIR").unwrap_or_else(|_| default_data_dir())
 }
 
+/// Point `WEFT_DATA_DIR` at one temporary directory for the whole test process.
+///
+/// A lib test that opens a named `Database` then never writes to the user's `~/.weftdb`
+/// (CI fails a run that leaves anything there). The directory lives until the process exits.
+///
+/// # Panics
+///
+/// If the temporary directory cannot be created.
+#[cfg(test)]
+pub fn use_temp_data_dir() {
+	static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+	let dir = DIR.get_or_init(|| tempfile::tempdir().expect("a temporary data dir"));
+	std::env::set_var("WEFT_DATA_DIR", dir.path());
+}
+
 // Version information
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PKG_NAME: &str = env!("CARGO_PKG_NAME");

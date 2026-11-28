@@ -74,8 +74,14 @@ pub const READ_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// # Errors
 ///
 /// Connecting, or (on Apple targets) setting the pragma.
-pub async fn connect(db: &turso::Database) -> turso::Result<turso::Connection> {
-	let conn = db.connect()?;
+pub async fn connect(db: &turso::Database) -> turso::Result<crate::cache::Connection> {
+	let (conn, pool) = crate::types::database::conn_pool::checkout(db, crate::types::database::conn_pool::Role::Writer)?;
+	// A pooled connection is a writer already; this only restates it, so nothing a holder
+	// set can make a later write wait on a lock instead of seeing `Busy`.
+	if pool.is_some() {
+		conn.busy_timeout(std::time::Duration::ZERO)?;
+	}
+	let conn = crate::cache::Connection::pooled(conn, pool);
 	#[cfg(target_vendor = "apple")]
 	{
 		// A query, drained, rather than `execute`, which fails on a pragma that answers
@@ -94,10 +100,29 @@ pub async fn connect(db: &turso::Database) -> turso::Result<turso::Connection> {
 /// # Errors
 ///
 /// As [`connect`], or setting the busy timeout.
-pub async fn connect_reader(db: &turso::Database) -> turso::Result<turso::Connection> {
-	let conn = connect(db).await?;
+pub async fn connect_reader(db: &turso::Database) -> turso::Result<crate::cache::Connection> {
+	let (conn, pool) = crate::types::database::conn_pool::checkout(db, crate::types::database::conn_pool::Role::Reader)?;
+	let conn = crate::cache::Connection::pooled(conn, pool);
+	#[cfg(target_vendor = "apple")]
+	{
+		let mut rows = conn.query("PRAGMA fullfsync=ON", ()).await?;
+		while rows.next().await?.is_some() {}
+	}
 	conn.busy_timeout(READ_BUSY_TIMEOUT)?;
 	Ok(conn)
+}
+
+/// Start pooling the writer and reader connections of control-plane database `db`. Its
+/// owning store calls this once it is open, and [`release`] when it drops.
+pub fn adopt(db: &turso::Database) {
+	crate::types::database::conn_pool::register(db, crate::types::database::conn_pool::Role::Writer);
+	crate::types::database::conn_pool::register(db, crate::types::database::conn_pool::Role::Reader);
+}
+
+/// Undo [`adopt`].
+pub fn release(db: &turso::Database) {
+	crate::types::database::conn_pool::unregister(db, crate::types::database::conn_pool::Role::Writer);
+	crate::types::database::conn_pool::unregister(db, crate::types::database::conn_pool::Role::Reader);
 }
 
 /// Switch the database behind `conn` to MVCC, prove that it is in MVCC and that a fresh
@@ -118,7 +143,9 @@ pub async fn enable_mvcc_full(db: &turso::Database, conn: &turso::Connection, na
 	let switched = pragma(conn, "PRAGMA journal_mode=experimental_mvcc").await;
 	let mode = pragma(conn, "PRAGMA journal_mode").await.with_context(|| format!("{name}: reading PRAGMA journal_mode"))?;
 	require_mvcc(name, &mode, switched.err())?;
-	let fresh = connect(db).await.with_context(|| format!("{name}: connecting to read PRAGMA synchronous"))?;
+	// A connection straight from Turso, never a pooled one: this proves what a new
+	// connection's sync mode is.
+	let fresh = connect(db).await.with_context(|| format!("{name}: connecting to read PRAGMA synchronous"))?.into_inner();
 	#[cfg(test)]
 	downgrade_for_test(&fresh, name).await?;
 	let synchronous = pragma(&fresh, "PRAGMA synchronous").await.with_context(|| format!("{name}: reading PRAGMA synchronous"))?;

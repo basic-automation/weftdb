@@ -1,10 +1,17 @@
 //! Fan-out benchmark — measure the cost of reading across many tagged series.
 //!
-//! On `main` `git grep -l fan-out` matches only `DECISIONS.md`, `ROADMAP.md` and
-//! `docs/roadmap-notes.md` — there is **no measurement**. This arm opens a real
-//! [`weftdb::SegmentStore`], ingests a seeded multi-series corpus, then
-//! reads every series at each rung of a series-count ladder (default 1, 10, 100, 1000)
-//! and records the wall time, rows read, and series touched.
+//! The arm landed in PR #809 (issue #807, TAG-12 cut A) and runs with `--fan-out`.
+//! What it has never had is a published ladder number: `bench/claims.json` holds no
+//! `fan_out` entry, so there is no measurement to quote. See `ROADMAP.md` L127, which
+//! stays open for exactly that reason.
+//!
+//! The arm opens a real [`weftdb::SegmentStore`], ingests a seeded multi-series corpus,
+//! then reads every series at each rung of a series-count ladder (default 1, 10, 100,
+//! 1000 series; 1000 rows per series; a 1000-second read window) and records wall time,
+//! rows read and series touched. Publishing a rung number means a figure in
+//! `docs/reference.md` vouched by an entry in the `bench/claims.json` registry, which
+//! `tools/check_claims.py` lints in CI under §3 of `docs/benchmark-policy.md` — until such
+//! an entry exists, quote nothing from this arm.
 //!
 //! **This is a cost curve for our own engine, not a race against another vendor.**
 //! The racing rules of `docs/benchmark-policy.md` are not engaged.

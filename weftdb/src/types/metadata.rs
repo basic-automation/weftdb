@@ -146,6 +146,12 @@ pub struct AspectMetadataStore {
 	db: turso::Database,
 }
 
+impl Drop for AspectMetadataStore {
+	fn drop(&mut self) {
+		crate::types::durable::control_plane::release(&self.db);
+	}
+}
+
 impl AspectMetadataStore {
 	/// The tables every `metadata.db` holds once opened. A snapshot missing any of them is
 	/// not a backup of this database (an empty file passes every other check), so
@@ -166,6 +172,7 @@ impl AspectMetadataStore {
 		// The control plane's MVCC write path; open fails rather than run without it.
 		crate::types::durable::control_plane::enable_mvcc_full(&db, &conn, path).await?;
 		conn.execute("PRAGMA busy_timeout=600000", turso::params![]).await.ok();
+		crate::types::durable::control_plane::adopt(&db);
 		Ok(Self { db })
 	}
 

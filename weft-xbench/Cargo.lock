@@ -4664,6 +4664,7 @@ dependencies = [
  "sha2 0.10.9",
  "splimes",
  "sysinfo",
+ "tempfile",
  "tokio",
  "uuid",
  "weft-arrow",
@@ -4677,7 +4678,7 @@ dependencies = [
 
 [[package]]
 name = "weft-line-protocol"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -4687,7 +4688,7 @@ dependencies = [
 
 [[package]]
 name = "weft-orchestration"
-version = "0.3.7"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bigdecimal",
@@ -4710,7 +4711,7 @@ dependencies = [
 
 [[package]]
 name = "weft-physical-type"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bigdecimal",
  "serde",
@@ -4758,7 +4759,7 @@ dependencies = [
 
 [[package]]
 name = "weftdb"
-version = "0.3.7"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4779,6 +4780,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "splimes",
  "sysinfo",
  "thiserror 2.0.21",

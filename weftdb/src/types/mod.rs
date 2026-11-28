@@ -10,12 +10,12 @@ pub use catalog::CatalogStore;
 pub use compression::{AggressivenessScaling, CompressionConfig, CompressionPhase, CompressionProgress, CompressionResult, CompressionSummary, DetailedCompressionSummary, DirtyRegion, LastCompressionInfo, ProgressCallback, SizeBasedCompressionConfig, TierCompressionResult, TimeBasedCompressionConfig};
 pub use correlation::{Correlation, CorrelationID, CorrelationKeys, Correlations};
 pub use database::{
-	clear_connection_cache_by_name, close_idle_databases, data_dir, default_data_dir, open_database_count, traits::{Config, DatabaseStructure, EventDatabase, Outputs, PatternDatabase, PipelineInputs, PipelineOutputs}, Database, DatabaseId, DatabaseInfo, DatabaseMap, UnbatchedEntry, DATABASES
+	clear_connection_cache_by_name, close_idle_databases, correlation_occurrences::{CorrelationOccurrences, RetireReport}, data_dir, default_data_dir, open_database_count, traits::{Config, DatabaseStructure, EventDatabase, Outputs, PatternDatabase, PipelineInputs, PipelineOutputs}, Database, DatabaseId, DatabaseInfo, DatabaseMap, UnbatchedEntry, DATABASES
 };
 pub use dataset::{Dataset, DatasetId};
 pub use dictionary::{Dictionary, DictionaryConstraints, DictionaryId, DictionaryMetadata, Steps, Variability, VariablilityType};
 pub use dictionary_name::InvalidDictionaryName;
-pub use event::{Event, EventID, EventName, Events, Manifestation, ManifestationId};
+pub use event::{fold_spans, spans_coincide, Event, EventID, EventName, Events, Manifestation, ManifestationId};
 pub use frame_read::FrameFaultError;
 pub use ingest::{IngestBatch, IngestPhase, IngestReceipt, LedgerEntry, MAX_ENCODED_FRAME_BYTES};
 pub use input_measurement::InputMeasurement;
@@ -25,6 +25,7 @@ pub use measurement::{Measurement, MeasurementId};
 pub use measurement_vector::MeasurementVector;
 pub use metadata::{AspectMetadata, AspectMetadataStore};
 pub use occurrence::Occurrence;
+pub use occurrence_codec::OccurrenceLog;
 pub use partial_sidecar::{PartialSidecar, PartialSidecarPolicy, DEFAULT_PARTIAL_SIDECAR_MIN_ROWS, MAX_SIDECAR_TIERS, PARTIAL_SIDECAR_VERSION, SIDECAR_AGGREGATIONS};
 pub use pattern::{Pattern, PatternID};
 pub use pipeline::{DetectorMetadata, DetectorType, PipelineConfig, PipelineState};

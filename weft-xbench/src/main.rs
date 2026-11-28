@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! TMPDIR=/mnt/weftbench weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N]
-//!                                   [--seed N] [--uci FILE] [--tsbs FILE] [--clickhouse URL] [--timescale URL]
+//!                                   [--seed N] [--uci FILE] [--tsbs FILE [--tsbs-queries]] [--clickhouse URL] [--timescale URL]
 //!                                   [--questdb ADDR] [--influxdb3 URL] [--iotdb URL]
 //!                                   [--cold-hook CMD [--cold-reps N]] [--container ENGINE=NAME]...
 //!                                   [--out DIR]
@@ -15,6 +15,11 @@
 //! the `TimescaleDB` arms are, and without `--questdb` (a `QuestDB` server's `host:port`) the
 //! `QuestDB` arms are, and without `--influxdb3` (an `InfluxDB` 3 HTTP endpoint) the `InfluxDB` 3
 //! arm is, and without `--iotdb` (an Apache `IoTDB` REST service) the `IoTDB` arm is. The process exits 1 when any result fails its correctness gate, after writing the report.
+//!
+//! `--tsbs-queries` (with `--tsbs`) also loads every host's ten `cpu` fields, over the whole file,
+//! into a tagged WeftDB store and times its answers to TSBS's `single-groupby` and `lastpoint` queries, `--reps` seeded
+//! instances of each, every answer gated against an in-memory reference (TAG-12, #341); see
+//! [`weft_xbench::run_tsbs_queries`].
 //!
 //! `--cold-hook CMD` adds OS-cold and post-restart reps (#146), `--cold-reps` of each (3 by
 //! default) per phase, beside the warm ones; see [`weft_xbench::Cold`] for what the hook is asked
@@ -39,7 +44,7 @@ use std::path::PathBuf;
 use weft_bench::{load_uci_corpus, scale::ScalePreset, RunMetadata, DEFAULT_UCI_COLUMN};
 use weft_xbench::{clickhouse, combine, render, run, tsbs, Cold, Container, Dataset, DatasetKind, InputFile, Protocol, Servers, XbenchReport, DEFAULT_SEED};
 
-const USAGE: &str = "usage: weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N] [--seed N] [--uci FILE] [--tsbs FILE] [--clickhouse URL] [--timescale URL] [--questdb ADDR] [--influxdb3 URL] [--iotdb URL] [--cold-hook CMD [--cold-reps N]] [--container ENGINE=NAME]... [--out DIR]\n       weft-xbench combine RUN.json RUN.json... --out DIR\n       weft-xbench render REPORT.json [--out DIR]";
+const USAGE: &str = "usage: weft-xbench [--scales tiny,small,medium] [--reps N] [--load-reps N] [--seed N] [--uci FILE] [--tsbs FILE [--tsbs-queries]] [--clickhouse URL] [--timescale URL] [--questdb ADDR] [--influxdb3 URL] [--iotdb URL] [--cold-hook CMD [--cold-reps N]] [--container ENGINE=NAME]... [--out DIR]\n       weft-xbench combine RUN.json RUN.json... --out DIR\n       weft-xbench render REPORT.json [--out DIR]";
 
 struct Cli {
 	scales: Vec<ScalePreset>,
@@ -48,6 +53,7 @@ struct Cli {
 	seed: u64,
 	uci: Option<PathBuf>,
 	tsbs: Option<PathBuf>,
+	tsbs_queries: bool,
 	clickhouse: Option<String>,
 	timescale: Option<String>,
 	questdb: Option<String>,
@@ -60,7 +66,7 @@ struct Cli {
 }
 
 fn parse(args: impl Iterator<Item = String>) -> Result<Cli, String> {
-	let mut cli = Cli { scales: vec![ScalePreset::Tiny, ScalePreset::Small, ScalePreset::Medium], reps: 10, load_reps: 3, seed: DEFAULT_SEED, uci: None, tsbs: None, clickhouse: None, timescale: None, questdb: None, influxdb3: None, iotdb: None, cold_hook: None, cold_reps: 3, containers: Vec::new(), out: PathBuf::from("reports/xbench") };
+	let mut cli = Cli { scales: vec![ScalePreset::Tiny, ScalePreset::Small, ScalePreset::Medium], reps: 10, load_reps: 3, seed: DEFAULT_SEED, uci: None, tsbs: None, tsbs_queries: false, clickhouse: None, timescale: None, questdb: None, influxdb3: None, iotdb: None, cold_hook: None, cold_reps: 3, containers: Vec::new(), out: PathBuf::from("reports/xbench") };
 	let mut args = args;
 	while let Some(flag) = args.next() {
 		let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value\n{USAGE}"));
@@ -71,6 +77,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Cli, String> {
 			"--seed" => cli.seed = value()?.parse().map_err(|e| format!("--seed: {e}"))?,
 			"--uci" => cli.uci = Some(PathBuf::from(value()?)),
 			"--tsbs" => cli.tsbs = Some(PathBuf::from(value()?)),
+			"--tsbs-queries" => cli.tsbs_queries = true,
 			"--clickhouse" => cli.clickhouse = Some(value()?),
 			"--timescale" => cli.timescale = Some(value()?),
 			"--questdb" => cli.questdb = Some(value()?),
@@ -90,6 +97,9 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Cli, String> {
 	}
 	if cli.reps == 0 || cli.load_reps == 0 || cli.cold_reps == 0 {
 		return Err("--reps, --load-reps and --cold-reps must be > 0".into());
+	}
+	if cli.tsbs_queries && cli.tsbs.is_none() {
+		return Err(format!("--tsbs-queries needs --tsbs FILE\n{USAGE}"));
 	}
 	Ok(cli)
 }
@@ -241,6 +251,13 @@ async fn main() -> anyhow::Result<()> {
 	report.inputs = inputs;
 	report.containers = containers;
 	report.binary_sha256 = binary_sha256;
+	if let (true, Some(path)) = (cli.tsbs_queries, &cli.tsbs) {
+		// The whole file, whatever `--scales` says: TSBS draws its windows over the generator's whole
+		// interval, and a 12-hour query has no window inside the tiny scale's hour.
+		let cpu = tsbs::load_cpu(path, i64::MAX)?;
+		eprintln!("weft-xbench: tsbs queries over {} hosts, {} readings from {}", cpu.hosts.len(), cpu.len(), path.display());
+		report.tsbs_queries = weft_xbench::run_tsbs_queries(&cpu, &tsbs::TsbsQuery::ALL, cli.reps, cli.seed).await?;
+	}
 
 	std::fs::create_dir_all(&cli.out)?;
 	let path = cli.out.join("xbench.json");
@@ -249,6 +266,9 @@ async fn main() -> anyhow::Result<()> {
 		let gate = r.correctness.as_ref().map_or(String::new(), |c| format!("  {}", if c.passed { "PASS" } else { "FAIL" }));
 		let p50_ms = weft_xbench::as_f64(r.latency.p50_ns) / 1e6;
 		println!("{:<14} {:<18} {:<11} {:<9} p50 {:>10.3} ms{gate}", r.dataset, r.arm.arm, format!("{:?}", r.phase).to_lowercase(), r.warmth.as_str(), p50_ms);
+	}
+	for q in &report.tsbs_queries {
+		println!("{:<22} {:<18} p50 {:>10.3} ms  {}", q.query, q.arm, weft_xbench::as_f64(q.latency.p50_ns) / 1e6, if q.passed { "PASS" } else { "FAIL" });
 	}
 	let blocks = render::blocks(&report);
 	std::fs::write(cli.out.join("report.md"), render::to_markdown(&blocks))?;
@@ -300,5 +320,8 @@ mod tests {
 		assert_eq!(c.containers, vec![("clickhouse".to_string(), "xbench-ch".to_string()), ("iotdb".to_string(), "xbench-iotdb".to_string())]);
 		assert!(cli(&["--container", "clickhouse"]).is_err());
 		assert!(cli(&["--container", "=x"]).is_err());
+		assert!(cli(&["--tsbs", "cpu.lp", "--tsbs-queries"]).expect("parses").tsbs_queries);
+		assert!(!cli(&["--tsbs", "cpu.lp"]).expect("parses").tsbs_queries);
+		assert!(cli(&["--tsbs-queries"]).is_err_and(|e| e.contains("needs --tsbs")), "--tsbs-queries without --tsbs is refused");
 	}
 }

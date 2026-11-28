@@ -480,6 +480,13 @@ impl Signals {
 		self.0.remove(&(correlation_id.clone(), manifestation_id.clone(), signal_type.clone()))
 	}
 
+	/// Keep only the signals whose correlation `keep` accepts; returns how many were dropped.
+	pub fn retain_correlations(&mut self, mut keep: impl FnMut(&CorrelationID) -> bool) -> usize {
+		let before = self.0.len();
+		self.0.retain(|(correlation_id, _, _), _| keep(correlation_id));
+		before - self.0.len()
+	}
+
 	/// Remove a signal and calculate error correction for the correlation
 	///
 	/// This method implements error correction using exponential moving average (EMA).
@@ -489,48 +496,26 @@ impl Signals {
 	/// - `correlation_id`: The correlation ID to remove signal for
 	/// - `manifestation_id`: The manifestation ID to remove signal for  
 	/// - `signal_type`: The signal type to remove
-	/// - `correlation`: Mutable reference to the correlation to update with new error rate
+	/// - `correlation`: The correlation the signal belongs to, as the caller last saw it
 	/// - `resolution_time`: The time when the event actually occurred
 	///
 	/// # Returns
 	/// - The removed signal if it existed, None otherwise
+	/// - The corrected correlation when the correction changed a stored field of it, None
+	///   when it changed nothing; callers persist only a returned correlation, so a removal
+	///   that changes nothing neither copies nor writes the correlation
 	///
-	/// # Error Correction Formula
-	/// The signal predicts an event at: `manifestation_date + distance + old_error_rate`
-	/// The event actually occurred at: `resolution_time`
+	/// # Error correction
 	///
-	/// Actual time from manifestation = `resolution_time` - `manifestation_date`
-	/// Predicted time from manifestation = distance + `old_error_rate`
-	/// Observed error = `actual_time` - `predicted_time` (can be positive or negative)
-	///
-	/// New Error Rate = alpha * `observed_error` + (1 - alpha) * `old_error_rate`
-	/// Where alpha = 0.2 (gives 20% weight to new observation, 80% to historical average)
+	/// No stored field of `correlation` is changed today, so the second value is always
+	/// None: the signal is only removed. Updating the error rate on every removal
+	/// accumulated without bound, so it was dropped.
 	///
 	/// # Errors
 	///
-	/// Returns an error if:
-	/// - No error rates are found for the signal type in the correlation
-	/// - Time difference calculation fails
-	///
-	/// # Panics
-	///
-	/// Panics if the alpha value (0.2) cannot be converted to `BigDecimal`, which should
-	/// not happen under normal circumstances.
-	pub fn remove_with_error_correction(&mut self, correlation: &mut Correlation, manifestation_id: &ManifestationId, signal_type: &SignalType, _resolution_time: DateTime<Utc>) -> Result<Option<Signal>> {
-		let correlation_id = correlation.id().clone();
-
-		// Get the signal before removing it
-		if self.get(&correlation_id, manifestation_id, signal_type).is_some() {
-			// Note: Error rate updates are now handled by calibrate_error_rates() during training.
-			// We don't update error_rate here to avoid accumulation issues with the
-			// formula: New Error Rate = (Signal - 1) + Current Error Rate
-			// which would cause unbounded growth.
-
-			// Just remove and return the signal
-			Ok(self.remove(&correlation_id, manifestation_id, signal_type))
-		} else {
-			Ok(None)
-		}
+	/// Never fails today; the `Result` is kept for a correction that can.
+	pub fn remove_with_error_correction(&mut self, correlation: &Correlation, manifestation_id: &ManifestationId, signal_type: &SignalType, _resolution_time: DateTime<Utc>) -> Result<(Option<Signal>, Option<Correlation>)> {
+		Ok((self.remove(correlation.id(), manifestation_id, signal_type), None))
 	}
 
 	/// Calculate the sum of probabilities for all signals of a given event and signal type at a specific date
@@ -542,19 +527,31 @@ impl Signals {
 	/// # Errors
 	///
 	/// Returns an error if signal probability calculation fails for any signal.
-	#[allow(deprecated)]
 	pub async fn probability_sum(&self, event_id: &EventID, signal_type: &SignalType, date: DateTime<Utc>, database: &crate::Database, aspect_id: &AspectId) -> Result<Option<BigDecimal>> {
-		use std::collections::HashSet;
-
 		use futures::StreamExt;
+
+		if !self.has_event_signals(event_id, signal_type) {
+			return Ok(None);
+		}
+		let correlations: Vec<Correlation> = database.get_correlations(aspect_id).await?.filter_map(|r| async { r.ok() }).collect().await;
+		self.probability_sum_with(event_id, signal_type, date, &correlations)
+	}
+
+	/// [`probability_sum`](Self::probability_sum) over correlations the caller already
+	/// loaded, so several queries can share one read of the aspect's correlations.
+	///
+	/// # Errors
+	///
+	/// Returns an error if signal probability calculation fails for any signal.
+	#[allow(deprecated)]
+	pub fn probability_sum_with(&self, event_id: &EventID, signal_type: &SignalType, date: DateTime<Utc>, correlations: &[Correlation]) -> Result<Option<BigDecimal>> {
+		use std::collections::HashSet;
 
 		let signals = self.get_by_event(event_id, signal_type);
 		if signals.is_empty() {
 			return Ok(None);
 		}
-
-		// Load correlations once to lookup average_distance and error_rate
-		let correlations: Vec<Correlation> = database.get_correlations(aspect_id).await?.filter_map(|r| async { r.ok() }).collect().await;
+		let correlations = index_correlations(correlations);
 
 		let mut prob = Vec::new();
 		let mut seen_correlations: HashSet<CorrelationID> = HashSet::new();
@@ -568,7 +565,7 @@ impl Signals {
 			}
 
 			// Find the correlation for this signal
-			let value = correlations.iter().find(|c| c.id() == s.correlation_id());
+			let value = correlations.get(s.correlation_id()).copied();
 			if let Some(correlation) = value {
 				// Use average_distance if available, otherwise fall back to individual distance + error_rate
 				if let Some(avg_dist) = correlation.average_distance() {
@@ -641,22 +638,32 @@ impl Signals {
 	/// # Errors
 	///
 	/// Returns an error if signal probability calculation fails for any signal.
-	#[allow(deprecated)]
 	pub async fn probability_average(&self, event_id: &EventID, signal_type: &SignalType, date: DateTime<Utc>, database: &crate::Database, aspect_id: &AspectId) -> Result<Option<BigDecimal>> {
-		use std::collections::HashSet;
-
 		use futures::StreamExt;
+
+		if !self.has_event_signals(event_id, signal_type) {
+			return Ok(None);
+		}
+		let correlations: Vec<Correlation> = database.get_correlations(aspect_id).await?.filter_map(|r| async { r.ok() }).collect().await;
+		let events: Vec<Event> = database.get_unprocessed_events(aspect_id).await?.filter_map(|r| async { r.ok() }).collect().await;
+		self.probability_average_with(event_id, signal_type, date, &correlations, &events)
+	}
+
+	/// [`probability_average`](Self::probability_average) over correlations and events the
+	/// caller already loaded, so several queries can share one read of each.
+	///
+	/// # Errors
+	///
+	/// Returns an error if signal probability calculation fails for any signal.
+	#[allow(deprecated)]
+	pub fn probability_average_with(&self, event_id: &EventID, signal_type: &SignalType, date: DateTime<Utc>, correlations: &[Correlation], events: &[Event]) -> Result<Option<BigDecimal>> {
+		use std::collections::HashSet;
 
 		let signals = self.get_by_event(event_id, signal_type);
 		if signals.is_empty() {
 			return Ok(None);
 		}
-
-		// Load correlations once to lookup average_distance and error_rate
-		let correlations: Vec<Correlation> = database.get_correlations(aspect_id).await?.filter_map(|r| async { r.ok() }).collect().await;
-
-		// Load the event to get manifestations for proper probability calculation
-		let events: Vec<Event> = database.get_unprocessed_events(aspect_id).await?.filter_map(|r| async { r.ok() }).collect().await;
+		let correlations = index_correlations(correlations);
 		let event = events.iter().find(|e| e.id() == event_id);
 
 		// Build a sorted list of manifestation midpoints for looking up the previous manifestation
@@ -686,7 +693,7 @@ impl Signals {
 			}
 
 			// Find the correlation for this signal
-			let value = correlations.iter().find(|c| c.id() == s.correlation_id());
+			let value = correlations.get(s.correlation_id()).copied();
 			if let Some(correlation) = value {
 				// Use average_distance if available, otherwise fall back to individual distance + error_rate
 				if let Some(avg_dist) = correlation.average_distance() {
@@ -785,13 +792,27 @@ impl Signals {
 	pub async fn event_probability(&self, event_id: &EventID, signal_type: &SignalType, date: DateTime<Utc>, database: &crate::Database, aspect_id: &AspectId) -> Result<Option<BigDecimal>> {
 		use futures::StreamExt;
 
-		let signals = self.get_by_event(event_id, signal_type);
-		if signals.is_empty() {
+		if !self.has_event_signals(event_id, signal_type) {
 			return Ok(None);
 		}
-
-		// Load correlations to get average_distance
 		let correlations: Vec<Correlation> = database.get_correlations(aspect_id).await?.filter_map(|r| async { r.ok() }).collect().await;
+		if !correlations.iter().any(|c| c.event_id() == event_id && c.average_distance().is_some_and(|d| !d.value().is_zero())) {
+			return Ok(None);
+		}
+		let events: Vec<Event> = database.get_unprocessed_events(aspect_id).await?.filter_map(|r| async { r.ok() }).collect().await;
+		self.event_probability_with(event_id, signal_type, date, &correlations, &events)
+	}
+
+	/// [`event_probability`](Self::event_probability) over correlations and events the
+	/// caller already loaded, so several queries can share one read of each.
+	///
+	/// # Errors
+	///
+	/// Returns an error if the elapsed-time calculation fails.
+	pub fn event_probability_with(&self, event_id: &EventID, signal_type: &SignalType, date: DateTime<Utc>, correlations: &[Correlation], events: &[Event]) -> Result<Option<BigDecimal>> {
+		if !self.has_event_signals(event_id, signal_type) {
+			return Ok(None);
+		}
 
 		// Find any correlation for this event with an average_distance
 		let avg_dist = correlations.iter().find(|c| c.event_id() == event_id && c.average_distance().is_some()).and_then(|c| c.average_distance().cloned());
@@ -805,7 +826,6 @@ impl Signals {
 		}
 
 		// Get the event to find the last manifestation
-		let events: Vec<Event> = database.get_unprocessed_events(aspect_id).await?.filter_map(|r| async { r.ok() }).collect().await;
 		let event = events.iter().find(|e| e.id() == event_id);
 
 		let Some(event) = event else {
@@ -847,6 +867,12 @@ impl Signals {
 		// 	reference_time.format("%Y-%m-%d %H:%M"), signal_type, date.format("%Y-%m-%d %H:%M"), time_elapsed, average_distance.value(), probability);
 
 		Ok(Some(probability))
+	}
+
+	/// Whether any signal of `signal_type` predicts `event_id`, without collecting them.
+	#[must_use]
+	pub fn has_event_signals(&self, event_id: &EventID, signal_type: &SignalType) -> bool {
+		self.0.values().any(|signal| signal.event_id() == event_id && signal.signal_type() == signal_type)
 	}
 
 	#[must_use]
@@ -946,6 +972,16 @@ impl Signals {
 		// Find signals that belong to these correlations
 		self.0.values().filter(|signal| correlation_ids.contains(&signal.correlation_id)).collect()
 	}
+}
+
+/// Correlations by id for per-signal lookups. On a repeated id the first one wins, the
+/// same one a linear `find` would have returned.
+fn index_correlations(correlations: &[Correlation]) -> HashMap<&CorrelationID, &Correlation> {
+	let mut index = HashMap::with_capacity(correlations.len());
+	for correlation in correlations {
+		index.entry(correlation.id()).or_insert(correlation);
+	}
+	index
 }
 
 #[cfg(test)]

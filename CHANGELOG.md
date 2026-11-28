@@ -8,7 +8,13 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-23
+
 ### Documentation
+
+- **CHRONO-INV, #791:** Inventory of `chrono` v0.4 dependency across the workspace — 9
+  consuming crates, 272 call sites, migration feasibility assessment.
+  See `docs/research/chrono-inventory.md`.
 
 - **The B-analysis wiring audit corrected in place (#362).** Two claims in
   `docs/research/per-point-analysis-wiring.md` were false and are retracted in a dated
@@ -18,9 +24,43 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   surviving defects are filed as #862 (re-titled to what was verified), #892 and #893.
 
 - **B-poll / B-retry / B-register audit (#361).** `docs/research/client-poll-retry-register-audit.md` published: all three backlog items are either already present (retry-for-503) or not needed (polling daemon, source registration). No behaviour changed. Phase label reconciled to Phase&nbsp;23.
+- **REST facade audit (#360).** Audited what the WeftDB HTTP API (the REST facade) still does not
+  expose from the `weftdb` library. Produced `docs/research/rest-facade-audit.md` with a route
+  inventory, grouped by scope, and a gap analysis. Four real gaps filed as separate issues (#878
+  row TTL expiry, #879 manual segment split, #880 metadata repair and rollup backfill, #881 series
+  resolution and tag lookup). No behaviour change; `ROADMAP.md:194` line left unchecked per the
+  audit contract.
+
+- **B-object audit** — `docs/research/object-store-audit.md` confirms no schemaless object/annotation store exists; every PhysicalType is numeric, the segment frame has no non-numeric column model, and the public-surface freeze blocks new routes. Deferred to post-1.0. Phase label reconciled from the stale "Phase 4" (issue body) to Phase 28 (the live ROADMAP.md position). (#363)
+
+### Added
+
+- **ILP writer for `LineRecord` and `FieldValue` (#866).**
+  `LineRecord` now implements `Display` and exposes `to_ilp()` to serialise
+  parsed records back into InfluxDB Line Protocol form. `FieldValue` also
+  implements `Display`. Escaping mirrors the parser exactly, not the Influx
+  published spec.
 
 ### Changed
 
+- **Correlations reference their pattern instead of copying its occurrences (breaking,
+  weftdb API).** A `Correlation` no longer holds an `occurrences` list:
+  `Correlation::new` drops that parameter and `Correlation::occurrences()` is removed.
+  The occurrences are the pattern's lossless log in the dictionary, resolved by
+  `pattern_id` through the new `Database::correlation_occurrences` (one load per
+  dictionary per call, pipeline dictionaries first, then every dictionary file).
+  Correlation writes no longer touch `correlation_occurrences`, so a pattern gaining
+  an occurrence writes nothing to its correlations, and `get_correlations` no longer
+  reads or parses per-occurrence JSON. This is why this release is 0.4.0.
+- **Copied occurrence rows are retired once per process per aspect.**
+  `Database::retire_correlation_occurrences` deletes `correlation_occurrences` rows
+  that are a prefix of the pattern's log (compared to the millisecond) and rows of
+  correlations that no longer exist; rows of a pattern no dictionary holds, or that do
+  not match, are kept and still read as a fallback. The table and its index stay.
+- **`replace_dictionary_patterns` never deletes a stored pattern.** It writes the
+  given patterns over the stored copies of the same ids and keeps the rest, so a
+  failed dictionary load followed by a write-back can no longer drop the patterns
+  correlations name.
 - **`url` is 2.5.9, not 2.5.8 (#857).** RustSec advisory RUSTSEC-2026-0592
   (`denial-of-service`) reports that `Url::origin()` handled a `blob:` URL by re-parsing its path as
   another URL and calling itself whatever the inner scheme was, with no depth limit: 10,000 `blob:`
@@ -51,6 +91,12 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   an identical re-run through that wrapper is still absorbed, and #803 stays open pending the
   server-ledger identity under #768.
 
+- **A worker's progress log was tracked at `progress.md` (#876).** It was a run log for issue
+  #838: a Done checklist written by an agent into its worktree, committed, and merged. Nothing in
+  `.github/`, `scripts/`, `docs/` or `tools/` references it and no document links to it, so it read
+  as project documentation while being none. It is removed, and `.gitignore` now covers the class
+  (`progress.md`, `.briefs/`) beside the `.handoff-*.md` entry that already existed.
+
 ### Fixed
 
 - **The legacy ingest-ledger key now digests its payload with 128 bits instead
@@ -67,6 +113,23 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ### Added
 
+- **TSBS tag-grouped queries in `weft-xbench`, answered and checked (TAG-12, #341).** `tsbs::load_cpu`
+  reads every host's ten `cpu` fields from a `tsbs_generate_data --use-case=cpu-only` file (integer
+  fields only; anything else is refused), and `TsbsCpu` answers TSBS's six `single-groupby-*` variants
+  and `lastpoint` in process as the reference. `TsbsWeft` stores the same data in a `SegmentStore`,
+  one aspect per metric and one series per `hostname`, and answers both query types from it; a test
+  pins the store's answers equal to the reference. `single-groupby` buckets by one minute, as TSBS's
+  generated SQL does for every engine, not every five minutes as TSBS's README says
+  ([timescale/tsbs#214](https://github.com/timescale/tsbs/issues/214)). Nothing is timed yet, and no
+  other engine runs these queries.
+- **`weft-xbench --tsbs FILE --tsbs-queries` times WeftDB's answers to TSBS's tag-grouped queries
+  (TAG-12, #341).** The phase loads the whole file into a store tagged by `hostname` and, for each of
+  the six `single-groupby-*` variants and `lastpoint`, answers `--reps` seeded instances. Each instance
+  picks distinct random hosts and a random window, drawn the way `tsbs_generate_queries` draws them.
+  One untimed burn-in instance comes first. Every answer is checked against the in-memory reference
+  outside the timed span. A mismatch fails the run's gate, as a failed interpolation result does. The
+  report schema is v9: a new top-level `tsbs_queries` list, rendered as a "TSBS queries" table that
+  compares no engines. `weft-xbench combine` refuses reports that carry it instead of pooling them.
 - **Multi-series crash cell (TAG-12, issue #341).** A new fault-injection test
   (`multiseries_crash`) writes interleaved frames across 8 series, then aborts the process
   with SIGABRT part-way through a second batch on one of them. The parent reopens the
@@ -234,6 +297,11 @@ origin/main
 
 ### Fixed
 
+- **The nightly cross-engine smoke builds again.** `weft-xbench/Cargo.lock` never recorded the
+  `tempfile` dependency `weft-bench` gained, so `cargo build --locked` for `weft-xbench` failed on every
+  scheduled `xbench-smoke` run from at least 2026-11-17 (through 2026-11-22). `weftdb`'s `sha2`
+  dependency, added by #849, was missing from it too. The lock now has both, and CI's `xbench-lock` job
+  also resolves `weft-xbench` with `cargo metadata --locked`, so a stale lock fails on the push.
 - **The cargo-deny exception for `chrono` (RUSTSEC-2026-0543) now expires on its date, not in prose.** The action pin was bumped to `EmbarkStudios/cargo-deny-action` v2.1.2 (commit `70f81531115945ba6eb6b941ec9d39d063438eb9`), which runs cargo-deny 0.21.0, and the ignore entry carries `expiry = "2027-01-31"`: once that date passes the advisory is reported again with `advisory-ignore-expired` and CI goes red until the migration (#791) lands or the exception is re-dated. The old pin (cargo-deny 0.20.2) rejected the `expiry` key with `error[unexpected-keys]`, which is why the deadline had only been documentation. Closes #794.
 - **TTL purge no longer drops a doomed segment that shadows a surviving segment of the same series (#797).**
   `purge_aspect_held` now builds a `survivors` map (straddling and wholly live segments)
@@ -3427,7 +3495,8 @@ before this release. A bare "0.1" in them means splimes 0.1.
   advisories, replaced the unmaintained `bincode` (RUSTSEC-2025-0141), and removed the
   unsound `lru` 0.16 (RUSTSEC-2026-0253) by disabling turso's unused full-text search.
 
-[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.3.7...HEAD
+[Unreleased]: https://github.com/basic-automation/weftdb/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/basic-automation/weftdb/compare/v0.3.7...v0.4.0
 [0.3.7]: https://github.com/basic-automation/weftdb/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/basic-automation/weftdb/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/basic-automation/weftdb/compare/v0.3.4...v0.3.5

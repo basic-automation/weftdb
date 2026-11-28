@@ -403,14 +403,53 @@ pub trait Inputs {
 	/// update correlation for a given aspect
 	async fn update_correlation(&self, aspect_id: &AspectId, correlation: &Correlation) -> Result<TxId>;
 
+	/// Update several correlations for a given aspect, replacing their error rates and occurrences.
+	///
+	/// The default updates them one at a time; implementations should batch the writes,
+	/// since each per-row delete scans the unindexed correlation tables. When an id repeats,
+	/// the last copy wins.
+	async fn update_correlations(&self, aspect_id: &AspectId, correlations: &[Correlation]) -> Result<TxId> {
+		let mut tx_id = TxId::new();
+		for correlation in correlations {
+			tx_id = self.update_correlation(aspect_id, correlation).await?;
+		}
+		Ok(tx_id)
+	}
+
 	/// remove correlation for a given aspect
 	async fn remove_correlation(&self, aspect_id: &AspectId, correlation_id: &CorrelationID) -> Result<TxId>;
+
+	/// Remove several correlations for a given aspect, with their error rates and occurrences.
+	///
+	/// The default removes them one at a time; implementations should batch the deletes,
+	/// since each per-row delete scans the unindexed correlation tables.
+	async fn remove_correlations(&self, aspect_id: &AspectId, correlation_ids: &[CorrelationID]) -> Result<TxId> {
+		let mut tx_id = TxId::new();
+		for correlation_id in correlation_ids {
+			tx_id = self.remove_correlation(aspect_id, correlation_id).await?;
+		}
+		Ok(tx_id)
+	}
 
 	//
 	// Unprocessed Events
 	//
 
+	/// Store `event` as an upsert: its row is added if none has its id, and each
+	/// manifestation whose span (dataset, start, end) the event does not hold yet is added.
+	/// Storing the same event again, or a later detection that re-reports old spans, adds only
+	/// what is new. Give the event a stable identity ([`Event::into_stable`]) so every run of
+	/// a detector collects onto one event.
 	async fn insert_unprocessed_event(&self, aspect_id: &AspectId, event: &Event) -> Result<TxId>;
+
+	/// Merge unprocessed events that share a name into one event under its stable id
+	/// ([`crate::EventID::for_name`]), keeping every distinct manifestation span once, and
+	/// fold repeated spans or rows of a single event into one. Stores written before events
+	/// had stable ids hold one event per detector run; this turns them into one per name.
+	///
+	/// Idempotent: a store with nothing to merge is left as it was. Answers the ids that no
+	/// longer exist, so the caller can drop what was keyed by them.
+	async fn merge_events_by_name(&self, aspect_id: &AspectId) -> Result<Vec<EventID>>;
 
 	async fn remove_unprocessed_event(&self, aspect_id: &AspectId, event_id: &EventID) -> Result<TxId>;
 

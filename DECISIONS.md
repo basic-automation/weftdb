@@ -6661,6 +6661,34 @@ needs `soak-baseline/` to be re-cut deliberately, not silently by a green check.
 (`scripts/annotate-soak-drift.py`) still emits `::warning::` and exits 0, which #688 does not ask to change;
 a refusal is the absence of a measurement, drift is a measurement that moved.
 
+## 2026-11-22 — `chrono` v0.4 inventory and migration path (#791)
+
+**Decision:** commission `docs/research/chrono-inventory.md` as the single source of truth for the
+workspace's `chrono` dependency surface, to be referenced by follow-up issues Phases A–D.
+
+**Chosen: document and file follow-ups, do not migrate now.** The dependency is stable (`0.4`, 9
+consuming crates, ~272 call sites) and the workspace's `serde = "0.4"` workspace entry is
+well-pinned. Migration would be 10–20 engineer-days across three phases, beginning after a
+dedicated newtype layer in `weft-physical-type`. The published crate boundaries (`weftdb`,
+`weft-client`) mean any replacement of `DateTime<Utc>` in public signatures is a semver-breaking
+change that must wait for the next major version.
+
+**Chosen: four phases, each its own issue.** Phase A (clock reads → `SystemTime`) is safe for
+today; Phase B (Duration newtype in `weft-physical-type`) needs no public API change; Phase C
+(Instant newtype in published signatures) is semver-breaking; Phase D purges the workspace
+dependency. Each phase is independently revertible and testable.
+
+**Chosen: leave the `compat` fixture crate on chrono.** It produces fixed binary test fixtures
+for an old format and must not drift.
+
+**Chosen: advisory codelines / architectural markers only.** The ROADMAP.md is not annotated
+because no line names `chrono` by name today (verified via `git grep -in chrono ROADMAP.md`).
+Two lines (`ROADMAP.md:374`, `docs/roadmap-notes.md:446`) contain a date stamp
+(`MEASURED 2026-10-08`) but reference backup costs, not chrono — not annotated.
+
+**Cost, stated plainly:** no code changed, no dependency removed. Every follow-up issue must be
+scoped to avoid scope creep: each phase addresses exactly one chrono feature-group and must not
+add features to the in-repo types beyond what chrono provided.
 ## 2026-11-11 — FRE-9b: the OpenAPI document becomes the contract candidate (FLAGGED FOR MERGE REVIEW)
 
 **Ambiguous:** the 1.0 plan (§6 W11) says only that "FRE-9b's annotations land
@@ -9334,6 +9362,31 @@ specified and that does not match the product's architecture. No code is missing
 is an accurate record of a feature that was never needed. Filing follow-ups for "not needed"
 findings would be editorial noise. The audit doc (`docs/research/client-poll-retry-register-audit.md`)
 records the evidence.
+## 2026-11-22 — ILP writer lives in `weft-line-protocol`, not a connector crate (#866)
+
+**The item asked: add an ILP writer so `LineRecord` can produce wire form, not only parse it.**
+The writer was added in the parser crate rather than a future connector crate (#867) because it
+shares escaping helpers with the parser and must round-trip against the exact dialect the parser
+accepts; a separate crate would duplicate the escaping logic and drift. The writer widens the
+published `weft-line-protocol` API while the public-surface freeze (#238) is still open. This is
+accepted because the freeze covers the *interface* (the record types and parse functions already
+shipped) and the writer is additive — it does not change any existing signature.
+
+**Guarantees.** The writer guarantees that every `LineRecord` parsed from a valid input line can
+be written back to a string that, when parsed again, yields an identical record — with the one
+exception recorded at the end of this paragraph. The output uses
+canonical forms: booleans as `t`/`f`, the shortest round-trip `f64` display, integers with `i`,
+unsigned with `u`, strings double-quoted with backslash escapes. Where the parser is broader
+than the published InfluxDB spec (boolean tokens `T`/`TRUE`/`True`/`F`/`FALSE`/`False`, raw
+`NaN`/`inf` floats), the writer emits only the canonical subset, and records containing non-finite
+floats are written as the `Display` of their `f64` (`NaN`, `inf`, `-inf`). The text round-trips;
+the **equality** half of the guarantee does not hold for `NaN`, because `FieldValue` derives
+`PartialEq` and `f64::NAN != f64::NAN`: a record carrying `NaN` re-parses to a record that is not
+`==` to the one written. `inf` and `-inf` do compare equal. The test
+`non_finite_floats_keep_their_text_but_not_their_equality` pins both halves. Neither value can reach
+storage in any case, because `parse_points` refuses a non-finite named field (ROB-7), so the
+caveat is confined to records that never leave the caller.
+
 ## 2026-11-22 — The cached-connection audit answers its roadmap line without ticking it (#369)
 
 **Question.** "Complete the cached-connection migration" (`ROADMAP.md`) presumes a migration that
@@ -9364,6 +9417,177 @@ before anyone starts. The loop did not claim either.
 
 **Needs human.** #873 needs the public-surface decision (an `Arc<Database>` or a `&Database` facade)
 while the #238 freeze is open.
+## 2026-11-22 — What "REST facade remainder" means, and what is actually missing (#360)
+
+**Question.** `ROADMAP.md:194` reads `- [ ] **B-rest** REST facade remainder` under Phase 22 — Connectors and ingest interop. `docs/roadmap-notes.md:449` lists it as `- **B-rest** *(Phase 2 · partial)*`. Neither says what "remainder" means. Two readings are possible: (a) gaps in WeftDB's own HTTP API ("the REST facade" per `weft-server/src/storage.rs:427), or (b) a vendor-compatible `/query`+`/write` shim implied by the Phase 22 connector context.
+
+**Chosen.** Treat (a) as the primary reading, document (b) as an alternative reading in the same doc with the evidence that the codebase does not use "facade" for that sense. Under either reading, the set of missing endpoints differs only by the InfluxDB query protocol and Prometheus remote write/read — the latter is already an explicit sub-bullet on the same roadmap line.
+
+**What the audit found.** 72 routes across 10 scopes. The `weftdb` library exposes ~90+ public methods through `SegmentStore`; every storage read, write, declare and backup path has a corresponding route. Four real gaps were identified:
+
+- **Row TTL expiry** (`expiry_sweep`, `purge_expired` in `weftdb/src/types/segment_store/maint.rs:22,82`): no endpoint calls them (#878).
+- **Manual segment split** (`split_segment` in `maint.rs:983`): called only internally by the overlap reconciler (#879).
+- **Metadata repair and rollup backfill** (`rebuild_aspect_metadata`, `rebuild_all_metadata`, `backfill_missing_rollups` in `maint.rs:2231,2250,2277`): no endpoint (#880).
+- **Series resolution and tag lookup** (`resolve_series`, `series_tags` in `weftdb/src/types/segment_store/read.rs:681,712`): library-only after TAG-10 landed per-series read variants (#881).
+
+**Not gaps.** `changes_since`/`ack_changes` overlap with B-conncache (#871–#873). `declare_with_upsert_keys` is a minor library variant. `interpolate_range_f64` is a precision trade-off already documented. `reap`/`mark_clean_shutdown`/`subscribe_poison` are deliberate daemon-only lifecycle.
+
+**What the doc rests on.** Every citation is from a fresh `rg`/`grep` at `5294136a7` (origin/main). Route inventory from `weft-server/src/routes.rs:805-975`; OpenAPI path list from `compat/openapi/weftdb.json`; library API from `weftdb/src/types/segment_store/`.
+
+**Alternative reading considered and rejected as primary.** The vendor-compatible shim reading would add InfluxDB v1 `/query` and Prometheus remote write/read as gaps. Prometheus remote write/read is already an explicit roadmap sub-item (`ROADMAP.md:198`); InfluxDB `/query` is not supported and no codebase evidence suggests it was intended. The `REST facade` term in the codebase (`weft-server/src/storage.rs:427`) refers to WeftDB's own HTTP API, not a shim.
+
+## 2026-11-22 — A worker's progress log reached `main`, and the fix is to ignore the class (#876)
+
+**Ambiguity.** `progress.md` sat at the repository root on `main`: a 163-line run log for issue
+#838, with a Done checklist and acceptance notes, written by an agent and merged along with the code
+it described. The question was whether such a file is documentation to keep, documentation to move
+under `docs/`, or scratch to delete. It is also the second scaffolding leak of this kind — the
+`.gitignore` scratch section already carries a `## Worker handoff notes are scratch, not repo
+content` entry for `.handoff-*.md`, which means the repo had already decided the class once.
+
+**Choice.** Delete the file and widen the ignore rule to the class: `progress.md` and `.briefs/`
+join the scratch section. Nothing references the file (`rg -n 'progress\.md' .github scripts docs
+tools` returns nothing), so deleting loses no information that anything depends on; the content
+itself describes work that is recorded properly in `ROADMAP.md`, `DECISIONS.md` and the issue
+tracker, which is where a reader looks for it.
+
+**Why not move it under `docs/`.** A run log is a statement about one agent's session, not about the
+system. Its claims were true at the moment the agent wrote them and are unverifiable afterwards, so
+placing it in `docs/` would add a document that invites trust it has not earned. The same reasoning
+already removed `DETAILED_CHANGES.txt` and `.handoff-*.md` from the tree.
+
+**The CI guard, and why it did not wait.** The complete fix is a check that no scaffolding filename
+is tracked, because an ignore rule only stops *this* checkout from re-adding one: `git add -f` and an
+already-tracked path both defeat it, and `progress.md` was already tracked when it was merged. The
+issue filed for that check (#885) said it should wait for the wiring-guard hardening branch
+(`ci-gates/wiring-basename`, #859), since both touch `scripts/ci/` and add a step to
+`.github/workflows/ci.yml`. While implementing it the wait looked wrong. The hazard #859 guards is a
+blanket `unittest discover` root — a workflow line that silently opts future files in. The steps this
+guard adds invoke two scripts by exact path, so they stay legal under #859's stricter rules whichever
+order they merge in; the residual cost is one possible `ci.yml` conflict on a branch that has to
+rebase anyway. The cost of waiting was not a conflict but a window: every agent that pushes to this
+repo meanwhile can land another `progress.md`, and the guard is what closes the window. Recorded
+because both the issue text and this section's first draft said the opposite.
+
+**What the guard enforces, and what it deliberately does not.** It enforces filename rules —
+`progress.md`, `progress-*.md`, `HANDOFF.md`, `.handoff-*.md` at any depth, and any path with a
+`.briefs` component. It does not enforce the heading rule, though the heading detector
+(`HANDOFF_HEADING`) is kept in the file so the rule stays expressible and can be wired into a
+pre-commit hook. The reason is concrete: `DECISIONS.md` on `main` quotes a `## Handoff` heading while
+describing this very incident, so a CI rule on headings would fail honest write-ups of the practice
+the rule exists to stop. A gate that fails legitimate prose gets routed around by a blanket exemption
+nobody re-reads, so the heading rule stays a review rule and the filename rule — which has no
+legitimate counter-use — is the one CI enforces.
+
+## 2026-11-21 — What TSBS's tag-grouped queries mean in `weft-xbench`, and what answers them first (TAG-12, #341)
+
+**Ambiguous.** The TAG-12 line names "TSBS tag-grouped query suite" and lists `single-groupby-*`, `double-groupby-*`, `lastpoint` and `high-cpu-*`. TSBS's README describes `single-groupby` as a MAX "every 5 mins", while the SQL TSBS generates buckets by one minute; and the line does not say how an engine's answer is judged.
+
+**Chosen.**
+
+- **TSBS's generated queries are the definition, not its README.** `single-groupby-M-H-T` is the MAX of the first `M` of TSBS's `cpuMetrics` over `H` named hosts per **one-minute** bucket in a half-open `[start, end)` window. Every generator read agrees: TimescaleDB `time_bucket('60 seconds', time)`, ClickHouse `toStartOfMinute`, InfluxDB `group by time(1m)`, QuestDB `SAMPLE BY 1m`. The README mismatch is [timescale/tsbs#214](https://github.com/timescale/tsbs/issues/214), open since 2022. Only the six variants TSBS registers (`1-1-1`, `1-1-12`, `1-8-1`, `5-1-1`, `5-1-12`, `5-8-1`) are named.
+- **An in-process reference judges every engine.** `tsbs::TsbsCpu` answers each query from the parsed file. TSBS picks hosts and windows from its own seed, so the caller passes the ones a generated query names, and the reference and the engine answer the same question. There is no ground truth beyond this, as with the `tsbs` interpolation datasets (2026-10-31).
+- **The fields stay TSBS's integers.** `load_cpu` refuses a float, unsigned, boolean or string field instead of converting it, so the reference is exact by construction and WeftDB stores the values as `ScaledI64` at scale 0 with no lossy step.
+- **WeftDB answers first, untimed.** `TsbsWeft` stores one aspect per metric and one series per `hostname` and answers from `downsample_range_of` (MAX per minute) and whole-series reads (`lastpoint`). A timed phase, the report and other engines come after the answers are pinned equal.
+
+**Rejected.**
+
+- The README's five-minute buckets: no engine TSBS benchmarks would run that query.
+- Timing first and checking later: a fast wrong answer is the failure this harness exists to catch.
+- Running TSBS's Go query generator in CI for the reference: the reference is twenty lines of Rust over data the tests already build, and the nightly does not carry a Go toolchain (2026-10-31).
+
+## 2026-11-22 — A doc comment that says a shipped feature is absent is its own defect (#860, TAG-12 residual)
+
+**Ambiguity.** `weft-bench/src/fan_out.rs` opened with "On `main` `git grep -l fan-out` matches only
+`DECISIONS.md`, `ROADMAP.md` and `docs/roadmap-notes.md` — there is **no measurement**", written before
+PR #809 landed the arm. The false half and the true half sit in one sentence, so the cheap move was to
+delete the sentence and the tidy move was to fold the fix into the next benchmark PR. Neither is right:
+deleting loses the true half, and folding makes a measurement diff harder to review while the falsehood
+keeps propagating in the meantime.
+
+**Choice.** Rewrote the module doc so both facts are stated separately and dated: the arm exists and is
+runnable (`--fan-out`; `run_fan_out_workload` at `weft-bench/src/main.rs:539`, flag parsed at `:1779`,
+dispatched at `:164`), and **no ladder number has ever been published** — `bench/claims.json` has no
+`fan_out` entry, so publishing one means a figure in `docs/reference.md` vouched by a registry entry that
+`tools/check_claims.py` lints in CI. Shipped as a docs-only slice.
+
+**Rationale.** A doc comment is a claim about the tree, and a false one makes the next agent's premise
+wrong — the same failure mode as a stale roadmap line (#851, #855), reached from the other direction:
+those roadmap lines had fallen behind the code, and this doc comment had fallen behind it too. Keeping the
+honest half explicit matters as much as removing the false half: the accurate statement is not "fan-out is
+missing" but "runnable and unmeasured", and that difference is what stops someone quoting a number that
+does not exist.
+
+**A related artifact found while appending.** `docs/roadmap-notes.md:844` on `main` carries a malformed
+heading: "## 2026-11-22 — Legacy ledger key digest widened from CRC-32 to 128 bits (#849, SEAL-HASH1) to
+128-bit SHA-256 prefix (#849)". It is the remains of a wrapped heading from the SEAL-HASH1 slice whose
+continuation was appended as a separate line and folded back into the heading. Repaired here by cutting
+the trailing fragment. Lesson for every future append-at-end slice: if a markdown heading must wrap, wrap
+it as prose **below** the heading, never as a continuation of it — a concatenated heredoc has no soft wrap.
+
+**Erratum, same slice.** My first cut of the replacement text said a published number "goes through
+`docs/benchmark-policy.md` and the baseline-control gate in `scripts/ci/check-baseline-control.py`" — wrong
+in precisely the way this slice exists to remove. That script compares the committed **OpenAPI** baseline
+digest against the base-ref copy (`--baseline compat/openapi/baseline/weftdb.json --digest-file
+compat/openapi/baseline/weftdb.json.sha256`), which is the FRE-18c contract gate and has nothing to do with
+benchmark figures; §3 of `docs/benchmark-policy.md` is a policy statement ("Every published number is ours,
+and reproducible"), not a publishing pipeline. The actual flow is a figure in `docs/reference.md` backed by a
+`bench/claims.json` entry (`schema: 1`; `id`, `figures`, `source`, `command`, `dataset`, `measured`,
+`reproducible_from_clone`, `artifact`) that `tools/check_claims.py` checks against the readme in CI. Caught
+by grepping the mechanism before anyone reviewed the PR. The lesson generalises to every citation this repo
+adds: name a gate only after reading what it gates, and re-read your own new sentence with the same scepticism
+the issue tells you to apply to the old one.
+
+**Not done.** No `ROADMAP.md` L127/L124 tick (a doc fix is not a measurement); no ladder run (needs the T7
+reference drive at L120, marked `*(owner)*`, and a local `cargo run`, which this host does not do); no
+`bench/claims.json` entry; no `weft-xbench` change (the nightly routine loop's lane, open PR #842); no
+`CHANGELOG.md` entry (nothing user-visible changed).
+
+## 2026-11-22 — B-object is absent; the freeze blocks it; defer to post-1.0 (#363)
+
+**Context.** Issue #363 "B-object (Phase 4 · absent)" from the predecessor backlog asks whether
+WeftDB has a schemaless object/annotation store beside numeric aspects. The audit
+(`docs/research/object-store-audit.md`) confirms:
+
+- **Nothing covers it.** Every `PhysicalType` variant (`weft-physical-type/src/lib.rs:161-200`)
+  is numeric (F64, F32, ScaledI64, ScaledI128, Decimal128, BigDecimalText).
+  `BigDecimalText` is an exactness escape hatch for decimal values, not a type escape hatch:
+  `parse_decimal` (`weft-physical-type/src/lib.rs:438`) rejects non-decimal text.
+- **No string/JSON/blob route path.** Every ingest point value is lifted through
+  `parse_decimal` to `BigDecimal` (`weft-server/src/ingest.rs:960,1042`). The segment frame
+  format has no non-numeric column model.
+- **The freeze blocks adding one.** Issue #238 ("Public surface declared and frozen", Phase 18
+  — Release candidate) prohibits new routes and JSON schema changes. B-object needs at minimum
+  a write route and a read route.
+- **Phase label reconciled.** Issue body says "Phase 4"; `ROADMAP.md:319` puts it under Phase 28
+  (Analytics premium); `docs/roadmap-notes.md` had "Phase 4 · absent". Corrected to Phase 28.
+
+**Chosen: defer to post-1.0, file no follow-ups, keep the box unchecked.**
+
+No implementation issues filed: creating fictionally actionable backlog items during the freeze
+would be speculative. The audit doc records the gap and recommends the post-1.0 re-evaluation
+scope a complete feature umbrella.
+
+**Needs human.** Whether the project wants object storage at all post-1.0, and whether it
+should be a new crate (`weft-object`) or a widened weft-physical-type. The audit doc recommends
+the crate path.
+
+## 2026-11-23 — How the TSBS query phase draws, warms and times its queries (TAG-12, #341)
+
+**Ambiguous.** The TAG-12 sub-item asks for "a timed `weft-xbench` TSBS-query phase with the reference gate in the report". It does not say which hosts and windows a timed rep asks for, whether reps repeat one question or ask new ones, what counts as warm-up, how much of the TSBS file the phase reads, or what `combine` does with the result.
+
+**Chosen.**
+
+- **Instances are drawn as `tsbs_generate_queries` draws them, from our own seed.** Hosts are a uniformly random subset of distinct hosts (`getRandomHosts` → `GetRandomSubsetPerm` in `cmd/tsbs_generate_queries/uses/devops/common.go`), and the window's start is uniform in `[first, end − window)` at nanosecond granularity, `end = start + window` (`TimeInterval.RandWindow` in `internal/utils/time_interval.go`). The seed is `weft-xbench`'s `--seed`, one stream per query type, so the instances are reproducible but are not the same instances a TSBS query file with the same seed would hold (Go's `math/rand` stream is not reproduced).
+- **Each timed rep answers a different instance**, as `tsbs_run_queries` runs a file of generated queries once each. With its defaults (`--burn-in 0`, `--workers 1`, `--prewarm-queries false`, `pkg/query/benchmarker.go`) TSBS times every query once. The phase answers one extra instance untimed first, as a burn-in of one, so the first timed rep does not alone pay whatever the store defers to its first read after a load. That reason is a precaution, not a measured effect.
+- **The gate runs outside the timed span**, on every instance, and a query type passes only when every instance equals the reference. A failure fails the run (`all_correct`), and the report flags it as any other gate failure does.
+- **The phase reads the whole `--tsbs` file**, whatever `--scales` says. TSBS draws its windows over the generator's whole interval, and the tiny scale's hour has no 12-hour window in it.
+- **`combine` refuses reports that carry TSBS query results** rather than pooling them. Carrying run 1's results alone would present one run as the pool, and pooling needs the same instance draw in every run, which has not been designed.
+- **Report schema v9**: `tsbs_queries` is a new top-level list, not a new `Phase` of `ArmResult`. An `ArmResult` is shaped around one dataset's grid (input points, missingness, accuracy against ground truth), none of which a TSBS query has.
+
+**Rejected.** Reusing one instance for every rep (it would time a cache, not TSBS's workload); TSBS's `--prewarm-queries` cold/warm pair (no cold hook is wired to this phase yet); timing the reference (it is the gate, not an engine).
+
+**Not decided here.** `lastpoint` reads every series' whole range, because `SegmentStore` has no per-series latest-row read (`read.rs` exposes range, point and downsample reads; `aspect_stats` has an aspect-wide time range only). TSBS's TimescaleDB `lastpoint` is a `LATERAL … ORDER BY time DESC LIMIT 1` per tag set. Whether WeftDB gets a latest-row read is an engine change and needs a benchmark behind it, so it is a ROADMAP sub-item, not part of this phase.
 
 ## 2026-11-22 — Retracting two claims in my own B-analysis audit (#362)
 

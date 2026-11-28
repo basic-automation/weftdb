@@ -184,6 +184,35 @@ impl OccurrenceLog {
 		Ok(Occurrence::new(aspect, resolution, size, database_info, pattern_id, from_nanos(cur.begin)?, from_nanos(cur.begin + cur.duration)?))
 	}
 
+	/// Whether the log holds an occurrence of the same window as `occurrence`: the same
+	/// aspect, resolution, size, database and exact span. The pattern id is ignored, since
+	/// extraction draws one fresh for every pattern it builds.
+	///
+	/// Compares the headers once and then walks the varint body without building any
+	/// [`Occurrence`], so no header (with its [`DatabaseInfo`]) is cloned per entry; when no
+	/// header matches, the body is not read at all.
+	#[must_use]
+	pub fn contains_window(&self, occurrence: &Occurrence) -> bool {
+		let matching: Vec<bool> = self.headers.iter().map(|(aspect, resolution, size, database_info, _)| aspect == occurrence.aspect() && resolution == occurrence.resolution() && *size == occurrence.size() && database_info == occurrence.database_info()).collect();
+		if !matching.contains(&true) {
+			return false;
+		}
+		let begin = nanos(occurrence.beginning());
+		let duration = nanos(occurrence.end()) - begin;
+		let mut r = Reader { bytes: &self.body, at: 0 };
+		let mut cur = Cursor::default();
+		for _ in 0..self.len {
+			let (Ok(index), Ok(delta), Ok(step)) = (r.usize(), r.var(), r.var()) else { return false };
+			cur.delta += unzigzag(delta);
+			cur.begin += cur.delta;
+			cur.duration += unzigzag(step);
+			if cur.begin == begin && cur.duration == duration && matching.get(index).copied().unwrap_or(false) {
+				return true;
+			}
+		}
+		false
+	}
+
 	#[must_use]
 	pub fn first(&self) -> Option<Occurrence> {
 		self.iter().next()
