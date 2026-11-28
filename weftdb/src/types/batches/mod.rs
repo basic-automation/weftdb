@@ -174,10 +174,7 @@ impl Batches {
 	///
 	/// Returns an error if any batch transformation fails.
 	pub fn process_batches(&mut self) -> Result<()> {
-		let result: Result<Vec<()>> =
-			self.0.par_iter_mut()
-				.map(|batch| batch.process())
-				.collect();
+		let result: Result<Vec<()>> = self.0.par_iter_mut().map(Batch::process).collect();
 		result?;
 		Ok(())
 	}
