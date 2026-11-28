@@ -8,6 +8,17 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
+### Documentation
+
+- **ILP docs and runnable examples (#869).** `docs/ingest-line-protocol.md`
+  published: the ingest-side reference covering the line record model,
+  `LineRecord::to_ilp()` writing, `parse`/`parse_points` reading, escaping rules
+  with both documented carve-outs (control characters, NaN equality), and the
+  `POST …/ilp` HTTP routes with their query parameters. The crate README and
+  `weft-client/README.md` link to the new page. Crate-level doctests added to
+  `weft-line-protocol/src/lib.rs` covering the build-write-parse round trip and
+  both carve-outs. No behaviour change, no new public items.
+
 ## [0.4.0] - 2026-11-23
 
 ### Documentation

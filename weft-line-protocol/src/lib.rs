@@ -33,6 +33,57 @@
 //!
 //! The timestamp's unit is caller-declared via [`TimestampPrecision`]; ILP's
 //! default is nanoseconds.
+//!
+//! ## Examples
+//!
+//! Build a [`LineRecord`], write it with [`LineRecord::to_ilp()`], re-parse it and assert
+//! the round trip:
+//!
+//! ```rust
+//! use weft_line_protocol::{FieldValue, LineRecord, parse};
+//!
+//! let record = LineRecord {
+//!     measurement: "cpu".to_string(),
+//!     tags: vec![("host".to_string(), "a".to_string())],
+//!     fields: vec![("load".to_string(), FieldValue::Float(0.5))],
+//!     timestamp: Some(1_000_000_000),
+//! };
+//! let text = record.to_ilp();
+//! let reparsed = parse(&text).expect("round-trip parses");
+//! assert_eq!(reparsed.len(), 1);
+//! assert_eq!(reparsed[0].to_ilp(), text, "ILP text round-trips");
+//! ```
+//!
+//! ### Carve-out: NaN text round-trips but records differ
+//!
+//! [`FieldValue`] derives `PartialEq`, and `f64::NAN != f64::NAN`, so a record
+//! containing `NaN` is **not** equal to its own round-trip:
+//!
+//! ```rust
+//! use weft_line_protocol::parse;
+//!
+//! let line = "m v=NaN 1";
+//! let parsed = parse(&line).expect("NaN parses as a record");
+//! let written = parsed[0].to_ilp();
+//! assert_eq!(written, line, "NaN text round-trips byte-identical");
+//!
+//! let reparsed = parse(&written).expect("written form re-parses");
+//! // reparsed[0] != parsed[0] because NaN != NaN
+//! assert_ne!(reparsed[0], parsed[0], "records differ after NaN round-trip");
+//! ```
+//!
+//! ### Carve-out: non-finite values refused by [`parse_points`]
+//!
+//! The single-series projection [`parse_points`] refuses a non-finite named field
+//! (ROB-7) rather than silently dropping it:
+//!
+//! ```rust
+//! use weft_line_protocol::{parse_points, TimestampPrecision, ParseErrorKind};
+//!
+//! let err = parse_points("weather temp=NaN 100\n", "temp", TimestampPrecision::Nanoseconds)
+//!     .expect_err("non-finite values are refused");
+//! assert_eq!(err.kind, ParseErrorKind::NonFiniteValue);
+//! ```
 
 #![recursion_limit = "1024"]
 #![forbid(clippy::pedantic, clippy::nursery, clippy::all)]
