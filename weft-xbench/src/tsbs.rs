@@ -18,6 +18,7 @@ use std::{
 	collections::{BTreeMap, BTreeSet}, io::BufRead, path::Path
 };
 
+use bigdecimal::BigDecimal;
 use splimes::Point;
 use weft_line_protocol::{FieldValue, SeriesKey, TimestampPrecision};
 
@@ -124,6 +125,10 @@ pub const HIGH_CPU_HOURS: u32 = 12;
 /// `high-cpu`'s threshold: `usage_user > 90.0`.
 pub const HIGH_CPU_ABOVE: i64 = 90;
 
+/// `double-groupby`'s window in hours: TSBS's `DoubleGroupByDuration` (`uses/devops/common.go`).
+/// The generator's doc comment says "a day"; the code draws twelve hours.
+pub const DOUBLE_GROUPBY_HOURS: u32 = 12;
+
 /// `groupby-orderby-limit`'s `LIMIT`.
 pub const ORDERBY_LIMIT: usize = 5;
 
@@ -180,6 +185,16 @@ pub enum TsbsQuery {
 		/// The window, in hours.
 		hours: u32,
 	},
+	/// `double-groupby-<metrics>`: the mean of the first `metrics` CPU fields per one-hour bucket
+	/// and host, over every host, over `hours` hours (TSBS's `GroupByTimeAndPrimaryTag`, an `avg`
+	/// grouped by hour and `hostname` and ordered by both, over `DoubleGroupByDuration`, twelve
+	/// hours; `double-groupby-all` takes all ten fields).
+	DoubleGroupby {
+		/// How many of [`CPU_METRICS`], from the first.
+		metrics: usize,
+		/// The window, in hours.
+		hours: u32,
+	},
 	/// `groupby-orderby-limit`: the MAX of `usage_user` over every host, per one-minute bucket,
 	/// for the five latest buckets before a random instant (TSBS's `GroupByOrderByLimit`: no
 	/// lower time bound, `ORDER BY minute DESC LIMIT 5`).
@@ -197,6 +212,32 @@ pub struct HourMax {
 	pub max: Vec<i64>,
 }
 
+/// One row of a `double-groupby` answer: one host's one-hour bucket.
+///
+/// The mean is kept as the exact rational `sum / count`, not as a rounded decimal, so two answers
+/// are equal exactly when their means are (locked constraint 4: no tolerance, no silent
+/// rounding). [`Self::means`] gives the decimal mean for display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostHourMean {
+	/// The bucket's start, in nanoseconds since the Unix epoch, a multiple of one hour.
+	pub hour_ns: i64,
+	/// The `hostname` tag.
+	pub host: String,
+	/// How many of the host's readings fell in the bucket.
+	pub count: u64,
+	/// The sum of each asked-for metric over those readings.
+	pub sum: Vec<i128>,
+}
+
+impl HostHourMean {
+	/// Each metric's mean, `sum / count` as `bigdecimal`'s division gives it.
+	#[must_use]
+	pub fn means(&self) -> Vec<BigDecimal> {
+		let count = BigDecimal::from(self.count);
+		self.sum.iter().map(|s| BigDecimal::from(*s) / &count).collect()
+	}
+}
+
 /// One row of a `single-groupby` answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MinuteMax {
@@ -210,9 +251,9 @@ impl TsbsQuery {
 	/// The query types TSBS defines that this module answers, for `single-groupby` only the
 	/// variants TSBS's own generator registers (`1-1-1`, `1-1-12`, `1-8-1`, `5-1-1`, `5-1-12`,
 	/// `5-8-1`), then `cpu-max-all-1` and `cpu-max-all-8`, then `high-cpu-1` and `high-cpu-all`,
-	/// then `groupby-orderby-limit`, then `lastpoint`. `cpu-max-all-32-24` is left out: it names
-	/// 32 hosts, and the reference file holds ten.
-	pub const ALL: [Self; 12] = [Self::SingleGroupby { metrics: 1, hosts: 1, hours: 1 }, Self::SingleGroupby { metrics: 1, hosts: 1, hours: 12 }, Self::SingleGroupby { metrics: 1, hosts: 8, hours: 1 }, Self::SingleGroupby { metrics: 5, hosts: 1, hours: 1 }, Self::SingleGroupby { metrics: 5, hosts: 1, hours: 12 }, Self::SingleGroupby { metrics: 5, hosts: 8, hours: 1 }, Self::CpuMaxAll { hosts: 1, hours: MAX_ALL_HOURS }, Self::CpuMaxAll { hosts: 8, hours: MAX_ALL_HOURS }, Self::HighCpu { hosts: 1, hours: HIGH_CPU_HOURS }, Self::HighCpu { hosts: 0, hours: HIGH_CPU_HOURS }, Self::GroupbyOrderbyLimit, Self::Lastpoint];
+	/// then `groupby-orderby-limit`, then `double-groupby-1`, `-5` and `-all`, then `lastpoint`.
+	/// `cpu-max-all-32-24` is left out: it names 32 hosts, and the reference file holds ten.
+	pub const ALL: [Self; 15] = [Self::SingleGroupby { metrics: 1, hosts: 1, hours: 1 }, Self::SingleGroupby { metrics: 1, hosts: 1, hours: 12 }, Self::SingleGroupby { metrics: 1, hosts: 8, hours: 1 }, Self::SingleGroupby { metrics: 5, hosts: 1, hours: 1 }, Self::SingleGroupby { metrics: 5, hosts: 1, hours: 12 }, Self::SingleGroupby { metrics: 5, hosts: 8, hours: 1 }, Self::CpuMaxAll { hosts: 1, hours: MAX_ALL_HOURS }, Self::CpuMaxAll { hosts: 8, hours: MAX_ALL_HOURS }, Self::HighCpu { hosts: 1, hours: HIGH_CPU_HOURS }, Self::HighCpu { hosts: 0, hours: HIGH_CPU_HOURS }, Self::GroupbyOrderbyLimit, Self::DoubleGroupby { metrics: 1, hours: DOUBLE_GROUPBY_HOURS }, Self::DoubleGroupby { metrics: 5, hours: DOUBLE_GROUPBY_HOURS }, Self::DoubleGroupby { metrics: CPU_METRICS.len(), hours: DOUBLE_GROUPBY_HOURS }, Self::Lastpoint];
 
 	/// The `--query-type` name.
 	#[must_use]
@@ -224,6 +265,9 @@ impl TsbsQuery {
 			Self::HighCpu { hosts: 0, hours: HIGH_CPU_HOURS } => "high-cpu-all".to_string(),
 			Self::HighCpu { hosts, hours: HIGH_CPU_HOURS } => format!("high-cpu-{hosts}"),
 			Self::HighCpu { hosts, hours } => format!("high-cpu-{hosts}-{hours}h"),
+			Self::DoubleGroupby { metrics: 10, hours: DOUBLE_GROUPBY_HOURS } => "double-groupby-all".to_string(),
+			Self::DoubleGroupby { metrics, hours: DOUBLE_GROUPBY_HOURS } => format!("double-groupby-{metrics}"),
+			Self::DoubleGroupby { metrics, hours } => format!("double-groupby-{metrics}-{hours}h"),
 			Self::GroupbyOrderbyLimit => "groupby-orderby-limit".to_string(),
 			Self::Lastpoint => "lastpoint".to_string(),
 		}
@@ -299,6 +343,33 @@ impl TsbsCpu {
 		Ok(rows)
 	}
 
+	/// `double-groupby`'s answer: for each one-hour bucket in `[start_ns, end_ns)` and each of
+	/// `hosts` with a reading in it, the exact mean of each of the first `metrics` [`CPU_METRICS`]
+	/// as a sum and a count, ordered by bucket then host name (TSBS's `ORDER BY hour, hostname`).
+	/// TSBS's query has no host filter; the caller names every host.
+	///
+	/// # Errors
+	///
+	/// `metrics` of 0 or more than ten, an empty or unknown host, or an empty window.
+	pub fn double_groupby(&self, metrics: usize, hosts: &[&str], start_ns: i64, end_ns: i64) -> anyhow::Result<Vec<HostHourMean>> {
+		anyhow::ensure!((1..=CPU_METRICS.len()).contains(&metrics), "a double-groupby takes 1 to {} metrics, not {metrics}", CPU_METRICS.len());
+		anyhow::ensure!(!hosts.is_empty(), "a TSBS query names at least one host");
+		anyhow::ensure!(start_ns < end_ns, "the window [{start_ns}, {end_ns}) is empty");
+		let mut buckets: BTreeMap<(i64, &str), (u64, Vec<i128>)> = BTreeMap::new();
+		for host in hosts {
+			let readings = self.hosts.get(*host).ok_or_else(|| anyhow::anyhow!("no host {host:?} in the TSBS data"))?;
+			let first = readings.partition_point(|r| r.ts_ns < start_ns);
+			for reading in readings[first..].iter().take_while(|r| r.ts_ns < end_ns) {
+				let (count, sum) = buckets.entry((reading.ts_ns.div_euclid(HOUR_NS) * HOUR_NS, host)).or_insert_with(|| (0, vec![0; metrics]));
+				*count += 1;
+				for (s, v) in sum.iter_mut().zip(&reading.values[..metrics]) {
+					*s += i128::from(*v);
+				}
+			}
+		}
+		Ok(buckets.into_iter().map(|((hour_ns, host), (count, sum))| HostHourMean { hour_ns, host: host.to_string(), count, sum }).collect())
+	}
+
 	/// `groupby-orderby-limit`'s answer: the MAX of `usage_user` over every host's readings before
 	/// `end_ns`, per one-minute bucket, the [`ORDERBY_LIMIT`] latest buckets, newest first.
 	#[must_use]
@@ -361,10 +432,10 @@ impl TsbsCpu {
 		let names: Vec<&String> = self.hosts.keys().collect();
 		let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
 		match query {
-			TsbsQuery::SingleGroupby { hosts, hours, .. } | TsbsQuery::CpuMaxAll { hosts, hours } | TsbsQuery::HighCpu { hosts, hours } => {
+			TsbsQuery::SingleGroupby { hosts, hours, .. } | TsbsQuery::CpuMaxAll { hosts, hours } | TsbsQuery::HighCpu { hosts, hours } | TsbsQuery::DoubleGroupby { metrics: hosts, hours } => {
+				// `high-cpu-all` and `double-groupby` name no host filter: every host.
+				let hosts = if matches!(query, TsbsQuery::HighCpu { hosts: 0, .. } | TsbsQuery::DoubleGroupby { .. }) { names.len() } else { hosts };
 				anyhow::ensure!(hosts <= names.len(), "{} names {hosts} hosts and the data holds {}", query.name(), names.len());
-				// `high-cpu-all` names no host filter: every host.
-				let hosts = if matches!(query, TsbsQuery::HighCpu { hosts: 0, .. }) { names.len() } else { hosts };
 				let window = i64::from(hours).saturating_mul(3_600_000_000_000);
 				let upper = end.saturating_sub(window);
 				anyhow::ensure!(upper > first, "{} needs a {hours}-hour window and the data spans {} s", query.name(), (end - first) / 1_000_000_000);
@@ -408,6 +479,10 @@ impl TsbsCpu {
 				let hosts: Vec<&str> = instance.hosts.iter().map(String::as_str).collect();
 				Ok(TsbsAnswer::Readings(self.high_cpu(&hosts, instance.start_ns, instance.end_ns)?))
 			}
+			TsbsQuery::DoubleGroupby { metrics, .. } => {
+				let hosts: Vec<&str> = instance.hosts.iter().map(String::as_str).collect();
+				Ok(TsbsAnswer::HostHours(self.double_groupby(metrics, &hosts, instance.start_ns, instance.end_ns)?))
+			}
 			TsbsQuery::GroupbyOrderbyLimit => Ok(TsbsAnswer::Minutes(self.groupby_orderby_limit(instance.end_ns))),
 			TsbsQuery::Lastpoint => Ok(TsbsAnswer::Latest(self.lastpoint().into_iter().map(|(h, r)| (h.to_string(), r.clone())).collect())),
 		}
@@ -437,6 +512,8 @@ pub enum TsbsAnswer {
 	Readings(Vec<(String, CpuReading)>),
 	/// A `lastpoint`: one row per host, in name order.
 	Latest(Vec<(String, CpuReading)>),
+	/// A `double-groupby`: one row per one-hour bucket and host, by bucket then host name.
+	HostHours(Vec<HostHourMean>),
 }
 
 impl TsbsAnswer {
@@ -447,6 +524,7 @@ impl TsbsAnswer {
 			Self::Minutes(rows) => rows.len(),
 			Self::Hours(rows) => rows.len(),
 			Self::Readings(rows) | Self::Latest(rows) => rows.len(),
+			Self::HostHours(rows) => rows.len(),
 		}
 	}
 }
@@ -661,6 +739,33 @@ cpu,hostname=host_1,region=us-west-1 usage_user=83i,usage_system=12i 14516064200
 	}
 
 	#[test]
+	fn double_groupby_is_the_exact_per_hour_per_host_mean_by_hour_then_host() {
+		let t0 = 1_451_606_400_000_000_000_i64;
+		let mut cpu = TsbsCpu::default();
+		// A reading every twenty minutes for two hours; metric m of host h at step s is
+		// 10 * h + m + s, so each hour's three steps average to their middle step, and host_1's
+		// mean of 1 + 2 + 4 = 7 over three is not a terminating decimal.
+		for h in [0_i64, 2] {
+			let readings = (0..6_i64).map(|s| CpuReading { ts_ns: t0 + s * 20 * MINUTE_NS, values: std::array::from_fn(|m| 10 * h + i64::try_from(m).expect("small") + s) }).collect();
+			cpu.hosts.insert(format!("host_{h}"), readings);
+		}
+		cpu.hosts.insert("host_1".into(), [1, 2, 4].iter().enumerate().map(|(s, v)| CpuReading { ts_ns: t0 + i64::try_from(s).expect("small") * 20 * MINUTE_NS, values: [*v; 10] }).collect());
+		let got = cpu.double_groupby(2, &["host_2", "host_1", "host_0"], t0, t0 + 2 * HOUR_NS).expect("answers");
+		let rows: Vec<(i64, &str, u64, Vec<i128>)> = got.iter().map(|r| ((r.hour_ns - t0) / HOUR_NS, r.host.as_str(), r.count, r.sum.clone())).collect();
+		assert_eq!(rows, [(0, "host_0", 3, vec![3, 6]), (0, "host_1", 3, vec![7, 7]), (0, "host_2", 3, vec![63, 66]), (1, "host_0", 3, vec![12, 15]), (1, "host_2", 3, vec![72, 75])], "by hour, then host name; host_1 has no second hour");
+		assert_eq!(got[0].means(), [BigDecimal::from(1), BigDecimal::from(2)]);
+		assert_eq!(got[1].means()[0], BigDecimal::from(7) / BigDecimal::from(3), "the rational, divided as bigdecimal divides");
+		// Half-open, cut inside an hour: steps 1 and 2 of the first hour, then step 3 alone.
+		let cut = cpu.double_groupby(1, &["host_0"], t0 + 1, t0 + HOUR_NS + 1).expect("answers");
+		assert_eq!(cut.iter().map(|r| (r.count, r.sum[0])).collect::<Vec<_>>(), [(2, 3), (1, 3)]);
+		assert!(cpu.double_groupby(0, &["host_0"], t0, t0 + HOUR_NS).is_err());
+		assert!(cpu.double_groupby(1, &["host_9"], t0, t0 + HOUR_NS).is_err());
+		let drawn = cpu.instances(TsbsQuery::DoubleGroupby { metrics: 1, hours: 1 }, 2, 7).expect("draws");
+		assert!(drawn.iter().all(|i| i.hosts.len() == 3 && i.end_ns - i.start_ns == HOUR_NS), "every host, whatever `metrics` is");
+		assert!(cpu.instances(TsbsQuery::DoubleGroupby { metrics: 10, hours: DOUBLE_GROUPBY_HOURS }, 1, 7).expect_err("too short").to_string().contains("12-hour window"));
+	}
+
+	#[test]
 	fn single_groupby_refuses_a_question_it_cannot_answer() {
 		let cpu = load_cpu_from_reader(cpu_sample().as_bytes(), 3600).expect("reads");
 		assert!(cpu.single_groupby(0, &["host_0"], 0, 1).is_err());
@@ -730,7 +835,9 @@ cpu,hostname=host_1,region=us-west-1 usage_user=83i,usage_system=12i 14516064200
 		assert!(TsbsQuery::parse("cpu-max-all-32-24").is_err(), "not in ALL: the reference file holds ten hosts");
 		assert_eq!((TsbsQuery::ALL[8].name().as_str(), TsbsQuery::ALL[9].name().as_str()), ("high-cpu-1", "high-cpu-all"));
 		assert_eq!(TsbsQuery::ALL[10].name(), "groupby-orderby-limit");
-		assert!(TsbsQuery::parse("double-groupby-1").expect_err("not yet").to_string().contains("supported: single-groupby-1-1-1"));
+		assert_eq!(TsbsQuery::ALL[11..14].iter().map(|q| q.name()).collect::<Vec<_>>(), ["double-groupby-1", "double-groupby-5", "double-groupby-all"]);
+		assert_eq!(TsbsQuery::ALL[14].name(), "lastpoint");
+		assert!(TsbsQuery::parse("double-groupby-2").expect_err("not registered").to_string().contains("supported: single-groupby-1-1-1"));
 	}
 
 	#[test]

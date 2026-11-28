@@ -137,7 +137,7 @@ The phase also cleared the remaining loose ends. The stale README status was fix
     - [ ] The other engines' TSBS SQL (TSBS's own per-engine generators), each checked against the reference
     - [ ] `double-groupby-*`, `high-cpu-*`, `cpu-max-all-*` and `groupby-orderby-limit`
       - [x] `cpu-max-all-1`, `cpu-max-all-8`, `high-cpu-1`, `high-cpu-all` and `groupby-orderby-limit`, gated against the reference in the timed phase (2026-11-25, `routine/weftdb-2026-11-25`: `TsbsCpu::{cpu_max_all, high_cpu, groupby_orderby_limit}` and `TsbsWeft`'s answers, defined from TSBS's TimescaleDB generator; a mutant per query fails its tests; a debug run over `/mnt/weftbench/tsbs/cpu-only.lp` passes all twelve queries on a busy host, timings unpublished)
-      - [ ] `double-groupby-1`, `-5` and `-all` (an `avg` per host and hour: settle how a mean is compared exactly first)
+      - [x] `double-groupby-1`, `-5` and `-all`, gated against the reference in the timed phase (2026-11-27, `routine/weftdb-2026-11-27`: `TsbsCpu::double_groupby` and `TsbsWeft::double_groupby`; the mean is compared as the exact rational sum / count, and the store's own `avg` must equal that sum ÷ count as `bigdecimal` divides (`DECISIONS.md` 2026-11-27); an inclusive-end mutant and an `avg` mutant each fail the store test)
       - [ ] `cpu-max-all-32-24` (32 hosts: needs a TSBS file with at least 32 hosts; the reference file has 10)
   - [ ] Tagged fixtures and freeze docs
 - [x] **ROB-24** Limits and overload evidence; frozen configuration documentation
