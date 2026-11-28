@@ -8,7 +8,39 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-11-25
+## [0.4.0] - 2026-11-28
+
+### Documentation
+
+- **ILP docs and runnable examples (#869).** `docs/ingest-line-protocol.md`
+  published: the ingest-side reference covering the line record model,
+  `LineRecord::to_ilp()` writing, `parse`/`parse_points` reading, escaping rules
+  with both documented carve-outs (control characters, NaN equality), and the
+  `POST …/ilp` HTTP routes with their query parameters. The crate README and
+  `weft-client/README.md` link to the new page. Crate-level doctests added to
+  `weft-line-protocol/src/lib.rs` covering the build-write-parse round trip and
+  both carve-outs. No behaviour change, no new public items.
+
+### Added
+
+- **`SegmentStore::read_latest_of` and `read_latest` (TAG-12, #341).** The latest row of one
+  series (or of series 0) and its value, equal to the last row of a whole-series
+  `read_time_range_of`, newer-wins across overlapping segments and a newer null included. It
+  reads only the series' latest instant instead of every row, and falls back to the whole
+  series if that instant reads empty. `weft-xbench`'s TSBS `lastpoint` now uses it. A new
+  `weftdb/benches/latest_read.rs` compares it with the whole-series read.
+- **`weft-xbench --tsbs-queries` answers five more TSBS queries (TAG-12, #341):**
+  `cpu-max-all-1`, `cpu-max-all-8`, `high-cpu-1`, `high-cpu-all` and
+  `groupby-orderby-limit`. Each is gated against the in-memory reference, like the
+  `single-groupby` variants and `lastpoint`.
+- **`weft-xbench --tsbs-queries` answers TSBS `double-groupby-1`, `-5` and `-all` (TAG-12,
+  #341):** the mean of 1, 5 or all ten CPU fields per hour and host, over every host and 12
+  hours. Answers carry each mean as an exact sum and row count, so the gate compares means
+  with no tolerance; the store's own `avg` must equal that sum divided by that count.
+
+### Fixed
+
+- **process_batches, #862:** `Batches::process_batches` now delegates to `Batch::process`, adding the missing `relative_analysis` step so the dead batch-collection producer behaves like the live path.
 
 ### Fixed (memory growth in long-running processes)
 
@@ -34,6 +66,25 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
 - **CHRONO-INV, #791:** Inventory of `chrono` v0.4 dependency across the workspace — 9
   consuming crates, 272 call sites, migration feasibility assessment.
   See `docs/research/chrono-inventory.md`.
+
+- **The B-analysis wiring audit corrected in place (#362).** Two claims in
+  `docs/research/per-point-analysis-wiring.md` were false and are retracted in a dated
+  `## Correction (2026-11-22)` section: per-point `analysis` *is* persisted
+  (`weftdb/src/types/database/inputs.rs:993` writes it, `outputs.rs:1721` reads it back), and the
+  producer *does* run on a live path (`weft-orchestration/src/pipeline.rs:747,849`). The
+  surviving defects are filed as #862 (re-titled to what was verified), #892 and #893.
+
+- **The same audit named two types that do not exist (#362).** `BatchCollection` and
+  `DatabaseOutputs` are phantoms. The batch-collection type is `Batches`
+  (`weftdb/src/types/batches/mod.rs:16`, `process_batches` at `:176`), and the query-time pair is
+  `analyze_point`/`analyze_range` on the `Outputs` trait
+  (`weftdb/src/types/database/traits/outputs.rs:12`), implemented for `Database`
+  (`weftdb/src/types/database/outputs.rs:34`). The names are corrected throughout
+  `docs/research/per-point-analysis-wiring.md`, which adds a dated `### Correction (2026-11-28)`
+  section listing both phantoms and re-basing three `weft-orchestration/src/lib.rs` anchors
+  (`773→797`, `795→819`, `872,887→896,911`); #862 is re-titled to match. Documentation only: no
+  behaviour change, and the `ROADMAP.md` verification line stays unchecked.
+
 - **B-poll / B-retry / B-register audit (#361).** `docs/research/client-poll-retry-register-audit.md` published: all three backlog items are either already present (retry-for-503) or not needed (polling daemon, source registration). No behaviour changed. Phase label reconciled to Phase&nbsp;23.
 - **REST facade audit (#360).** Audited what the WeftDB HTTP API (the REST facade) still does not
   expose from the `weftdb` library. Produced `docs/research/rest-facade-audit.md` with a route
@@ -518,7 +569,7 @@ origin/main
 - **The per-point analysis model was audited, and it is not wired end-to-end (#362).**
   `docs/research/per-point-analysis-wiring.md` records four breaks, each with call-site
   evidence: `Batch::process()` runs only inside `weft-orchestration`'s pipeline and two
-  `weftdb` tests, and `BatchCollection::process_batches()` has no callers at all;
+  `weftdb` tests, and `Batches::process_batches()` (the batch-collection type is named `Batches`) has no callers at all;
   `BatchedMeasurement::new` fixes `analysis: None` and both read-side batch constructors build
   measurements only through it, so nothing an earlier pass computed survives a re-read;
   `weft-server` contains no "analysis" token and `analyze_point`/`analyze_range` have no
