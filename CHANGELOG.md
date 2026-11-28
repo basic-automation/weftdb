@@ -34,9 +34,9 @@ While the project is pre-1.0, minor version bumps may contain breaking changes.
   #341):** the mean of 1, 5 or all ten CPU fields per hour and host, over every host and 12
   hours. Answers carry each mean as an exact sum and row count, so the gate compares means
   with no tolerance; the store's own `avg` must equal that sum divided by that count.
-  ### Fixed
-  
-  - **process_batches, #862:** `Batches::process_batches` now delegates to `Batch::process`, adding the missing `relative_analysis` step so the dead batch-collection producer behaves like the live path.
+### Fixed
+
+- **process_batches, #862:** `Batches::process_batches` now delegates to `Batch::process`, adding the missing `relative_analysis` step so the dead batch-collection producer behaves like the live path.
 
 ## [0.4.0] - 2026-11-23
 
